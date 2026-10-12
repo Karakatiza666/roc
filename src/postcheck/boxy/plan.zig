@@ -2357,7 +2357,7 @@ pub fn literalSiteValueType(bodies: checked.CheckedBodyStoreView, expr_id: check
     return switch (expr.data) {
         .interpolation => |interpolation| interpolation.assembler_ty,
         .numeral, .str_from_quote => expr.ty,
-        .pending, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("literal site did not name a checked literal conversion"),
+        .pending, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("literal site did not name a checked literal conversion"),
     };
 }
 
@@ -4389,7 +4389,7 @@ const Builder = struct {
             switch (args[0]) {
                 .generated_interpolation_segments => |expr| switch (view.checked_bodies.expr(expr).data) {
                     .interpolation => |interpolation| try self.bindInterpolationItemRepresentation(view, interpolation),
-                    .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("interpolation segments operand named a non-interpolation expression"),
+                    .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("interpolation segments operand named a non-interpolation expression"),
                 },
                 .checked_expr, .generated_numeral, .generated_quote => {},
             }
@@ -5084,7 +5084,7 @@ const Builder = struct {
                         typeRef(site.view, bodies.expr(hash.hasher).ty),
                         typeRef(site.view, expr.ty),
                     ),
-                    .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => unreachable, // derived_root_after_operands is pushed only for structural_eq and structural_hash
+                    .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => unreachable, // derived_root_after_operands is pushed only for structural_eq and structural_hash
                 }
             },
             .low_level_after_args => |site| {
@@ -6633,6 +6633,7 @@ const Builder = struct {
             => {},
             .empty_record => try actions.append(self.allocator, .{ .omitted_defaults = site }),
             .str_from_quote => |quote| try actions.append(self.allocator, .{ .string_literal_conversion = .{ .view = view, .expr = expr_id, .plan = quote.plan } }),
+            .code_from_lambda => |maybe_node| try self.pushCodeConversion(actions, view, expr_id, maybe_node),
             .lookup_local,
             .lookup_external,
             .lookup_required,
@@ -6849,6 +6850,24 @@ const Builder = struct {
         }
     }
 
+    /// A staged function's description is a constant the reifier already
+    /// wrote, so planning walks the stored node for representations and has no
+    /// dispatch target to resolve.
+    fn pushCodeConversion(
+        self: *Builder,
+        actions: *std.ArrayList(PlanAction),
+        view: ModuleView,
+        expr_id: checked.CheckedExprId,
+        maybe_node: ?checked.ConstNodeId,
+    ) Allocator.Error!void {
+        const node = maybe_node orelse return;
+        const store = view.const_store orelse
+            boxyPlanInvariant("staged code module had no ConstStore");
+        if (store.get(node) == .crash) return;
+        const rep = try self.analyzeType(view, view.checked_bodies.expr(expr_id).ty);
+        try self.pushStaticConstRoot(actions, view, node, rep, null);
+    }
+
     /// Analyze a stored constant's nodes under a visited set of their own.
     fn pushStaticConstRoot(
         self: *Builder,
@@ -6872,7 +6891,7 @@ const Builder = struct {
         const ref_id = switch (expr.data) {
             .lookup_local => |lookup| lookup.resolved.?,
             .lookup_external, .lookup_required => |resolved| resolved.?,
-            .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => unreachable, // the callable_lookup step rejected non-lookup expressions before pushing this site
+            .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => unreachable, // the callable_lookup step rejected non-lookup expressions before pushing this site
         };
         const stored_fn = self.storedFnSourceForProcedureValueRef(view, ref_id);
         const source = if (stored_fn) |stored|
@@ -6965,7 +6984,7 @@ const Builder = struct {
             .generated_interpolation_segments => |expr| {
                 const interpolation = switch (view.checked_bodies.expr(expr).data) {
                     .interpolation => |value| value,
-                    .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("crashing interpolation segments referenced a non-interpolation expression"),
+                    .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("crashing interpolation segments referenced a non-interpolation expression"),
                 };
                 try actions.append(self.allocator, exprAction(view, interpolation.segments[0]));
                 for (interpolation.values, interpolation.segments[1..]) |value, segment| {
@@ -9908,7 +9927,7 @@ const Builder = struct {
                     .return_ => |ret| if (functionResultType(view, bodies.expr(ret.lambda).ty)) |fn_ret| {
                         try work.append(self.allocator, .{ typeRef(view, fn_ret), typeRef(view, bodies.expr(ret.expr).ty) });
                     },
-                    .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .for_, .hosted_lambda, .run_low_level => {},
+                    .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .for_, .hosted_lambda, .run_low_level => {},
                 }
             }
         }
@@ -13493,7 +13512,7 @@ const Builder = struct {
             .str_from_quote => |quote| quote.plan,
             .interpolation => |interpolation| interpolation.plan,
             .numeral => |numeral| numeral.plan,
-            .pending, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("boxy direct call plan referenced a checked expression that is not lowered as a worker call"),
+            .pending, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("boxy direct call plan referenced a checked expression that is not lowered as a worker call"),
         };
     }
 
@@ -22679,6 +22698,7 @@ pub fn divergentStep(view: anytype, expr_id: checked.CheckedExprId) DivergentSte
         .str_from_quote => |quote| divergentDispatchStep(view, quote.plan),
         inline .pending,
         .str_segment,
+        .code_from_lambda,
         .bytes_literal,
         .lookup_local,
         .lookup_external,
@@ -22736,7 +22756,7 @@ pub fn divergentEarlierOperands(
                 .checked_expr => |expr| try list.append(alloc, expr),
                 .generated_interpolation_segments => |expr| switch (v.checked_bodies.expr(expr).data) {
                     .interpolation => |value| try interpolation(list, alloc, value),
-                    .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("dispatch interpolation segments referenced a non-interpolation expression"),
+                    .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("dispatch interpolation segments referenced a non-interpolation expression"),
                 },
                 .generated_numeral, .generated_quote => {},
             };
@@ -22762,7 +22782,7 @@ pub fn divergentEarlierOperands(
         .numeral => |numeral| try Append.dispatch(view, &operands, allocator, numeral.plan),
         .str_from_quote => |quote| try Append.dispatch(view, &operands, allocator, quote.plan),
         // A single-operand form evaluates nothing before its operand.
-        .pending, .str_segment, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .nominal, .zero_argument_tag, .closure, .lambda, .unary_minus, .unary_not, .field_access, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .row_coerce => {},
+        .pending, .str_segment, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .nominal, .zero_argument_tag, .closure, .lambda, .unary_minus, .unary_not, .field_access, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .row_coerce => {},
     }
     const len = std.mem.findScalar(checked.CheckedExprId, operands.items, divergent) orelse 0;
     return try allocator.dupe(checked.CheckedExprId, operands.items[0..len]);
@@ -22781,7 +22801,7 @@ fn divergentDispatchStep(view: anytype, maybe_plan: ?static_dispatch.StaticDispa
         .checked_expr => |expr| if (bodies.exprDiverges(expr, .run)) return .{ .operand = expr },
         .generated_interpolation_segments => |expr| switch (bodies.expr(expr).data) {
             .interpolation => |value| if (firstDivergentInterpolationOperand(bodies, value)) |divergent| return .{ .operand = divergent },
-            .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("dispatch interpolation segments referenced a non-interpolation expression"),
+            .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => boxyPlanInvariant("dispatch interpolation segments referenced a non-interpolation expression"),
         },
         .generated_numeral, .generated_quote => {},
     };
@@ -22791,7 +22811,7 @@ fn divergentDispatchStep(view: anytype, maybe_plan: ?static_dispatch.StaticDispa
 fn isLookupExpr(data: anytype) bool {
     return switch (data) {
         .lookup_local, .lookup_external, .lookup_required => true,
-        .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => false,
+        .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => false,
     };
 }
 

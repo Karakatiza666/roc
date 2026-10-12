@@ -106,6 +106,7 @@ const RedundantOpenTagUnion = problem_mod.RedundantOpenTagUnion;
 const ComptimeOrigin = problem_mod.ComptimeOrigin;
 const ComptimeCrash = problem_mod.ComptimeCrash;
 const ComptimeInvalidInterpolation = problem_mod.ComptimeInvalidInterpolation;
+const StagedCode = problem_mod.StagedCode;
 const ComptimeExpectFailed = problem_mod.ComptimeExpectFailed;
 const ComptimeEvalError = problem_mod.ComptimeEvalError;
 
@@ -1137,6 +1138,7 @@ pub const ReportBuilder = struct {
             .comptime_invalid_numeral => |data| return self.buildComptimeInvalidLiteralReport(data, "Invalid Number", "The from_numeral implementation for this number literal's type rejected it."),
             .comptime_invalid_quote => |data| return self.buildComptimeInvalidLiteralReport(data, "Invalid String", "The from_quote implementation for this string literal's type rejected it."),
             .comptime_invalid_interpolation => |data| return self.buildComptimeInvalidInterpolationReport(data),
+            .staged_code => |data| return self.buildStagedCodeReport(data),
             .comptime_expect_failed => |data| return self.buildComptimeExpectFailedReport(data),
             .comptime_eval_error => |data| return self.buildComptimeEvalErrorReport(data),
             .invalid_numeric_literal => |data| return self.buildInvalidNumericLiteralReport(data),
@@ -2093,6 +2095,18 @@ pub const ReportBuilder = struct {
         // Extract only the argument types from the function snapshots
         const actual_arg_type = types.actual_snapshot;
         const expected_arg_type = types.expected_snapshot;
+
+        // A function named where a `Code` is expected is staged, and staging
+        // reaches a top-level definition or a lambda a block binds. Anywhere
+        // else the checker sees a function against a `Code`, which says
+        // nothing about staging, so the staged-code report replaces the
+        // mismatch.
+        if (self.stagedCodeArgMismatch(expected_arg_type, actual_arg_type)) {
+            return try self.buildStagedCodeReport(.{
+                .reason = .not_a_named_function,
+                .region = self.can_ir.store.getRegionAt(@fromBackingInt(@intCast(@backingInt(ctx.arg_var)))),
+            });
+        }
 
         if (ctx.fn_name) |fn_name_ident| {
             return try self.makeMismatchReport(
@@ -5782,6 +5796,207 @@ pub const ReportBuilder = struct {
         return .{
             D.bytes(location.module_name).withAnnotation(.path),
             D.bytes(location.position).withAnnotation(.emphasized).withNoPrecedingSpace(),
+        };
+    }
+
+    /// Whether an argument mismatch is a function named where a `Code` was
+    /// expected. The expected side is the builtin `Code` and the actual side is
+    /// a function: the checker looked for a description and was handed the
+    /// function itself, which is what a staging site that did not trigger
+    /// leaves behind.
+    fn stagedCodeArgMismatch(
+        self: *Self,
+        expected: SnapshotContentIdx,
+        actual: SnapshotContentIdx,
+    ) bool {
+        const nominal = switch (self.snapshots.?.getContentUnwrapAlias(expected)) {
+            .structure => |structure| switch (structure) {
+                .nominal_type => |nominal_type| nominal_type,
+                .box,
+                .tuple,
+                .fn_pure,
+                .fn_effectful,
+                .fn_unbound,
+                .record,
+                .empty_record,
+                .tag_union,
+                .empty_tag_union,
+                => return false,
+            },
+            .flex, .rigid, .alias, .recursive, .err => return false,
+        };
+        if (!nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code)) return false;
+
+        return switch (self.snapshots.?.getContentUnwrapAlias(actual)) {
+            .structure => |structure| switch (structure) {
+                .fn_pure, .fn_effectful, .fn_unbound => true,
+                .box,
+                .tuple,
+                .nominal_type,
+                .record,
+                .empty_record,
+                .tag_union,
+                .empty_tag_union,
+                => false,
+            },
+            .flex, .rigid, .alias, .recursive, .err => false,
+        };
+    }
+
+    /// Build a report for a function the compiler cannot reify.
+    fn buildStagedCodeReport(self: *Self, data: StagedCode) Allocator.Error!Report {
+        // One verb across the whole family: reifying is the act, and the
+        // description is what it produces. Each title names what the
+        // highlighted region is, and each summary says why that region stopped
+        // the compiler, so the first two lines answer the question on their
+        // own.
+        var report = switch (data.reason) {
+            .unsupported_construct => try Report.init(
+                self.gpa,
+                "Cannot Reify This Expression",
+                "Reifying turns a function into a description a translator reads, and a description has no form for this expression.",
+                .runtime_error,
+            ),
+            .unsupported_type => try Report.init(
+                self.gpa,
+                "Cannot Reify This Type",
+                "Reifying turns a function into a description a translator reads, and a description has no form for this type.",
+                .runtime_error,
+            ),
+            .unresolved_type => try Report.init(
+                self.gpa,
+                "Cannot Reify A Polymorphic Function",
+                "This function is polymorphic here, and the place it is used does not narrow every type variable to one type.",
+                .runtime_error,
+            ),
+            .captures_a_binding => try Report.init(
+                self.gpa,
+                "Reified Function Captures A Value",
+                "This function reads a value from the scope around it, and a description carries no scope.",
+                .runtime_error,
+            ),
+            .performs_an_effect => try Report.init(
+                self.gpa,
+                "Reified Function Performs An Effect",
+                "This function performs an effect, and a description is read while the compiler runs, where an effect has nowhere to happen.",
+                .runtime_error,
+            ),
+            .definition_not_reachable => try Report.init(
+                self.gpa,
+                "Cannot Reach This Definition",
+                "This name should lead to a function body the compiler can read, and it does not.",
+                .runtime_error,
+            ),
+            .not_a_named_function => try Report.init(
+                self.gpa,
+                "Cannot Reify This Function",
+                "Reifying reads the body a name is bound to, and no body stands behind this name.",
+                .runtime_error,
+            ),
+            .argument_not_constant => try Report.init(
+                self.gpa,
+                "Template Needs A Constant",
+                "A template's arguments are written into the description it produces, so each one is fixed while the compiler runs.",
+                .runtime_error,
+            ),
+            .outside_staged_position => try Report.init(
+                self.gpa,
+                "Code Is Not Allowed Here",
+                "A Code can name a function's parameter, or what a function returns.",
+                .runtime_error,
+            ),
+        };
+        errdefer report.deinit();
+
+        const region_info = self.module_env.calcRegionInfo(data.region);
+        try report.document.addSourceRegion(
+            region_info,
+            .error_highlight,
+            self.filename,
+            self.source,
+            self.module_env.getLineStarts(),
+        );
+        try report.document.addLineBreak();
+
+        switch (data.reason) {
+            .unsupported_construct => try D.renderSlice(&.{
+                D.bytes("A description covers a subset of Roc, so that a translator can match"),
+                D.bytes("every shape it might meet. Rewrite this expression using a form the"),
+                D.bytes("subset has, or move it out of the reified function."),
+            }, self, &report),
+            .unsupported_type => try D.renderSlice(&.{
+                D.bytes("A description covers a subset of Roc's types, so that a translator can"),
+                D.bytes("match every shape it might meet. Use a type the subset has, or move"),
+                D.bytes("this value out of the reified function."),
+            }, self, &report),
+            .unresolved_type => try D.renderSlice(&.{
+                D.bytes("A description is built for one concrete type at a time, so a type"),
+                D.bytes("variable has no shape to describe. Use this function where its types"),
+                D.bytes("are already fixed, or write a type annotation that fixes them."),
+            }, self, &report),
+            .captures_a_binding => try D.renderSlice(&.{
+                D.bytes("A translator receives the description on its own, without the scope the"),
+                D.bytes("function was written in. Pass this value as a parameter instead."),
+            }, self, &report),
+            .performs_an_effect => try D.renderSlice(&.{
+                D.bytes("A translator runs during"),
+                D.bytes("roc build").withAnnotation(.emphasized),
+                D.bytes("and produces a value from the description. Effects belong in the"),
+                D.bytes("program the translator produces, not in the function it describes."),
+            }, self, &report),
+            .definition_not_reachable => try D.renderSlice(&.{
+                D.bytes("Reifying reads the function's body. Name a function defined at the"),
+                D.bytes("top level of this module or of one it imports."),
+            }, self, &report),
+            .not_a_named_function => try D.renderSlice(&.{
+                D.bytes("A name leads to a body when a top-level definition binds it, or when"),
+                D.bytes("a block binds it to a lambda. Bind this name to the lambda itself, or"),
+                D.bytes("name a top-level function. A function picked or passed in when the"),
+                D.bytes("program runs can never be reified: there is no body to read until then."),
+            }, self, &report),
+            .argument_not_constant => try D.renderSlice(&.{
+                D.bytes("This argument is computed when the program runs. Write a literal"),
+                D.bytes("here, or take the value as a parameter of the reified function, where"),
+                D.bytes("the translator can read it as a name."),
+            }, self, &report),
+            .outside_staged_position => try D.renderSlice(&.{
+                D.bytes("A"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("exists only while the compiler runs, so it names a function"),
+                D.bytes("parameter, which takes a description, or what a function returns,"),
+                D.bytes("which makes that function a template the compiler calls. A record"),
+                D.bytes("field and a list element have nothing to hold."),
+            }, self, &report),
+        }
+
+        // The walk names what stopped it, which the region alone does not: a
+        // rejected expression is often one operator inside a longer line.
+        const detail = self.problems.getExtraString(data.detail);
+        if (detail.len != 0) {
+            if (stagedCodeDetailLead(data.reason)) |lead| {
+                const owned_detail = try report.addOwnedString(detail);
+                try report.document.addLineBreak();
+                try report.document.addLineBreak();
+                try D.renderSlice(&.{
+                    D.bytes(lead),
+                    D.bytes(owned_detail).withAnnotation(.emphasized),
+                }, self, &report);
+            }
+        }
+
+        return report;
+    }
+
+    /// How a staged-code report introduces the name the walk recorded. Null for
+    /// a reason whose name says everything the detail would.
+    fn stagedCodeDetailLead(reason: StagedCode.Reason) ?[]const u8 {
+        return switch (reason) {
+            .unsupported_construct, .unsupported_type => "There is no description for:",
+            .unresolved_type => "What is left open (not fixed):",
+            .captures_a_binding => "It reads, from around itself:",
+            .performs_an_effect => "The effect is:",
+            .definition_not_reachable => "The compiler could not follow:",
+            .not_a_named_function, .outside_staged_position, .argument_not_constant => null,
         };
     }
 

@@ -31,6 +31,12 @@ exposed_items: ExposedItems,
 line_starts: SafeList(u32),
 /// The source code of this module.
 source: []const u8,
+/// How many lines at the top of `source` the compiler wrote rather than the
+/// author: `roc file.roc` compiles a headerless file with app wiring prepended.
+///
+/// `calcRegionInfo` counts lines in `source`, so it counts these too. Anything
+/// that hands a line to the author asks `calcAuthoredRegionInfo` instead.
+prepended_line_count: u32 = 0,
 
 pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!CommonEnv {
     var idents = try Ident.Store.initCapacity(gpa, 1024);
@@ -46,6 +52,7 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .exposed_items = ExposedItems.init(),
         .line_starts = line_starts,
         .source = source,
+        .prepended_line_count = 0,
     };
 }
 
@@ -86,6 +93,7 @@ pub fn clone(self: *const CommonEnv, gpa: std.mem.Allocator) std.mem.Allocator.E
         .exposed_items = exposed_items,
         .line_starts = line_starts,
         .source = self.source,
+        .prepended_line_count = self.prepended_line_count,
     };
 }
 
@@ -97,6 +105,8 @@ pub const Serialized = extern struct {
     exposed_items: ExposedItems.Serialized,
     line_starts: SafeList(u32).Serialized,
     source: [2]u64, // Reserve space for slice (ptr + len), provided during deserialization
+    prepended_line_count: u32,
+    prepended_line_count_padding: u32 = 0,
 
     /// Serialize a ModuleEnv into this Serialized struct, appending data to the writer
     pub fn serialize(
@@ -114,6 +124,8 @@ pub const Serialized = extern struct {
         // Set source to all zeros; the space needs to be here,
         // but the value will be set separately during deserialization.
         self.source = .{ 0, 0 };
+        self.prepended_line_count = env.prepended_line_count;
+        self.prepended_line_count_padding = 0;
     }
 
     /// Deserialize into a CommonEnv value (no in-place modification of cache buffer).
@@ -131,6 +143,7 @@ pub const Serialized = extern struct {
             .exposed_items = self.exposed_items.deserializeInto(base_addr),
             .line_starts = self.line_starts.deserializeInto(base_addr),
             .source = source,
+            .prepended_line_count = self.prepended_line_count,
         };
     }
 
@@ -314,6 +327,19 @@ pub fn calcRegionInfo(self: *const CommonEnv, region: Region) RegionInfo {
     return info;
 }
 
+/// The lines and columns of a region, counted in the file the author wrote.
+///
+/// Identical to `calcRegionInfo` for a module the compiler did not prepend to.
+/// A region inside the prepended wiring itself has no authored line, so it
+/// keeps the first one rather than counting backwards past the top of the file.
+pub fn calcAuthoredRegionInfo(self: *const CommonEnv, region: Region) RegionInfo {
+    var info = self.calcRegionInfo(region);
+    if (self.prepended_line_count == 0) return info;
+    info.start_line_idx -|= self.prepended_line_count;
+    info.end_line_idx -|= self.prepended_line_count;
+    return info;
+}
+
 /// Returns the entire source code content.
 pub fn getSourceAll(self: *const CommonEnv) []const u8 {
     return self.source;
@@ -399,6 +425,7 @@ test "CommonEnv.Serialized roundtrip" {
 
     const test_string_idx = try original.insertString(gpa, "test string");
     try original.addExposedById(gpa, hello_idx);
+    original.prepended_line_count = 6;
 
     {
         const expected_idx = original.line_starts.items.items.len;
@@ -455,6 +482,35 @@ test "CommonEnv.Serialized roundtrip" {
     try testing.expectEqual(@as(u32, 20), env.line_starts.items.items[2]);
 
     try testing.expectEqualStrings(source, env.source);
+    // A cached module has to remember how much of its source the compiler
+    // wrote, or every line it reports moves when it comes back from cache.
+    try testing.expectEqual(@as(u32, 6), env.prepended_line_count);
+}
+
+test "calcAuthoredRegionInfo counts from the file the author wrote" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const source = "one\ntwo\nthree\n";
+    var env = try CommonEnv.init(gpa, source);
+    defer env.deinit(gpa);
+    try env.calcLineStarts(gpa);
+
+    // "three" is on line 3 of this source and on line 1 of the file the author
+    // wrote, once two prepended lines are taken off.
+    const region = Region{ .start = .{ .offset = 8 }, .end = .{ .offset = 13 } };
+    try testing.expectEqual(@as(u32, 2), env.calcRegionInfo(region).start_line_idx);
+    try testing.expectEqual(@as(u32, 2), env.calcAuthoredRegionInfo(region).start_line_idx);
+
+    env.prepended_line_count = 2;
+    try testing.expectEqual(@as(u32, 2), env.calcRegionInfo(region).start_line_idx);
+    const authored = env.calcAuthoredRegionInfo(region);
+    try testing.expectEqual(@as(u32, 0), authored.start_line_idx);
+    try testing.expectEqual(@as(u32, 0), authored.start_col_idx);
+
+    // A region in the prepended wiring has no authored line and keeps the first.
+    const wiring = Region{ .start = .{ .offset = 0 }, .end = .{ .offset = 3 } };
+    try testing.expectEqual(@as(u32, 0), env.calcAuthoredRegionInfo(wiring).start_line_idx);
 }
 
 test "CommonEnv.Serialized deserializeOwned keeps inserting where the original left off" {

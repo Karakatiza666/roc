@@ -18123,14 +18123,19 @@ fn canonicalizePatternInGroup(
                     last_pattern = duplicate;
                     continue :patternkernel_loop .dispatch;
                 }
+                // The pattern reaches through the name it binds, so its region
+                // ends where that name does. Reading a binder's name off its
+                // region depends on that, the way an `assign` pattern's region
+                // being exactly its identifier does.
+                const region = base.Region{ .start = state.region.start, .end = name_region.end };
                 // Create the as pattern
-                const adopted_binder = try self.adoptForwardAsBinder(ident_idx, inner_pattern, state.region);
+                const adopted_binder = try self.adoptForwardAsBinder(ident_idx, inner_pattern, region);
                 const pattern_idx = adopted_binder orelse try self.env.addPattern(Pattern{
                     .as = .{
                         .pattern = inner_pattern,
                         .ident = ident_idx,
                     },
-                }, state.region);
+                }, region);
 
                 // Introduce the identifier into scope (an adopted binder is
                 // already there)

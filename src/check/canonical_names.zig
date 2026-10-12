@@ -588,6 +588,10 @@ pub const CanonicalNameStore = struct {
         return lookupId(ExportNameId, &self.export_names, idents.getText(ident));
     }
 
+    pub fn lookupExportName(self: *const CanonicalNameStore, text: []const u8) ?ExportNameId {
+        return lookupId(ExportNameId, &self.export_names, text);
+    }
+
     pub fn lookupExternalSymbolIdent(self: *const CanonicalNameStore, idents: *const Ident.Store, ident: Ident.Idx) ?ExternalSymbolNameId {
         return lookupId(ExternalSymbolNameId, &self.external_symbol_names, idents.getText(ident));
     }
@@ -604,6 +608,8 @@ pub const CanonicalNameStore = struct {
         return lookupId(MethodNameId, &self.method_names, text);
     }
 
+    /// Looks a record field label up by its text, for a caller holding one
+    /// store's id that has to name the same field in another's.
     pub fn lookupRecordFieldLabel(self: *const CanonicalNameStore, text: []const u8) ?RecordFieldLabelId {
         return lookupId(RecordFieldLabelId, &self.record_field_labels, text);
     }

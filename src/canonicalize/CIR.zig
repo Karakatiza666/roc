@@ -91,6 +91,12 @@ pub const BuiltinIndices = struct {
     crypto_sha256_hasher_type: Statement.Idx,
     crypto_blake3_digest_type: Statement.Idx,
     crypto_blake3_hasher_type: Statement.Idx,
+    code_type: Statement.Idx,
+    code_ir_type: Statement.Idx,
+    code_ty_type: Statement.Idx,
+    code_lit_type: Statement.Idx,
+    code_pattern_type: Statement.Idx,
+    code_branch_type: Statement.Idx,
 
     // Ident indices - simple unqualified names (e.g., "Bool", "U8")
     bool_ident: Ident.Idx,
@@ -149,6 +155,12 @@ pub const BuiltinIndices = struct {
     crypto_sha256_hasher_ident: Ident.Idx,
     crypto_blake3_digest_ident: Ident.Idx,
     crypto_blake3_hasher_ident: Ident.Idx,
+    code_ident: Ident.Idx,
+    code_ir_ident: Ident.Idx,
+    code_ty_ident: Ident.Idx,
+    code_lit_ident: Ident.Idx,
+    code_pattern_ident: Ident.Idx,
+    code_branch_ident: Ident.Idx,
     // Tag idents for Try type
     ok_ident: Ident.Idx,
     err_ident: Ident.Idx,
@@ -298,6 +310,14 @@ pub const builtin_type_specs = [_]BuiltinTypeSpec{
     .{ .display_name = "Hasher", .qualified_name = "Builtin.Crypto.SHA256.Hasher", .type_field = "crypto_sha256_hasher_type", .ident_field = "crypto_sha256_hasher_ident", .lookup = .{ .qualified = "Builtin.Crypto.SHA256.Hasher" }, .auto_import = false },
     .{ .display_name = "Digest", .qualified_name = "Builtin.Crypto.BLAKE3.Digest", .type_field = "crypto_blake3_digest_type", .ident_field = "crypto_blake3_digest_ident", .lookup = .{ .qualified = "Builtin.Crypto.BLAKE3.Digest" }, .auto_import = false },
     .{ .display_name = "Hasher", .qualified_name = "Builtin.Crypto.BLAKE3.Hasher", .type_field = "crypto_blake3_hasher_type", .ident_field = "crypto_blake3_hasher_ident", .lookup = .{ .qualified = "Builtin.Crypto.BLAKE3.Hasher" }, .auto_import = false },
+    .{ .display_name = "Code", .qualified_name = "Builtin.Code", .type_field = "code_type", .ident_field = "code_ident", .lookup = .{ .top_level = "Code" } },
+    // A translator names these through `Code`, which keeps `Branch` or
+    // `Pattern` free for a module of the same name.
+    .{ .display_name = "Ir", .qualified_name = "Builtin.Code.Ir", .type_field = "code_ir_type", .ident_field = "code_ir_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Ir" } }, .auto_import = false },
+    .{ .display_name = "Ty", .qualified_name = "Builtin.Code.Ty", .type_field = "code_ty_type", .ident_field = "code_ty_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Ty" } }, .auto_import = false },
+    .{ .display_name = "Lit", .qualified_name = "Builtin.Code.Lit", .type_field = "code_lit_type", .ident_field = "code_lit_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Lit" } }, .auto_import = false },
+    .{ .display_name = "Pattern", .qualified_name = "Builtin.Code.Pattern", .type_field = "code_pattern_type", .ident_field = "code_pattern_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Pattern" } }, .auto_import = false },
+    .{ .display_name = "Branch", .qualified_name = "Builtin.Code.Branch", .type_field = "code_branch_type", .ident_field = "code_branch_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Branch" } }, .auto_import = false },
 };
 
 /// The registry entry for the builtin type whose `BuiltinIndices` statement
@@ -340,7 +360,7 @@ fn hashInt(hash: u64, value: u64) u64 {
 
 /// Hash of the builtin type registry used to reject stale generated builtin index metadata.
 pub const BUILTIN_TYPE_REGISTRY_HASH: u64 = blk: {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(20_000);
     var hash = hashBytes(hash_offset, "roc-builtin-type-registry-v1");
     for (builtin_type_specs) |spec| {
         hash = hashBytes(hash, spec.display_name);

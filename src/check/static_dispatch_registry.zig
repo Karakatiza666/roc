@@ -2718,6 +2718,13 @@ pub const StaticDispatchPlanTable = struct {
         return self.evidence_refs[span.start .. span.start + span.len];
     }
 
+    /// The substitution this edge recorded for its target's scheme: one
+    /// checked type per quantified variable, in the target scheme's
+    /// `scheme_vars` order. Empty for a monomorphic target.
+    pub fn targetSubstitution(self: *const StaticDispatchPlanTable, node: EvidenceNode) []const CheckedTypeId {
+        return self.site_substitutions[node.subst.start .. node.subst.start + node.subst.len];
+    }
+
     pub fn generatedCodecCallEvidence(self: *const StaticDispatchPlanTable, call: GeneratedCodecCall) []const CheckedEvidence {
         const node = switch (call.resolution) {
             .callable => |node_id| self.evidenceNode(node_id),

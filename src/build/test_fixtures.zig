@@ -117,6 +117,9 @@ pub const Plan = struct {
             _ = files.addCopyDirectory(self.b.path(dir), dir, .{});
         }
         _ = files.addCopyDirectory(self.b.path("ci"), "ci", .{ .exclude_extensions = &.{ ".pyc", ".pyo" } });
+        // The reifying examples are CLI fixtures: the translator tests run
+        // them, and an app reaches the GLSL stage as a package by path.
+        _ = files.addCopyDirectory(self.b.path("examples/reifying"), "examples/reifying", .{});
         // Roc's string-import fixtures reference these files relative to their
         // original test directories. Declare the external inputs at the same
         // paths so prepared trees preserve those imports and hash their bytes.

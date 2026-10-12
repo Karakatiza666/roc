@@ -358,7 +358,9 @@ pub const Constants = struct {
     ///      their bodies demand.
     /// 161: generated codec derivations record the renaming their snapshot
     ///      applied to every type that holds a variable.
-    pub const CACHE_VERSION = 161;
+    /// 162: A module remembers how many lines of its source the compiler
+    ///      prepended, so a region it reports names the line the author wrote.
+    pub const CACHE_VERSION = 162;
 };
 
 /// Configuration for the Roc cache system.

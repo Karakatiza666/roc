@@ -115,6 +115,7 @@ pub const Problem = union(enum) {
     platform_alias_not_found: PlatformAliasNotFound,
     comptime_crash: ComptimeCrash,
     comptime_invalid_numeral: ComptimeInvalidNumeral,
+    staged_code: StagedCode,
     comptime_invalid_quote: ComptimeInvalidQuote,
     comptime_invalid_interpolation: ComptimeInvalidInterpolation,
     comptime_expect_failed: ComptimeExpectFailed,
@@ -356,6 +357,47 @@ pub const ComptimeCrash = struct {
     origin: ?ComptimeOrigin = null,
 
     pub const Origin = ComptimeOrigin;
+};
+
+/// A function named where a `Code` was expected, which the compiler cannot
+/// reify.
+pub const StagedCode = struct {
+    reason: Reason,
+    region: base.Region,
+    /// Names the construct, binding or type that stopped the walk, as the walk
+    /// recorded it. Empty for a reason that names nothing beyond itself.
+    detail: ExtraStringIdx = .{ .start = 0, .count = 0 },
+
+    pub const Reason = enum {
+        /// Only a function the compiler can see the definition of may be
+        /// staged. A lambda written at the call site, or a function that
+        /// arrives as a runtime argument, cannot.
+        not_a_named_function,
+        /// The staged function uses an expression the `Code.Ir` has no shape
+        /// for.
+        unsupported_construct,
+        /// The staged function names a type the `Code.Ty` has no shape for.
+        unsupported_type,
+        /// Checking left a type variable open inside the staged function.
+        unresolved_type,
+        /// The staged function reads a value from the scope around it. A
+        /// description is closed, so it can carry no such value.
+        captures_a_binding,
+        /// The staged function, or something it calls, performs an effect. A
+        /// stage runs during `roc build`, where an effect has nowhere to
+        /// happen.
+        performs_an_effect,
+        /// The compiler could not follow the name to a definition it can walk.
+        definition_not_reachable,
+        /// A template's argument is not a value the compiler can fix while it
+        /// runs. Each one is written into the description, so each one has to
+        /// be a literal at the call.
+        argument_not_constant,
+        /// A `Code` names a function parameter's type, or what a function
+        /// returns, and nothing else. It has no runtime representation, so a
+        /// record field or a list element holding one has nothing to hold.
+        outside_staged_position,
+    };
 };
 
 /// A numeric literal that a custom `from_numeral` implementation rejected

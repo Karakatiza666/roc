@@ -23598,6 +23598,692 @@ Builtin :: [].{
 		}
 	}
 
+	## A reified description of a pure Roc function: its parameters, its body,
+	## and the type the checker solved for every node in it.
+	##
+	## A translator is a compile-time compiler written in ordinary Roc. It receives
+	## one of these and turns it into whatever its target consumes: GLSL text,
+	## PTX, a query plan. The function it describes stays an ordinary Roc function,
+	## so it can still be called, tested with `expect`, and stepped through.
+	##
+	## `Code` cannot be constructed by hand. The compiler builds one when a
+	## function appears where a `Code` is expected, which is a parameter of type
+	## `Code(f)`, and the function that takes it reads it during `roc build`.
+	##
+	## A function that returns a `Code` is a template, and the compiler calls
+	## it rather than compiling it. Each call's arguments have to be fixed while
+	## the compiler runs: a literal, a name bound to one, an aggregate of those,
+	## or a function. Each one is written into the description that call
+	## produces, so one template describes as many bodies as it is called
+	## with: given
+	## `weaker_than : I32 -> Code(Entity -> Bool)`, written as
+	## `weaker_than = |threshold| |e| e.hp < threshold`, the threshold is a
+	## literal in the description by the time a translator reads it.
+	##
+	## The type parameter records the function type the description came from.
+	## It never appears in the description itself, which is a [Code.Ir].
+	Code(_fn) :: { defs : List(Def), root : Ir }.{
+
+		## The type of a reified expression. Every [Code.Ir] node carries one.
+		##
+		## `Named` carries a nominal type's name alongside its backing, which is
+		## what lets a translator recognise `Math.Vec2` rather than seeing an
+		## anonymous record.
+		Ty := [
+			I8,
+			U8,
+			I16,
+			U16,
+			I32,
+			U32,
+			I64,
+			U64,
+			I128,
+			U128,
+			F32,
+			F64,
+			Dec,
+			Bool,
+			Str,
+			ListOf(Ty),
+
+			## A record, one entry per field, with what the type says about
+			## whether the field is there. An `Optional` field may be absent from
+			## a value of this type, so a translator emitting a struct either has
+			## a form for absence or rejects the type by name. A field with a
+			## default is `Required`: the default fills it in, so every value of
+			## the type carries it.
+			Record(List({ name : Str, ty : Ty, presence : [Required, Optional] })),
+			Tuple(List(Ty)),
+			Fn(List(Ty), Ty),
+			Named(Str, Ty),
+
+			## A reference back to the enclosing `Named` of this name, so a
+			## recursive type has a finite description. A translator resolves the
+			## name against the `Named` nodes it is inside, innermost first.
+			##
+			## Roc reaches recursion only through a nominal, and a nominal that
+			## reaches itself at other type arguments gets a `Named` of its own
+			## at those arguments, so the nearest enclosing `Named` of that
+			## name is always the type meant.
+			Recursive(Str),
+
+			## A tag union, each variant by name with the types of its payloads.
+			## A variant written without payloads carries an empty list, and an
+			## empty tag union is an empty list of variants.
+			##
+			## Variants arrive in the order the compiler holds them: a union a
+			## nominal declares keeps its written order, and one the solver
+			## built is in name order. A translator that needs a fixed order
+			## sorts them itself.
+			TagUnion(List({ name : Str, payloads : List(Ty) })),
+
+			## A type this IR has no shape for, named the way the compiler names
+			## it, with its type arguments. A `Hasher`, a `Dict`, an encoding: a
+			## derived implementation threads these without looking inside them,
+			## and an opaque nominal forbids looking inside from outside its own
+			## module. A translator that owns the type recognises the name; every
+			## other translator rejects it by name.
+			Opaque(Str, List(Ty)),
+		].{
+
+			## The types immediately inside this one, empty where there are none.
+			##
+			## A pass that asks one question of every type in a signature walks
+			## with this instead of writing an arm per constructor. A translator
+			## that emits still matches every constructor, because it has a form
+			## to emit for each.
+			##
+			## A `Fn`'s children are its parameters and then its result. A
+			## `Record`'s are its field types, a `TagUnion`'s are every variant's
+			## payloads in variant order, and a `Recursive` has none, so a walk
+			## over a recursive type terminates.
+			children : Ty -> List(Ty)
+			children = |ty| match ty {
+				ListOf(item) => [item]
+				Record(fields) => fields.map(|field| field.ty)
+				Tuple(parts) => parts
+				Fn(params, result) => params.append(result)
+				Named(_, backing) => [backing]
+				TagUnion(variants) => variants.join_map(|variant| variant.payloads)
+				Opaque(_, args) => args
+				I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | I128 | U128 => []
+				F32 | F64 | Dec | Bool | Str | Recursive(_) => []
+			}
+
+			## What an operation site needs to know about a number, or
+			## `Err(NotNumeric)` where this type is not one.
+			##
+			## The question an emitter asks before picking a form is narrow and
+			## the numeric tags are thirteen, so asking it inline costs thirteen
+			## arms at every site: `a // b` is `a / b` at an integer and
+			## `trunc(a / b)` at a float, and `a % b` is `a % b` at an integer and
+			## `mod(a, b)` at a float, in GLSL and in most targets.
+			##
+			## Mapping a Roc type onto a target type wants the concrete tag
+			## instead, so that job stays `match ty { F32 => .. }`.
+			numeric : Ty -> Try({ bits : U16, kind : [Int, Frac, Fixed], signed : Bool }, [NotNumeric])
+			numeric = |ty| match ty {
+				I8 => Ok({ bits: 8, kind: Int, signed: Bool.True })
+				U8 => Ok({ bits: 8, kind: Int, signed: Bool.False })
+				I16 => Ok({ bits: 16, kind: Int, signed: Bool.True })
+				U16 => Ok({ bits: 16, kind: Int, signed: Bool.False })
+				I32 => Ok({ bits: 32, kind: Int, signed: Bool.True })
+				U32 => Ok({ bits: 32, kind: Int, signed: Bool.False })
+				I64 => Ok({ bits: 64, kind: Int, signed: Bool.True })
+				U64 => Ok({ bits: 64, kind: Int, signed: Bool.False })
+				I128 => Ok({ bits: 128, kind: Int, signed: Bool.True })
+				U128 => Ok({ bits: 128, kind: Int, signed: Bool.False })
+				F32 => Ok({ bits: 32, kind: Frac, signed: Bool.True })
+				F64 => Ok({ bits: 64, kind: Frac, signed: Bool.True })
+				Dec => Ok({ bits: 128, kind: Fixed, signed: Bool.True })
+				Bool | Str | ListOf(_) | Record(_) | Tuple(_) => Err(NotNumeric)
+				Fn(_, _) | Named(_, _) | Recursive(_) | TagUnion(_) | Opaque(_, _) => Err(NotNumeric)
+			}
+
+			## This type, spelled the way Roc spells it, so a translator that
+			## refuses a type names the one it refused.
+			##
+			## A `Named` and an `Opaque` are their own names, so a nominal is
+			## never printed as the shape it was declared over, and a `Recursive`
+			## is the name it refers back to.
+			name : Ty -> Str
+			name = |ty| match ty {
+				I8 => "I8"
+				U8 => "U8"
+				I16 => "I16"
+				U16 => "U16"
+				I32 => "I32"
+				U32 => "U32"
+				I64 => "I64"
+				U64 => "U64"
+				I128 => "I128"
+				U128 => "U128"
+				F32 => "F32"
+				F64 => "F64"
+				Dec => "Dec"
+				Bool => "Bool"
+				Str => "Str"
+				ListOf(item) => "List(${item.name()})"
+				Record(fields) => {
+					rendered = fields.map(|field| "${field.name} : ${field.ty.name()}")
+					"{ ${Str.join_with(rendered, ", ")} }"
+				}
+				Tuple(parts) => "(${Str.join_with(parts.map(|part| part.name()), ", ")})"
+				Fn(params, result) => {
+					taken = Str.join_with(params.map(|param| param.name()), ", ")
+					"${taken} -> ${result.name()}"
+				}
+				Named(nominal, _) => nominal
+				Recursive(nominal) => nominal
+				TagUnion(variants) => {
+					rendered = variants.map(
+						|variant| {
+							payloads = Str.join_with(variant.payloads.map(|payload| payload.name()), ", ")
+							if payloads.is_empty() {
+								variant.name
+							} else {
+								"${variant.name}(${payloads})"
+							}
+						},
+					)
+					"[${Str.join_with(rendered, ", ")}]"
+				}
+				Opaque(nominal, args) => {
+					if args.is_empty() {
+						nominal
+					} else {
+						"${nominal}(${Str.join_with(args.map(|arg| arg.name()), ", ")})"
+					}
+				}
+			}
+		}
+
+		## Where a node was written.
+		##
+		## Resolved to lines and columns by the compiler, because a translator
+		## holds a description and never the source text an offset would need.
+		## Lines and columns count from 1, the way an editor shows them, and
+		## `module_name` names the module the reified function was written in,
+		## which a translator has no other way to learn. (`module` is reserved,
+		## so the field is not it.)
+		Region : {
+			module_name : Str,
+			start_line : U32,
+			start_column : U32,
+			end_line : U32,
+			end_column : U32,
+		}
+
+		## What the checker knew about a node: the type it solved for it, and
+		## where it was written. Every [Code.Ir] node carries one, so a translator can
+		## name a line rather than only a construct.
+		Meta : { ty : Ty, region : Region }
+
+		## A literal, carrying the type the checker solved for it.
+		##
+		## `Int` holds every integer width in an `I128` because that is the one
+		## integer type wide enough to hold them all without loss; the `Ty`
+		## beside it says which width the source meant.
+		##
+		## `Bytes` is the contents of a file embedded with
+		## `import "path" as name : List(U8)`. It is one literal rather than a
+		## list of `Int` literals because a file is as large as it is, and a
+		## translator wants to recognise the blob as one value. A file embedded
+		## as a `Str` is a `Str` literal instead.
+		##
+		## The `Ty` an `Int` or a `Frac` carries is the type of the [Code.Ir]
+		## `Lit` node around it, the same type the node's `Meta` carries. It is
+		## here so that printing a literal is a `Code.Lit -> Str` of its own,
+		## which an `F32` needs: read as an `F64`, `0.004` prints as
+		## `0.004000000189989805`.
+		Lit := [
+			Int(I128, Ty),
+			Frac(F64, Ty),
+			Fixed(Dec),
+			Bool(Bool),
+			Str(Str),
+			Bytes(List(U8)),
+		]
+
+		## What one `match` branch tests for.
+		##
+		## A pattern that binds carries the name it binds, so a translator emits
+		## the same name the author wrote rather than inventing one. A derived
+		## `==` over a tag union is the one match the compiler writes itself,
+		## and it names the payloads it binds `eq_lhs_N` and `eq_rhs_N`.
+		Pattern := [
+			## `x`: matches any value and binds it to this name.
+			Bind(Str, Meta),
+
+			## `_`: matches any value and binds nothing.
+			Anything(Meta),
+
+			## `Tag(p, q)`: the variant's name and a pattern per payload. A
+			## variant written bare carries an empty list.
+			Variant(Str, List(Pattern), Meta),
+
+			## A literal: matches when the value equals it.
+			PatLit(Lit, Meta),
+
+			## `(p, q)`.
+			PatTuple(List(Pattern), Meta),
+
+			## `{ a, b: p }`: one entry per field the pattern names, by label. A
+			## `..` that binds nothing adds no entry, because the fields it
+			## stands for are the ones this list does not hold.
+			PatRecord(List({ name : Str, pattern : Pattern }), Meta),
+
+			## `[p, q]`: a list of exactly this many items, each matching its
+			## own pattern.
+			PatList(List(Pattern), Meta),
+
+			## `[p, .., q]`: the patterns before the rest, what the rest binds,
+			## and the patterns after it. This matches a list holding at least
+			## as many items as the two lists name, and the rest takes whatever
+			## lies between them. It is a node of its own rather than a
+			## [Code.Pattern] `PatList` carrying an optional rest, because a
+			## translator answers the two questions differently: one is a test
+			## on the length, the other a slice.
+			PatListRest(List(Pattern), [Ignored, Named(Str)], List(Pattern), Meta),
+
+			## `"a${x}b"`: the text the string starts with, then one step per
+			## interpolation. Each step is what the slice up to the next
+			## delimiter is bound to, and that delimiter. `Exact` says the last
+			## delimiter ends the string; `Tail` says the last capture takes
+			## whatever is left of it.
+			##
+			## A target that cannot split a string rejects this node by name,
+			## which costs that translator one rejection where refusing the
+			## pattern outright would cost every author the construct.
+			PatStr(Str, List({ capture : [Ignored, Named(Str)], delimiter : Str }), [Exact, Tail], Meta),
+
+			## `p as name`: the pattern, and the name the whole matched value
+			## is bound to beside it. A translator whose target has its own
+			## `as` emits both; one that has none rejects this node by name.
+			PatAs(Pattern, Str, Meta),
+
+			## `p` when a condition also holds. The compiler writes one for a
+			## literal of a type of your own: the pattern binds the matched
+			## value and the condition is that type's equality against its
+			## conversion of the literal, so `380` against a `Px` reads as
+			## `PatGuard(Bind("bind#0"), bind#0.is_eq(Px.from_numeral(380)))`.
+			##
+			## The condition belongs to this one alternative, which is what a
+			## branch's own `guard` cannot say: that one is tested after any
+			## alternative matched, so it may not read a name only one of them
+			## binds. A translator whose target has no per-alternative
+			## condition splits the branch itself, or rejects this node by
+			## name.
+			PatGuard(Pattern, Ir, Meta),
+		].{
+
+			## What the checker knew about this pattern.
+			pattern_meta : Pattern -> Meta
+			pattern_meta = |pattern| match pattern {
+				Bind(_, m) => m
+				Anything(m) => m
+				Variant(_, _, m) => m
+				PatLit(_, m) => m
+				PatTuple(_, m) => m
+				PatRecord(_, m) => m
+				PatList(_, m) => m
+				PatListRest(_, _, _, m) => m
+				PatStr(_, _, _, m) => m
+				PatAs(_, _, m) => m
+				PatGuard(_, _, m) => m
+			}
+
+			## The type the checker solved for this pattern.
+			pattern_ty : Pattern -> Ty
+			pattern_ty = |pattern| pattern.pattern_meta().ty
+
+			## Where this pattern was written.
+			pattern_region : Pattern -> Region
+			pattern_region = |pattern| pattern.pattern_meta().region
+		}
+
+		## One branch of a [Code.Ir] `Match`.
+		##
+		## `patterns` holds more than one for a branch written `A | B =>`, and
+		## every one of them binds the same names. `guard` is the `if` a branch
+		## may carry, which is tested only once a pattern has matched.
+		##
+		## Nominal rather than an alias, for the reason [Code.Ir] and
+		## [Code.Pattern] are: a tag union an alias declares defers how wide it
+		## is to each use of the alias, and `guard` is exactly these two tags
+		## wherever a branch is read.
+		Branch := {
+			patterns : List(Pattern),
+			guard : [NoGuard, Guard(Ir)],
+			value : Ir,
+		}
+
+		## A reified expression.
+		##
+		## `Let` is a node rather than an inlining step: a binding written once
+		## in the source stays written once here, so a translator can emit one local
+		## instead of duplicating the bound expression at every use.
+		Ir := [
+			## A function: named parameters, body, function type.
+			## [Code.ir] always returns one of these at the root, and a lambda
+			## written inside the body is one of these in place.
+			##
+			## Parameter names carry the source spelling. Roc rejects a binding
+			## that shadows one in scope, so a name resolves to one binder
+			## wherever it is read.
+			Lambda(List({ name : Str, ty : Ty }), Ir, Meta),
+
+			## A reference to one of the lambda's parameters.
+			Param(Str, Meta),
+
+			## A reference to a name the description binds: a `Let`, a binder
+			## inside a [Code.Branch] pattern, or a name a loop carries.
+			##
+			## Some of these names the author never wrote. The `Ir` has no
+			## assignment, so each assignment to a `var` binds a name of its
+			## own: `$x` is the declaration and `$x#1`, `$x#2` are the
+			## assignments after it, in order. A binding the walk had to
+			## invent, for an operand a derived `==` reads twice or for a `?`
+			## operator's subject, is spelled `bind#N`. Both are unique across
+			## one description, and a translator whose target rejects `#` in an
+			## identifier rewrites them.
+			Local(Str, Meta),
+			Let(Str, Ir, Ir, Meta),
+			Lit(Lit, Meta),
+
+			## A binary operator, named by the method it dispatches to. The name
+			## is one of `plus`, `minus`, `times`, `div_by`, `div_trunc_by`,
+			## `rem_by`, `is_lt`, `is_lte`, `is_gt`, `is_gte` and `is_eq`, or
+			## `and` for the conjunction a derived `==` over an aggregate
+			## writes over its components.
+			##
+			## The operator is the method, so `x + y` and `x.plus(y)` are one
+			## node. Two operators are not here: `!=` is [Code.Ir] `Unary`
+			## named `not` over the `is_eq` it negates, and a written `and` or
+			## `or` short-circuits, so it is the [Code.Ir] `If` it stands for.
+			Binop(Str, Ir, Ir, Meta),
+
+			## `neg` or `not`.
+			Unary(Str, Ir, Meta),
+
+			## A resolved call, named by its fully qualified callee:
+			## `Num.F32.sin` for a method, `Shader.step` for a definition
+			## written in Roc.
+			##
+			## A call to a definition resolves against [Code.definitions],
+			## which holds that definition's own description under this same
+			## name.
+			##
+			## The name is complete, so a translator matches all of it. Matching
+			## the last segment instead makes every module's own `sin` the
+			## builtin `Num.F32.sin`.
+			Call(Str, List(Ir), Meta),
+			Field(Ir, Str, Meta),
+
+			## `r.?name`: reading a field the type marks `Optional`, which may be
+			## absent. The result is the `Try(a, [MissingField])` the field's
+			## value is wrapped in rather than the value, which is why this is a
+			## node of its own and not a `Field`. A translator whose target has
+			## no absent field rejects this node by name.
+			OptField(Ir, Str, Meta),
+			Index(Ir, U64, Meta),
+			MakeRecord(List({ name : Str, value : Ir }), Meta),
+			MakeTuple(List(Ir), Meta),
+			MakeList(List(Ir), Meta),
+
+			## Tag construction: the variant's name and the payloads it was
+			## given, in the order they were written. A variant written without
+			## payloads carries an empty list.
+			##
+			## `Bool.True` is not one of these. A Bool is `Lit(Bool(..))`,
+			## because a translator emitting a boolean wants the value rather
+			## than the two tags Roc represents it with.
+			MakeTag(Str, List(Ir), Meta),
+
+			If(Ir, Ir, Ir, Meta),
+
+			## A `match`: the value it scrutinises, and its branches in the order
+			## they were written. The first branch whose pattern matches and
+			## whose guard holds is the one that runs, which is what Roc does, so
+			## a translator that keeps the order keeps the meaning.
+			Match(Ir, List(Branch), Meta),
+
+			## `crash`: the message it was given, and the type the crash stands
+			## in for. The message is an [Ir] rather than a [Str] because Roc
+			## admits an interpolated one, which reaches here as the
+			## concatenation it is.
+			##
+			## The node's own type is the type the branch it sits in produces,
+			## so a translator emitting a `match` over a closed union reads it
+			## as the branch that cannot happen.
+			Crash(Ir, Meta),
+
+			## A call to a compiler-derived method, left unexpanded: the method
+			## name, the type it derives over, its arguments, and the type of
+			## the call. `parser_for` and `encoder_for` arrive here by design,
+			## and `to_hash` arrives when the description cannot reach far
+			## enough to expand it.
+			##
+			## The subject type is separate because the arguments do not carry
+			## it. `Row.parser_for(encoding)` names `Row` nowhere else, and the
+			## node's own type is the parser the call constructs.
+			##
+			## A codec is curried: `encoder_for` hands back an encoder the
+			## caller then runs. Both halves are one node, with the arguments
+			## the constructor took before the ones the run took, so
+			## `Row.encoder_for(encoding)(value, state)` arrives as
+			## `Derived("encoder_for", Row, [encoding, value, state], _)`. Which
+			## argument belongs to which half is the codec protocol's to fix,
+			## not this node's: a translator that expands `encoder_for` knows
+			## the first is the encoding.
+			##
+			## A derived recipe is fixed by the type rather than written in Roc,
+			## so there is no body to describe. Each one threads a vehicle the
+			## translator owns and recognises by type: a `Hasher` for hashing, an
+			## encoding for a codec. A translator that owns the vehicle expands the
+			## node in its own target language; every other translator rejects it by
+			## name.
+			##
+			## A derived `map` carries the value and the mapping function, in
+			## that order, and the mapping function is a `Lambda` like any
+			## other. The subject names the nominal the compiler derived
+			## against, which is what says where the payload being mapped sits.
+			##
+			## A `to_hash` here cannot be expanded to agree with what Roc
+			## computes for the same value: component order, traversal order and
+			## write widths are the compiler's, and this node withholds all
+			## three. A translator whose hashes have to meet Roc's must refuse it.
+			Derived(Str, Ty, List(Ir), Meta),
+
+			## A value used at a wider tag union than its own: the inner node
+			## keeps its own union, and this node's type is the wider one.
+			##
+			## Every tag the inner union lists is in the wider one, with the
+			## same payloads, so the value does not change. Its tag can: a
+			## target that numbers the tags of each union on its own gives `B`
+			## one number in `[B]` and another in `[A, B]`, and this node is
+			## where it renumbers. The widening reaches into tag payloads and
+			## through the backing of a named type, so a `Try` whose error
+			## union widens arrives here too.
+			##
+			## A use of a top-level value writes one, because each use widens
+			## the value's own union, and so does a call to a function whose
+			## body closed the union its annotation left open.
+			Widen(Ir, Meta),
+
+			## `a..<b` and `a..=b`: the two ends, and which of them the range
+			## reaches. A translator emits the range its target has, or
+			## rejects this node by name.
+			Range(Ir, Ir, [Exclusive, Inclusive], Meta),
+
+			## `for item in source { .. }`, as the fold it is.
+			##
+			## The `Ir` has no assignment, so a loop carries a state from one
+			## turn to the next instead of writing to one. `carried` names one
+			## entry per `var` the body assigns: the name that `var` goes by
+			## inside `body`, and what it starts at. A turn hands back the
+			## state the next turn starts from, and the node's own value is
+			## what the last turn left, which is what the bindings under it
+			## read.
+			##
+			## The name is a version of the written one, `$sum#1` for `$sum`,
+			## for the reason [Code.Ir] `Local` gives.
+			##
+			## One carried name is that state on its own. Several are a tuple
+			## in `carried` order, which is also the order the bindings under
+			## the loop take it apart. Carrying none leaves both the body and
+			## the node at `{}`, and such a loop matters only for what leaves
+			## it, which is a [Code.Ir] `Break` or `Return`.
+			For({ body : Ir, carried : List({ initial : Ir, name : Str }), item : Str, source : Ir }, Meta),
+
+			## `while cond { .. }`, with the state [Code.Ir] `For` carries and
+			## no item. Both `cond` and `body` read the carried names, and the
+			## node's own value is what the last turn left.
+			While({ body : Ir, carried : List({ initial : Ir, name : Str }), cond : Ir }, Meta),
+
+			## `break`: the state the loop settles on, which is what its
+			## `carried` names hold where the `break` was written.
+			##
+			## This node stands only inside the body of a `For` or a `While`.
+			## Its own type is the type of the branch it stands in, the way
+			## [Code.Ir] `Crash`'s is, because the branch hands back nothing of
+			## its own. A target with a `break` of its own emits one; a target
+			## that folds reads the node as the turn that settles the fold.
+			##
+			## It transfers, so a `Let` written under it never binds: the loop
+			## settles where the `break` stands.
+			Break(Ir, Meta),
+
+			## `return` written inside a loop: the value the function hands
+			## back.
+			##
+			## Anywhere else a `return` is the branch the description makes of
+			## the statements written after it, and needs no node. Inside a
+			## loop what it transfers to is the turns that have not run, which
+			## no branch says. Its own type is the branch it stands in, and it
+			## transfers past whatever is written under it, as `Break`'s does.
+			Return(Ir, Meta),
+		].{
+
+			## What the checker knew about this node.
+			node_meta : Ir -> Meta
+			node_meta = |node| match node {
+				Lambda(_, _, m) => m
+				Param(_, m) => m
+				Local(_, m) => m
+				Let(_, _, _, m) => m
+				Lit(_, m) => m
+				Binop(_, _, _, m) => m
+				Unary(_, _, m) => m
+				Call(_, _, m) => m
+				Field(_, _, m) => m
+				OptField(_, _, m) => m
+				Index(_, _, m) => m
+				MakeRecord(_, m) => m
+				MakeTuple(_, m) => m
+				MakeList(_, m) => m
+				MakeTag(_, _, m) => m
+				If(_, _, _, m) => m
+				Match(_, _, m) => m
+				Crash(_, m) => m
+				Derived(_, _, _, m) => m
+				Widen(_, m) => m
+				Range(_, _, _, m) => m
+				For(_, m) => m
+				While(_, m) => m
+				Break(_, m) => m
+				Return(_, m) => m
+			}
+
+			## The type the checker solved for this node.
+			node_ty : Ir -> Ty
+			node_ty = |node| node.node_meta().ty
+
+			## Where this node was written.
+			node_region : Ir -> Region
+			node_region = |node| node.node_meta().region
+
+			## The expressions immediately inside this node, empty where there
+			## are none.
+			##
+			## The passes that want this run before the emitter and have nothing
+			## to say about any one kind: collect every callee the target has no
+			## form for, so an author reads all of them rather than the first;
+			## find whether a body can reach a `crash`; measure the depth a target
+			## limits; list which parameters a body reads. A translator that emits
+			## still matches every kind, because it has a form for each.
+			##
+			## Only the [Code.Ir] in a node are its children. A [Code.Branch]'s
+			## patterns are not, being [Code.Pattern], so a `Match` hands back its
+			## scrutinee and then, per branch, its guard and its value. A `For`
+			## hands back its source, its body, and what each carried name starts
+			## at; a `While` its condition in place of the source.
+			children : Ir -> List(Ir)
+			children = |node| match node {
+				Lambda(_, body, _) => [body]
+				Param(_, _) => []
+				Local(_, _) => []
+				Let(_, bound, rest, _) => [bound, rest]
+				Lit(_, _) => []
+				Binop(_, lhs, rhs, _) => [lhs, rhs]
+				Unary(_, operand, _) => [operand]
+				Call(_, args, _) => args
+				Field(receiver, _, _) => [receiver]
+				OptField(receiver, _, _) => [receiver]
+				Index(receiver, _, _) => [receiver]
+				MakeRecord(fields, _) => fields.map(|field| field.value)
+				MakeTuple(parts, _) => parts
+				MakeList(items, _) => items
+				MakeTag(_, payloads, _) => payloads
+				If(condition, then_branch, else_branch, _) => [condition, then_branch, else_branch]
+				Match(subject, branches, _) =>
+					List.concat(
+						[subject],
+						branches.join_map(
+							|branch| match branch.guard {
+								NoGuard => [branch.value]
+								Guard(condition) => [condition, branch.value]
+							},
+						),
+					)
+				Crash(message, _) => [message]
+				Derived(_, _, args, _) => args
+				Widen(value, _) => [value]
+				Range(low, high, _, _) => [low, high]
+				For(loop, _) =>
+					List.concat([loop.source, loop.body], loop.carried.map(|state| state.initial))
+				While(loop, _) =>
+					List.concat([loop.cond, loop.body], loop.carried.map(|state| state.initial))
+				Break(value, _) => [value]
+				Return(value, _) => [value]
+			}
+		}
+
+		## One definition the reified body calls: the name a `Call` names it
+		## by, and its own reified body.
+		##
+		## The name is module-qualified, `Shader.step`, so a table that spans
+		## modules holds at most one row per definition.
+		Def : { ir : Ir, name : Str }
+
+		## The reified function body.
+		ir : Code(_fn) -> Ir
+		ir = |Code.(inner)| inner.root
+
+		## Every definition the body calls, and every definition those call, each
+		## one described once however many calls reach it.
+		##
+		## A callee comes before its caller, so a target that declares before it
+		## calls emits the list in order. A cycle has no such order, and a
+		## translator emitting into such a target writes prototypes for it.
+		##
+		## The described function itself is not a row unless it calls itself:
+		## [Code.ir] is where its body is.
+		definitions : Code(_fn) -> List(Def)
+		definitions = |Code.(inner)| inner.defs
+	}
+
 }
 
 hasher_start : U64 -> Hasher

@@ -1146,6 +1146,13 @@ pub const BuildEnv = struct {
         const root_pkg = self.packages.get(pkg_name) orelse unreachable; // Must call discoverDependencies() first
         const pkg_root_file = root_pkg.root_file;
 
+        // A headerless root is compiled from a file the CLI wrote app wiring on
+        // top of, so a line this build hands to that file's author counts from
+        // the file the author wrote. The package entry outlives the coordinator.
+        if (self.synthetic_root_header_lines > 0) {
+            coord.setPrependedSource(pkg_root_file, self.synthetic_root_header_lines);
+        }
+
         // Create coordinator packages mirroring BuildEnv packages
         // Skip .module kind packages - these are platform-exposed modules (e.g., Stdout)
         // that were incorrectly registered as packages. They should be modules within

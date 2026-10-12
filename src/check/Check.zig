@@ -39,6 +39,7 @@ const Ident = base.Ident;
 const Region = base.Region;
 const DeferredConstraintCheck = unifier.DeferredConstraintCheck;
 const StaticDispatchConstraint = types_mod.StaticDispatchConstraint;
+const CodeReificationSite = can.NodeStore.CodeReificationSite;
 const LiteralDispatchPlan = can.NodeStore.LiteralDispatchPlan;
 const InterpolationPartMetadata = types_mod.InterpolationPartMetadata;
 const Func = types_mod.Func;
@@ -684,6 +685,17 @@ pending_predeclared_use_relations: std.ArrayListUnmanaged(PendingPredeclaredUseR
 /// Backing storage for `PendingPredeclaredUseRelation.fresh`. Reclaimed once
 /// no relation is pending.
 predeclared_relation_vars: std.ArrayListUnmanaged(Var) = .empty,
+/// Every top-level pattern bound to a template: a function whose annotation
+/// returns a `Code`. Empty for a module that declares none, which is what
+/// keeps a call in an ordinary module from paying for the lookup.
+staged_templates: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, Var) = .empty,
+/// Staged function types whose rows are grounded when the binding holding them
+/// generalizes rather than when their own site finishes. See
+/// `groundPendingStagedRows`.
+pending_staged_rows: std.ArrayListUnmanaged(PendingStagedRows) = .empty,
+/// Whether the top-level body being checked is a template's, so a lambda it
+/// writes at a `Code` position is the template's result.
+checking_template_body: bool = false,
 /// The block-local (`s_decl`) analogue of `predeclared_scheme_vars`, keyed by
 /// pattern and live only while the local def is in flight (entries are
 /// removed when the statement finishes). The value is the def's annotation,
@@ -1726,6 +1738,9 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .waiting_predeclared_dispatch_uses = .boundary,
     .pending_predeclared_use_relations = .boundary,
     .predeclared_relation_vars = .keyed,
+    .staged_templates = .keyed,
+    .pending_staged_rows = .boundary,
+    .checking_template_body = .lexical,
     .predeclared_local_annotations = .lexical,
     .hole_shared_schemes = .keyed,
     .hole_shared_vars = .keyed,
@@ -12706,6 +12721,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
     try self.setupCheckOrder();
     try self.rejectTopLevelValueAnnotations();
     try self.predeclareAnnotatedDefSchemes(&env);
+    try self.collectStagedTemplates();
     const group_count: u32 = @intCast(self.check_order.?.sccs.len);
     var group_index: u32 = 0;
     while (group_index < group_count) : (group_index += 1) {
@@ -12757,6 +12773,10 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
             => {},
         }
     }
+
+    // A staged site no binding generalizes, one in an `expect` say, grounds
+    // here, once nothing else can widen its rows.
+    try self.groundPendingStagedRows(&env, null);
 
     try self.finalizeTypes(&env, .{ .module = .{ .skip_numeric_defaults = skip_numeric_defaults } });
 
@@ -12817,6 +12837,7 @@ fn checkFileInternal(self: *Self, skip_numeric_defaults: bool) std.mem.Allocator
 
     try self.pruneSelectedHoistedRootsAfterSolving();
     try self.withdrawProblemsOfVoidRelations();
+    try self.poisonUndescribableStagedCode();
     // Pruning can mark a destructured name erroneous; its uses are poisoned
     // like those of any other erroneous binding.
     try self.poisonErroneousValueUses();
@@ -12861,6 +12882,47 @@ fn withdrawSupersededLiteralDefaultWarnings(self: *Self) Allocator.Error!void {
         kept += 1;
     }
     self.problems.truncate(kept);
+}
+
+/// Poison the definition holding a reification site whose `f` has no
+/// instantiation.
+///
+/// The walk that describes a staged function runs at publication and reports
+/// there, but by then the definition holding the site is a compile-time
+/// constant, and evaluating it instantiates `f` before it ever reaches the
+/// site. An `f` that is erroneous or still holds a type variable has no
+/// instantiation, so the definition is poisoned here, while poisoning still
+/// reaches lowering.
+fn poisonUndescribableStagedCode(self: *Self) std.mem.Allocator.Error!void {
+    for (self.cir.store.codeReificationSites()) |site| {
+        switch (site.kind) {
+            // These three are the sites a description is built for, and so
+            // the sites a compile-time constant evaluates through.
+            .named_function, .inline_lambda, .template_call => {},
+            // A template's lambda stands for every call of the template, and
+            // each call describes its own, so an `f` still holding a variable
+            // here is the shape working rather than failing. The callee the
+            // call replaced is read by nothing.
+            .template, .template_callee => continue,
+        }
+
+        const fn_var = ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(site.fn_var))));
+        const erroneous = try self.canonical_key_writer.containsError(fn_var);
+        const polymorphic = (try self.canonical_key_writer.fromVar(fn_var)).contains_identity_variables;
+        if (!erroneous and !polymorphic) continue;
+
+        // The definition to poison is the one the site was written inside, and
+        // a site is an expression of exactly one definition's body.
+        const site_region = self.cir.store.getExprRegion(@fromBackingInt(@intCast(site.node_idx)));
+        for (self.cir.store.sliceDefs(self.cir.all_defs)) |def_idx| {
+            const def = self.cir.store.getDef(def_idx);
+            const def_region = self.cir.store.getExprRegion(def.expr);
+            if (def_region.start.offset > site_region.start.offset) continue;
+            if (site_region.end.offset > def_region.end.offset) continue;
+            try self.markErroneous(ModuleEnv.varFrom(def.expr));
+            try self.erroneous_value_exprs.put(self.gpa, def.expr, {});
+        }
+    }
 }
 
 /// Turn every provisional platform-requirement row into the explicit
@@ -18062,6 +18124,8 @@ const DefActivity = struct {
         enclosing_func_name: ?Ident.Idx,
         exhaustiveness_scope: ?ExhaustivenessContext.Scope,
         checking_immediate_callee: bool,
+        /// Whether the enclosing definition's body was a template's.
+        checking_template_body: bool,
         active_scheme_root: ?Var,
         function_effect_dependency_scope_start: usize,
         current_expect_effect_slot: ?ExpectEffectSlotId,
@@ -18078,6 +18142,7 @@ const DefActivity = struct {
         checker.function_effect_dependency_scope_start = saved.function_effect_dependency_scope_start;
         checker.active_scheme_root = saved.active_scheme_root;
         checker.checking_immediate_callee = saved.checking_immediate_callee;
+        checker.checking_template_body = saved.checking_template_body;
         if (saved.exhaustiveness_scope) |scope| scope.leave();
         checker.enclosing_func_name = saved.enclosing_func_name;
         checker.open_literal_vars_def_start = saved.open_literal_vars_def_start;
@@ -18136,6 +18201,7 @@ fn beginDef(self: *Self, state: *DefActivity, env: *Env) std.mem.Allocator.Error
         .enclosing_func_name = self.enclosing_func_name,
         .exhaustiveness_scope = null,
         .checking_immediate_callee = self.checking_immediate_callee,
+        .checking_template_body = self.checking_template_body,
         .active_scheme_root = self.active_scheme_root,
         .function_effect_dependency_scope_start = self.function_effect_dependency_scope_start,
         .current_expect_effect_slot = self.current_expect_effect_slot,
@@ -18221,6 +18287,7 @@ fn beginDef(self: *Self, state: *DefActivity, env: *Env) std.mem.Allocator.Error
     if (self.checking_executable_root) self.checking_immediate_callee = true;
     self.checking_binding_rhs = true;
     self.checking_binding_rhs_pattern = def.pattern;
+    self.checking_template_body = self.staged_templates.contains(def.pattern);
     // A singleton value definition has no scheme boundary and therefore owns
     // no side-table candidates. Recursive groups still provisionally own every
     // member here because the shared group boundary decides which roots
@@ -18435,6 +18502,50 @@ fn predeclareAnnotatedDefSchemes(self: *Self, env: *Env) std.mem.Allocator.Error
         const scheme_var = try self.predeclareAnnotationScheme(annotation_idx, env);
         self.setPredeclaredSchemeVar(def_idx, scheme_var);
         try self.registerPredeclaredSlots(annotation_idx, scheme_var);
+    }
+}
+
+/// Every top-level definition whose annotation returns a `Code`.
+///
+/// `weaker_than : I32 -> Code(Entity -> Bool)` declares a template: the compiler
+/// calls it, folds the call's arguments into the lambda it returns, and the
+/// call site takes the description that produces. Collecting the templates
+/// before any body is checked is what lets a call recognise one whichever
+/// order the two definitions are checked in.
+///
+/// The predeclared scheme is the type read, because `predeclareAnnotationScheme`
+/// resets the annotation's own nodes for the body pass to regenerate.
+fn collectStagedTemplates(self: *Self) std.mem.Allocator.Error!void {
+    for (0..self.cir.all_defs.span.len) |def_offset| {
+        const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
+        const scheme_var = self.predeclaredSchemeVar(def_idx) orelse continue;
+        const returns = self.functionReturnVar(scheme_var) orelse continue;
+        const fn_var = self.stagedCodeFnVar(returns) orelse continue;
+        const def = self.cir.store.getDef(def_idx);
+        try self.staged_templates.put(self.gpa, def.pattern, fn_var);
+    }
+}
+
+/// What a function type returns, following aliases. Null for every other type.
+fn functionReturnVar(self: *Self, fn_var: Var) ?Var {
+    var var_ = fn_var;
+    var guard = types_mod.debug.IterationGuard.init("Check.functionReturnVar");
+    while (true) {
+        guard.tick();
+        switch (self.types.resolveVar(var_).desc.content) {
+            .structure => |flat_type| switch (flat_type) {
+                .fn_pure, .fn_unbound, .fn_effectful => |func| return func.ret,
+                .record,
+                .tuple,
+                .nominal_type,
+                .empty_record,
+                .tag_union,
+                .empty_tag_union,
+                => return null,
+            },
+            .alias => |alias| var_ = self.types.getAliasBackingVar(alias),
+            .flex, .rigid, .field_presence, .err => return null,
+        }
     }
 }
 
@@ -19735,6 +19846,7 @@ fn finishRecursiveGroupBoundary(self: *Self, defs: []const CIR.Def.Idx, member_r
             try self.checkEffectfulFunctionName(member_def.pattern, member_def.expr);
         }
     }
+    try self.groundPendingStagedRows(env, env.rank());
     try self.judgePendingAccessesAtBoundary(env);
     self.unify_scratch.clearPersistentOpenings();
     try self.linkDeferredUsesFrom(env.rank());
@@ -20962,6 +21074,10 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     // Redirect the root annotation to inner annotation
     _ = try self.unify(annotation_var, ModuleEnv.varFrom(annotation.anno), env);
 
+    // A misplaced `Code` poisons its type, so it is checked before the
+    // annotation's erroneousness is recorded.
+    try self.checkStagedCodePositions(annotation);
+
     // An erroneous annotation declares no type. Record that on the annotation
     // itself, before anything is related to it, so every consumer (including
     // importers, which read this module's annotations) can refuse to relate
@@ -20969,6 +21085,98 @@ fn generateAnnotationType(self: *Self, annotation_idx: CIR.Annotation.Idx, env: 
     self.var_set.clearRetainingCapacity();
     if (try self.varContainsError(annotation_var, &self.var_set)) {
         self.cir.store.markAnnotationErroneous(annotation_idx);
+    }
+}
+
+/// A `Code` may name a function parameter's type, or what the annotated
+/// function returns, and nothing else.
+///
+/// The rule belongs to staging rather than to unification: a `Code` exists
+/// only while the compiler runs, so a record field holding one has nothing to
+/// hold. Reading the position off the annotation, rather than off the solved
+/// type, is what lets the message point at the `Code` the user wrote.
+fn checkStagedCodePositions(self: *Self, annotation: CIR.Annotation) std.mem.Allocator.Error!void {
+    try self.rejectMisplacedStagedCode(annotation.anno);
+    const where_span = annotation.where orelse return;
+    for (self.cir.store.sliceWhereClauses(where_span)) |where_idx| {
+        switch (self.cir.store.getWhereClause(where_idx)) {
+            .w_method => |method| try self.rejectMisplacedStagedCode(method.anno),
+            .w_alias, .w_malformed => {},
+        }
+    }
+}
+
+/// One annotation tree. A `Code` directly on a function parameter is allowed,
+/// as is one the whole annotation returns; everywhere else, including inside
+/// such a parameter, is not.
+///
+/// `returns_allowed` rides only as far as the annotation's outermost function,
+/// because a template is called by the compiler and never handed around: a
+/// function that returns one cannot itself be a parameter or a return value.
+fn rejectMisplacedStagedCode(self: *Self, root: CIR.TypeAnno.Idx) std.mem.Allocator.Error!void {
+    const Pending = struct { anno: CIR.TypeAnno.Idx, allowed: bool, returns_allowed: bool };
+
+    var stack: std.ArrayList(Pending) = .empty;
+    defer stack.deinit(self.gpa);
+    try stack.append(self.gpa, .{ .anno = root, .allowed = false, .returns_allowed = true });
+
+    while (stack.pop()) |pending| {
+        const anno_idx = pending.anno;
+        const is_code = self.stagedCodeFnVar(ModuleEnv.varFrom(anno_idx)) != null;
+        if (is_code and !pending.allowed) {
+            _ = try self.problems.appendProblem(.{ .staged_code = .{
+                .reason = .outside_staged_position,
+                .region = self.cir.store.getTypeAnnoRegion(anno_idx),
+            } });
+            // The type is poisoned as well as reported, because a `Code` the
+            // compiler never staged reaches lowering as a value with no layout.
+            try self.markErroneous(ModuleEnv.varFrom(anno_idx));
+        }
+
+        switch (self.cir.store.getTypeAnno(anno_idx)) {
+            // Parentheses do not change a position, so the allowance rides
+            // through them onto the type they wrap.
+            .parens => |parens| try stack.append(self.gpa, .{
+                .anno = parens.anno,
+                .allowed = pending.allowed,
+                .returns_allowed = pending.returns_allowed,
+            }),
+            .@"fn" => |func| {
+                for (self.cir.store.sliceTypeAnnos(func.args)) |arg_idx| {
+                    try stack.append(self.gpa, .{ .anno = arg_idx, .allowed = true, .returns_allowed = false });
+                }
+                try stack.append(self.gpa, .{ .anno = func.ret, .allowed = pending.returns_allowed, .returns_allowed = false });
+            },
+            .apply => |apply| {
+                for (self.cir.store.sliceTypeAnnos(apply.args)) |arg_idx| {
+                    try stack.append(self.gpa, .{ .anno = arg_idx, .allowed = false, .returns_allowed = false });
+                }
+            },
+            .tag_union => |tag_union| {
+                for (self.cir.store.sliceTypeAnnos(tag_union.tags)) |tag_idx| {
+                    try stack.append(self.gpa, .{ .anno = tag_idx, .allowed = false, .returns_allowed = false });
+                }
+                if (tag_union.ext) |ext_idx| try stack.append(self.gpa, .{ .anno = ext_idx, .allowed = false, .returns_allowed = false });
+            },
+            .tag => |tag| {
+                for (self.cir.store.sliceTypeAnnos(tag.args)) |arg_idx| {
+                    try stack.append(self.gpa, .{ .anno = arg_idx, .allowed = false, .returns_allowed = false });
+                }
+            },
+            .tuple => |tuple| {
+                for (self.cir.store.sliceTypeAnnos(tuple.elems)) |elem_idx| {
+                    try stack.append(self.gpa, .{ .anno = elem_idx, .allowed = false, .returns_allowed = false });
+                }
+            },
+            .record => |record| {
+                for (self.cir.store.sliceAnnoRecordFields(record.fields)) |field_idx| {
+                    const field = self.cir.store.getAnnoRecordField(field_idx);
+                    try stack.append(self.gpa, .{ .anno = field.ty, .allowed = false, .returns_allowed = false });
+                }
+                if (record.ext) |ext_idx| try stack.append(self.gpa, .{ .anno = ext_idx, .allowed = false, .returns_allowed = false });
+            },
+            .underscore, .rigid_var, .rigid_var_lookup, .lookup, .malformed => {},
+        }
     }
 }
 
@@ -26776,6 +26984,10 @@ const ExprCheckFrame = struct {
     hoist_frame_open: bool,
     /// The annotation this frame materialized, if any.
     annotation: ?CIR.Annotation.Idx = null,
+    /// Set when this expression is a function being reified into a `Code`.
+    /// The expression still checks as an ordinary function, against this
+    /// var; the node itself takes the surrounding `Code(f)` type.
+    staged_code_fn_var: ?Var = null,
     active: bool = true,
 
     fn deinit(self: *ExprCheckFrame, checker: *Self, env: *Env) void {
@@ -26813,13 +27025,23 @@ const ExprCheckFrame = struct {
         if (self.mb_anno_vars) |anno_vars| {
             checker.var_set.clearRetainingCapacity();
             const expr_is_erroneous = try checker.varContainsError(self.expr_var, &checker.var_set);
+            // A staged function relates to the function type inside `Code(f)`,
+            // not to the `Code` itself. The node still takes the `Code` below,
+            // which is what the surrounding expression asked for.
+            const relate_to = self.staged_code_fn_var orelse anno_vars.anno_var;
             // Unify the anno with the expr var. An erroneous value already owns
             // its report, so, like any other consumer of an erroneous value, the
             // annotation relates to it without reporting a mismatch of its own.
             const annotation_result = if (expr_is_erroneous)
-                try checker.runUnify(anno_vars.anno_var, self.expr_var, env, unifyOptionsForContext(anno_vars.context, .write_no_report))
+                try checker.runUnify(relate_to, self.expr_var, env, unifyOptionsForContext(anno_vars.context, .write_no_report))
             else
-                try checker.unifyInContext(anno_vars.anno_var, self.expr_var, env, anno_vars.context);
+                try checker.unifyInContext(relate_to, self.expr_var, env, anno_vars.context);
+            if (self.staged_code_fn_var != null and annotation_result.isEstablished()) {
+                try checker.pending_staged_rows.append(checker.gpa, .{
+                    .root = relate_to,
+                    .region = checker.cir.store.getExprRegion(self.expr_idx),
+                });
+            }
             if (!annotation_result.isEstablished()) {
                 // Suppression by an erroneous annotation does not establish
                 // the relation either; its executable value must be retired.
@@ -26906,6 +27128,7 @@ const ExprCheckFrame = struct {
 
         // If this type of expr should be generalized, generalize it!
         if (self.should_generalize) {
+            try checker.groundPendingStagedRows(env, env.rank());
             // Bind pending record-destructure binders BEFORE boundary literal
             // defaulting: a numeral flowing through a destructured field only
             // becomes signature-reachable once the binder is unified through
@@ -27064,8 +27287,53 @@ fn beginExprCheckFrame(
 
     try self.setVarRank(expr_var_raw, env);
 
+    // A function named where a `Code(f)` is expected is reified. The node takes
+    // the `Code`, so the function type must never reach its var: check the
+    // expression into a fresh var instead, which `finish` relates to `f`.
+    const staged_code = staged: {
+        if (!exprIsStageable(expr)) break :staged null;
+        const expected_type = expected.aggregateType() orelse break :staged null;
+        const fn_var = self.stagedCodeFnVar(expected_type.var_) orelse break :staged null;
+        // A parameter already holding a description is passed along; only a
+        // name the compiler can follow to a body is reified.
+        if (!self.namesAReifiableDefinition(expr)) break :staged null;
+        break :staged .{ .fn_var = fn_var, .expected_type = expected_type };
+    };
+    frame.staged_code_fn_var = if (staged_code) |staged| staged.fn_var else null;
+    if (staged_code) |staged| {
+        // Publication walks the function this site names; the checked bodies
+        // that walk reads do not exist yet, so the site is only recorded here.
+        const writes_a_lambda = expr == .e_closure or expr == .e_lambda;
+        const kind: CodeReificationSite.Kind = if (writes_a_lambda)
+            self.lambdaSiteKind(frame.is_call_arg)
+        else
+            .named_function;
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), staged.fn_var, kind);
+    }
+
+    // A call to a template is the other way a description is built. The call
+    // is the whole value: neither it nor the name it calls is compiled, so
+    // both nodes leave the checked body as descriptions.
+    if (self.stagedTemplateCall(expr)) |call| {
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), call.fn_var, .template_call);
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(call.callee), call.fn_var, .template_callee);
+    }
+
     // Materialize an annotation once at the expression frame that owns it.
     frame.expr_var, frame.mb_anno_vars, frame.nested_expected = blk: {
+        if (staged_code) |staged| {
+            const backup = try self.instantiateVarOrphan(staged.expected_type.var_, env, env.rank(), .use_last_var);
+            break :blk .{
+                try self.fresh(env, expr_region),
+                AnnoVars{
+                    .anno_var = staged.expected_type.var_,
+                    .anno_var_backup = backup,
+                    .context = staged.expected_type.context,
+                },
+                Expected.none(),
+            };
+        }
+
         if (expr == .e_closure) {
             break :blk .{ expr_var_raw, null, expected };
         }
@@ -27116,6 +27384,189 @@ fn beginExprCheckFrame(
     self.checking_binding_rhs_pattern = null;
 
     return frame;
+}
+
+/// The function type inside a `Code(f)` expected type.
+///
+/// Returns null for every other expected type, so an ordinary expression in an
+/// ordinary position never pays for this.
+fn stagedCodeFnVar(self: *Self, expected_var: Var) ?Var {
+    const flat = switch (self.types.resolveVar(expected_var).desc.content) {
+        .structure => |structure| structure,
+        .flex, .rigid, .alias, .field_presence, .err => return null,
+    };
+    const nominal = switch (flat) {
+        .nominal_type => |nominal_type| nominal_type,
+        .record,
+        .tuple,
+        .fn_pure,
+        .fn_effectful,
+        .fn_unbound,
+        .empty_record,
+        .tag_union,
+        .empty_tag_union,
+        => return null,
+    };
+    if (!nominal.originIsBuiltin()) return null;
+    if (!nominal.ident.ident_idx.eql(self.cir.idents.builtin_code)) return null;
+    const args = self.types.sliceNominalArgs(nominal);
+    if (args.len != 1) return null;
+    return args[0];
+}
+
+/// Which of the two lambdas at a `Code(f)` position this one is.
+///
+/// A template's result stands for every call of the template, so each call
+/// describes its own; a lambda written in place is described where it stands.
+/// Two signals separate them, and the enclosing definition supplies both:
+///
+/// ```roc
+/// mk : U8 -> Code(Str -> U16)                   # a template, by its return
+/// mk = |n| {
+///     _ = Stage.describe(|s| s.len().to_u16())  # in place, by being an argument
+///     |s| s.len().to_u16() + n.to_u16()         # the template's result
+/// }
+/// ```
+fn lambdaSiteKind(self: *const Self, is_call_arg: bool) CodeReificationSite.Kind {
+    if (is_call_arg or !self.checking_template_body) return .inline_lambda;
+    return .template;
+}
+
+/// Whether this lookup names a definition the walk can read. Only reached for
+/// an expression `exprIsStageable` already admitted.
+///
+/// A top-level definition is one, of this module or of a module it imports,
+/// and so is a name a block binds to a lambda. A name bound anywhere else in a
+/// `Code` position is a description being passed along rather than a function
+/// being staged: a stage that takes `Code(f)` and hands it to `Code.ir` names
+/// its own parameter.
+fn namesAReifiableDefinition(self: *Self, expr: CIR.Expr) bool {
+    // An imported name leads to a definition the walk reads through the
+    // exporting module's published view, so only a local one is asked about.
+    if (expr != .e_lookup_local) return true;
+
+    const pattern_idx = expr.e_lookup_local.pattern_idx;
+    // A block binds a lambda as a local procedure candidate before it checks
+    // the rest of the block, so the entry exists before any use.
+    if (self.local_procedure_candidates.contains(pattern_idx)) return true;
+    for (self.cir.store.sliceDefs(self.cir.all_defs)) |def_idx| {
+        if (self.cir.store.getDef(def_idx).pattern == pattern_idx) return true;
+    }
+    return false;
+}
+
+/// Claim a call that produces a `Code`, or report that nothing can.
+///
+/// A template of this module is claimed by `stagedTemplateCall` before the call
+/// is checked. An imported one is claimed here instead, because the callee's
+/// type is what says it is a template and that is not solved any earlier.
+/// Whatever is left is a call the walk cannot follow, through a binding rather
+/// than a name, and it is reported and poisoned: a `Code` nothing staged has no
+/// runtime layout for lowering to meet.
+fn claimOrRejectCodeCall(
+    self: *Self,
+    expr_idx: CIR.Expr.Idx,
+    callee_idx: CIR.Expr.Idx,
+    region: Region,
+) std.mem.Allocator.Error!void {
+    const fn_var = self.stagedCodeFnVar(ModuleEnv.varFrom(expr_idx)) orelse return;
+    if (self.cir.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr_idx)) != null) return;
+
+    if (self.cir.store.getExpr(callee_idx) == .e_lookup_external) {
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), fn_var, .template_call);
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(callee_idx), fn_var, .template_callee);
+        return;
+    }
+
+    _ = try self.problems.appendProblem(.{ .staged_code = .{
+        .reason = .definition_not_reachable,
+        .region = region,
+    } });
+    try self.markErroneous(ModuleEnv.varFrom(expr_idx));
+    try self.erroneous_value_exprs.put(self.gpa, expr_idx, {});
+}
+
+/// A call whose callee is a template, with the `f` of the `Code(f)` it builds.
+fn stagedTemplateCall(self: *const Self, expr: CIR.Expr) ?struct { callee: CIR.Expr.Idx, fn_var: Var } {
+    if (self.staged_templates.count() == 0) return null;
+    if (expr != .e_call) return null;
+    const callee_idx = expr.e_call.func;
+    const callee = self.cir.store.getExpr(callee_idx);
+    if (callee != .e_lookup_local) return null;
+    const fn_var = self.staged_templates.get(callee.e_lookup_local.pattern_idx) orelse return null;
+    return .{ .callee = callee_idx, .fn_var = fn_var };
+}
+
+/// Whether this expression is described rather than compiled.
+///
+/// A reference to a named function qualifies, which is the form the proposal
+/// turns on: a staged function that cannot be given a name cannot be tested.
+/// A function that arrives as a runtime argument does not, and that is the
+/// error case.
+///
+/// A lambda written where a `Code` is expected qualifies too, because that is
+/// how a template is written: the lambda a `Code`-returning function returns
+/// is described once per call, with that call's arguments folded into it.
+fn exprIsStageable(expr: CIR.Expr) bool {
+    return switch (expr) {
+        .e_lookup_local, .e_lookup_external, .e_closure, .e_lambda => true,
+        .e_deferred_import_ref => base.invariant("check invariant violated: deferred import reference reached checking", .{}),
+        .e_num,
+        .e_frac_f32,
+        .e_frac_f64,
+        .e_dec,
+        .e_dec_small,
+        .e_num_from_numeral,
+        .e_typed_int,
+        .e_typed_frac,
+        .e_typed_num_from_numeral,
+        .e_str_segment,
+        .e_str,
+        .e_bytes_literal,
+        .e_lookup_associated_local,
+        .e_lookup_associated,
+        .e_lookup_associated_resolved,
+        .e_lookup_required,
+        .e_list,
+        .e_empty_list,
+        .e_tuple,
+        .e_match,
+        .e_if,
+        .e_call,
+        .e_record,
+        .e_empty_record,
+        .e_block,
+        .e_tag,
+        .e_nominal,
+        .e_nominal_external,
+        .e_zero_argument_tag,
+        .e_binop,
+        .e_unary_minus,
+        .e_field_access,
+        .e_method_call,
+        .e_dispatch_call,
+        .e_interpolation,
+        .e_structural_eq,
+        .e_structural_hash,
+        .e_method_eq,
+        .e_type_method_call,
+        .e_type_dispatch_call,
+        .e_tuple_access,
+        .e_runtime_error,
+        .e_crash,
+        .e_dbg,
+        .e_expect_err,
+        .e_expect,
+        .e_ellipsis,
+        .e_anno_only,
+        .e_derived_method,
+        .e_return,
+        .e_break,
+        .e_for,
+        .e_hosted_lambda,
+        .e_run_low_level,
+        => false,
+    };
 }
 
 fn checkExpr(self: *Self, expr_idx: CIR.Expr.Idx, env: *Env, expected: Expected) std.mem.Allocator.Error!bool {
@@ -29562,6 +30013,7 @@ fn resumeStatement(self: *Self, block_state: *BlockStatementsCheck, statement: *
                 // Resolve those dispatches before generalizing, as a
                 // recursive top-level group's boundary does.
                 try self.checkStaticDispatchConstraints(env, false);
+                try self.groundPendingStagedRows(env, env.rank());
                 try self.judgeRecordDestructBinds(env);
                 try self.defaultLiteralsAtGeneralizationBoundary(.{ .owner = decl_pattern_var, .interface = decl_pattern_var, .binding = decl_pattern_var }, env);
                 try self.judgePendingAccessesAtBoundary(env);
@@ -30316,7 +30768,16 @@ fn resumeLambdaCheck(self: *Self, task: *ExprTask, state: *LambdaCheck, env: *En
     state.body_is_delayed_dependency = !frame.is_immediate_callee;
     if (state.body_is_delayed_dependency) self.delayed_dependency_depth += 1;
 
-    const lambda_body_expected = Expected.none().withHoistPosition(nested_expected.hoist_position);
+    // A function that returns a `Code` is a template, and the lambda it
+    // returns is described rather than compiled. Naming the return type as
+    // expected is what puts the body in a `Code` position, which is the one
+    // place the staged trigger reads.
+    const lambda_body_expected = blk: {
+        const plain = Expected.none().withHoistPosition(nested_expected.hoist_position);
+        const returns = (state.mb_anno_func orelse break :blk plain).ret;
+        if (self.stagedCodeFnVar(returns) == null) break :blk plain;
+        break :blk plain.withExpectedType(.{ .var_ = returns, .context = lambdaAnnoContext(frame) });
+    };
     const expected_result = if (state.mb_anno_func) |expected_func| expected_func.ret else null;
     try self.pushReturnConstraintFrame(expr_idx, body_var, expected_result);
     state.return_frame_pushed = true;
@@ -30700,6 +31161,12 @@ fn resumeCallCheck(self: *Self, task: *ExprTask, state: *CallCheck, env: *Env, c
     }
 
     _ = try self.unify(expr_var, state.shape_func.ret, env);
+
+    // A call is a `Code` only when it calls a template, and a template is
+    // called by the compiler. One the site recording did not claim is either
+    // an imported template, which is recorded here where the callee's type is
+    // known, or a call the walk cannot reach.
+    try self.claimOrRejectCodeCall(expr_idx, call.func, expr_region);
 
     // Argument unification above is the point at which an effect-polymorphic
     // callback can become pure or effectful. Resolve the directed formula
@@ -57428,6 +57895,124 @@ fn branchRelationOwner(ctx: problem.Context) problem.RelationOwner {
     if (ctx == .match_branch) return .of(.branch, ctx.match_branch.match_expr, ctx.match_branch.branch_index);
     if (ctx == .try_operator_value) return .of(.branch, ctx.try_operator_value.expr, 0);
     return .none;
+}
+
+/// A staged function type waiting for its rows to be grounded.
+const PendingStagedRows = struct { root: Var, region: Region };
+
+/// Ground the rows of every queued staged function type that the boundary
+/// about to generalize at `rank` owns, or all of them when `rank` is null.
+///
+/// A site's rows wait for its binding rather than closing where the site
+/// finishes, because the site is not the last word on them. A call relates
+/// its arguments only after checking every one, so in `join(orders, |c, o| ..)`
+/// the table fixes the row after the lambda has been checked; and the next
+/// clause of a chain reads the same parameter record, so in
+/// `.filter_by(|b, p| .. b.low).filter_by(|b, p| .. b.high)` the second
+/// lambda adds a field to the row the first opened. An extension an outer
+/// scope owns is left for that scope's own boundary.
+fn groundPendingStagedRows(self: *Self, env: *Env, rank: ?Rank) std.mem.Allocator.Error!void {
+    var kept: usize = 0;
+    var index: usize = 0;
+    while (index < self.pending_staged_rows.items.len) : (index += 1) {
+        const pending = self.pending_staged_rows.items[index];
+        if (try self.groundStagedCodeRows(pending.root, env, pending.region, rank)) {
+            self.pending_staged_rows.items[kept] = pending;
+            kept += 1;
+        }
+    }
+    self.pending_staged_rows.shrinkRetainingCapacity(kept);
+}
+
+/// Close every row a staged function's type left open.
+///
+/// Naming a function where a `Code` is expected FIXES it: the description the
+/// walk writes is monomorphic, so a row the annotation opened for a caller to
+/// widen has no caller here to widen it and stands for exactly the tags or
+/// fields it lists. Closing it is the same commitment
+/// `constrainDerivedParserErrorRowIncludes` makes when an inclusion has to
+/// retain a closed row rather than a default awaiting a wider relation.
+///
+/// Only an extension still a variable is closed, and with a `rank`, only one
+/// that boundary is about to generalize. A rigid extension is a name the
+/// author wrote (`..others`), which a description cannot carry, and the walk
+/// refuses that by name rather than closing it here. Returns whether an open
+/// extension was left for an outer boundary.
+fn groundStagedCodeRows(self: *Self, root_var: Var, env: *Env, region: Region, rank: ?Rank) std.mem.Allocator.Error!bool {
+    self.var_set.clearRetainingCapacity();
+    const stack = &self.type_visit_stack;
+    const stack_base = stack.items.len;
+    defer stack.items.len = stack_base;
+    try stack.append(self.gpa, root_var);
+    var left_open = false;
+
+    while (stack.items.len > stack_base) {
+        const var_ = stack.pop().?;
+        const resolved = self.types.resolveVar(var_);
+        if (self.var_set.contains(resolved.var_)) continue;
+        try self.var_set.put(resolved.var_, {});
+
+        switch (resolved.desc.content) {
+            .flex, .rigid, .field_presence, .err => {},
+            .alias => |alias| {
+                try stack.append(self.gpa, self.types.getAliasBackingVar(alias));
+                try stack.appendSlice(self.gpa, self.types.sliceAliasArgs(alias));
+            },
+            .structure => |flat_type| switch (flat_type) {
+                .empty_record, .empty_tag_union => {},
+                .tuple => |tuple| try stack.appendSlice(self.gpa, self.types.sliceVars(tuple.elems)),
+                .nominal_type => |nominal| try stack.appendSlice(self.gpa, self.types.sliceNominalArgs(nominal)),
+                .fn_pure, .fn_effectful, .fn_unbound => |func| {
+                    try stack.appendSlice(self.gpa, self.types.sliceVars(func.args));
+                    try stack.append(self.gpa, func.ret);
+                },
+                .record => |record| {
+                    const fields = self.types.getRecordFieldsSlice(record.fields);
+                    for (fields.items(.presence)) |presence| {
+                        try stack.append(self.gpa, presence.typeVar());
+                        if (presence.presenceVar()) |presence_var| try stack.append(self.gpa, presence_var);
+                    }
+                    if (try self.groundStagedRowExtension(record.ext, .empty_record, env, region, rank)) left_open = true;
+                },
+                .tag_union => |tag_union| {
+                    const tags = self.types.getTagsSlice(tag_union.tags);
+                    for (tags.items(.args)) |tag_args| {
+                        try stack.appendSlice(self.gpa, self.types.sliceVars(tag_args));
+                    }
+                    if (try self.groundStagedRowExtension(tag_union.ext, .empty_tag_union, env, region, rank)) left_open = true;
+                },
+            },
+        }
+    }
+    return left_open;
+}
+
+/// One row extension of a staged function's type, closed where it is still an
+/// unconstrained variable the boundary owns. Anything else is pushed back onto
+/// the walk: a longer chain carries the rest of the row, and a constrained
+/// variable is a dispatch receiver rather than a row this site may decide.
+/// Returns whether the extension was left open for an outer boundary.
+fn groundStagedRowExtension(
+    self: *Self,
+    ext: Var,
+    empty: types_mod.FlatType,
+    env: *Env,
+    region: Region,
+    rank: ?Rank,
+) std.mem.Allocator.Error!bool {
+    const resolved = self.types.resolveVar(ext);
+    if (resolved.desc.content == .flex and resolved.desc.content.flex.constraints.len() == 0) {
+        if (rank) |boundary| {
+            if (@backingInt(resolved.desc.rank) < @backingInt(boundary)) return true;
+        }
+        const closed = try self.freshFromContent(.{ .structure = empty }, env, region);
+        // An unconstrained variable against a fresh empty row always relates,
+        // so there is no outcome here a caller could act on.
+        _ = try self.unify(resolved.var_, closed, env);
+        return false;
+    }
+    try self.type_visit_stack.append(self.gpa, ext);
+    return false;
 }
 
 /// Check if a type variable contains any error types anywhere in its structure.

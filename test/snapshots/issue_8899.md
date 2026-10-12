@@ -213,7 +213,7 @@ EndOfFile,
 					(e-block
 						(s-reassign
 							(p-var-assign (ident "$acc"))
-							(e-call (constraint-fn-var 298)
+							(e-call (constraint-fn-var 443)
 								(e-lookup-external
 									(builtin))
 								(e-lookup-local
@@ -225,7 +225,7 @@ EndOfFile,
 							(e-match
 								(match
 									(cond
-										(e-call (constraint-fn-var 311)
+										(e-call (constraint-fn-var 456)
 											(e-lookup-external
 												(builtin))
 											(e-lookup-local
@@ -236,7 +236,7 @@ EndOfFile,
 												(pattern (degenerate false)
 													(p-applied-tag)))
 											(value
-												(e-dispatch-call (method "plus") (constraint-fn-var 316)
+												(e-dispatch-call (method "plus") (constraint-fn-var 461)
 													(receiver
 														(e-lookup-local
 															(p-var-assign (ident "$total"))))
@@ -253,7 +253,7 @@ EndOfFile,
 						(e-empty_record)))
 				(e-lookup-local
 					(p-var-assign (ident "$total"))))))
-	(e-call (constraint-fn-var 331)
+	(e-call (constraint-fn-var 476)
 		(e-lookup-local
 			(p-assign (ident "sum_with_last")))
 		(e-list

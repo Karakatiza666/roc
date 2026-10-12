@@ -158,6 +158,7 @@ pub const CommonIdents = extern struct {
     builtin_range: Ident.Idx,
     builtin_try: Ident.Idx,
     builtin_numeral: Ident.Idx,
+    builtin_code: Ident.Idx,
     builtin_str: Ident.Idx,
     builtin_list: Ident.Idx,
     builtin_box: Ident.Idx,
@@ -318,6 +319,7 @@ pub const CommonIdents = extern struct {
             .builtin_range = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("range_type").qualified_name)),
             .builtin_try = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("try_type").qualified_name)),
             .builtin_numeral = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("numeral_type").qualified_name)),
+            .builtin_code = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_type").qualified_name)),
             .builtin_str = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("str_type").qualified_name)),
             .builtin_list = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("list_type").qualified_name)),
             .builtin_box = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("box_type").qualified_name)),
@@ -3916,6 +3918,11 @@ pub fn calcRegionInfo(self: *const Self, region: Region) RegionInfo {
     return self.common.calcRegionInfo(region);
 }
 
+/// The lines and columns of a region, counted in the file the author wrote.
+/// See `CommonEnv.prepended_line_count`.
+pub fn calcAuthoredRegionInfo(self: *const Self, region: Region) RegionInfo {
+    return self.common.calcAuthoredRegionInfo(region);
+}
 /// Get the source line for a given region
 pub fn getSourceLine(self: *const Self, region: Region) error{ BeginTooLarge, EndTooLarge, InvalidPosition, NoLineStarts, OutOfOrder }![]const u8 {
     return self.common.getSourceLine(region);
@@ -4715,6 +4722,21 @@ pub fn finalizeLiteralDispatchResolution(
     resolution: NodeStore.LiteralDispatchPlan.Resolution,
 ) void {
     self.store.finalizeLiteralDispatchResolution(node_idx, resolution);
+}
+
+/// Record that this function expression is reified into a `Code` at `fn_var`.
+pub fn recordCodeReificationSite(
+    self: *Self,
+    node_idx: Node.Idx,
+    fn_var: TypeVar,
+    kind: NodeStore.CodeReificationSite.Kind,
+) std.mem.Allocator.Error!void {
+    try self.store.recordCodeReificationSite(node_idx, fn_var, kind);
+}
+
+/// The reification recorded for this expression, if it has one.
+pub fn codeReificationSiteForNode(self: *const Self, node_idx: Node.Idx) ?NodeStore.CodeReificationSite {
+    return self.store.codeReificationSiteForNode(node_idx);
 }
 
 /// Record the checked `from_quote` function for a string literal node.

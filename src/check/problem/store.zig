@@ -246,6 +246,7 @@ pub const Store = struct {
                     .platform_alias_not_found,
                     .comptime_crash,
                     .comptime_invalid_numeral,
+                    .staged_code,
                     .comptime_invalid_quote,
                     .comptime_invalid_interpolation,
                     .comptime_expect_failed,

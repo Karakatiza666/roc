@@ -23,6 +23,7 @@ const canonical_type_keys = @import("canonical_type_keys.zig");
 const type_key_engine = @import("type_key_engine.zig");
 const hoist_roots = @import("hoist_roots.zig");
 const const_store = @import("const_store.zig");
+const code_reifier = @import("code_reifier.zig");
 const problem = @import("problem.zig");
 pub const EvaluationDiagnostics = @import("evaluation_diagnostics.zig").Templates;
 const requirement_solution = @import("requirement_solution.zig");
@@ -3898,7 +3899,9 @@ const CheckedStructuralRootEntry = struct {
     next_plus_one: u32,
 };
 
-const CheckedTypePublication = struct {
+/// The checked types one module publishes, with the source-variable index
+/// that maps a solved type to its checked root while publication runs.
+pub const CheckedTypePublication = struct {
     store: CheckedTypeStore,
     /// The source graph is immutable throughout publication. Keep its direct
     /// index through registry construction and all remaining source consumers.
@@ -10718,6 +10721,11 @@ pub const CheckedPatternBinder = struct {
     /// inside the declaration's value capture this binder before the value
     /// exists.
     recursive_value: bool = false,
+    /// The `decl` statement whose pattern binds this binder, null for one a
+    /// parameter, a branch, a loop or a `var` binds. A lambda records what it
+    /// captures by binder, and this is what leads from a capture back to the
+    /// expression that produced its value.
+    defining_statement: ?CheckedStatementId = null,
 };
 
 /// Public `CheckedStringLiteralId` declaration.
@@ -11033,7 +11041,7 @@ pub fn literalConversionRootOf(data: CheckedExprData) ?ComptimeRootId {
     return switch (data) {
         .numeral => |numeral| numeral.conversion_root,
         .str_from_quote => |quote| quote.conversion_root,
-        .pending, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
+        .pending, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
     };
 }
 
@@ -11095,6 +11103,11 @@ pub const CheckedExprData = union(enum) {
     /// the complete post-escape contents; Monotype either materializes Str or
     /// converts through the specialized target's `from_quote` method.
     str_from_quote: CheckedQuoteData,
+    /// A function named where a `Code(f)` was expected. Publication walks the
+    /// function's body into this module's const store and records the root of
+    /// that description here; null means the walk refused the body and said so
+    /// as a `staged_code` problem.
+    code_from_lambda: ?ConstNodeId,
     str_segment: CheckedStringLiteralId,
     str: []const CheckedExprId,
     bytes_literal: CheckedStringLiteralId,
@@ -11607,7 +11620,7 @@ pub const CheckedBodyStoreView = struct {
         const plan = switch (self.stored_exprs[@backingInt(id)].data) {
             inline .if_, .match_ => |payload| payload.state_merge,
             .for_ => |for_| self.loopMutations(for_.mutations orelse checkedArtifactInvariant("checked loop omitted its mutation plan", .{})).state_merge,
-            .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => checkedArtifactInvariant("state merge plan requested for an expression that is not control flow", .{}),
+            .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => checkedArtifactInvariant("state merge plan requested for an expression that is not control flow", .{}),
         };
         return plan orelse checkedArtifactInvariant("checked control-flow expression omitted its state merge plan", .{});
     }
@@ -11664,6 +11677,12 @@ pub const CheckedBodyStoreView = struct {
         var live = reconstructBodyData(CheckedStatement, self, self.stored_statements[@backingInt(id)]);
         live.id = id;
         return live;
+    }
+
+    pub fn patternBinderForCheckedPattern(self: CheckedBodyStoreView, checked_pattern: CheckedPatternId) ?PatternBinderId {
+        const raw = @backingInt(checked_pattern);
+        if (raw >= self.pattern_binder_by_pattern.len) return null;
+        return self.pattern_binder_by_pattern[raw].get();
     }
 
     pub fn patternBinder(self: CheckedBodyStoreView, id: PatternBinderId) CheckedPatternBinder {
@@ -12266,7 +12285,7 @@ const CheckedReassignmentPublisher = struct {
                     if (empty_state == null) empty_state = try store.appendStateMerge(allocator, .{ .binders = .{} });
                     payload.state_merge = empty_state;
                 },
-                .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => {},
+                .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => {},
             };
             for (store.stored_statements.items) |*stmt| switch (stmt.data) {
                 inline .for_, .while_, .infinite_loop, .breakable_loop => |*loop_| {
@@ -12294,7 +12313,7 @@ const CheckedReassignmentPublisher = struct {
                     try self.publishPlan(.{ .state = id });
                 },
                 .if_, .match_ => try self.publishPlan(.{ .state = id }),
-                .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => {},
+                .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => {},
             }
         }
         for (store.stored_statements.items, 0..) |stmt, index| {
@@ -12372,7 +12391,7 @@ const CheckedReassignmentPublisher = struct {
         return switch (self.store.stored_exprs.items[@backingInt(id)].data) {
             inline .if_, .match_ => |*payload| &payload.state_merge,
             .for_ => |for_| &self.store.loop_mutations.items[@backingInt(for_.mutations orelse return null)].state_merge,
-            .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => checkedArtifactInvariant("state merge publication referenced an expression that is not control flow", .{}),
+            .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => checkedArtifactInvariant("state merge publication referenced an expression that is not control flow", .{}),
         };
     }
 
@@ -12387,7 +12406,7 @@ const CheckedReassignmentPublisher = struct {
     fn ownsStateMerge(self: *@This(), id: CheckedExprId) bool {
         return switch (self.store.stored_exprs.items[@backingInt(id)].data) {
             .if_, .match_, .for_ => true,
-            .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => false,
+            .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => false,
         };
     }
 
@@ -12607,6 +12626,7 @@ const CheckedReassignmentPublisher = struct {
             .hosted_lambda,
             .numeral,
             .str_from_quote,
+            .code_from_lambda,
             .str_segment,
             .bytes_literal,
             .lookup_local,
@@ -13476,6 +13496,74 @@ pub const CheckedBodyStore = struct {
         }
     }
 
+    /// Record the description the reifier built for a staged site.
+    ///
+    /// A site that named a function holds the empty description body copying
+    /// left on it. A lambda written in place holds itself, because the walk
+    /// had to read it to build the description now taking its place.
+    pub fn attachCodeReification(self: *CheckedBodyStore, expr_id: CheckedExprId, node: ?ConstNodeId) void {
+        const data = &self.stored_exprs.items[@backingInt(expr_id)].data;
+        switch (data.*) {
+            .code_from_lambda, .lambda, .closure => {},
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .str_segment,
+            .str,
+            .row_coerce,
+            .bytes_literal,
+            .lookup_local,
+            .lookup_external,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => checkedArtifactInvariant(
+                "code reification site pointed at checked expression {d}, which is not a staged site",
+                .{@backingInt(expr_id)},
+            ),
+        }
+        data.* = .{ .code_from_lambda = node };
+    }
+
+    /// Whether checking replaced a staged site with a runtime error. Its own
+    /// diagnostic already says why, and the error is what lowering meets.
+    pub fn codeSiteWasPoisoned(self: *const CheckedBodyStore, expr_id: CheckedExprId) bool {
+        return self.stored_exprs.items[@backingInt(expr_id)].data == .runtime_error;
+    }
+
     pub fn attachQuotePlans(
         self: *CheckedBodyStore,
         plans: *const static_dispatch.StaticDispatchPlanTable,
@@ -14299,6 +14387,7 @@ fn CheckedBodyDiagnosticErrorScan(comptime follow_constants: bool) type {
                 .run_low_level => |run| try self.pushExprSpan(run.args),
                 .numeral,
                 .str_from_quote,
+                .code_from_lambda,
                 .str_segment,
                 .bytes_literal,
                 .lookup_local,
@@ -14666,6 +14755,7 @@ pub fn checkedExprDivergence(kind: CheckedExprKind) CheckedExprDivergence {
         .closure,
         .lambda,
         .anno_only,
+        .code_from_lambda,
         .hosted_lambda,
         => .{ .evaluation = false, .dispatch_plan = false },
     };
@@ -14872,6 +14962,7 @@ const DivergenceScan = struct {
             .numeral,
             .str_from_quote,
             .str_segment,
+            .code_from_lambda,
             .bytes_literal,
             .lookup_local,
             .lookup_external,
@@ -15247,6 +15338,17 @@ const CheckedBodyPayloadCopier = struct {
     }
 
     fn copyExprData(self: *@This(), expr_idx: CIR.Expr.Idx) Allocator.Error!CheckedExprData {
+        // A staged lookup is not a lookup: the function it names becomes a
+        // description, which publication fills in once every body is copied.
+        // The two lambdas are copied as the lambdas they are: a template's is
+        // read by every call of it, and a lambda written in place is what the
+        // walk reads to build the description that replaces it.
+        if (self.module.moduleEnvConst().codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr_idx))) |site| {
+            switch (site.kind) {
+                .named_function, .template_call, .template_callee => return .{ .code_from_lambda = null },
+                .inline_lambda, .template => {},
+            }
+        }
         const expr = self.module.expr(expr_idx).data;
         return switch (expr) {
             .e_num => self.copyNumeralLiteral(expr_idx),
@@ -15685,6 +15787,22 @@ const CheckedBodyPayloadCopier = struct {
         };
     }
 
+    /// Mark every binder a `decl` pattern binds with the statement binding it.
+    fn recordDefiningStatement(
+        self: *@This(),
+        statement_idx: CIR.Statement.Idx,
+        pattern_idx: CIR.Pattern.Idx,
+    ) Allocator.Error!void {
+        const statement = self.source_node_map.statement(statement_idx) orelse
+            checkedArtifactInvariant("checked artifact invariant violated: a decl statement was not copied into the checked body store", .{});
+        var binders = std.ArrayList(PatternBinderId).empty;
+        defer binders.deinit(self.allocator);
+        try self.collectBinders(pattern_idx, &binders, .all);
+        for (binders.items) |binder| {
+            self.pattern_binders.items[@backingInt(binder)].defining_statement = statement;
+        }
+    }
+
     fn copyStatementData(self: *@This(), statement_idx: CIR.Statement.Idx) Allocator.Error!CheckedStatementData {
         const statement = self.module.getStatement(statement_idx);
         return switch (statement) {
@@ -15705,6 +15823,7 @@ const CheckedBodyPayloadCopier = struct {
                     const binder = try self.patternBinder(decl.pattern);
                     self.pattern_binders.items[@backingInt(binder)].is_scheme_alias = true;
                 }
+                try self.recordDefiningStatement(statement_idx, decl.pattern);
                 break :blk .{ .decl = .{
                     .pattern = self.checkedPattern(decl.pattern),
                     .expr = self.checkedExpr(decl.expr),
@@ -16097,18 +16216,22 @@ const CheckedBodyPayloadCopier = struct {
     fn copyReassignedBinders(self: *@This(), pattern_idx: CIR.Pattern.Idx) Allocator.Error![]const PatternBinderId {
         var binders = std.ArrayList(PatternBinderId).empty;
         defer binders.deinit(self.allocator);
-        try self.collectReassignedBinders(pattern_idx, &binders);
+        try self.collectBinders(pattern_idx, &binders, .reassignable);
         if (binders.items.len == 0) return &.{};
         return try binders.toOwnedSlice(self.allocator);
     }
 
-    /// Append the binders a reassigned pattern rebinds, in preorder. Patterns
-    /// wait on an explicit stack, so pattern nesting never becomes native
-    /// call depth.
-    fn collectReassignedBinders(
+    /// Which of a pattern's binders `collectBinders` gathers.
+    const BinderFilter = enum { all, reassignable };
+
+    /// Append the binders of a pattern the filter admits, in preorder.
+    /// Patterns wait on an explicit stack, so pattern nesting never becomes
+    /// native call depth.
+    fn collectBinders(
         self: *@This(),
         pattern_idx: CIR.Pattern.Idx,
         out: *std.ArrayList(PatternBinderId),
+        filter: BinderFilter,
     ) Allocator.Error!void {
         const Pending = union(enum) { pattern: CIR.Pattern.Idx };
         var pending: std.ArrayList(Pending) = .empty;
@@ -16118,7 +16241,7 @@ const CheckedBodyPayloadCopier = struct {
             const current = item.pattern;
             const pattern = self.module.pattern(current).data;
             switch (pattern) {
-                .assign, .var_assign, .as => try self.appendReassignedBinder(current, out),
+                .assign, .var_assign, .as => try self.appendBinder(current, out, filter),
                 .deferred_import_ref => checkedArtifactInvariant("deferred import reference pattern reached checked artifact publication", .{}),
                 .applied_tag, .nominal, .nominal_external, .record_destructure, .list, .tuple, .num_literal, .small_dec_literal, .dec_literal, .frac_f32_literal, .frac_f64_literal, .num_from_numeral_literal, .str_literal, .str_interpolation, .underscore, .runtime_error => {},
             }
@@ -16126,13 +16249,14 @@ const CheckedBodyPayloadCopier = struct {
         }
     }
 
-    fn appendReassignedBinder(
+    fn appendBinder(
         self: *@This(),
         pattern_idx: CIR.Pattern.Idx,
         out: *std.ArrayList(PatternBinderId),
+        filter: BinderFilter,
     ) Allocator.Error!void {
         const binder = try self.patternBinder(pattern_idx);
-        if (!self.pattern_binders.items[@backingInt(binder)].reassignable) return;
+        if (filter == .reassignable and !self.pattern_binders.items[@backingInt(binder)].reassignable) return;
         for (out.items) |existing| {
             if (existing == binder) return;
         }
@@ -16310,7 +16434,7 @@ fn verifyCheckedExprDataComplete(
                 }
             }
         },
-        .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .hosted_lambda, .run_low_level => {},
+        .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .hosted_lambda, .run_low_level => {},
         .row_coerce => |coerce| {
             if (@backingInt(coerce.value) >= checked_bodies.exprCount()) {
                 checkedArtifactInvariant("checked row coercion value expression was out of range", .{});
@@ -17044,6 +17168,9 @@ pub const ResolvedValueRefTable = struct {
                 tag != .expr_required_lookup) continue;
 
             const expr_idx: CIR.Expr.Idx = @fromBackingInt(@intCast(node_idx));
+            // A staged lookup names the function a description is built from,
+            // not a value the program reads, so it resolves to nothing.
+            if (module.moduleEnvConst().codeReificationSiteForNode(@fromBackingInt(@intCast(node_idx))) != null) continue;
             // A lookup keeps its own node and type; a row coercion that
             // widens it into a function's result is a separate wrapper node
             // its parent refers to (design.md "Row Coercion Primitive").
@@ -17194,6 +17321,7 @@ fn checkedExprDataCategory(tag: std.meta.Tag(CheckedExprData)) CheckedExprDataCa
         .pending,
         .numeral,
         .str_from_quote,
+        .code_from_lambda,
         .str_segment,
         .str,
         .bytes_literal,
@@ -18229,6 +18357,22 @@ fn sealCheckedProcedureTemplateRefs(
     defer local_schemes.deinit();
     var nested_function_uses = collections.DenseMap(u32, u32).init(allocator);
     defer nested_function_uses.deinit();
+    // A lambda at a `Code` position is the root of a description, so no
+    // template lowers it: publication replaces a lambda written in place with
+    // its description, and every call of a template is a site that the
+    // template's result lambda is described at. Its node holds the `Code`
+    // rather than a function, which is why a relation read off it would ask a
+    // function type of an opaque one.
+    var staged_lambdas = collections.DenseMap(u32, void).init(allocator);
+    defer staged_lambdas.deinit();
+    for (module.moduleEnvConst().store.codeReificationSites()) |site| {
+        switch (site.kind) {
+            .inline_lambda, .template => {},
+            .named_function, .template_call, .template_callee => continue,
+        }
+        const checked_expr = checked_bodies.exprIdForSource(@fromBackingInt(@intCast(site.node_idx))) orelse continue;
+        try staged_lambdas.put(@backingInt(checked_expr), {});
+    }
     {
         const types_store = module.typeStoreConst();
 
@@ -18295,6 +18439,7 @@ fn sealCheckedProcedureTemplateRefs(
         static_dispatch_plans,
         &local_schemes,
         &nested_function_uses,
+        &staged_lambdas,
     );
     defer collector.deinit();
 
@@ -21887,6 +22032,8 @@ const CheckedTemplateRefCollector = struct {
     /// Checked nested function expr -> `SchemeUseRecord` index for the
     /// construction edge that instantiated it.
     nested_function_uses: *const collections.DenseMap(u32, u32),
+    /// Checked lambdas written at a `Code` position, which no template lowers.
+    staged_lambdas: *const collections.DenseMap(u32, void),
     value_refs: std.ArrayList(ResolvedValueRefId),
     dispatch_refs: std.ArrayList(static_dispatch.StaticDispatchPlanId),
     iterator_refs: std.ArrayList(static_dispatch.IteratorForPlanId),
@@ -21917,6 +22064,7 @@ const CheckedTemplateRefCollector = struct {
         static_dispatch_plans: *const static_dispatch.StaticDispatchPlanTable,
         local_schemes: *const collections.DenseMap(u32, Var),
         nested_function_uses: *const collections.DenseMap(u32, u32),
+        staged_lambdas: *const collections.DenseMap(u32, void),
     ) CheckedTemplateRefCollector {
         return .{
             .allocator = allocator,
@@ -21926,6 +22074,7 @@ const CheckedTemplateRefCollector = struct {
             .static_dispatch_plans = static_dispatch_plans,
             .local_schemes = local_schemes,
             .nested_function_uses = nested_function_uses,
+            .staged_lambdas = staged_lambdas,
             .value_refs = .empty,
             .dispatch_refs = .empty,
             .iterator_refs = .empty,
@@ -22116,6 +22265,7 @@ const CheckedTemplateRefCollector = struct {
         if (entry.found_existing) return;
 
         const raw_expr = @backingInt(expr_id);
+        if (self.staged_lambdas.contains(raw_expr)) return;
         if (self.nested_function_uses.get(raw_expr)) |record_idx| {
             try self.scheme_use_sites.append(self.allocator, .{
                 .record_idx = record_idx,
@@ -22335,6 +22485,7 @@ const CheckedTemplateRefCollector = struct {
             .crash,
             .ellipsis,
             .anno_only,
+            .code_from_lambda,
             .pending,
             => {},
         }
@@ -22791,6 +22942,16 @@ pub const CheckedProcedureTemplate = struct {
     demands: artifact_serialize.Span = .{},
 };
 
+/// Whether a row variable is one the checker closed to `[]`.
+///
+/// The checker marks the identity it leaves behind when it closes a row
+/// (`empty_tag_union_is_default`), and that mark survives into the artifact as
+/// this default. So a variable carrying it names a row that took no further
+/// variants, while one without it names a row still open.
+pub fn checkedRowVariableClosesTagRow(variable: CheckedTypeVariable) bool {
+    return variable.row_default == .empty_tag_union;
+}
+
 fn checkedTypeIsClosedTagRow(
     checked_types: *const CheckedTypeStore,
     root: CheckedTypeId,
@@ -22802,7 +22963,7 @@ fn checkedTypeIsClosedTagRow(
             .alias => |alias| current = alias.backing,
             .tag_union => |tag_union| current = tag_union.ext,
             .empty_tag_union => return true,
-            .flex, .rigid => |variable| return variable.row_default == .empty_tag_union,
+            .flex, .rigid => |variable| return checkedRowVariableClosesTagRow(variable),
             .pending,
             .err,
             .record,
@@ -23095,6 +23256,15 @@ pub const CheckedProcedureTemplateTable = struct {
         }
         allocator.free(self.promoted);
         self.promoted = entries;
+    }
+
+    /// The template of the local function checking promoted from the binding
+    /// at `pattern`, or null for a pattern no promotion bound.
+    pub fn lookupPromotedByPattern(self: *const CheckedProcedureTemplateTable, pattern: CIR.Pattern.Idx) ?canonical.ProcedureTemplateRef {
+        for (self.promoted) |entry| {
+            if (entry.pattern == pattern) return entry.template;
+        }
+        return null;
     }
 
     pub fn lookupByDef(self: *const CheckedProcedureTemplateTable, def_idx: CIR.Def.Idx) ?canonical.ProcedureTemplateRef {
@@ -23655,6 +23825,7 @@ const NestedProcSiteBuilder = struct {
             .crash,
             .ellipsis,
             .anno_only,
+            .code_from_lambda,
             .pending,
             => {},
         }
@@ -23895,7 +24066,7 @@ const NestedProcSiteBuilder = struct {
         const expr_id = site.checked_expr orelse return &.{};
         return switch (self.checked_bodies.expr(expr_id).data) {
             .closure => |closure| closure.captures,
-            .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => &.{},
+            .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => &.{},
         };
     }
 
@@ -23931,7 +24102,7 @@ const NestedProcSiteBuilder = struct {
             try site_by_expr.put(allocator, expr_id, @intCast(index));
             switch (self.checked_bodies.expr(expr_id).data) {
                 .closure => |closure| try site_by_expr.put(allocator, closure.lambda, @intCast(index)),
-                .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => {},
+                .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => {},
             }
         }
 
@@ -25830,6 +26001,7 @@ fn publishLiteralConversionRoots(
             .numeral => |*numeral| .{ numeral.plan.?, &numeral.conversion_root },
             .str_from_quote => |*quote| .{ quote.plan.?, &quote.conversion_root },
             .pending,
+            .code_from_lambda,
             .str_segment,
             .str,
             .bytes_literal,
@@ -25920,6 +26092,7 @@ fn publishLiteralConversionRoots(
             .numeral => |numeral| numeral.plan.?,
             .str_from_quote => |quote| quote.plan.?,
             .pending,
+            .code_from_lambda,
             .str_segment,
             .str,
             .bytes_literal,
@@ -27109,6 +27282,9 @@ pub fn pairCheckedPlatform(
                     expr.data = .{ .runtime_error = .{} };
                 }
             },
+            // A description names no type variable (the walk refuses one), so
+            // no requirement formal reaches the const nodes a site holds.
+            .code_from_lambda,
             .pending,
             .numeral,
             .str_from_quote,
@@ -29078,6 +29254,7 @@ const TemplateDemandPass = struct {
             .lookup_required,
             .str_segment,
             .bytes_literal,
+            .code_from_lambda,
             .empty_list,
             .empty_record,
             .zero_argument_tag,
@@ -30083,6 +30260,7 @@ fn checkedExprContains(
                 .numeral,
                 .str_from_quote,
                 .str_segment,
+                .code_from_lambda,
                 .bytes_literal,
                 .lookup_local,
                 .lookup_external,
@@ -33277,6 +33455,11 @@ pub const StoredConstTemplate = struct {
     /// Exact producer-owned Monotype representation used to evaluate `node`.
     /// This is explicit post-check evidence, stored in `ConstStore.type_store`.
     root_type: const_store.ConstTypeId,
+    /// The checked body the value was written as, carried over from the eval
+    /// template this replaced. A staged body that reads this constant by name
+    /// describes what was written rather than what it evaluated to, so the
+    /// body has to outlive the evaluation.
+    body: ?CheckedConstBodyRef = null,
 };
 
 /// Public `ConstTemplateState` declaration.
@@ -33416,11 +33599,14 @@ pub const ConstTemplateTable = struct {
         template: StoredConstTemplate,
     ) void {
         const record = self.recordForRef(ref);
+        var stored = template;
         switch (record.state) {
-            .reserved, .eval_template => record.state = .{ .stored_const = template },
+            .reserved => {},
+            .eval_template => |eval| stored.body = eval.body,
             .stored_const => checkedArtifactInvariant("constant template was filled twice", .{}),
             .unimplemented => checkedArtifactInvariant("constant template without a declared value was given a stored value", .{}),
         }
+        record.state = .{ .stored_const = stored };
     }
 
     /// Replace a stored constant's template with an equal stored value: a
@@ -33600,7 +33786,9 @@ pub const ExportedConstTemplateTable = struct {
     ) void {
         for (self.templates) |*entry| {
             if (!constRefEql(entry.const_ref, ref)) continue;
-            entry.template.state = .{ .stored_const = template };
+            var stored = template;
+            if (entry.template.state == .eval_template) stored.body = entry.template.state.eval_template.body;
+            entry.template.state = .{ .stored_const = stored };
             return;
         }
     }
@@ -34828,6 +35016,7 @@ pub const CheckedModuleArtifact = struct {
                     .numeral => |numeral| numeral.plan,
                     .str_from_quote => |quote| quote.plan,
                     .pending,
+                    .code_from_lambda,
                     .str_segment,
                     .str,
                     .bytes_literal,
@@ -35710,6 +35899,9 @@ pub const CheckedModuleArtifact = struct {
                 base.invariant("checked artifact invariant violated: pattern binder was not indexed by pattern", .{});
             };
             std.debug.assert(indexed == binder.id);
+            if (binder.defining_statement) |statement| {
+                std.debug.assert(self.checked_bodies.statement(statement).data == .decl);
+            }
         }
 
         for (self.checked_bodies.stored_statements.items) |statement| {
@@ -37441,6 +37633,329 @@ pub fn checkedModuleKeyFromModuleEnv(
     );
 }
 
+/// How the walk reaches a staged definition another module exports.
+///
+/// An imported module arrives as a published view, which carries its checked
+/// bodies and solved types but no source-node map. So the export tables answer
+/// where the definition's body is: the row an external lookup's target def
+/// names carries the checked body the walk starts from.
+const ForeignStagedLookup = struct {
+    module: TypedCIR.Module,
+    names: *const canonical.CanonicalNameStore,
+    method_registry: *const static_dispatch.MethodRegistry,
+    imports: []const PublishImportArtifact,
+    available: []const ImportedModuleView,
+
+    fn lookup(self: *const ForeignStagedLookup) code_reifier.ForeignLookup {
+        return .{
+            .context = self,
+            .resolve = resolve,
+            .resolve_exported = resolveExported,
+            .resolve_constant = resolveConstant,
+            .resolve_method = resolveMethod,
+            .resolve_inspect_override = resolveInspectOverride,
+        };
+    }
+
+    /// The target a nominal's declaration names for one method.
+    ///
+    /// A method is declared against a nominal rather than exported under a
+    /// name, so the registries answer this where the export tables answer a
+    /// call. The module being published is asked first and the views after it,
+    /// which is the order `lookupCheckedMethodTarget` uses, because a method
+    /// this module declares on an imported nominal is the one Roc dispatches
+    /// to.
+    fn resolveMethod(
+        context: *const anyopaque,
+        owner: code_reifier.ForeignNominal,
+        method: []const u8,
+    ) ?static_dispatch.MethodTarget {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        if (registeredMethod(self.names, self.method_registry, owner, method)) |target| return target;
+        for (self.imports) |import_artifact| {
+            if (registeredMethod(
+                import_artifact.view.canonical_names,
+                import_artifact.view.method_registry,
+                owner,
+                method,
+            )) |target| return target;
+        }
+        for (self.available) |view| {
+            if (registeredMethod(view.canonical_names, view.method_registry, owner, method)) |target| return target;
+        }
+        return null;
+    }
+
+    /// The inspect override a nominal's declaration names, asked of the
+    /// registry that declares its `to_inspect`, in `resolveMethod`'s order.
+    ///
+    /// The first registry holding the method answers, override or not: a
+    /// declaration that is not an override is still the one Roc resolves, so
+    /// a later registry must not supply one in its place.
+    fn resolveInspectOverride(
+        context: *const anyopaque,
+        owner: code_reifier.ForeignNominal,
+    ) ?static_dispatch.MethodTarget {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        if (registeredMethod(self.names, self.method_registry, owner, "to_inspect") != null) {
+            return registeredInspectOverride(self.names, self.method_registry, owner);
+        }
+        for (self.imports) |import_artifact| {
+            const names = import_artifact.view.canonical_names;
+            const registry = import_artifact.view.method_registry;
+            if (registeredMethod(names, registry, owner, "to_inspect") != null) {
+                return registeredInspectOverride(names, registry, owner);
+            }
+        }
+        for (self.available) |view| {
+            if (registeredMethod(view.canonical_names, view.method_registry, owner, "to_inspect") != null) {
+                return registeredInspectOverride(view.canonical_names, view.method_registry, owner);
+            }
+        }
+        return null;
+    }
+
+    /// A constant of a named artifact. The ref the checker resolved names the
+    /// artifact, which may be one this module never imported itself, so the
+    /// available artifacts answer where the direct imports do not.
+    fn resolveConstant(
+        context: *const anyopaque,
+        const_ref: ConstRef,
+    ) ?code_reifier.ForeignConstant {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        for (self.imports) |import_artifact| {
+            if (!std.meta.eql(import_artifact.key.bytes, const_ref.artifact.bytes)) continue;
+            return exportedConstant(import_artifact.view, const_ref);
+        }
+        for (self.available) |view| {
+            if (!std.meta.eql(view.key.bytes, const_ref.artifact.bytes)) continue;
+            return exportedConstant(view, const_ref);
+        }
+        return null;
+    }
+
+    fn resolve(
+        context: *const anyopaque,
+        import_idx: CIR.Import.Idx,
+        target_node_idx: u32,
+    ) ?code_reifier.ForeignDefinition {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        const resolved_module_idx = self.module.resolvedImportModule(import_idx) orelse return null;
+        const import_artifact = publishImportForModule(self.imports, resolved_module_idx) orelse return null;
+        return exportedDefinition(import_artifact.view, @fromBackingInt(@intCast(target_node_idx)));
+    }
+
+    /// A definition of a named artifact, which a call inside a description
+    /// reaches. The binding the producer resolved names the artifact rather
+    /// than an import, and may name one this module never imported itself, so
+    /// the available artifacts answer where the direct imports do not.
+    fn resolveExported(
+        context: *const anyopaque,
+        artifact: canonical.ArtifactRef,
+        def: CIR.Def.Idx,
+    ) ?code_reifier.ForeignDefinition {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        for (self.imports) |import_artifact| {
+            if (!std.meta.eql(import_artifact.key.bytes, artifact.bytes)) continue;
+            return exportedDefinition(import_artifact.view, def);
+        }
+        for (self.available) |view| {
+            if (!std.meta.eql(view.key.bytes, artifact.bytes)) continue;
+            return exportedDefinition(view, def);
+        }
+        return null;
+    }
+};
+
+/// One registry's answer for a nominal named by content identity and
+/// declaration.
+///
+/// Every id in a registry belongs to the store beside it, so the nominal's
+/// module and the method are interned there first. A store that never saw one
+/// of those names cannot hold an entry keyed by it, which is the null.
+pub fn registeredMethod(
+    names: *const canonical.CanonicalNameStore,
+    registry: *const static_dispatch.MethodRegistry,
+    owner: code_reifier.ForeignNominal,
+    method: []const u8,
+) ?static_dispatch.MethodTarget {
+    const key = registeredMethodKey(names, owner, method) orelse return null;
+    return switch (registry.lookup(key) orelse return null) {
+        .target => |target| target,
+        // A declaration the earlier stages rejected has no runtime target, and
+        // its diagnostic is already reported, so the walk reads it as no
+        // declaration rather than as one it can call.
+        .rejected => null,
+    };
+}
+
+/// The `to_inspect` one registry records as `owner`'s inspect override, or
+/// null when the registry records none.
+pub fn registeredInspectOverride(
+    names: *const canonical.CanonicalNameStore,
+    registry: *const static_dispatch.MethodRegistry,
+    owner: code_reifier.ForeignNominal,
+) ?static_dispatch.MethodTarget {
+    const key = registeredMethodKey(names, owner, "to_inspect") orelse return null;
+    const found = registry.inspectOverride(key) orelse return null;
+    return found.target;
+}
+
+/// The registry key for one method of a nominal named across stores, or null
+/// when this store has never interned one of its names, which means no entry
+/// here can match.
+fn registeredMethodKey(
+    names: *const canonical.CanonicalNameStore,
+    owner: code_reifier.ForeignNominal,
+    method: []const u8,
+) ?static_dispatch.MethodKey {
+    const owner_key: static_dispatch.MethodOwner = if (owner.builtin) |builtin_owner|
+        .{ .builtin = builtin_owner }
+    else
+        .{ .nominal = .{
+            .module = names.lookupModuleIdentity(owner.module) orelse return null,
+            .source_decl = owner.source_decl,
+        } };
+    return .{
+        .owner = owner_key,
+        .method = names.lookupMethodName(method) orelse return null,
+    };
+}
+
+/// The body an exported constant holds, read from the owning module's own
+/// tables the way a procedure's body is.
+fn exportedConstant(view: ImportedModuleView, const_ref: ConstRef) ?code_reifier.ForeignConstant {
+    const body = code_reifier.constantBody(view.const_templates, view.checked_const_bodies, const_ref) orelse
+        return null;
+    return .{
+        .module = .{
+            .sources = .{
+                .types = view.checked_types,
+                .bodies = view.checked_bodies,
+                .plans = view.static_dispatch_plans,
+                .names = view.canonical_names,
+                .artifact = view.key,
+                .value_refs = view.resolved_value_refs,
+                .procedure_bindings = view.top_level_procedure_bindings,
+                .procedure_templates = view.checked_procedure_templates,
+                .const_templates = view.const_templates,
+                .const_bodies = view.checked_const_bodies,
+            },
+            .env = view.module_env,
+        },
+        .body = body,
+    };
+}
+
+/// The body and the template an exported procedure holds for this definition.
+fn exportedDefinition(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.ForeignDefinition {
+    for (view.exported_procedure_templates.templates) |template| {
+        if (template.def != def) continue;
+        const body_id = switch (template.template_data.body) {
+            .checked_body => |body| body,
+            .intrinsic_wrapper, .entry_wrapper, .unimplemented => return null,
+        };
+        return .{
+            .module = .{
+                .sources = .{
+                    .types = view.checked_types,
+                    .bodies = view.checked_bodies,
+                    .plans = view.static_dispatch_plans,
+                    .names = view.canonical_names,
+                    .artifact = view.key,
+                    .value_refs = view.resolved_value_refs,
+                    .procedure_bindings = view.top_level_procedure_bindings,
+                    .procedure_templates = view.checked_procedure_templates,
+                    .const_templates = view.const_templates,
+                    .const_bodies = view.checked_const_bodies,
+                },
+                .env = view.module_env,
+            },
+            .body = view.checked_bodies.body(body_id).root_expr,
+            .template = template.template_data,
+        };
+    }
+    return null;
+}
+
+/// Walk every function this module stages into `store`, recording each
+/// description on its site and reporting every walk that could not finish.
+///
+/// Publication owns this because the walk reads checked bodies and solved
+/// types, neither of which exists while the checker runs.
+fn reifyStagedCode(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    module_env: *const ModuleEnv,
+    type_publication: *const CheckedTypePublication,
+    checked_bodies: *CheckedBodyStore,
+    plans: *const static_dispatch.StaticDispatchPlanTable,
+    names: *const canonical.CanonicalNameStore,
+    artifact_key: CheckedModuleArtifactKey,
+    value_refs: *const ResolvedValueRefTable,
+    procedure_bindings: *const TopLevelProcedureBindingTable,
+    procedure_templates: *const CheckedProcedureTemplateTable,
+    const_templates: *const ConstTemplateTable,
+    const_bodies: *const CheckedConstBodyTable,
+    method_registry: *const static_dispatch.MethodRegistry,
+    imports: []const PublishImportArtifact,
+    available: []const ImportedModuleView,
+    store: *ConstStore,
+    problem_store: ?*problem.Store,
+) Allocator.Error!void {
+    var foreign = ForeignStagedLookup{
+        .module = module,
+        .names = names,
+        .method_registry = method_registry,
+        .imports = imports,
+        .available = available,
+    };
+    const outcomes = try code_reifier.reifyModuleSites(allocator, store, .{
+        .types = &type_publication.store,
+        .bodies = checked_bodies,
+        .plans = plans,
+        .names = names,
+        .artifact = artifact_key,
+        .value_refs = value_refs,
+        .procedure_bindings = procedure_bindings,
+        .procedure_templates = procedure_templates,
+        .const_templates = const_templates,
+        .const_bodies = const_bodies,
+        .site_types = type_publication,
+    }, module, module_env, foreign.lookup());
+    defer allocator.free(outcomes);
+
+    for (outcomes) |site| {
+        if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
+        switch (site.outcome) {
+            .reified => |node| checked_bodies.attachCodeReification(site.expr, node),
+            .rejected => |rejection| {
+                checked_bodies.attachCodeReification(site.expr, null);
+                const problems = problem_store orelse continue;
+                const detail = try problems.putExtraString(rejection.detail);
+                _ = try problems.appendProblem(.{ .staged_code = .{
+                    .reason = stagedCodeReason(rejection.kind),
+                    .region = rejection.region,
+                    .detail = detail,
+                } });
+            },
+        }
+    }
+}
+
+/// The reported reason for a walk that stopped.
+fn stagedCodeReason(kind: code_reifier.Rejection.Kind) problem.StagedCode.Reason {
+    return switch (kind) {
+        .unsupported_expression => .unsupported_construct,
+        .unsupported_type => .unsupported_type,
+        .unresolved_type => .unresolved_type,
+        .capture => .captures_a_binding,
+        .effect => .performs_an_effect,
+        .unresolved_reference => .definition_not_reachable,
+        .argument_not_constant => .argument_not_constant,
+    };
+}
+
 /// Public `publishFromTypedModule` function.
 pub fn publishFromTypedModule(
     allocator: Allocator,
@@ -37658,7 +38173,6 @@ pub fn publishFromTypedModule(
 
     var checked_const_store = ConstStore.init(allocator);
     errdefer checked_const_store.deinit();
-
     var top_level_procedure_bindings = TopLevelProcedureBindingTable.initEmpty();
     errdefer top_level_procedure_bindings.deinit(allocator);
 
@@ -37947,6 +38461,31 @@ pub fn publishFromTypedModule(
         &checked_procedure_templates,
         &top_level_values,
         &hoisted_constants,
+    );
+
+    // Every function this module stages becomes a description here. The walk
+    // reads a dispatch plan's resolution, which total resolution assigns, and
+    // the body of any constant it folds, which sealing above fills in, so this
+    // is the earliest point in publication it can run.
+    try reifyStagedCode(
+        allocator,
+        module,
+        module_env,
+        &checked_type_publication,
+        checked_bodies,
+        &static_dispatch_plans,
+        &canonical_names,
+        artifact_key,
+        &resolved_value_refs,
+        &top_level_procedure_bindings,
+        &checked_procedure_templates,
+        &const_templates,
+        &checked_const_bodies,
+        &method_registry,
+        inputs.imports,
+        inputs.available_artifacts,
+        &checked_const_store,
+        inputs.problem_store,
     );
 
     var exhaustiveness_reachability = try ExhaustivenessTemplateReachability.build(
@@ -40254,6 +40793,7 @@ fn divergenceParityFixture(comptime kind: CheckedExprKind) CheckedExprData {
         .pending => .pending,
         .numeral => .{ .numeral = .{ .literal = .{ .node_idx = 0, .digits_start = 0, .before_len = 0, .after_len = 0, .after_decimal_digit_count = 0, .flags = 0 }, .plan = null } },
         .str_from_quote => .{ .str_from_quote = .{ .plan = null, .literal = string } },
+        .code_from_lambda => .{ .code_from_lambda = null },
         .str_segment => .{ .str_segment = string },
         .str => .{ .str = ops },
         .bytes_literal => .{ .bytes_literal = string },
@@ -40527,8 +41067,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0x9E, 0x95, 0xA0, 0x89, 0xD4, 0xE9, 0x7E, 0x19, 0x87, 0xFC, 0xED, 0x27, 0x77, 0x05, 0x99, 0x55,
-        0xC9, 0xC3, 0x41, 0xB7, 0x4F, 0x99, 0xC6, 0x55, 0x92, 0xD1, 0x99, 0x9C, 0x95, 0x00, 0x70, 0x61,
+        0xC8, 0xAE, 0xF5, 0x8E, 0x0B, 0x62, 0xFA, 0xB7, 0xCA, 0x09, 0xB4, 0xB9, 0xCB, 0xED, 0xF8, 0x6D,
+        0x69, 0xD4, 0x09, 0xB7, 0xF0, 0xC2, 0x65, 0x2E, 0xD3, 0xE4, 0xBD, 0x37, 0x2A, 0xC6, 0xC8, 0x20,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

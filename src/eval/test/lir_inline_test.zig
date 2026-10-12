@@ -9141,6 +9141,7 @@ test "literal conversion ownership includes nested codec evidence" {
                 .numeral => |numeral| numeral.plan orelse continue,
                 .str_from_quote => |quote| quote.plan orelse continue,
                 .pending,
+                .code_from_lambda,
                 .str_segment,
                 .str,
                 .bytes_literal,
@@ -9253,6 +9254,7 @@ test "custom literal field default gets an ordinary conversion root" {
         .numeral => |numeral| numeral.plan.?,
         .str_from_quote => |quote| quote.plan.?,
         .pending,
+        .code_from_lambda,
         .str_segment,
         .str,
         .bytes_literal,
@@ -13237,7 +13239,7 @@ fn stampRowCoerceOnIdentityMatch(bodies: *check.CheckedArtifact.CheckedBodyStore
         const every_arm_yields_a_tag = for (branches) |branch| {
             switch (bodies.stored_exprs.items[@backingInt(branch.value)].data) {
                 .tag, .zero_argument_tag, .nominal => {},
-                .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => break false,
+                .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => break false,
             }
         } else true;
         if (!every_arm_yields_a_tag) continue;
