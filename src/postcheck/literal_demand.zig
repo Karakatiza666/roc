@@ -537,6 +537,7 @@ const Builder = struct {
             .pending,
             .str_segment,
             .str,
+            .code_from_lambda,
             .bytes_literal,
             .lookup_local,
             .lookup_external,

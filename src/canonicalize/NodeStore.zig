@@ -781,6 +781,7 @@ write_occurrences: collections.SafeList(WriteOccurrence),
 int128_values: collections.SafeList(i128), // Typed storage for large numeric literals
 literal_dispatch_plans: collections.SafeList(LiteralDispatchPlan), // Checked literal dispatch metadata owned by literal nodes
 literal_pattern_contexts: collections.SafeList(LiteralPatternContext),
+code_reification_sites: collections.SafeList(CodeReificationSite), // Function expressions the checker reified into a `Code`
 interpolation_data: collections.SafeList(InterpolationData), // Canonical and checked data owned by interpolation expressions
 span2_data: collections.SafeList(Span2), // Typed storage for (start, len) span pairs
 span_with_node_data: collections.SafeList(SpanWithNode), // Typed storage for (start, len, node) triples
@@ -901,6 +902,44 @@ pub const LiteralDispatchPlan = extern struct {
 pub const LiteralPatternContext = extern struct {
     failure_owner: u32,
     equality_fn_var_plus_one: u32 = 0,
+};
+
+/// A function expression the checker decided to reify into a `Code` value.
+///
+/// Unlike a literal conversion, this is not owned by the node's payload: the
+/// expressions that can be staged are ordinary lambdas and lookups, which have
+/// no spare field to hang a plan on.
+pub const CodeReificationSite = extern struct {
+    node_idx: u32,
+    /// The function type the expression was reified at, which is the argument
+    /// of the surrounding `Code(f)`.
+    fn_var: u32,
+    kind: Kind,
+    /// Written so the record's tail bytes are the same on every build: this
+    /// list is serialized into the module cache.
+    kind_padding: [3]u8 = .{ 0, 0, 0 },
+
+    /// What the site's node is, which decides where the description comes from.
+    ///
+    /// No kind's node is compiled as the expression it is written as: the
+    /// value at a `Code(f)` position is a description, and each kind says
+    /// which walk writes it there.
+    pub const Kind = enum(u8) {
+        /// A name in a `Code(f)` position. The function it names is described.
+        named_function,
+        /// A lambda written at a `Code(f)` position. The lambda itself is
+        /// described, so nothing has to name it.
+        inline_lambda,
+        /// The lambda a template returns. Nothing describes it: it stands for
+        /// every call of the template, and each call describes its own.
+        template,
+        /// A call to a template. The template is described with this call's
+        /// compile-time arguments folded into it.
+        template_call,
+        /// The name a template call calls. The call replaced it, so nothing
+        /// reads it.
+        template_callee,
+    };
 };
 
 comptime {
@@ -1424,6 +1463,41 @@ fn setLiteralDispatchPlanPlusOne(store: *NodeStore, node_idx: Node.Idx, plan_plu
         },
     }
     store.nodes.set(node_idx, node);
+}
+
+/// Record that this expression is reified into a `Code` at `fn_var`.
+pub fn recordCodeReificationSite(
+    store: *NodeStore,
+    node_idx: Node.Idx,
+    fn_var: types.Var,
+    kind: CodeReificationSite.Kind,
+) Allocator.Error!void {
+    const raw = @backingInt(node_idx);
+    for (store.code_reification_sites.items.items) |*existing| {
+        if (existing.node_idx != raw) continue;
+        existing.fn_var = @backingInt(fn_var);
+        existing.kind = kind;
+        return;
+    }
+    _ = try store.code_reification_sites.append(store.gpa, .{
+        .node_idx = raw,
+        .fn_var = @backingInt(fn_var),
+        .kind = kind,
+    });
+}
+
+/// Every expression this module reifies into a `Code`.
+pub fn codeReificationSites(store: *const NodeStore) []const CodeReificationSite {
+    return store.code_reification_sites.items.items;
+}
+
+/// The reification recorded for this expression, if it has one.
+pub fn codeReificationSiteForNode(store: *const NodeStore, node_idx: Node.Idx) ?CodeReificationSite {
+    const raw = @backingInt(node_idx);
+    for (store.code_reification_sites.items.items) |site| {
+        if (site.node_idx == raw) return site;
+    }
+    return null;
 }
 
 /// Attach or update the checked dispatch evidence owned by a literal node.
@@ -5583,6 +5657,7 @@ pub const Serialized = extern struct {
     int128_values: collections.SafeList(i128).Serialized, // Must be first data field for 16-byte alignment
     literal_dispatch_plans: collections.SafeList(LiteralDispatchPlan).Serialized,
     literal_pattern_contexts: collections.SafeList(LiteralPatternContext).Serialized,
+    code_reification_sites: collections.SafeList(CodeReificationSite).Serialized,
     interpolation_data: collections.SafeList(InterpolationData).Serialized,
     nodes: Node.List.Serialized,
     replaced_source_nodes: Node.List.Serialized,
