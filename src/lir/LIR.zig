@@ -511,6 +511,20 @@ pub const LoweringModuleId = enum(u32) {
     _,
 };
 
+/// The node a `Code.refuse_at` crash refuses: the `U64` key of its site, the
+/// `U32` index of its row in the site's graph, and the `U32` index of the
+/// node in that row.
+pub const Refusal = struct {
+    site: LocalId,
+    row: LocalId,
+    node: LocalId,
+
+    /// The three locals, which the crash reads.
+    pub fn locals(self: Refusal) [3]LocalId {
+        return .{ self.site, self.row, self.node };
+    }
+};
+
 /// The kind of literal whose checked conversion rejected it.
 pub const LiteralRejectionKind = enum(u8) {
     numeral,
@@ -1233,6 +1247,10 @@ pub const CrashExtra = struct {
     /// Set when this crash is the failure path of a read of a compile-time
     /// value whose producer failed.
     failed_value: ?ComptimeValueRef = null,
+    /// Set when this crash is `Code.refuse_at` (plan I9): compile-time
+    /// evaluation reports `msg` at the source regions of the node these
+    /// locals name. Every other evaluation crashes with `msg`.
+    refusal: ?Refusal = null,
 };
 
 /// The ownership facts ARC stamps on a `CFStmt.assign_ref`, stored out of

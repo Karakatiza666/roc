@@ -4,8 +4,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY);
 -- migration 001_catalog
 CREATE TABLE products (
 	id BIGINT NOT NULL,
-	title TEXT NOT NULL,
 	price NUMERIC(10, 2) NOT NULL,
+	title TEXT NOT NULL,
 	PRIMARY KEY (id),
 	CHECK (price > 0.0)
 );
@@ -13,17 +13,17 @@ INSERT INTO schema_migrations (id) VALUES ('001_catalog');
 
 -- migration 002_customers_and_orders
 CREATE TABLE customers (
+	country VARCHAR(2) NOT NULL,
 	id BIGINT NOT NULL,
 	name TEXT NOT NULL,
-	country VARCHAR(2) NOT NULL,
 	PRIMARY KEY (id)
 );
 CREATE TABLE orders (
-	id BIGINT NOT NULL,
 	customer_id BIGINT NOT NULL,
+	discount NUMERIC(3, 2) NOT NULL,
+	id BIGINT NOT NULL,
 	product_id BIGINT NOT NULL,
 	quantity BIGINT NOT NULL,
-	discount NUMERIC(3, 2) NOT NULL,
 	PRIMARY KEY (id),
 	FOREIGN KEY (customer_id) REFERENCES customers,
 	FOREIGN KEY (product_id) REFERENCES products,
@@ -56,19 +56,19 @@ INSERT INTO orders (customer_id, discount, id, product_id, quantity) VALUES (3, 
 INSERT INTO orders (customer_id, discount, id, product_id, quantity) VALUES (4, 0.15, 6, 2, 20);
 
 -- query: premium
-SELECT products.title AS title, products.price AS price, products.price * 1.2 AS with_tax
+SELECT products.price AS price, products.title AS title, products.price * 1.2 AS with_tax
 FROM products
 WHERE (products.price >= 20.0) AND (products.title <> 'Gift card')
 ORDER BY price DESC;
 
 -- query: in_band
-SELECT products.title AS title, products.price AS price
+SELECT products.price AS price, products.title AS title
 FROM products
 WHERE (products.price >= 10.0) AND (products.price <= 20.0)
 ORDER BY price;
 
 -- query: contacts
-SELECT customers.name AS name, COALESCE(customers.email, '(none)') AS email
+SELECT COALESCE(customers.email, '(none)') AS email, customers.name AS name
 FROM customers
 WHERE customers.country <> 'NL'
 ORDER BY name;

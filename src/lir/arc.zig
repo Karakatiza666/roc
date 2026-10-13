@@ -5804,7 +5804,10 @@ const Inserter = struct {
                 try uses.append(gpa, switch_stmt.payload);
             },
             .ret => |ret_stmt| try uses.append(gpa, ret_stmt.value),
-            .crash => |crash_stmt| if (crash_stmt.msg.localId()) |message| try uses.append(gpa, message),
+            .crash => |crash_stmt| {
+                if (crash_stmt.msg.localId()) |message| try uses.append(gpa, message);
+                if (self.store.stmtRowOrDefault(crash_stmt.extra).refusal) |refusal| try uses.appendSlice(gpa, &refusal.locals());
+            },
             .expect_err => |expect_err_stmt| try uses.append(gpa, expect_err_stmt.message),
             .decref, .decref_if_initialized, .free => return .{ .uses_every_place = true },
             inline .str_match, .str_match_set => |match| try uses.append(gpa, match.source),
@@ -7150,8 +7153,11 @@ const Inserter = struct {
                     if (self.store.stmtRow(tag_match.source_desc).localOrNull()) |local| try self.noteLivenessUseLocal(reads, local);
                 },
                 .ret => |ret_stmt| try self.noteLivenessUseLocal(reads, ret_stmt.value),
-                .crash => |crash_stmt| if (crash_stmt.msg.localId()) |message| {
-                    try self.noteLivenessUseLocal(reads, message);
+                .crash => |crash_stmt| {
+                    if (crash_stmt.msg.localId()) |message| try self.noteLivenessUseLocal(reads, message);
+                    if (self.store.stmtRowOrDefault(crash_stmt.extra).refusal) |refusal| {
+                        for (refusal.locals()) |local| try self.noteLivenessUseLocal(reads, local);
+                    }
                 },
                 .assign_literal,
                 .init_uninitialized,

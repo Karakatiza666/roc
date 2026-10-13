@@ -7,10 +7,7 @@
 Stage := {}.{
 	## Whether the description is a lambda, which is all this fixture needs.
 	shape : Code(f) -> Str
-	shape = |code| match Code.ir(code) {
-		Lambda(_, _, _) => "lambda"
-		_ => "other"
-	}
+	shape = |code| "lambda/${Code.graph(code).root_row().params.len().to_str()}"
 }
 
 scaled : F32 -> Code(F32 -> F32)

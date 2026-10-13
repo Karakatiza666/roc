@@ -108,6 +108,7 @@ const ComptimeCrash = problem_mod.ComptimeCrash;
 const ComptimeInvalidInterpolation = problem_mod.ComptimeInvalidInterpolation;
 const StagedCode = problem_mod.StagedCode;
 const ComptimeExpectFailed = problem_mod.ComptimeExpectFailed;
+const TranslationRefused = problem_mod.TranslationRefused;
 const ComptimeEvalError = problem_mod.ComptimeEvalError;
 
 // Number errors
@@ -1140,6 +1141,7 @@ pub const ReportBuilder = struct {
             .comptime_invalid_interpolation => |data| return self.buildComptimeInvalidInterpolationReport(data),
             .staged_code => |data| return self.buildStagedCodeReport(data),
             .comptime_expect_failed => |data| return self.buildComptimeExpectFailedReport(data),
+            .translation_refused => |data| return self.buildTranslationRefusedReport(data),
             .comptime_eval_error => |data| return self.buildComptimeEvalErrorReport(data),
             .invalid_numeric_literal => |data| return self.buildInvalidNumericLiteralReport(data),
             .tuple_access_needs_annotation => |data| return self.buildTupleAccessNeedsAnnotationReport(data),
@@ -5800,7 +5802,7 @@ pub const ReportBuilder = struct {
     }
 
     /// Whether an argument mismatch is a function named where a `Code` was
-    /// expected. The expected side is the builtin `Code` and the actual side is
+    /// expected. The expected side is the builtin `Code` or `Code.Inlined` and the actual side is
     /// a function: the checker looked for a description and was handed the
     /// function itself, which is what a staging site that did not trigger
     /// leaves behind.
@@ -5825,7 +5827,8 @@ pub const ReportBuilder = struct {
             },
             .flex, .rigid, .alias, .recursive, .err => return false,
         };
-        if (!nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code)) return false;
+        if (!nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code) and
+            !nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code_inlined)) return false;
 
         return switch (self.snapshots.?.getContentUnwrapAlias(actual)) {
             .structure => |structure| switch (structure) {
@@ -5899,6 +5902,12 @@ pub const ReportBuilder = struct {
                 "A template's arguments are written into the description it produces, so each one is fixed while the compiler runs.",
                 .runtime_error,
             ),
+            .exceeds_a_bound => try Report.init(
+                self.gpa,
+                "Cannot Normalize This Function",
+                "Bringing this function's description to its normal form reaches a bound the language sets.",
+                .runtime_error,
+            ),
             .outside_staged_position => try Report.init(
                 self.gpa,
                 "Code Is Not Allowed Here",
@@ -5959,6 +5968,12 @@ pub const ReportBuilder = struct {
                 D.bytes("here, or take the value as a parameter of the reified function, where"),
                 D.bytes("the translator can read it as a name."),
             }, self, &report),
+            .exceeds_a_bound => try D.renderSlice(&.{
+                D.bytes("The rules that normalize a description run in rounds, and each"),
+                D.bytes("round can enable the next. A fixed bound stops a function whose rules"),
+                D.bytes("keep enabling one another, so a build never runs without end. Split"),
+                D.bytes("the function into smaller helpers."),
+            }, self, &report),
             .outside_staged_position => try D.renderSlice(&.{
                 D.bytes("A"),
                 D.bytes("Code").withAnnotation(.emphasized),
@@ -5996,6 +6011,7 @@ pub const ReportBuilder = struct {
             .captures_a_binding => "It reads, from around itself:",
             .performs_an_effect => "The effect is:",
             .definition_not_reachable => "The compiler could not follow:",
+            .exceeds_a_bound => "The bound is:",
             .not_a_named_function, .outside_staged_position, .argument_not_constant => null,
         };
     }
@@ -6152,6 +6168,52 @@ pub const ReportBuilder = struct {
         try report.document.addLineBreaks(2);
         try report.document.addCodeBlock(owned_message);
 
+        return report;
+    }
+
+    /// Build a report for a translator's refusal of one source of a node.
+    fn buildTranslationRefusedReport(self: *Self, data: TranslationRefused) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Translation Refused", "A translator refused code that this expression built.", .runtime_error);
+        errdefer report.deinit();
+        const owned_message = try report.addOwnedString(self.problems.getExtraString(data.message));
+        const path = self.problems.getExtraString(data.path);
+
+        const region_info = self.module_env.calcRegionInfo(data.region);
+        try report.document.addSourceRegion(
+            region_info,
+            .error_highlight,
+            self.filename,
+            self.source,
+            self.module_env.getLineStarts(),
+        );
+        try report.document.addLineBreak();
+        if (data.unplaced) {
+            try D.renderSlice(&.{D.bytes("The translator named a node that the code of this definition does not have.")}, self, &report);
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+        } else if (data.origin) |origin| {
+            const origin_docs = originLocationDocs(try self.comptimeOriginLocation(&report, origin));
+            try D.renderSlice(&.{
+                D.bytes("The refused expression is in the module"),
+                origin_docs[0],
+                origin_docs[1],
+                D.bytes("outside this module."),
+            }, self, &report);
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+        }
+        if (path.len != 0) {
+            try D.renderSlice(&.{D.bytes("The translated code reached it through these calls:")}, self, &report);
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+            try report.document.addCodeBlock(try report.addOwnedString(path));
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+        }
+        try D.renderSlice(&.{D.bytes("The translator gave this reason:")}, self, &report);
+        try report.document.addLineBreak();
+        try report.document.addLineBreak();
+        try report.document.addCodeBlock(owned_message);
         return report;
     }
 

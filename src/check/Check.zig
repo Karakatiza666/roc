@@ -688,7 +688,7 @@ predeclared_relation_vars: std.ArrayListUnmanaged(Var) = .empty,
 /// Every top-level pattern bound to a template: a function whose annotation
 /// returns a `Code`. Empty for a module that declares none, which is what
 /// keeps a call in an ordinary module from paying for the lookup.
-staged_templates: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, Var) = .empty,
+staged_templates: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, StagedCode) = .empty,
 /// Staged function types whose rows are grounded when the binding holding them
 /// generalizes rather than when their own site finishes. See
 /// `groundPendingStagedRows`.
@@ -18520,9 +18520,9 @@ fn collectStagedTemplates(self: *Self) std.mem.Allocator.Error!void {
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         const scheme_var = self.predeclaredSchemeVar(def_idx) orelse continue;
         const returns = self.functionReturnVar(scheme_var) orelse continue;
-        const fn_var = self.stagedCodeFnVar(returns) orelse continue;
+        const staged = self.stagedCode(returns) orelse continue;
         const def = self.cir.store.getDef(def_idx);
-        try self.staged_templates.put(self.gpa, def.pattern, fn_var);
+        try self.staged_templates.put(self.gpa, def.pattern, staged);
     }
 }
 
@@ -21122,7 +21122,7 @@ fn rejectMisplacedStagedCode(self: *Self, root: CIR.TypeAnno.Idx) std.mem.Alloca
 
     while (stack.pop()) |pending| {
         const anno_idx = pending.anno;
-        const is_code = self.stagedCodeFnVar(ModuleEnv.varFrom(anno_idx)) != null;
+        const is_code = self.stagedCode(ModuleEnv.varFrom(anno_idx)) != null;
         if (is_code and !pending.allowed) {
             _ = try self.problems.appendProblem(.{ .staged_code = .{
                 .reason = .outside_staged_position,
@@ -27293,11 +27293,11 @@ fn beginExprCheckFrame(
     const staged_code = staged: {
         if (!exprIsStageable(expr)) break :staged null;
         const expected_type = expected.aggregateType() orelse break :staged null;
-        const fn_var = self.stagedCodeFnVar(expected_type.var_) orelse break :staged null;
+        const code = self.stagedCode(expected_type.var_) orelse break :staged null;
         // A parameter already holding a description is passed along; only a
         // name the compiler can follow to a body is reified.
         if (!self.namesAReifiableDefinition(expr)) break :staged null;
-        break :staged .{ .fn_var = fn_var, .expected_type = expected_type };
+        break :staged .{ .fn_var = code.fn_var, .view = code.view, .expected_type = expected_type };
     };
     frame.staged_code_fn_var = if (staged_code) |staged| staged.fn_var else null;
     if (staged_code) |staged| {
@@ -27308,15 +27308,15 @@ fn beginExprCheckFrame(
             self.lambdaSiteKind(frame.is_call_arg)
         else
             .named_function;
-        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), staged.fn_var, kind);
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), staged.fn_var, kind, staged.view);
     }
 
     // A call to a template is the other way a description is built. The call
     // is the whole value: neither it nor the name it calls is compiled, so
     // both nodes leave the checked body as descriptions.
     if (self.stagedTemplateCall(expr)) |call| {
-        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), call.fn_var, .template_call);
-        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(call.callee), call.fn_var, .template_callee);
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), call.code.fn_var, .template_call, call.code.view);
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(call.callee), call.code.fn_var, .template_callee, call.code.view);
     }
 
     // Materialize an annotation once at the expression frame that owns it.
@@ -27386,11 +27386,19 @@ fn beginExprCheckFrame(
     return frame;
 }
 
-/// The function type inside a `Code(f)` expected type.
+/// A `Code` type a description is reified at: the function type `f` inside
+/// it, and the view the type selects.
+const StagedCode = struct {
+    fn_var: Var,
+    view: CodeReificationSite.View,
+};
+
+/// The function type inside a `Code(f)` or `Code.Inlined(f)` expected type,
+/// with the view that type selects (plan 1.5).
 ///
 /// Returns null for every other expected type, so an ordinary expression in an
 /// ordinary position never pays for this.
-fn stagedCodeFnVar(self: *Self, expected_var: Var) ?Var {
+fn stagedCode(self: *Self, expected_var: Var) ?StagedCode {
     const flat = switch (self.types.resolveVar(expected_var).desc.content) {
         .structure => |structure| structure,
         .flex, .rigid, .alias, .field_presence, .err => return null,
@@ -27408,10 +27416,15 @@ fn stagedCodeFnVar(self: *Self, expected_var: Var) ?Var {
         => return null,
     };
     if (!nominal.originIsBuiltin()) return null;
-    if (!nominal.ident.ident_idx.eql(self.cir.idents.builtin_code)) return null;
+    const view: CodeReificationSite.View = if (nominal.ident.ident_idx.eql(self.cir.idents.builtin_code))
+        .graph
+    else if (nominal.ident.ident_idx.eql(self.cir.idents.builtin_code_inlined))
+        .inline_
+    else
+        return null;
     const args = self.types.sliceNominalArgs(nominal);
     if (args.len != 1) return null;
-    return args[0];
+    return .{ .fn_var = args[0], .view = view };
 }
 
 /// Which of the two lambdas at a `Code(f)` position this one is.
@@ -27469,12 +27482,12 @@ fn claimOrRejectCodeCall(
     callee_idx: CIR.Expr.Idx,
     region: Region,
 ) std.mem.Allocator.Error!void {
-    const fn_var = self.stagedCodeFnVar(ModuleEnv.varFrom(expr_idx)) orelse return;
+    const code = self.stagedCode(ModuleEnv.varFrom(expr_idx)) orelse return;
     if (self.cir.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr_idx)) != null) return;
 
     if (self.cir.store.getExpr(callee_idx) == .e_lookup_external) {
-        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), fn_var, .template_call);
-        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(callee_idx), fn_var, .template_callee);
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), code.fn_var, .template_call, code.view);
+        try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(callee_idx), code.fn_var, .template_callee, code.view);
         return;
     }
 
@@ -27487,14 +27500,14 @@ fn claimOrRejectCodeCall(
 }
 
 /// A call whose callee is a template, with the `f` of the `Code(f)` it builds.
-fn stagedTemplateCall(self: *const Self, expr: CIR.Expr) ?struct { callee: CIR.Expr.Idx, fn_var: Var } {
+fn stagedTemplateCall(self: *const Self, expr: CIR.Expr) ?struct { callee: CIR.Expr.Idx, code: StagedCode } {
     if (self.staged_templates.count() == 0) return null;
     if (expr != .e_call) return null;
     const callee_idx = expr.e_call.func;
     const callee = self.cir.store.getExpr(callee_idx);
     if (callee != .e_lookup_local) return null;
-    const fn_var = self.staged_templates.get(callee.e_lookup_local.pattern_idx) orelse return null;
-    return .{ .callee = callee_idx, .fn_var = fn_var };
+    const code = self.staged_templates.get(callee.e_lookup_local.pattern_idx) orelse return null;
+    return .{ .callee = callee_idx, .code = code };
 }
 
 /// Whether this expression is described rather than compiled.
@@ -30775,7 +30788,7 @@ fn resumeLambdaCheck(self: *Self, task: *ExprTask, state: *LambdaCheck, env: *En
     const lambda_body_expected = blk: {
         const plain = Expected.none().withHoistPosition(nested_expected.hoist_position);
         const returns = (state.mb_anno_func orelse break :blk plain).ret;
-        if (self.stagedCodeFnVar(returns) == null) break :blk plain;
+        if (self.stagedCode(returns) == null) break :blk plain;
         break :blk plain.withExpectedType(.{ .var_ = returns, .context = lambdaAnnoContext(frame) });
     };
     const expected_result = if (state.mb_anno_func) |expected_func| expected_func.ret else null;

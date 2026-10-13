@@ -66,7 +66,7 @@ foo = |num| {
 				(p-assign (ident "num")))
 			(e-block
 				(s-dbg
-					(e-dispatch-call (method "to_str") (constraint-fn-var 363)
+					(e-dispatch-call (method "to_str") (constraint-fn-var 368)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "num"))))

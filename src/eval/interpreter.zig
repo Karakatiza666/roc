@@ -429,6 +429,9 @@ pub const Interpreter = struct {
     failed_stmt_inline_scope: InlineScopeId = InlineScopeId.none,
     /// The crash statement that ended the current evaluation, if one did.
     failed_crash_stmt: ?LIR.CFStmtId = null,
+    /// The node a translator refused, when that crash was a `Code.refuse_at`
+    /// (plan I9c).
+    failed_refusal: ?builtins.in_process_host.CodeRefusal = null,
     /// Heap-pinned owner used by host-facing integrations whose erased
     /// callables can outlive the evaluation that created them.
     retained_owner: ?*Retained = null,
@@ -1080,6 +1083,12 @@ pub const Interpreter = struct {
         return self.failed_crash_stmt;
     }
 
+    /// The node a translator refused, when the crash that ended the last
+    /// evaluation was a `Code.refuse_at`.
+    pub fn getFailedRefusal(self: *const LirInterpreter) ?builtins.in_process_host.CodeRefusal {
+        return self.failed_refusal;
+    }
+
     pub fn getFailedSourceLoc(self: *const LirInterpreter) ?base.SourceLoc {
         if (self.failed_stmt_loc.hasLocation()) return self.failed_stmt_loc;
         return null;
@@ -1245,6 +1254,7 @@ pub const Interpreter = struct {
         self.failed_stmt_region = base.Region.zero();
         self.failed_stmt_inline_scope = InlineScopeId.none;
         self.failed_crash_stmt = null;
+        self.failed_refusal = null;
         if (builtin.mode == .debug) self.inflight_zeroed_box_payloads.clearRetainingCapacity();
     }
 
@@ -1619,6 +1629,7 @@ pub const Interpreter = struct {
         self.failed_stmt_region = base.Region.zero();
         self.failed_stmt_inline_scope = InlineScopeId.none;
         self.failed_crash_stmt = null;
+        self.failed_refusal = null;
         if (builtin.mode == .debug) self.inflight_zeroed_box_payloads.clearRetainingCapacity();
         // The result is copied to scratch before the root's frame ends, so
         // every frame this evaluation pushes is released when it returns,
@@ -3521,6 +3532,13 @@ pub const Interpreter = struct {
                 .ret => |ret_stmt| return .{ .returned = ret_stmt.value },
                 .crash => |crash_stmt| {
                     self.failed_crash_stmt = current;
+                    if (self.store.stmtRowOrDefault(crash_stmt.extra).refusal) |refusal| {
+                        self.failed_refusal = .{
+                            .site = (try self.getLocalChecked(frame, refusal.site)).read(u64),
+                            .row = (try self.getLocalChecked(frame, refusal.row)).read(u32),
+                            .node = (try self.getLocalChecked(frame, refusal.node)).read(u32),
+                        };
+                    }
                     switch (crash_stmt.msg) {
                         .literal => |literal| return self.triggerCrash(self.store.getString(literal)),
                         .local => |message_local| {
@@ -7212,6 +7230,7 @@ pub const Interpreter = struct {
 
             // ── Crash ──
             .crash => return self.triggerCrash("Roc crashed"),
+            .code_refuse => unreachable, // lowering makes `code_refuse` a crash statement, so LIR never holds it
 
             // ── Numeric conversions ──
             // Every op that no arm above names must be a numeric conversion;

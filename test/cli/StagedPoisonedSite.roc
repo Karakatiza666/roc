@@ -5,10 +5,7 @@
 # and the site it stood at is left to that error rather than reified.
 Stage := {}.{
 	shape : Code(U64 -> Bool) -> Str
-	shape = |code| match code.ir() {
-		Lambda(_, _, _) => "lambda"
-		_ => "other"
-	}
+	shape = |code| "lambda/${Code.graph(code).root_row().params.len().to_str()}"
 }
 
 staged : Str

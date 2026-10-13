@@ -33,6 +33,7 @@ pub const ConstStore = @import("const_store.zig");
 pub const CheckedArtifact = @import("checked_artifact.zig");
 /// **Staging reifier**: a checked function body as a `Code.Ir` const tree.
 pub const CodeReifier = @import("code_reifier.zig");
+pub const CodeEmit = @import("code_emit.zig");
 /// Comptime layout fingerprint for a registered serialization root (recurses into
 /// nested aggregates and `SerializedElement`s), so every admitted blob invalidates on
 /// any layout change, not just a top-level one.
@@ -65,6 +66,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("canonical_type_keys.zig"));
     std.testing.refAllDecls(@import("codec_identity.zig"));
     std.testing.refAllDecls(@import("code_reifier.zig"));
+    std.testing.refAllDecls(@import("code_emit.zig"));
     std.testing.refAllDecls(@import("const_store.zig"));
     std.testing.refAllDecls(@import("artifact_serialize.zig"));
     std.testing.refAllDecls(@import("checked_artifact.zig"));

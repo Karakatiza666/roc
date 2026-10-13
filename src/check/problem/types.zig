@@ -119,6 +119,7 @@ pub const Problem = union(enum) {
     comptime_invalid_quote: ComptimeInvalidQuote,
     comptime_invalid_interpolation: ComptimeInvalidInterpolation,
     comptime_expect_failed: ComptimeExpectFailed,
+    translation_refused: TranslationRefused,
     comptime_eval_error: ComptimeEvalError,
     invalid_numeric_literal: InvalidNumericLiteral,
     tuple_access_needs_annotation: TupleAccessNeedsAnnotation,
@@ -393,6 +394,10 @@ pub const StagedCode = struct {
         /// runs. Each one is written into the description, so each one has to
         /// be a literal at the call.
         argument_not_constant,
+        /// Normalizing the description reached a hard bound of the language
+        /// version, such as the number of simplify rounds, so the compiler
+        /// refuses the site rather than run without end.
+        exceeds_a_bound,
         /// A `Code` names a function parameter's type, or what a function
         /// returns, and nothing else. It has no runtime representation, so a
         /// record field or a list element holding one has nothing to hold.
@@ -441,6 +446,22 @@ pub const ComptimeExpectFailed = struct {
     /// inside a `??` field default fails while the consuming module's
     /// compile-time root evaluates the inlined copy.
     origin: ?ComptimeOrigin = null,
+};
+
+/// A translator refused one node of a reified `Code` (I9c). Finalization
+/// reports one of these at each source the node came from.
+pub const TranslationRefused = struct {
+    message: ExtraStringIdx,
+    /// The source, when it is in this module; else the compile-time root.
+    region: base.Region,
+    /// The source, when it is in another module.
+    origin: ?ComptimeOrigin = null,
+    /// The calls the source was inlined through, innermost first, one per
+    /// line. Empty when the source is in the translated function itself.
+    path: ExtraStringIdx,
+    /// The translator named a node that its graph does not have, so no
+    /// source holds it.
+    unplaced: bool = false,
 };
 
 /// An error that occurred during compile-time evaluation

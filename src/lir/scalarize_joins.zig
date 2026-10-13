@@ -2307,7 +2307,10 @@ const Pass = struct {
                 },
 
                 .ret => |ret_stmt| try self.noteUse(ret_stmt.value),
-                .crash => |crash_stmt| if (crash_stmt.msg.localId()) |message| try self.noteUse(message),
+                .crash => |crash_stmt| {
+                    if (crash_stmt.msg.localId()) |message| try self.noteUse(message);
+                    if (self.store.stmtRowOrDefault(crash_stmt.extra).refusal) |refusal| for (refusal.locals()) |local| try self.noteUse(local);
+                },
                 inline .incref, .decref, .free => |rc| try self.noteUse(rc.value),
                 .decref_if_initialized => |rc| {
                     try self.noteUse(rc.cond);

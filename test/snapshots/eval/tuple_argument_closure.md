@@ -38,14 +38,14 @@ EndOfFile,
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-call (constraint-fn-var 385)
+(e-call (constraint-fn-var 390)
 	(e-lambda
 		(args
 			(p-tuple
 				(patterns
 					(p-assign (ident "x"))
 					(p-assign (ident "y")))))
-		(e-dispatch-call (method "times") (constraint-fn-var 363)
+		(e-dispatch-call (method "times") (constraint-fn-var 368)
 			(receiver
 				(e-lookup-local
 					(p-assign (ident "x"))))

@@ -4063,7 +4063,10 @@ const Certifier = struct {
                     continue;
                 },
                 .ret => |ret_stmt| try self.noteProcLocal(ret_stmt.value),
-                .crash => |crash_stmt| if (crash_stmt.msg.localId()) |message| try self.noteProcLocal(message),
+                .crash => |crash_stmt| {
+                    if (crash_stmt.msg.localId()) |message| try self.noteProcLocal(message);
+                    if (self.store.stmtRowOrDefault(crash_stmt.extra).refusal) |refusal| for (refusal.locals()) |local| try self.noteProcLocal(local);
+                },
                 .jump, .runtime_error, .comptime_exhaustiveness_failed => {},
             }
             // Every other statement's successors stay in its region.

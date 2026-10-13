@@ -647,6 +647,12 @@ pub const LowLevel = enum(u16) {
 
     // Crash/panic
     crash,
+    /// (site: U64, row: U32, node: U32, message: Str) -> a: `Code.refuse_at`
+    /// (plan I9). It crashes with `message`; compile-time evaluation reports
+    /// the refusal at the source regions of node `node` of row `row` of the
+    /// site keyed `site`. It is lowered to a crash statement that names its
+    /// three values, so no stage after lowering sees the operation.
+    code_refuse,
 
     /// Index into `builtins.simd.Op`. The SIMD entries are intentionally one
     /// contiguous, order-pinned block so the interpreter and compile-time
@@ -1387,6 +1393,7 @@ pub const LowLevel = enum(u16) {
         .f64_from_str = byType(.none()),
         .compare = byType(.none()),
         .crash = byType(.none()),
+        .code_refuse = byType(.none()),
     };
 
     /// ARC-only primitive variant whose result may borrow from an argument.

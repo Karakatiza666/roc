@@ -1770,6 +1770,7 @@ pub fn build(b: *std.Build) void {
     const build_coverage_tools_step = b.step("build-coverage-tools", "Build parser coverage tools");
     const run_coverage_parser_step = b.step("run-coverage-parser", "Run parser tests with kcov code coverage");
     const run_minici_step = b.step("minici", "Run a subset of CI build and test steps");
+    const reify_rules_step = b.step("reify-rules", "Run the offline normalization-rule derivation tool");
     const run_fmt_zig_step = b.step("run-fmt-zig", "Format all zig code");
     const run_snapshot_tool_step = b.step("run-snapshot-tool", "Run the snapshot tool to update snapshot files");
     const echo_wasm_step = b.step("build-echo-wasm", "Build the echo platform to zig-out/lib/echo/echo.wasm");
@@ -2308,6 +2309,22 @@ pub fn build(b: *std.Build) void {
     });
     minici_exe.root_module.addImport("build_options", roc_modules.build_options);
     minici_exe.root_module.addImport("roc_target", roc_modules.roc_target);
+
+    // The offline rule-derivation tool of roc-reify-rule-derivation.md. No
+    // compiler artifact depends on it; `zig build reify-rules -- --sig S1 --k 3`.
+    const reify_rules_exe = b.addExecutable(.{
+        .name = "reify_rules",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/reify/derive/main.zig"),
+            .target = hostToolTarget(b, optimize),
+            .optimize = optimize,
+        }),
+    });
+    reify_rules_exe.root_module.addImport("reify", roc_modules.reify);
+    reify_rules_exe.root_module.addImport("reify_derive", roc_modules.reify_derive);
+    const run_reify_rules = b.addRunArtifact(reify_rules_exe);
+    if (run_args.len != 0) run_reify_rules.addArgs(run_args);
+    reify_rules_step.dependOn(&run_reify_rules.step);
 
     const install_zig_lints = b.addInstallArtifact(zig_lints_exe, .{});
     const install_tidy = b.addInstallArtifact(tidy_exe, .{});
@@ -4919,6 +4936,7 @@ pub fn build(b: *std.Build) void {
         "typecheck",
         "build",
         "build-errors",
+        "reify",
     };
     for (names) |name| {
         add_fuzz_target(

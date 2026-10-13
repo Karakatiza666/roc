@@ -5,5 +5,5 @@ import Deeper
 
 Helper := {}.{
 	twice : F32 -> F32
-	twice = |x| Deeper.inner(x) * 2.0
+	twice = |x| Deeper.inner(Deeper.inner(x)) * 2.0
 }

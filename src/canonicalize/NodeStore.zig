@@ -915,9 +915,15 @@ pub const CodeReificationSite = extern struct {
     /// of the surrounding `Code(f)`.
     fn_var: u32,
     kind: Kind,
+    /// Which view of the normal form the site's declared type asks for.
+    view: View = .graph,
     /// Written so the record's tail bytes are the same on every build: this
     /// list is serialized into the module cache.
-    kind_padding: [3]u8 = .{ 0, 0, 0 },
+    kind_padding: [2]u8 = .{ 0, 0 },
+
+    /// The view a site's declared type selects (plan 1.5): `Code(f)` holds
+    /// the `graph` view and `Code.Inlined(f)` the `inline` view.
+    pub const View = enum(u8) { graph, inline_ };
 
     /// What the site's node is, which decides where the description comes from.
     ///
@@ -1471,18 +1477,21 @@ pub fn recordCodeReificationSite(
     node_idx: Node.Idx,
     fn_var: types.Var,
     kind: CodeReificationSite.Kind,
+    view: CodeReificationSite.View,
 ) Allocator.Error!void {
     const raw = @backingInt(node_idx);
     for (store.code_reification_sites.items.items) |*existing| {
         if (existing.node_idx != raw) continue;
         existing.fn_var = @backingInt(fn_var);
         existing.kind = kind;
+        existing.view = view;
         return;
     }
     _ = try store.code_reification_sites.append(store.gpa, .{
         .node_idx = raw,
         .fn_var = @backingInt(fn_var),
         .kind = kind,
+        .view = view,
     });
 }
 

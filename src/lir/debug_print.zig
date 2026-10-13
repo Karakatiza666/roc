@@ -638,6 +638,10 @@ const Printer = struct {
                         .literal => try writer.writeAll("crash\n"),
                         .local => |local| try writer.print("crash l{d}\n", .{@backingInt(local)}),
                     }
+                    if (self.store.stmtRowOrDefault(s.extra).refusal) |refusal| {
+                        try writeIndent(indent + 1, writer);
+                        try writer.print("refusal site=l{d} row=l{d} node=l{d}\n", .{ @backingInt(refusal.site), @backingInt(refusal.row), @backingInt(refusal.node) });
+                    }
                     return;
                 },
                 .runtime_error => {

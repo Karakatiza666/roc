@@ -6,10 +6,7 @@
 # has supplied `n`, so the report names the parameter rather than `k`.
 Stage := {}.{
 	render : Code(U16 -> U16) -> Str
-	render = |code| match Code.ir(code) {
-		Lambda(_p, _b, _m) => "lambda"
-		_ => "other"
-	}
+	render = |code| "lambda/${Code.graph(code).root_row().params.len().to_str()}"
 }
 
 scaled : U16 -> Str

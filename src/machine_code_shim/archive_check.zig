@@ -52,6 +52,9 @@ const imports = symbols.runtime_set ++ .{
     // Referenced weakly by the builtins; a platform executable leaves it
     // undefined and a crash at code checking rejected goes unrecorded.
     symbols.roc_checked_error_reached,
+    // Referenced weakly by the builtins; a platform executable leaves it
+    // undefined and a `Code.refuse_at` crashes as any other crash.
+    symbols.roc_code_refused,
 };
 
 // Explicit OS ABI dependencies, not symbols discovered from the built archive.

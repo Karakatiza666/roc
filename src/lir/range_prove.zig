@@ -6251,6 +6251,7 @@ const Pass = struct {
             .ptr_cast,
             .compare,
             .crash,
+            .code_refuse,
             => try self.bindFresh(s.target),
             .num_plus, .num_minus, .num_times => unreachable, // lowering resolves source-policy arithmetic to a family member before LIR
         }

@@ -3300,7 +3300,7 @@ fn evalInterpreterProgramRoots(
                 break :blk stored;
             }
 
-            const eval_result = try evalCompileTimeRoot(interpreter, problem_store, owners, root.owner, module, compile_time_root, &lowered.lir_result, program.slotEnvironment(), root.proc, root.ret_layout, options.retry);
+            const eval_result = try evalCompileTimeRoot(interpreter, problem_store, owners, root.owner, module, program.imports, compile_time_root, &lowered.lir_result, program.slotEnvironment(), root.proc, root.ret_layout, options.retry);
             switch (eval_result) {
                 .retry => continue,
                 .value => |value| {
@@ -4190,6 +4190,8 @@ const InterpreterProgram = struct {
     /// so published values may reference them for the whole finalization.
     static_strings: Interpreter.StaticStrings.Table,
     interpreter: Interpreter,
+    /// The modules a refusal's site may come from, besides the root (I9c).
+    imports: []const checked.ImportedModuleView,
     /// Owner named by the callable headers of every image this program's
     /// slot environment installs: its static callables run on `interpreter`.
     callable_owner: Interpreter.StaticCallableOwner = .unbound,
@@ -4211,6 +4213,7 @@ const InterpreterProgram = struct {
         self.allocator = allocator;
         self.timing_io = null;
         self.shared_slots = null;
+        self.imports = modules.imports;
         self.callable_owner = .unbound;
         self.shared_callable_owner = null;
         self.callable_images = 0;
@@ -4259,6 +4262,7 @@ const InterpreterProgram = struct {
             .host = CompilerHost.init(allocator),
             .static_strings = undefined,
             .interpreter = undefined,
+            .imports = self.imports,
         };
         errdefer child.host.deinit();
         child.interpreter = try Interpreter.initWithBoxyTables(allocator, &lowered.lir_result.store, &lowered.lir_result.layouts, Interpreter.BoxyTables.fromResult(&lowered.lir_result), self.interpreter.static_strings, child.host.ops());
@@ -4840,6 +4844,8 @@ const DevProgram = struct {
     /// The bytes the program's erased callables reserve before their
     /// captures (`LirProgram.Result.erased_capture_prefix`).
     capture_prefix: u32,
+    /// The modules a refusal's site may come from, besides the root (I9c).
+    imports: []const checked.ImportedModuleView,
 
     /// How a program's procedures are compiled: as a dev build's object
     /// code, linked into this process, or, for a Boxy program, whose code no
@@ -4988,6 +4994,7 @@ const DevProgram = struct {
             .entry_offsets = entry_offsets,
             .artifacts = artifacts,
             .capture_prefix = lowered.lir_result.erased_capture_prefix,
+            .imports = modules.imports,
         };
     }
 
@@ -5329,8 +5336,10 @@ fn evalDevProgramRoots(
                 break :crashed try devCrashedRootPayload(
                     problem_store,
                     module,
+                    native.imports,
                     job.compile_time_root,
                     job.root.request,
+                    job.host.refusal,
                     message,
                     failed_at,
                     owners,
@@ -5515,8 +5524,10 @@ fn devComptimeExhaustivenessRootPayload(
 fn devCrashedRootPayload(
     problem_store: ?*check.problem.Store,
     module: *checked.CheckedModuleArtifact,
+    imports: []const checked.ImportedModuleView,
     root: checked.CompileTimeRoot,
     request: checked.RootRequest,
+    refusal: ?builtins.in_process_host.CodeRefusal,
     message: []const u8,
     failed_at: FailedAt,
     owners: *const ModuleOwners,
@@ -5524,6 +5535,11 @@ fn devCrashedRootPayload(
     had_problem: *bool,
 ) FinalizeError!checked.CompileTimeRootPayload {
     const lir_store = &lir_result.store;
+    if (refusal) |refused| if (problem_store) |store| {
+        try reportRefusal(store, module, imports, devRootSourceRegion(module, root), refused, message);
+        had_problem.* = true;
+        return try failedRootPayload(module, root, message, .crash);
+    };
     switch (try reportEmbeddedFailure(problem_store, module, devRootSourceRegion(module, root), owners, lir_result, failed_at, message)) {
         .reported => {
             had_problem.* = true;
@@ -5554,6 +5570,121 @@ fn devCrashedRootPayload(
     } });
     had_problem.* = true;
     return try failedRootPayload(module, root, message, RootFailure.of(failed_at.meaning));
+}
+
+/// Report a translator's refusal (I9c) at each source of the node it
+/// refused, with the calls each source was inlined through.
+fn reportRefusal(
+    store: *check.problem.Store,
+    module: *const checked.CheckedModuleArtifact,
+    imports: []const checked.ImportedModuleView,
+    root_region: base.Region,
+    refusal: builtins.in_process_host.CodeRefusal,
+    message: []const u8,
+) Allocator.Error!void {
+    const message_idx = try store.putExtraString(message);
+    const found = refusalSite(module, imports, refusal.site) orelse
+        finalizationInvariant("a refusal named a reification site that no module's provenance holds");
+    const chains = found.table.origins(found.site, refusal.row, refusal.node) orelse {
+        _ = try store.appendProblem(.{ .translation_refused = .{
+            .message = message_idx,
+            .region = root_region,
+            .path = try store.putExtraString(""),
+            .unplaced = true,
+        } });
+        return;
+    };
+    if (chains.len == 0) finalizationInvariant("a reified node has no source");
+    for (chains) |chain| {
+        const links = found.table.links[chain.start..][0..chain.len];
+        const place = refusalPlace(module, imports, found, links[0]);
+        // A foreign source is shown here at the innermost call in this module
+        // that reached it.
+        var region = if (place.foreign) root_region else place.region;
+        var placed = !place.foreign;
+        var path: std.ArrayList(u8) = .empty;
+        defer path.deinit(store.gpa);
+        for (links[1..]) |link| {
+            const call = refusalPlace(module, imports, found, link);
+            if (!placed and !call.foreign) {
+                region = call.region;
+                placed = true;
+            }
+            if (path.items.len != 0) try path.append(store.gpa, '\n');
+            if (call.foreign)
+                try path.print(store.gpa, "{s} (in {s}, line {d}, column {d})", .{ call.text, call.module_name, call.line, call.column })
+            else
+                try path.print(store.gpa, "{s} (line {d}, column {d})", .{ call.text, call.line, call.column });
+        }
+        _ = try store.appendProblem(.{ .translation_refused = .{
+            .message = message_idx,
+            .region = region,
+            .origin = if (place.foreign) .{
+                .module_name = try store.putExtraString(place.module_name),
+                .line = place.line,
+                .column = place.column,
+            } else null,
+            .path = try store.putExtraString(path.items),
+        } });
+    }
+}
+
+const RefusalSite = struct {
+    table: *const checked.CodeProvenanceTable,
+    site: checked.CodeProvenanceTable.Site,
+};
+
+/// The provenance of the site whose `Code` value carries `key`: the root
+/// module's, or an import's when an import made that value.
+fn refusalSite(
+    module: *const checked.CheckedModuleArtifact,
+    imports: []const checked.ImportedModuleView,
+    key: u64,
+) ?RefusalSite {
+    if (module.code_provenance.site(key)) |site| return .{ .table = &module.code_provenance, .site = site };
+    for (imports) |view| if (view.code_provenance.site(key)) |site| return .{ .table = view.code_provenance, .site = site };
+    return null;
+}
+
+const RefusalPlace = struct {
+    region: base.Region,
+    foreign: bool,
+    module_name: []const u8,
+    text: []const u8,
+    line: u32,
+    column: u32,
+};
+
+/// Where one source of a site is: its region, its module and its text.
+fn refusalPlace(
+    module: *const checked.CheckedModuleArtifact,
+    imports: []const checked.ImportedModuleView,
+    found: RefusalSite,
+    link: u32,
+) RefusalPlace {
+    const src = found.table.source(found.site, link);
+    const key = found.table.modules[src.module];
+    const region = base.Region.from_raw_offsets(src.region_start, src.region_end);
+    const local = std.meta.eql(key, module.key);
+    const env = if (local) module.moduleEnvConst() else for (imports) |view| {
+        if (std.meta.eql(view.key, key)) break view.module_env;
+    } else finalizationInvariant("a reification source names a module that finalization does not see");
+    const info = env.calcAuthoredRegionInfo(region);
+    const root_env = module.moduleEnvConst();
+    // The bare name, unless it is the root module's own bare name. The name is
+    // resolved in the root's interner before the identities are compared.
+    const bare_name_collides = if (root_env.common.idents.lookup(base.Ident.for_text(env.module_name))) |display_ident|
+        display_ident.eql(root_env.display_module_name_idx)
+    else
+        false;
+    return .{
+        .region = region,
+        .foreign = !local,
+        .module_name = if (!local and bare_name_collides) env.qualifiedModuleName() else env.module_name,
+        .text = env.getSource(region),
+        .line = info.start_line_idx + 1,
+        .column = info.start_col_idx + 1,
+    };
 }
 
 fn reportDevHostEvents(
@@ -5764,6 +5895,7 @@ fn evalCompileTimeRoot(
     owners: *const ModuleOwners,
     root_owner: lir.LIR.LoweringModuleId,
     module: *checked.CheckedModuleArtifact,
+    imports: []const checked.ImportedModuleView,
     root: checked.CompileTimeRoot,
     lir_result: *const lir.Program.Result,
     slots: *const StaticSlotEnvironment,
@@ -5792,6 +5924,10 @@ fn evalCompileTimeRoot(
                 if (exhaustivenessFailure(failed_at.meaning)) |failure| {
                     return .{ .failed = .{ .message = message, .payload = try reportCompileTimeExhaustiveness(problem_store, owners, root_owner, module, root, lir_result, failure, proc) } };
                 }
+                if (interpreter.getFailedRefusal()) |refused| if (problem_store) |store| {
+                    try reportRefusal(store, module, imports, devRootSourceRegion(module, root), refused, message);
+                    return .{ .failed = .{ .message = message, .payload = try failedRootPayload(module, root, message, .crash) } };
+                };
                 return .{ .failed = .{ .message = message, .payload = try reportCompileTimeCrash(problem_store, module, root, failed_at, owners, lir_result, message) } };
             },
             error.ExpectErr => finalizationInvariant("compile-time root reached an expect_err statement"),

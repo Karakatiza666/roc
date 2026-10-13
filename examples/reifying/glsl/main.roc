@@ -24,8 +24,10 @@
 # It is the shader `roc-ray/examples/post_process` loads from
 # `assets/post_process.fs`, written in Roc instead.
 
-import Glsl
-import Interp
+app [main!] { glsl: "package.roc" }
+
+import glsl.Glsl
+import glsl.Interp
 
 ## The varyings raylib's default vertex shader supplies. The names are its
 ## names, not ours: a fragment shader that renames them receives nothing.
@@ -57,15 +59,13 @@ expected =
 	\\#version 330
 	\\in vec4 fragColor;
 	\\in vec2 fragTexCoord;
-	\\uniform float time;
 	\\uniform sampler2D texture0;
+	\\uniform float time;
 	\\out vec4 finalColor;
 	\\void main() {
-	\\	float wave = (sin(((fragTexCoord.y * 28.0) + (time * 2.0))) * 0.004);
-	\\	vec2 shifted = vec2((fragTexCoord.x + wave), fragTexCoord.y);
-	\\	vec4 color = (texture(texture0, shifted) * fragColor);
-	\\	vec3 pulse = ((vec3(sin(time), sin((time + 2.1)), sin((time + 4.2))) * 0.08) + 0.92);
-	\\	finalColor = vec4((color.r * pulse.x), (color.g * pulse.y), (color.b * pulse.z), color.a);
+	\\	vec4 n20 = (texture(texture0, vec2((fragTexCoord.x + (sin(((fragTexCoord.y * 28.0) + (time * 2.0))) * 0.004)), fragTexCoord.y)) * fragColor);
+	\\	vec3 n36 = ((vec3(sin(time), sin((time + 2.1)), sin((time + 4.2))) * 0.08) + 0.92);
+	\\	finalColor = vec4((n20.r * n36.x), (n20.g * n36.y), (n20.b * n36.z), n20.a);
 	\\}
 
 expect {
@@ -79,7 +79,7 @@ expect {
 # instead of failing the first `uniform_f32!` call.
 expect {
 	match Glsl.fragment_330(post_process) {
-		Ok(fragment) => fragment.bindings.map(|binding| binding.name) == ["fragColor", "fragTexCoord", "time", "texture0"]
+		Ok(fragment) => fragment.bindings.map(|binding| binding.name) == ["fragColor", "fragTexCoord", "texture0", "time"]
 		Err(_) => Bool.False
 	}
 }
@@ -102,29 +102,6 @@ expect {
 	out.a == 1.0
 }
 
-## The description the translator reads, opened here so the interpreter can run
-## the same IR the emitter compiled.
-described : Code.Ir
-described = Code.ir(post_process)
-
-# The same IR on the CPU. This is a differential test: the emitter and
-# the interpreter read one description, and the interpreter's answer for `wave`
-# is comparable with what Roc computes for the same arithmetic.
-expect {
-	scope = [
-		{ name: "fragTexCoord", value: Interp.Value.Vector([0.25, 0.5]) },
-		{ name: "time", value: Interp.Value.Float(1.0) },
-	]
-	direct = F64.sin(0.5 * 28.0 + 1.0 * 2.0) * 0.004
-	match described {
-		Lambda(_, Let(_, bound, _, _), _) => match Interp.eval(bound, scope) {
-			Ok(Float(interpreted)) => F64.abs(interpreted - direct) < 0.000001
-			_ => Bool.False
-		}
-		_ => Bool.False
-	}
-}
-
 ## Two operators GLSL spells differently at a float. Roc's `//` truncates
 ## toward zero, which GLSL's `/` does only at an integer, and GLSL 330 keeps
 ## `%` for integers and spells the float remainder `mod`. The translator asks
@@ -139,9 +116,33 @@ banded = |frag, settings| {
 expect {
 	match Glsl.fragment_330(banded) {
 		Ok(fragment) =>
-			fragment.source.contains("float band = trunc(time / 0.25);")
-				and fragment.source.contains("float phase = mod(time, 0.25);")
+			fragment.source.contains("finalColor = vec4(trunc(time / 0.25), mod(time, 0.25), fragTexCoord.x, 1.0);")
 		Err(_) => Bool.False
+	}
+}
+
+# The same description on the CPU. This is a differential test: the emitter and
+# the interpreter read one description, and the interpreter's answer is
+# comparable with what Roc computes when it calls `banded` itself.
+expect {
+	frag = Interp.Value.Fields(
+		[
+			{ name: "fragTexCoord", value: Interp.Value.Vector([0.25, 0.5]) },
+			{ name: "fragColor", value: Interp.Value.Vector([1.0, 1.0, 1.0, 1.0]) },
+		],
+	)
+	settings = Interp.Value.Fields([{ name: "time", value: Interp.Value.Float(1.1) }])
+	direct = banded(
+		{
+			fragTexCoord: Glsl.Vec2.({ x: 0.25, y: 0.5 }),
+			fragColor: Glsl.Vec4.({ r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
+		},
+		{ texture0: flat(Glsl.Vec4.({ r: 0.0, g: 0.0, b: 0.0, a: 1.0 })), time: 1.1 },
+	)
+	close = |interpreted, computed| F64.abs(interpreted - computed.to_f64()) < 0.0001
+	match Interp.run(Code.graph(banded), [frag, settings]) {
+		Ok(Vector([r, g, b, a])) => close(r, direct.r) and close(g, direct.g) and close(b, direct.b) and close(a, direct.a)
+		_ => Bool.False
 	}
 }
 
@@ -151,13 +152,11 @@ too_dim : Varyings, Uniforms -> F32
 too_dim = |frag, settings|
 	frag.fragColor.r * settings.time
 
-# Every node carries where it was written, so a refusal names the module and
-# the line the author has to look at and not only the construct. The line is
-# `too_dim`'s body, as this file numbers it.
+# The refusal names the construct and what to write instead.
 expect {
 	match Glsl.fragment_330(too_dim) {
 		Ok(_) => Bool.False
-		Err(BadType(message)) => message == "main:152:2: a fragment shader must return Vec4; this one returns float"
+		Err(BadType(message)) => message == "a fragment shader must return Vec4; this one returns float"
 		Err(_) => Bool.False
 	}
 }

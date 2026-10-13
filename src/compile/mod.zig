@@ -23,6 +23,7 @@ pub const messages = @import("messages.zig");
 pub const canonicalized_cache_entry = @import("canonicalized_cache_entry.zig");
 pub const channel = @import("channel.zig");
 pub const coordinator = @import("coordinator.zig");
+pub const reify_fuzz = @import("reify_fuzz.zig");
 pub const app_header = @import("app_header.zig");
 
 pub const key = @import("cache_key.zig");
@@ -115,6 +116,7 @@ test "compile tests" {
     std.testing.refAllDecls(@import("test/embedding_smoke.zig"));
     std.testing.refAllDecls(@import("test/hoisted_constants_test.zig"));
     std.testing.refAllDecls(@import("test/code_reifier_test.zig"));
+    std.testing.refAllDecls(@import("reify_fuzz.zig"));
     std.testing.refAllDecls(@import("test/issue_9614_test.zig"));
     std.testing.refAllDecls(@import("test/issue_9634_test.zig"));
     std.testing.refAllDecls(@import("test/issue_806_stack_aggregate_test.zig"));

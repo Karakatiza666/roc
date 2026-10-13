@@ -3,7 +3,7 @@
 A translator is a compiler written in ordinary Roc that runs during `roc build`.
 It receives a `Code(f)`: a reified, typed, closed, monomorphic description of a
 pure Roc function, shaped like the `Ir`, `Ty`, `Lit` and `Pattern` unions
-declared in `src/build/roc/Builtin.roc:21296`.
+declared in `src/build/roc/Builtin.roc:23625`.
 
 This file is the checklist for that surface. Every box is a feature of pure Roc
 that a description could carry. A ticked box is one the compiler carries today.
@@ -76,10 +76,21 @@ one translator a rejection, and a refusal costs every author the construct.
 - [x] A top-level value of this module or of one it imports, written as a
       literal or as a record, tuple, list, tag or nominal built from literals,
       folded into the description as the value it holds
-      (`src/check/code_reifier.zig:4211`).
-- [ ] A top-level value that has to be computed, `limit = xs.len()`. The
-      compiler evaluates it after the description is built, so it is refused
-      as a capture, naming it (`src/check/code_reifier.zig:961`).
+      (`src/check/code_reifier.zig:2194`).
+- [x] A top-level value that has to be computed, `limit = 7.0 * 2.0` or
+      `limit = xs.len()`, of this module or of one in its package. It is not
+      evaluated first: its definition names only things the compiler fixes,
+      so the walk builds that definition where the name stands, by the same
+      path that folds a literal (`src/check/code_reifier.zig:2194`).
+      `x > limit` describes as `x > 7.0 * 2.0`, and a constant the definition
+      reads folds in turn, so `List.len([1, 2, 3])` stands where `limit` did.
+      The order of compile-time evaluation does not change, and two sites
+      that read different constants describe differently. Two cases stay
+      refused. A computed value of another package is a body of that package,
+      which the walk does not read (N8h): "a computed constant of another
+      package". A top-level value that computes a function names no
+      definition, so a call on it has no row to name: "a top-level constant
+      that computes a function" (`src/check/code_reifier.zig:4010`).
 - [x] A value the block around a lambda written at a `Code` position binds,
       read by that lambda. The statement that bound it is replayed at the head
       of the lambda's body, so it describes as a `Let` and a read of it as a
@@ -221,11 +232,26 @@ one translator a rejection, and a refusal costs every author the construct.
       Only a plain call specializes: a lambda handed to a dispatch stays a
       `Lambda` node in the call's arguments, which is what a derived `map` and
       a builtin `map` both want.
-- [ ] A function with no definition behind it: one chosen by an `if`, read out
-      of a record field, or taken from a list. "a call to a function value"
-      (`src/check/code_reifier.zig:2779`). There is nothing to specialize
-      against, and it is also the program a first-order translator could not
-      emit whatever the `Ir` carried.
+- [x] A call through an exact alias, `same_thing = add_one`. The checker
+      records the lookup an alias forwards to (`forwarded_lookup`,
+      `src/check/checked_artifact.zig:17173`), and the walk follows it to the
+      procedure it names (`src/check/code_reifier.zig:4066`, `:4110`), so the
+      call is a `Call` of that procedure's row and the alias and the name
+      share one row. An alias another module exports is followed the same way
+      through its export row (`src/check/code_reifier.zig:4086`). An alias of
+      a computed function, `f = make(2)`, has no forwarded lookup and stays
+      refused as "a top-level constant that computes a function". Pinned by
+      `eval_staging_tests.zig` ("staging - a call through an alias ...") and
+      `code_reifier_test.zig:531`.
+- [x] A function chosen by an `if`, or read out of a record literal, and then
+      called: `(if c double else triple)(x)`. The callee names no definition,
+      so the call is an `Apply` of the value (`src/check/code_reifier.zig:393`,
+      N8i), and simplifying turns each `Apply` whose function is a known
+      closure into a `Call` of its row. Checked with a probe of each form.
+- [ ] A function taken from a list and then called, `Ok(g) => g(x)` in a
+      `match` on `[double].first()`. "a call to a function value that no
+      simplification resolves" (`src/reify/driver.zig:116`): simplifying does
+      not read a closure back out of a list, so the `Apply` stays.
 
 ## 5 Control flow
 
@@ -321,13 +347,21 @@ one translator a rejection, and a refusal costs every author the construct.
 - [x] A record field with a default (`port : U16 ?? 8080`), read as an ordinary
       field.
 - [x] Tuple literal. `Ir.MakeTuple(List(Ir), Meta)`.
-- [x] A value used at a wider tag union than its own. `Ir.Widen(Ir, Meta)`:
-      the inner node keeps its own union and the meta carries the wider one.
-      The checker writes this as a `row_coerce` (design.md, "Row Coercion
+- [x] A value used at a wider tag union than its own. There is no node for
+      it. The checker writes a `row_coerce` (design.md, "Row Coercion
       Primitive") at each use of a top-level value, and around a call to a
       function whose body closed the union its annotation left open. The
-      node is explicit because the move can renumber the tag on a target
-      that numbers each union's tags on its own.
+      description identifies a tag by its name, so the value does not change
+      when it moves to a wider union: a value of a narrower union conforms to
+      a wider slot, with no node between. A tag switch has one arm per member
+      of its scrutinee's own union. A call takes the type its site reads it
+      at, and inlining builds the helper's ends at that type, so a helper
+      gives the same description as the code written inline. A translator that
+      matches tags by name needs nothing more. A translator that numbers tags
+      per union, such as a C or GLSL struct, converts where the type of a
+      child is narrower than the type of its slot
+      (`src/build/roc/Builtin.roc:23930-23936`). See
+      `roc-reify-tag-names.md`.
 - [x] Tuple access, `t.0`. `Ir.Index(Ir, U64, Meta)`.
 - [x] List literal with at least one item. `Ir.MakeList(List(Ir), Meta)`.
 - [x] Indexing a list. `List.get` returns `Try(a, [OutOfBounds]*)`, and the
@@ -632,6 +666,13 @@ translator owns, a codec or `to_inspect`, stays a `Derived` node.
 - [x] A top-level definition of a module it imports, read through that module's
       published view and its export table.
 - [x] A definition reached through a type module (`Maker := {}.{ ... }`).
+- [x] An exact alias named where a `Code` is expected, `count_rows(same_thing)`
+      with `same_thing = add_one`, of this module or of one it imports. A
+      named site holds no lookup in its checked body, so the walk goes from
+      the name's pattern to its procedure binding through the top-level value
+      table, and from an alias binding to the lookup it forwards to
+      (`src/check/code_reifier.zig:6946`). The site describes the procedure
+      that lookup names, byte for byte the description of naming it directly.
 - [x] A function bound inside a block, named where a `Code` is expected. The
       checker records a name a block binds to a lambda
       (`src/check/Check.zig:24051`), and the walk follows the binder's defining
@@ -700,15 +741,16 @@ auto-imported, so a user module may still be named `Pattern` or `Branch`.
       not one per node (`src/check/code_reifier.zig:7316`). A description
       another module's walk writes carries that module's regions, so a refusal
       names the file the author must open.
-- [x] `Ir.children` and `Ty.children`, so a pass with nothing to say about any
-      one kind walks a description without an arm per kind
-      (`src/build/roc/Builtin.roc:21878`, `:21372`).
+- [x] `Node.children` (the normal form of `Ir.children`) and `Ty.children`,
+      so a pass with nothing to say about any one kind walks a description
+      without an arm per kind (`src/build/roc/Builtin.roc:24004`, `:23703`).
 - [x] `Ty.numeric`, the question an operation site asks about a number, and
       `Ty.name`, the answer a refusal names a type with
-      (`src/build/roc/Builtin.roc:21396`, `:21421`).
-- [ ] Comparing two `Ty` values. `Code.Ty` declares no `is_eq`, so `a == b` is
-      a missing-method error, and a translator that compares types writes its
-      own comparison.
+      (`src/build/roc/Builtin.roc:23727`, `:23752`).
+- [x] Comparing two `Ty` values. `Code.Ty` declares `is_eq : _` and
+      `to_hash : _` (`src/build/roc/Builtin.roc:23689`), so `a == b` and
+      `a != b` are the derived structural comparison. Checked with a probe
+      that compares the parameter types of a `I64, I64, F32 -> I64` row.
 
 ---
 
@@ -716,9 +758,10 @@ auto-imported, so a user module may still be named `Pattern` or `Branch`.
 
 | Gap | What it costs |
 | --- | --- |
-| No function without a definition behind it | one chosen by an `if`, read out of a record field, or taken from a list: there is nothing to specialize against, and it is also what a first-order translator could not emit |
+| No function taken from a list | `[double].first()` and then a call: simplifying does not read a closure back out of a list, so the call stays an `Apply` and the site is refused; a function chosen by an `if` or read from a record literal does describe |
 | No name whose value exists only at run time | a lambda cannot read a parameter, binder or `var` of the function it is written in; the value becomes a parameter of the lambda, or a template fixes it |
-| No computed top-level value | `limit = xs.len()` is refused where `limit = 7` folds, because the compiler evaluates it after the description is built |
+| No computed function at top level | `doubler = make(2.0)` names no definition, so a call on it is refused; the author writes it as a lambda, `doubler = \|x\| x * 2.0`, or as a template; an exact alias, `same = add_one`, does describe |
+| No computed value of another package | `limit = xs.len()` in a package the app depends on is refused, because its body is that package's; a value written as data still folds |
 | No open tag union | a result whose row nothing closed has no one set of variants to describe |
 
 A shader or a codec is written as one function calling others, over as many

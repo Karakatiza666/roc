@@ -360,7 +360,10 @@ pub const Constants = struct {
     ///      applied to every type that holds a variable.
     /// 162: A module remembers how many lines of its source the compiler
     ///      prepended, so a region it reports names the line the author wrote.
-    pub const CACHE_VERSION = 162;
+    /// 163: A stored `Code` value holds the normal-form IR, not `Code.Ir`:
+    ///      placement and numbering are canonical, rows are digests, and the
+    ///      `graph` view inlines rows called once.
+    pub const CACHE_VERSION = 163;
 };
 
 /// Configuration for the Roc cache system.

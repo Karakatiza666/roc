@@ -159,6 +159,7 @@ pub const CommonIdents = extern struct {
     builtin_try: Ident.Idx,
     builtin_numeral: Ident.Idx,
     builtin_code: Ident.Idx,
+    builtin_code_inlined: Ident.Idx,
     builtin_str: Ident.Idx,
     builtin_list: Ident.Idx,
     builtin_box: Ident.Idx,
@@ -320,6 +321,7 @@ pub const CommonIdents = extern struct {
             .builtin_try = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("try_type").qualified_name)),
             .builtin_numeral = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("numeral_type").qualified_name)),
             .builtin_code = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_type").qualified_name)),
+            .builtin_code_inlined = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_inlined_type").qualified_name)),
             .builtin_str = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("str_type").qualified_name)),
             .builtin_list = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("list_type").qualified_name)),
             .builtin_box = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("box_type").qualified_name)),
@@ -998,6 +1000,12 @@ display_module_name_idx: Ident.Idx,
 /// checked, fresh or loaded from a cache. Empty for environments built outside
 /// the coordinator; `qualifiedModuleName` then reports the bare name.
 qualified_module_name: []const u8,
+/// The package this module belongs to, as the workspace names it (e.g. "pf").
+/// Workspace information like `qualified_module_name`: runtime-only, and the
+/// coordinator records it beside that name on every environment it installs.
+/// Empty for a module no coordinator placed in a package. Reification reads it
+/// to tell a function of another package (N8h).
+package_name: []const u8,
 /// Env-local module identity table: dense `base.ModuleIdentity.Idx` -> 32-byte
 /// deep content hash (see `base.module_identity`). Entry ids are the
 /// `origin_module` values stored on nominal/alias types in this env's type
@@ -1496,6 +1504,7 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .module_name = "", // May be set later during canonicalization
         .display_module_name_idx = Ident.Idx.NONE, // Will be set later during canonicalization
         .qualified_module_name = "", // Recorded by the coordinator
+        .package_name = "", // Recorded by the coordinator
         .module_identities = .{},
         .module_identity_displays = .{},
         .self_module_identity = base.ModuleIdentity.Idx.NONE,
@@ -4001,6 +4010,7 @@ pub const Serialized = extern struct {
         .Owner = Self,
         .owner_only_fields = &.{
             "qualified_module_name", // Workspace information, recorded by the coordinator.
+            "package_name", // Workspace information, recorded by the coordinator.
         },
         .serialized_only_fields = &.{
             "display_module_name_idx_padding", // Fixed-width padding after the display name slot.
@@ -4162,6 +4172,7 @@ pub const Serialized = extern struct {
             .module_name = module_basename,
             .display_module_name_idx = @bitCast(self.display_module_name_idx_reserved),
             .qualified_module_name = "",
+            .package_name = "",
             .module_identities = self.module_identities.deserialize(base_addr),
             .module_identity_displays = self.module_identity_displays.deserializeInto(base_addr),
             .self_module_identity = @fromBackingInt(@intCast(self.self_module_identity_reserved)),
@@ -4243,6 +4254,7 @@ pub const Serialized = extern struct {
             .module_name = module_basename,
             .display_module_name_idx = @bitCast(self.display_module_name_idx_reserved),
             .qualified_module_name = "",
+            .package_name = "",
             .module_identities = self.module_identities.deserialize(base_addr),
             // Copy so the display list can grow if runtime type copies add identities.
             .module_identity_displays = try self.module_identity_displays.deserializeWithCopy(base_addr, gpa),
@@ -4340,6 +4352,7 @@ pub const Serialized = extern struct {
             .module_name = module_basename,
             .display_module_name_idx = @bitCast(self.display_module_name_idx_reserved),
             .qualified_module_name = "",
+            .package_name = "",
             .module_identities = module_identities,
             .module_identity_displays = try self.module_identity_displays.deserializeWithCopy(base_addr, gpa),
             .self_module_identity = @fromBackingInt(@intCast(self.self_module_identity_reserved)),
@@ -4730,8 +4743,9 @@ pub fn recordCodeReificationSite(
     node_idx: Node.Idx,
     fn_var: TypeVar,
     kind: NodeStore.CodeReificationSite.Kind,
+    view: NodeStore.CodeReificationSite.View,
 ) std.mem.Allocator.Error!void {
-    try self.store.recordCodeReificationSite(node_idx, fn_var, kind);
+    try self.store.recordCodeReificationSite(node_idx, fn_var, kind, view);
 }
 
 /// The reification recorded for this expression, if it has one.

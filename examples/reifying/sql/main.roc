@@ -118,7 +118,8 @@ seed_orders = [
 
 # ---------------------------------------------------------------- queries
 
-## Binary operators and `NUMERIC` arithmetic, over one table.
+## Binary operators and `NUMERIC` arithmetic, over one table. A record's
+## fields reach the translator in name order, so the result columns do too.
 premium =
 	Sql.from(products)
 		.filter(|p| p.price >= 20 and p.title != "Gift card")
@@ -218,13 +219,14 @@ revenue_by_country_in_memory = {
 
 # ---------------------------------------------------------------- refusals
 
-# A translator refuses what SQL cannot say, and names the line to change.
-# `count_utf8_bytes` has an SQL look-alike, `length`, that counts characters
+# A translator refuses what SQL cannot say, and names the construct. The
+# line it was written on comes with source provenance, which is not in the
+# description yet. `count_utf8_bytes` has an SQL look-alike, `length`, that counts characters
 # instead, so a translator that mapped one onto the other would compute a
 # different answer for any name with an accent in it.
 byte_length = Sql.from(customers).filter(|c| c.name.count_utf8_bytes() > 5).select(|c| { name: c.name })
 
-expect byte_length.to_sql() == Err(Unsupported("main:225:46: `count_utf8_bytes` counts bytes, and SQL's `length` counts characters; the two disagree on any non-ASCII text"))
+expect byte_length.to_sql() == Err(Unsupported("`count_utf8_bytes` counts bytes, and SQL's `length` counts characters; the two disagree on any non-ASCII text"))
 
 # Roc's `//` truncates a `Dec` toward zero. SQL has no portable spelling of
 # that, so the translator refuses it rather than emit a `/` that rounds

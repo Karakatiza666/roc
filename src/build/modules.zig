@@ -255,6 +255,8 @@ pub const ModuleType = enum {
     lsp_integration,
     host_alloc,
     fast_memset,
+    reify,
+    reify_derive,
 
     /// The build's facts about this module. Adding a module means adding its
     /// arm here and its field to `RocModules`; both are checked at comptime.
@@ -291,7 +293,7 @@ pub const ModuleType = enum {
             },
             .check => .{
                 .root = "src/check/mod.zig",
-                .deps = &.{ .tracy, .builtins, .collections, .base, .parse, .types, .can, .reporting, .build_options, .fmt },
+                .deps = &.{ .tracy, .builtins, .collections, .base, .parse, .types, .can, .reporting, .build_options, .fmt, .reify },
                 .tests = .{ .unit = .{ .aggregators = &.{"check tests"} } },
             },
             .tracy => .{
@@ -413,7 +415,7 @@ pub const ModuleType = enum {
             },
             .compile => .{
                 .root = "src/compile/mod.zig",
-                .deps = &.{ .tracy, .build_options, .ctx, .builtins, .collections, .base, .types, .parse, .can, .check, .reporting, .layout, .static_data, .eval, .unbundle, .roc_target, .backend, .lir, .symbol, .sljmp },
+                .deps = &.{ .tracy, .build_options, .ctx, .builtins, .collections, .base, .types, .parse, .can, .check, .reporting, .layout, .static_data, .eval, .unbundle, .roc_target, .backend, .lir, .symbol, .sljmp, .reify },
                 .extra_imports = &.{"compiler_platform_sources"},
                 .tests = .{ .unit = .{ .aggregators = &.{"compile tests"} } },
             },
@@ -471,6 +473,21 @@ pub const ModuleType = enum {
                 .root = "src/fast_memset.zig",
                 .tests = .{ .unit = .{} },
                 .no_builtin = true,
+            },
+            // The normal form of a reified function (roc-reify-normal-form.md).
+            .reify => .{
+                .root = "src/reify/mod.zig",
+                .deps = &.{ .base, .collections },
+                .tests = .{ .unit = .{ .aggregators = &.{"reify tests"} } },
+                .available = .dependents_only,
+            },
+            // The offline rule-derivation tool's library
+            // (roc-reify-rule-derivation.md). No compiler binary imports it.
+            .reify_derive => .{
+                .root = "src/reify/derive/mod.zig",
+                .deps = &.{.reify},
+                .tests = .{ .unit = .{ .aggregators = &.{"reify derive tests"} } },
+                .available = .dependents_only,
             },
         };
     }
@@ -575,6 +592,8 @@ pub const RocModules = struct {
     glue: *Module,
     host_alloc: *Module,
     fast_memset: *Module,
+    reify: *Module,
+    reify_derive: *Module,
     embedded_lld: *Module,
     compiler_platform_sources: *Module,
 

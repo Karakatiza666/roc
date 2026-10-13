@@ -96,6 +96,10 @@ code_end: usize = 0,
 entry_frame: usize = 0,
 /// Where the run failed, once it has.
 failure: ?FailurePoint = null,
+/// The node a translator refused, when the crash that ended the run was a
+/// `Code.refuse_at` (plan I9c). Taken from the crashing thread's in-process
+/// host as the crash reaches this host.
+refusal: ?builtins.in_process_host.CodeRefusal = null,
 timing_io: ?std.Io = null,
 jmp_buf: JmpBuf = undefined,
 active_jmp_buf: ?*JmpBuf = null,
@@ -138,6 +142,7 @@ pub fn resetForRun(self: *CompileTimeHost) void {
     self.clearHostState();
     _ = self.host_arena.reset(.free_all);
     self.failure = null;
+    self.refusal = null;
     _ = self.arena.reset(.free_all);
     self.termination = .returned;
     self.active_jmp_buf = null;
@@ -344,6 +349,7 @@ fn rocExpectFailed(roc_ops: *RocOps, bytes: [*]const u8, len: usize) callconv(.c
 fn rocCrashed(roc_ops: *RocOps, bytes: [*]const u8, len: usize) callconv(.c) void {
     const self: *CompileTimeHost = @ptrCast(@alignCast(roc_ops.env));
     self.failure = self.currentFailurePoint(@frameAddress());
+    self.refusal = builtins.in_process_host.takeCodeRefusal();
     self.appendEvent(.crashed, bytes[0..len]);
     self.jump(.crashed);
 }

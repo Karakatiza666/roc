@@ -44,6 +44,10 @@ pub const roc_expect_err_region = "roc_expect_err_region";
 /// called just before that crash. Builtins reference it weakly; a platform
 /// executable defines no such symbol.
 pub const roc_checked_error_reached = "roc_checked_error_reached";
+/// The in-process host's recorder for the node a translator refused, called
+/// just before a `Code.refuse_at` crashes. Builtins reference it weakly; a
+/// platform executable defines no such symbol.
+pub const roc_code_refused = "roc_code_refused";
 /// The in-process host's recorders that builtins reference weakly. A platform
 /// executable defines none of them, so a linker that does not resolve an
 /// undefined weak reference to null on its own (Mach-O) is told each may stay
@@ -51,6 +55,7 @@ pub const roc_checked_error_reached = "roc_checked_error_reached";
 pub const in_process_recorder_set = [_][:0]const u8{
     roc_expect_err_region,
     roc_checked_error_reached,
+    roc_code_refused,
 };
 /// The default platform's `main` implementation inside the machine-code shim.
 pub const roc_shim_default_main = "roc_shim_default_main";

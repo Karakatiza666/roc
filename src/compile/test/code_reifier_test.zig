@@ -1,11 +1,14 @@
-//! The reifier over a real checked module: a function written in Roc becomes a
-//! `Code.Ir` tree in the module's const store.
+//! The reifier over a real checked module: a function written in Roc becomes
+//! its normal form, which each test reads as the site's dump
+//! (`reify.dump.dumpSite`): the rows the site reaches, root first, with the
+//! nodes the emitter keeps.
 
 const std = @import("std");
 const base = @import("base");
 const build_options = @import("build_options");
 const can = @import("can");
 const check = @import("check");
+const reify = @import("reify");
 const collections = @import("collections");
 const eval = @import("eval");
 const roc_target = @import("roc_target");
@@ -47,6 +50,7 @@ const StagedError = std.mem.Allocator.Error ||
         PathOutsideWorkspace,
         StagedFixtureDidNotCheck,
         StagedLambdaNotFound,
+        StagedSiteDoesNotVerify,
         UnsupportedHeader,
         UnsupportedTarget,
         WriteFailed,
@@ -66,88 +70,12 @@ fn sharedBuiltinModules() eval.BuiltinModules.InitError!*eval.BuiltinModules {
     return &shared_test_builtins.?;
 }
 
-const platform_main =
-    \\platform ""
-    \\    requires {} { main! : List(Str) => Try({}, [Exit(I8), ..]) }
-    \\    exposes [Echo]
-    \\    packages {}
-    \\    provides { "roc_main": main_for_host! }
-    \\    hosted { "roc_echo_line": Echo.line! }
-    \\
-    \\import Echo
-    \\
-    \\main_for_host! : List(Str) => I8
-    \\main_for_host! = |args|
-    \\    match main!(args) {
-    \\        Ok({}) => 0
-    \\        Err(Exit(code)) => code
-    \\        Err(other) => {
-    \\            Echo.line!("Program exited with error: ${Str.inspect(other)}")
-    \\            1
-    \\        }
-    \\    }
-;
-
-const platform_echo =
-    \\Echo := [].{
-    \\    line! : Str => {}
-    \\}
-;
-
-/// The method registries the walk reads, for a test that walks one app.
-///
-/// A fixture declares its nominals in the app module, and the walk asks the
-/// registries whether such a nominal writes `is_eq` or `to_hash` or derives
-/// it, and whether its `to_inspect` is an inspect override. Publication answers
-/// both from every view it holds; a test holds the app it published, where its
-/// fixtures' nominals are declared, and the builtin artifact, where a builtin
-/// container declares its own.
-///
-/// The other three questions keep the answer this harness has always given
-/// them, which is none.
-const StagedLookup = struct {
-    artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-    builtins: *const check.CheckedArtifact.CheckedModuleArtifact,
-
-    fn lookup(self: *const StagedLookup) CodeReifier.ForeignLookup {
-        var asked = CodeReifier.ForeignLookup.none;
-        asked.context = self;
-        asked.resolve_method = resolveMethod;
-        asked.resolve_inspect_override = resolveInspectOverride;
-        return asked;
-    }
-
-    fn resolveInspectOverride(
-        context: *const anyopaque,
-        owner: CodeReifier.ForeignNominal,
-    ) ?check.StaticDispatchRegistry.MethodTarget {
-        const self: *const StagedLookup = @ptrCast(@alignCast(context));
-        if (check.CheckedArtifact.registeredMethod(&self.artifact.canonical_names, &self.artifact.method_registry, owner, "to_inspect") != null) {
-            return check.CheckedArtifact.registeredInspectOverride(&self.artifact.canonical_names, &self.artifact.method_registry, owner);
-        }
-        return check.CheckedArtifact.registeredInspectOverride(&self.builtins.canonical_names, &self.builtins.method_registry, owner);
-    }
-
-    fn resolveMethod(
-        context: *const anyopaque,
-        owner: CodeReifier.ForeignNominal,
-        method: []const u8,
-    ) ?check.StaticDispatchRegistry.MethodTarget {
-        const self: *const StagedLookup = @ptrCast(@alignCast(context));
-        if (check.CheckedArtifact.registeredMethod(
-            &self.artifact.canonical_names,
-            &self.artifact.method_registry,
-            owner,
-            method,
-        )) |target| return target;
-        return check.CheckedArtifact.registeredMethod(
-            &self.builtins.canonical_names,
-            &self.builtins.method_registry,
-            owner,
-            method,
-        );
-    }
-};
+const reify_fuzz = @import("../reify_fuzz.zig");
+const platform_main = reify_fuzz.platform_main;
+const platform_echo = reify_fuzz.platform_echo;
+const StagedLookup = reify_fuzz.Lookup;
+const stagedLambda = reify_fuzz.lambdaByParam;
+const stagedTemplate = reify_fuzz.templateOf;
 
 /// One app whose `wobble` function carries the body under test, compiled the
 /// way `roc build` compiles it and then walked by the reifier.
@@ -167,6 +95,8 @@ const Staged = struct {
     reifier: *CodeReifier.Reifier,
     env: *const ModuleEnv,
     outcome: CodeReifier.Outcome,
+    /// The site's dump, or empty where the walk refused the body.
+    dump: std.ArrayList(u8) = .empty,
 
     /// `wobble_source` declares and defines `wobble`; `main!` only has to call
     /// it, so every fixture shares one caller.
@@ -182,13 +112,38 @@ const Staged = struct {
         wobble_source: []const u8,
         main_statement: []const u8,
     ) StagedError!*Staged {
-        const self = try createChecked(gpa, wobble_source, main_statement);
+        return createNamed(gpa, wobble_source, main_statement, "input");
+    }
+
+    /// The site is the lambda whose one parameter is named `param`.
+    fn createNamed(
+        gpa: Allocator,
+        wobble_source: []const u8,
+        main_statement: []const u8,
+        param: []const u8,
+    ) StagedError!*Staged {
+        return createSite(gpa, wobble_source, main_statement, param, null);
+    }
+
+    /// `createNamed`, beside a package `lib` holding `lib_source`.
+    fn createSite(
+        gpa: Allocator,
+        wobble_source: []const u8,
+        main_statement: []const u8,
+        param: []const u8,
+        lib_source: ?[]const u8,
+    ) StagedError!*Staged {
+        const self = try createCheckedWithPackage(gpa, wobble_source, main_statement, lib_source);
         const artifact = self.coord.appRootCheckedArtifact();
 
-        const lambda = stagedLambda(artifact, self.env) orelse return error.StagedLambdaNotFound;
+        const lambda = stagedLambda(artifact, self.env, param) orelse return error.StagedLambdaNotFound;
 
         self.store = ConstStore.init(gpa);
-        self.foreign = .{ .artifact = artifact, .builtins = &(try sharedBuiltinModules()).checked_artifact };
+        self.foreign = .{
+            .artifact = artifact,
+            .builtins = &(try sharedBuiltinModules()).checked_artifact,
+            .imports = try self.coord.collectImportedArtifactViews(self.arena_impl.allocator(), artifact),
+        };
         self.walk = CodeReifier.Walk.init(gpa, &self.store, self.foreign.lookup());
         self.reifier = try self.walk.reader(.{
             .sources = CodeReifier.Reifier.artifactSources(artifact),
@@ -199,10 +154,12 @@ const Staged = struct {
             .in_block = false,
             .caller = self.reifier,
             // Every fixture here declares `wobble` at one concrete type, so
-            // there is no quantified variable for a site to fix.
+            // the only variable its scheme quantifies is the open row of a
+            // tag-union result, which no site needs to fix.
             .fixed = null,
             .region = base.Region.zero(),
         });
+        try self.dumpSite();
         return self;
     }
 
@@ -211,6 +168,17 @@ const Staged = struct {
         gpa: Allocator,
         wobble_source: []const u8,
         main_statement: []const u8,
+    ) StagedError!*Staged {
+        return createCheckedWithPackage(gpa, wobble_source, main_statement, null);
+    }
+
+    /// The fixture beside a package `lib` whose one module `Lib` holds
+    /// `lib_source`, where one is given.
+    fn createCheckedWithPackage(
+        gpa: Allocator,
+        wobble_source: []const u8,
+        main_statement: []const u8,
+        lib_source: ?[]const u8,
     ) StagedError!*Staged {
         const self = try gpa.create(Staged);
         errdefer gpa.destroy(self);
@@ -228,10 +196,15 @@ const Staged = struct {
             .data = platform_echo,
         });
 
+        if (lib_source) |lib| {
+            try self.tmp.dir.createDirPath(std.testing.io, "lib");
+            try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/main.roc", .data = "package [Lib] {}\n\nimport /Lib as Lib\n" });
+            try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "lib/Lib.roc", .data = lib });
+        }
         const app_source = try std.fmt.allocPrint(gpa,
-            \\app [main!] {{ pf: platform "./.roc_echo_platform/main.roc" }}
+            \\app [main!] {{ pf: platform "./.roc_echo_platform/main.roc"{s} }}
             \\
-            \\import pf.Echo
+            \\import pf.Echo{s}
             \\
             \\{s}
             \\
@@ -240,7 +213,12 @@ const Staged = struct {
             \\    Ok({{}})
             \\}}
             \\
-        , .{ wobble_source, main_statement });
+        , .{
+            if (lib_source != null) ", lib: \"./lib/main.roc\"" else "",
+            if (lib_source != null) "\nimport lib.Lib" else "",
+            wobble_source,
+            main_statement,
+        });
         defer gpa.free(app_source);
         try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.roc", .data = app_source });
 
@@ -274,6 +252,7 @@ const Staged = struct {
         }
 
         self.env = self.coord.appRootCheckedArtifact().module_env.env();
+        self.dump = .empty;
         return self;
     }
 
@@ -319,10 +298,12 @@ const Staged = struct {
             return self;
         }
         self.outcome = try self.reifier.reifyTemplateCall(template, values.items, .zero());
+        try self.dumpSite();
         return self;
     }
 
     fn destroy(self: *Staged) void {
+        self.dump.deinit(self.gpa);
         self.walk.deinit();
         self.store.deinit();
         self.coord.deinit();
@@ -331,13 +312,57 @@ const Staged = struct {
         self.gpa.destroy(self);
     }
 
-    /// The `Ir` root, or a test failure naming what the walk refused.
-    ///
-    /// A site holds `Code`'s backing, `{ defs, root }`, whose fields are in
-    /// label order, so the body is the second.
-    fn root(self: *Staged) RejectedError!ConstNodeId {
+    /// Verify the site's IR and keep its dump. A site the verifier reports
+    /// on fails the test with the report.
+    fn dumpSite(self: *Staged) StagedError!void {
+        if (self.outcome != .reified) return;
+        const site = self.walk.site.?;
+        var report = try reify.verify.verifyAll(self.gpa, &site.store, &site.types);
+        defer report.deinit();
+        if (!report.ok()) {
+            for (report.messages.items) |message| std.debug.print("verifier: {s}\n", .{message});
+            return error.StagedSiteDoesNotVerify;
+        }
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        reify.dump.dumpSite(&out.writer, self.gpa, &site.store, &site.types, self.walk.root.?) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.WriteFailed => return error.WriteFailed,
+        };
+        try self.dump.appendSlice(self.gpa, out.written());
+    }
+
+    /// Each node of the site's graph, by row and node, with the source text
+    /// of every origin it has, the node's own first and then each call that
+    /// reached it: `r0 n2: 'x * 2' < 'step(x)'`.
+    fn expectProvenance(self: *Staged, expected: []const u8) (RejectedError || Allocator.Error || error{TestExpectedEqual})!void {
+        if (self.outcome != .reified) return self.expectDump("");
+        const published = self.walk.published.items;
+        const site = published[published.len - 1];
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        const origins = &site.origins;
+        for (origins.rows.items, 0..) |row, r| {
+            for (0..row.len) |k| {
+                const chains = origins.of(@intCast(r), @intCast(k)).?;
+                try out.print(self.gpa, "r{d} n{d}:", .{ r, k });
+                for (chains, 0..) |chain, c| {
+                    try out.appendSlice(self.gpa, if (c == 0) " " else " | ");
+                    for (origins.links.items[chain.start..][0..chain.len], 0..) |link, step| {
+                        const source = site.sources[link.index()];
+                        try out.print(self.gpa, "{s}'{s}'", .{ if (step == 0) "" else " < ", self.env.getSource(source.region) });
+                    }
+                }
+                try out.append(self.gpa, '\n');
+            }
+        }
+        try std.testing.expectEqualStrings(expected, out.items);
+    }
+
+    /// The site's dump, or a test failure naming what the walk refused.
+    fn expectDump(self: *Staged, expected: []const u8) (RejectedError || error{TestExpectedEqual})!void {
         switch (self.outcome) {
-            .reified => |node| return self.recordFields(node)[1],
+            .reified => try std.testing.expectEqualStrings(expected, self.dump.items),
             .rejected => |rejection| {
                 std.debug.print("reification rejected: {t} {s} at '{s}'\n", .{
                     rejection.kind,
@@ -349,109 +374,17 @@ const Staged = struct {
         }
     }
 
-    fn tagName(self: *Staged, node: ConstNodeId) []const u8 {
-        return self.store.get(node).tag.tag_name;
-    }
-
-    fn payloads(self: *Staged, node: ConstNodeId) []const ConstNodeId {
-        return self.store.get(node).tag.payloads;
-    }
-
-    fn strText(self: *Staged, node: ConstNodeId) []const u8 {
-        return self.store.strBytes(self.store.get(node).str);
-    }
-
-    fn listNodes(self: *Staged, node: ConstNodeId) []const ConstNodeId {
-        return self.store.get(node).list.nodes;
-    }
-
-    fn recordFields(self: *Staged, node: ConstNodeId) []const ConstNodeId {
-        return self.store.get(node).record;
-    }
-
-    /// The definitions a site's table holds, as `{ ir, name }` rows in label
-    /// order.
-    fn definitions(self: *Staged) RejectedError![]const ConstNodeId {
+    /// The walk refused the body, naming `detail`.
+    fn expectRejected(self: *Staged, detail: []const u8) error{ TestExpectedEqual, TestUnexpectedResult }!void {
         switch (self.outcome) {
-            .reified => |node| return self.listNodes(self.recordFields(node)[0]),
-            .rejected => return error.StagedBodyRejected,
+            .reified => {
+                std.debug.print("reified, where a refusal was expected:\n{s}\n", .{self.dump.items});
+                return error.TestUnexpectedResult;
+            },
+            .rejected => |rejection| try std.testing.expectEqualStrings(detail, rejection.detail),
         }
     }
-
-    /// The type a node's `Meta` carries. A constant record's fields are
-    /// restored in label order, so `region` precedes `ty`.
-    fn metaTy(self: *Staged, meta: ConstNodeId) ConstNodeId {
-        return self.recordFields(meta)[1];
-    }
-
-    /// The node a `Meta`'s region names its module through. Every `Region` in
-    /// a description names one module, so this is one node per walk.
-    fn metaModule(self: *Staged, meta: ConstNodeId) ConstNodeId {
-        return self.recordFields(self.recordFields(meta)[0])[2];
-    }
-
-    /// The region a node's `Meta` carries, as (module_name, start_line,
-    /// start_column, end_line, end_column) read out of its label order.
-    fn metaRegion(self: *Staged, meta: ConstNodeId) struct {
-        module_name: []const u8,
-        start_line: u32,
-        start_column: u32,
-        end_line: u32,
-        end_column: u32,
-    } {
-        const fields = self.recordFields(self.recordFields(meta)[0]);
-        return .{
-            .module_name = self.strText(fields[2]),
-            .start_line = self.store.get(fields[4]).scalar.u32,
-            .start_column = self.store.get(fields[3]).scalar.u32,
-            .end_line = self.store.get(fields[1]).scalar.u32,
-            .end_column = self.store.get(fields[0]).scalar.u32,
-        };
-    }
-
-    /// The `Ir` body of the staged lambda, past its parameter list.
-    fn body(self: *Staged) RejectedError!ConstNodeId {
-        return self.payloads(try self.root())[1];
-    }
 };
-
-/// The lambda bound to `wobble`, found by the name of its one parameter. The
-/// source-node map is build-only, so the test reads the pattern's region the
-/// same way the reifier does.
-fn stagedLambda(
-    artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-    env: *const ModuleEnv,
-) ?CheckedExprId {
-    for (0..artifact.checked_bodies.exprCount()) |raw| {
-        const expr_id: CheckedExprId = @fromBackingInt(@intCast(@as(u32, @intCast(raw))));
-        const data = artifact.checked_bodies.expr(expr_id).data;
-        if (data != .lambda) continue;
-        const lambda = data.lambda;
-        if (lambda.args.len != 1) continue;
-        const pattern = artifact.checked_bodies.pattern(lambda.args[0]);
-        if (pattern.data != .assign) continue;
-        if (!std.mem.eql(u8, env.getSource(pattern.source_region), "input")) continue;
-        return expr_id;
-    }
-    return null;
-}
-
-/// The procedure template one checked lambda is the body of, which says what
-/// the definition quantifies over.
-fn stagedTemplate(
-    artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
-    lambda: CheckedExprId,
-) ?check.CheckedArtifact.CheckedProcedureTemplate {
-    for (artifact.checked_procedure_templates.templates.items) |template| {
-        const body = switch (template.body) {
-            .checked_body => |body_id| body_id,
-            .intrinsic_wrapper, .entry_wrapper, .unimplemented => continue,
-        };
-        if (artifact.checked_bodies.body(body).root_expr != lambda) continue;
-        return template;
-    }
-    return null;
-}
 
 /// The template `wobble` is defined as: a lambda taking `arg_count`
 /// compile-time parameters whose body is the lambda a call describes.
@@ -490,6 +423,21 @@ fn checkedExprWithSource(
     return null;
 }
 
+/// A nominal whose `from_numeral` and `is_eq` are both written, so a literal
+/// pattern against it names both rather than expanding either.
+const count_nominal =
+    \\Count := { n : U32 }.{
+    \\    from_numeral : Numeral -> Try(Count, [InvalidNumeral(Str)])
+    \\    from_numeral = |v| match U32.from_numeral(v) {
+    \\        Ok(u) => Ok({ n: u })
+    \\        Err(e) => Err(e)
+    \\    }
+    \\    is_eq : Count, Count -> Bool
+    \\    is_eq = |a, b| a.n == b.n
+    \\}
+    \\
+;
+
 test "a template call folds its arguments into the description" {
     // The template's own parameter is not a name in the description: the value
     // the call fixed is written where the name was, so the stage reads a
@@ -504,25 +452,17 @@ test "a template call folds its arguments into the description" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Binop", staged.tagName(body));
-    try std.testing.expectEqualStrings("times", staged.strText(staged.payloads(body)[0]));
-
-    const rhs = staged.payloads(body)[2];
-    try std.testing.expectEqualStrings("Lit", staged.tagName(rhs));
-    const literal = staged.payloads(rhs)[0];
-    try std.testing.expectEqualStrings("Frac", staged.tagName(literal));
-    const bits = staged.store.get(staged.payloads(literal)[0]).scalar.f64_bits;
-    try std.testing.expectEqual(@as(f64, 3.5), @as(f64, @bitCast(bits)));
-
-    // The staged lambda's parameters are its own, so the template's parameter
-    // is absent from the signature the stage reads.
-    const params = staged.listNodes(staged.payloads(try staged.root())[0]);
-    try std.testing.expectEqual(@as(usize, 1), params.len);
-    try std.testing.expectEqualStrings("input", staged.strText(staged.recordFields(params[0])[0]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = float 0x40600000 : F32
+        \\  n2 = Num.F32.times(n0, n1) : F32
+        \\  value n2
+        \\
+    );
 }
 
-test "a checked function body becomes a Code.Ir tree" {
+test "a checked function body becomes its normal form" {
     const staged = try Staged.create(std.testing.allocator,
         \\wobble : { time : F32, uv : F32 } -> F32
         \\wobble = |input| {
@@ -532,59 +472,38 @@ test "a checked function body becomes a Code.Ir tree" {
     );
     defer staged.destroy();
 
-    // Lambda([{ name: "input", ty: Named(...) }], Let(...), Meta)
-    const root = try staged.root();
-    try std.testing.expectEqualStrings("Lambda", staged.tagName(root));
-    const lambda_args = staged.payloads(root);
-    try std.testing.expectEqual(@as(usize, 3), lambda_args.len);
-
-    const params = staged.listNodes(lambda_args[0]);
-    try std.testing.expectEqual(@as(usize, 1), params.len);
-    try std.testing.expectEqualStrings("input", staged.strText(staged.recordFields(params[0])[0]));
-
-    // A lambda carries its own type, the way every other node does, so the
-    // return type sits inside the function type rather than in the slot.
-    const lambda_ty = staged.metaTy(lambda_args[2]);
-    try std.testing.expectEqualStrings("Fn", staged.tagName(lambda_ty));
-    try std.testing.expectEqualStrings("F32", staged.tagName(staged.payloads(lambda_ty)[1]));
-
-    // The `wave =` binding survives as a Let rather than being inlined, which
-    // is the property a stage needs to emit one GLSL local.
-    const let_node = try staged.body();
-    try std.testing.expectEqualStrings("Let", staged.tagName(let_node));
-    const let_args = staged.payloads(let_node);
-    try std.testing.expectEqualStrings("wave", staged.strText(let_args[0]));
-
-    // wave = input.uv * 2.0.F32
-    const times = staged.payloads(let_args[1]);
-    try std.testing.expectEqualStrings("Binop", staged.tagName(let_args[1]));
-    try std.testing.expectEqualStrings("times", staged.strText(times[0]));
-    try std.testing.expectEqualStrings("Field", staged.tagName(times[1]));
-    const uv = staged.payloads(times[1]);
-    try std.testing.expectEqualStrings("Param", staged.tagName(uv[0]));
-    try std.testing.expectEqualStrings("input", staged.strText(staged.payloads(uv[0])[0]));
-    try std.testing.expectEqualStrings("uv", staged.strText(uv[1]));
-
-    // The digit pool is a big-endian base-256 magnitude, not ASCII, so assert
-    // the decoded value and not just the node's shape.
-    try std.testing.expectEqualStrings("Lit", staged.tagName(times[2]));
-    const frac = staged.payloads(staged.payloads(times[2])[0]);
-    try std.testing.expectEqual(
-        @as(f64, 2.0),
-        @as(f64, @bitCast(staged.store.get(frac[0]).scalar.f64_bits)),
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = float 0x40000000 : F32
+        \\  n2 = Num.F32.times(n0, n1) : F32
+        \\  n3 = field 0(p0) : F32
+        \\  n4 = Num.F32.plus(n2, n3) : F32
+        \\  value n4
+        \\
     );
-
-    // wave + input.time
-    const plus = staged.payloads(let_args[2]);
-    try std.testing.expectEqualStrings("Binop", staged.tagName(let_args[2]));
-    try std.testing.expectEqualStrings("plus", staged.strText(plus[0]));
-    try std.testing.expectEqualStrings("Local", staged.tagName(plus[1]));
-    try std.testing.expectEqualStrings("wave", staged.strText(staged.payloads(plus[1])[0]));
-    try std.testing.expectEqualStrings("Field", staged.tagName(plus[2]));
-    try std.testing.expectEqualStrings("time", staged.strText(staged.payloads(plus[2])[1]));
 }
 
-test "a plain call names its callee, and the table holds the callee's body" {
+test "N10: each node of a site comes from the expression that built it, and an inlined helper's node through its call" {
+    const staged = try Staged.create(std.testing.allocator,
+        \\step : F32 -> F32
+        \\step = |x| x * 3.0.F32
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| step(input.uv) + input.time
+    );
+    defer staged.destroy();
+
+    try staged.expectProvenance(
+        \\r0 n0: 'input.uv'
+        \\r0 n1: '3.0.F32' < 'step(input.uv)'
+        \\r0 n2: 'x * 3.0.F32' < 'step(input.uv)'
+        \\r0 n3: 'input.time'
+        \\r0 n4: 'step(input.uv) + input.time'
+        \\
+    );
+}
+
+test "a plain call is a Call of the callee's row, which the site holds once" {
     const staged = try Staged.create(std.testing.allocator,
         \\step : F32 -> F32
         \\step = |x| x + 1.0.F32
@@ -593,57 +512,53 @@ test "a plain call names its callee, and the table holds the callee's body" {
     );
     defer staged.destroy();
 
-    // The call names the callee, module-qualified, and the callee's body is
-    // nowhere in the described body.
-    const plus = staged.payloads(try staged.body());
-    try std.testing.expectEqualStrings("Call", staged.tagName(plus[1]));
-    try std.testing.expectEqualStrings("main.step", staged.strText(staged.payloads(plus[1])[0]));
-
-    // One row, however many calls reach it. `Code.Def` is `{ ir, name }`, and
-    // a constant record's fields are restored in label order.
-    const rows = try staged.definitions();
-    try std.testing.expectEqual(@as(usize, 1), rows.len);
-    const row = staged.recordFields(rows[0]);
-    try std.testing.expectEqualStrings("main.step", staged.strText(row[1]));
-    try std.testing.expectEqualStrings("Lambda", staged.tagName(row[0]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = call r1(n0) : F32
+        \\  n2 = field 0(p0) : F32
+        \\  n3 = call r1(n2) : F32
+        \\  n4 = call r1(n3) : F32
+        \\  n5 = Num.F32.plus(n1, n4) : F32
+        \\  value n5
+        \\row r1 (F32) -> F32
+        \\  n0 = float 0x3f800000 : F32
+        \\  n1 = Num.F32.plus(p0, n0) : F32
+        \\  value n1
+        \\
+    );
 }
 
-test "every Ir node carries where it was written" {
-    // The region is resolved to lines and columns in the walk rather than left
-    // as a byte offset, because a stage holds a description and never the
-    // source text an offset would need. The lambda spans two lines, so all four
-    // numbers differ and a field restored out of order cannot pass.
+test "a call through an alias is a Call of the row of the function it names" {
+    // The checker records the lookup an exact alias forwards to, so the alias
+    // and the name it forwards to reach one definition and share one row.
     const staged = try Staged.create(std.testing.allocator,
+        \\step : F32 -> F32
+        \\step = |x| x + 1.0.F32
+        \\same : F32 -> F32
+        \\same = step
         \\wobble : { time : F32, uv : F32 } -> F32
-        \\wobble = |input|
-        \\    input.uv * 2.0.F32
+        \\wobble = |input| same(input.uv) + step(input.time)
     );
     defer staged.destroy();
 
-    // The fixture's app header takes four lines, so `wobble = ` is on line 6.
-    const lambda = staged.metaRegion(staged.payloads(try staged.root())[2]);
-    try std.testing.expectEqualStrings("main", lambda.module_name);
-    try std.testing.expectEqual(@as(u32, 6), lambda.start_line);
-    try std.testing.expectEqual(@as(u32, 10), lambda.start_column);
-    try std.testing.expectEqual(@as(u32, 7), lambda.end_line);
-    try std.testing.expectEqual(@as(u32, 23), lambda.end_column);
-
-    // A node inside the body points at its own span, not the lambda's.
-    const body = try staged.body();
-    const times = staged.metaRegion(staged.payloads(body)[3]);
-    try std.testing.expectEqual(@as(u32, 7), times.start_line);
-    try std.testing.expectEqual(@as(u32, 5), times.start_column);
-    try std.testing.expectEqual(@as(u32, 7), times.end_line);
-    try std.testing.expectEqual(@as(u32, 23), times.end_column);
-
-    // A chain of field reads becomes one `Field` per segment, and each points
-    // at its own segment: this one covers `.uv`, not the `input` it reads from.
-    const field = staged.metaRegion(staged.payloads(staged.payloads(body)[1])[2]);
-    try std.testing.expectEqual(@as(u32, 10), field.start_column);
-    try std.testing.expectEqual(@as(u32, 13), field.end_column);
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = call r1(n0) : F32
+        \\  n2 = field 0(p0) : F32
+        \\  n3 = call r1(n2) : F32
+        \\  n4 = Num.F32.plus(n1, n3) : F32
+        \\  value n4
+        \\row r1 (F32) -> F32
+        \\  n0 = float 0x3f800000 : F32
+        \\  n1 = Num.F32.plus(p0, n0) : F32
+        \\  value n1
+        \\
+    );
 }
 
-test "a derived == on a scalar becomes an is_eq Binop" {
+test "a derived == on a scalar is the builtin's is_eq" {
     // `==` desugars to `is_eq`, and every numeric type derives it, so the
     // checker rewrites the call to `structural_eq` before the reifier sees it.
     // A comparison against a constant is the first thing a shader body writes.
@@ -653,38 +568,55 @@ test "a derived == on a scalar becomes an is_eq Binop" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("If", staged.tagName(body));
-    const condition = staged.payloads(body)[0];
-    try std.testing.expectEqualStrings("Binop", staged.tagName(condition));
-    try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(condition)[0]));
-    try std.testing.expectEqualStrings("Field", staged.tagName(staged.payloads(condition)[1]));
-    try std.testing.expectEqualStrings("Lit", staged.tagName(staged.payloads(condition)[2]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x0 : F32
+        \\  n2 = Num.F32.is_eq(n0, n1) : Bool
+        \\  n4 = switch n2 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      n3 = field 1(p0) : F32
+        \\      value n3
+        \\  value n4
+        \\
+    );
 }
 
-test "a derived != on a scalar becomes a negated is_eq" {
+test "a derived != on a scalar is Bool.not of the builtin's is_eq" {
     const staged = try Staged.create(std.testing.allocator,
         \\wobble : { time : F32, uv : F32 } -> F32
         \\wobble = |input| if input.time != 0.0.F32 input.uv else input.time
     );
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Unary", staged.tagName(condition));
-    try std.testing.expectEqualStrings("not", staged.strText(staged.payloads(condition)[0]));
-    const compare = staged.payloads(condition)[1];
-    try std.testing.expectEqualStrings("Binop", staged.tagName(compare));
-    try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(compare)[0]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x0 : F32
+        \\  n2 = Num.F32.is_eq(n0, n1) : Bool
+        \\  n4 = switch n2 : F32
+        \\    arm 0
+        \\      n3 = field 1(p0) : F32
+        \\      value n3
+        \\    arm 1
+        \\      value n0
+        \\  value n4
+        \\
+    );
 }
 
-test "a hand-written is_eq becomes an is_eq Binop" {
+test "a hand-written is_eq describes its own body" {
     // A written `is_eq` carries a dispatch plan, so it is an ordinary method
     // call. It reads as derived only because the checker groups it with the
-    // two forms that are.
+    // two forms that are. Its body compares with `<=`, so the description
+    // shows the method rather than the backing's equality; the one call of
+    // its row is inlined (V1).
     const staged = try Staged.create(std.testing.allocator,
         \\Meters := F32.{
         \\    is_eq : Meters, Meters -> Bool
-        \\    is_eq = |Meters.(a), Meters.(b)| a == b
+        \\    is_eq = |Meters.(a), Meters.(b)| a <= b
         \\}
         \\
         \\wobble : { time : F32, uv : F32 } -> F32
@@ -693,19 +625,31 @@ test "a hand-written is_eq becomes an is_eq Binop" {
     );
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Binop", staged.tagName(condition));
-    try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(condition)[0]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x0 : F32
+        \\  n2 = Num.F32.is_lte(n0, n1) : Bool
+        \\  n4 = switch n2 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      n3 = field 1(p0) : F32
+        \\      value n3
+        \\  value n4
+        \\
+    );
 }
 
-test "a written is_eq reached by != becomes a negated is_eq" {
+test "a written is_eq reached by != negates its body" {
     // Which of `==` and `!=` the author wrote rides on the dispatch plan when
     // the type writes its own `is_eq`, so a walk that reads only the checked
-    // node describes the comparison the body negates.
+    // node describes the comparison the body negates: the switch on the
+    // method's result has its arms swapped.
     const staged = try Staged.create(std.testing.allocator,
         \\Meters := F32.{
         \\    is_eq : Meters, Meters -> Bool
-        \\    is_eq = |Meters.(a), Meters.(b)| a == b
+        \\    is_eq = |Meters.(a), Meters.(b)| a <= b
         \\}
         \\
         \\wobble : { time : F32, uv : F32 } -> F32
@@ -714,15 +658,23 @@ test "a written is_eq reached by != becomes a negated is_eq" {
     );
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Unary", staged.tagName(condition));
-    try std.testing.expectEqualStrings("not", staged.strText(staged.payloads(condition)[0]));
-    const compare = staged.payloads(condition)[1];
-    try std.testing.expectEqualStrings("Binop", staged.tagName(compare));
-    try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(compare)[0]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x0 : F32
+        \\  n2 = Num.F32.is_lte(n0, n1) : Bool
+        \\  n4 = switch n2 : F32
+        \\    arm 0
+        \\      n3 = field 1(p0) : F32
+        \\      value n3
+        \\    arm 1
+        \\      value n0
+        \\  value n4
+        \\
+    );
 }
 
-test "a string a description names twice is one node" {
+test "a value a body reads twice is one node" {
     // A description names the same few strings over and over: one module name
     // per `Region`, one operator name per arithmetic node, one field name per
     // read of that field. A node id is a shared reference, so the second
@@ -733,19 +685,15 @@ test "a string a description names twice is one node" {
     );
     defer staged.destroy();
 
-    // `+` is left associative, so the outer node's left operand is the inner.
-    const outer = staged.payloads(try staged.body());
-    const inner = staged.payloads(outer[1]);
-    try std.testing.expectEqualStrings("plus", staged.strText(outer[0]));
-    try std.testing.expectEqual(outer[0], inner[0]);
-    try std.testing.expectEqual(staged.metaModule(outer[3]), staged.metaModule(inner[3]));
-
-    // `input.time` is read twice, and both reads name the field through one
-    // node.
-    const first = staged.payloads(inner[1]);
-    const second = staged.payloads(outer[2]);
-    try std.testing.expectEqualStrings("time", staged.strText(first[1]));
-    try std.testing.expectEqual(first[1], second[1]);
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = field 1(p0) : F32
+        \\  n2 = Num.F32.plus(n0, n1) : F32
+        \\  n3 = Num.F32.plus(n2, n0) : F32
+        \\  value n3
+        \\
+    );
 }
 
 test "a derived == on a record compares every field" {
@@ -759,24 +707,24 @@ test "a derived == on a record compares every field" {
     );
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Binop", staged.tagName(condition));
-    try std.testing.expectEqualStrings("and", staged.strText(staged.payloads(condition)[0]));
-
-    for (staged.payloads(condition)[1..3], 0..) |compare, index| {
-        try std.testing.expectEqualStrings("Binop", staged.tagName(compare));
-        try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(compare)[0]));
-
-        const left = staged.payloads(compare)[1];
-        const right = staged.payloads(compare)[2];
-        try std.testing.expectEqualStrings("Field", staged.tagName(left));
-        try std.testing.expectEqualStrings("Field", staged.tagName(right));
-        const field = if (index == 0) "time" else "uv";
-        try std.testing.expectEqualStrings(field, staged.strText(staged.payloads(left)[1]));
-        try std.testing.expectEqualStrings(field, staged.strText(staged.payloads(right)[1]));
-        try std.testing.expectEqualStrings("Param", staged.tagName(staged.payloads(left)[0]));
-        try std.testing.expectEqualStrings("MakeRecord", staged.tagName(staged.payloads(right)[0]));
-    }
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x0 : F32
+        \\  n2 = Num.F32.is_eq(n0, n1) : Bool
+        \\  n3 = field 1(p0) : F32
+        \\  n5 = and(n2) : Bool
+        \\    operand
+        \\      n4 = Num.F32.is_eq(n3, n1) : Bool
+        \\      value n4
+        \\  n6 = switch n5 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      value n3
+        \\  value n6
+        \\
+    );
 }
 
 test "a derived == on a nominal tuple compares every element" {
@@ -793,16 +741,25 @@ test "a derived == on a nominal tuple compares every element" {
     );
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Binop", staged.tagName(condition));
-    try std.testing.expectEqualStrings("and", staged.strText(staged.payloads(condition)[0]));
-
-    for (staged.payloads(condition)[1..3]) |compare| {
-        try std.testing.expectEqualStrings("Binop", staged.tagName(compare));
-        try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(compare)[0]));
-        try std.testing.expectEqualStrings("Index", staged.tagName(staged.payloads(compare)[1]));
-        try std.testing.expectEqualStrings("Index", staged.tagName(staged.payloads(compare)[2]));
-    }
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x0 : F32
+        \\  n2 = Num.F32.is_eq(n0, n1) : Bool
+        \\  n3 = field 1(p0) : F32
+        \\  n6 = and(n2) : Bool
+        \\    operand
+        \\      n4 = float 0x3f800000 : F32
+        \\      n5 = Num.F32.is_eq(n3, n4) : Bool
+        \\      value n5
+        \\  n7 = switch n6 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      value n3
+        \\  value n7
+        \\
+    );
 }
 
 test "a derived to_hash threads the hasher through every component" {
@@ -819,26 +776,19 @@ test "a derived to_hash threads the hasher through every component" {
     , "");
     defer staged.destroy();
 
-    // The outer call feeds the last component, so the inner one is the first.
-    const outer = try staged.body();
-    try std.testing.expectEqualStrings("Call", staged.tagName(outer));
-    try std.testing.expectEqualStrings("Builtin.Hasher.write_f32", staged.strText(staged.payloads(outer)[0]));
-
-    const outer_args = staged.listNodes(staged.payloads(outer)[1]);
-    try std.testing.expectEqual(@as(usize, 2), outer_args.len);
-    try std.testing.expectEqualStrings("b", staged.strText(staged.payloads(outer_args[1])[1]));
-
-    const inner = outer_args[0];
-    try std.testing.expectEqualStrings("Call", staged.tagName(inner));
-    try std.testing.expectEqualStrings("Builtin.Hasher.write_u64", staged.strText(staged.payloads(inner)[0]));
-
-    const inner_args = staged.listNodes(staged.payloads(inner)[1]);
-    try std.testing.expectEqualStrings("Field", staged.tagName(inner_args[0]));
-    try std.testing.expectEqualStrings("hasher", staged.strText(staged.payloads(inner_args[0])[1]));
-    try std.testing.expectEqualStrings("a", staged.strText(staged.payloads(inner_args[1])[1]));
+    try staged.expectDump(
+        \\row r0 ({ hasher : Builtin.Hasher, key : U64 }) -> Builtin.Hasher
+        \\  n0 = field 0(p0) : Builtin.Hasher
+        \\  n1 = field 1(p0) : U64
+        \\  n2 = Hasher.write_u64(n0, n1) : Builtin.Hasher !spec
+        \\  n3 = float 0x3f800000 : F32
+        \\  n4 = Hasher.write_f32(n2, n3) : Builtin.Hasher !spec
+        \\  value n4
+        \\
+    );
 }
 
-test "a derived to_hash the walk cannot reach stays a Derived node" {
+test "a derived to_hash the walk cannot expand stays a Derived node" {
     // `List` writes its own `to_hash`, so the compiler dispatches to it rather
     // than walking the list's representation. The reifier cannot see that
     // method, so it describes none of the derivation instead of part of it.
@@ -848,27 +798,15 @@ test "a derived to_hash the walk cannot reach stays a Derived node" {
     , "");
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Derived", staged.tagName(body));
-    try std.testing.expectEqualStrings("to_hash", staged.strText(staged.payloads(body)[0]));
-
-    // The subject is the type derived over, which no argument carries.
-    const subject = staged.payloads(body)[1];
-    try std.testing.expectEqualStrings("Record", staged.tagName(subject));
-    const subject_fields = staged.listNodes(staged.payloads(subject)[0]);
-    try std.testing.expectEqual(@as(usize, 1), subject_fields.len);
-    try std.testing.expectEqualStrings("a", staged.strText(staged.recordFields(subject_fields[0])[0]));
-
-    const args = staged.listNodes(staged.payloads(body)[2]);
-    try std.testing.expectEqual(@as(usize, 2), args.len);
-    try std.testing.expectEqualStrings("MakeRecord", staged.tagName(args[0]));
-    try std.testing.expectEqualStrings("hasher", staged.strText(staged.payloads(args[1])[1]));
-
-    // `Hasher` is opaque, so its `Ty` names it without its backing.
-    const ty = staged.metaTy(staged.payloads(body)[3]);
-    try std.testing.expectEqualStrings("Opaque", staged.tagName(ty));
-    try std.testing.expectEqualStrings("Builtin.Hasher", staged.strText(staged.payloads(ty)[0]));
-    try std.testing.expectEqual(@as(usize, 0), staged.listNodes(staged.payloads(ty)[1]).len);
+    try staged.expectDump(
+        \\row r0 ({ hasher : Builtin.Hasher, keys : List(U64) }) -> Builtin.Hasher
+        \\  n0 = field 1(p0) : List(U64)
+        \\  n1 = record(n0) : { a : List(U64) }
+        \\  n2 = field 0(p0) : Builtin.Hasher
+        \\  n3 = derived(n1, n2) : Builtin.Hasher !spec
+        \\  value n3
+        \\
+    );
 }
 
 test "a derived == through a nominal component that derives its own is_eq expands the backing" {
@@ -887,20 +825,30 @@ test "a derived == through a nominal component that derives its own is_eq expand
     );
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Binop", staged.tagName(condition));
-    try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(condition)[0]));
-    try std.testing.expectEqualStrings("Field", staged.tagName(staged.payloads(condition)[1]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x0 : F32
+        \\  n2 = Num.F32.is_eq(n0, n1) : Bool
+        \\  n4 = switch n2 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      n3 = field 1(p0) : F32
+        \\      value n3
+        \\  value n4
+        \\
+    );
 }
 
-test "a derived == through a nominal component that writes its own is_eq calls it" {
+test "a derived == through a nominal component that writes its own is_eq describes the method" {
     // The comparison Roc performs is the method, not the backing, so the
-    // description is the call and the method's body goes into the table the way
-    // any other callee's does.
+    // description is the method's `<=`, where the backing would compare with
+    // `is_eq`. Its row has one call, so V1 inlines it.
     const staged = try Staged.create(std.testing.allocator,
         \\Meters := { m: F32 }.{
         \\    is_eq : Meters, Meters -> Bool
-        \\    is_eq = |a, b| a.m == b.m
+        \\    is_eq = |a, b| a.m <= b.m
         \\}
         \\
         \\wobble : { time : F32, uv : F32 } -> F32
@@ -909,23 +857,27 @@ test "a derived == through a nominal component that writes its own is_eq calls i
     );
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Call", staged.tagName(condition));
-    try std.testing.expectEqualStrings("Meters.is_eq", staged.strText(staged.payloads(condition)[0]));
-    try std.testing.expectEqual(@as(usize, 2), staged.listNodes(staged.payloads(condition)[1]).len);
-
-    var written: ?ConstNodeId = null;
-    for (try staged.definitions()) |row| {
-        const fields = staged.recordFields(row);
-        if (std.mem.eql(u8, "Meters.is_eq", staged.strText(fields[1]))) written = fields[0];
-    }
-    try std.testing.expectEqualStrings("Lambda", staged.tagName(written.?));
-    try std.testing.expectEqualStrings("Binop", staged.tagName(staged.payloads(written.?)[1]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x0 : F32
+        \\  n2 = Num.F32.is_lte(n0, n1) : Bool
+        \\  n4 = switch n2 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      n3 = field 1(p0) : F32
+        \\      value n3
+        \\  value n4
+        \\
+    );
 }
 
-test "a derived to_hash through a nominal component that writes its own to_hash calls it" {
+test "a derived to_hash through a nominal component that writes its own to_hash describes the method" {
     // The same question, asked of the other derivation: a written `to_hash` is
-    // the one Roc threads the hasher through, so the recipe stops at the call.
+    // the one Roc threads the hasher through, so the recipe is the method's
+    // `U64.to_hash`, where the backing would write the field with
+    // `Hasher.write_u64`. Its row has one call, so V1 inlines it.
     const staged = try Staged.createRunning(std.testing.allocator,
         \\Meters := { m: U64 }.{
         \\    to_hash : Meters, Hasher -> Hasher
@@ -937,15 +889,72 @@ test "a derived to_hash through a nominal component that writes its own to_hash 
     , "");
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Call", staged.tagName(body));
-    try std.testing.expectEqualStrings("Meters.to_hash", staged.strText(staged.payloads(body)[0]));
+    try staged.expectDump(
+        \\row r0 ({ hasher : Builtin.Hasher, key : Meters }) -> Builtin.Hasher
+        \\  n0 = field 1(p0) : Meters
+        \\  n1 = unwrap(n0) : { m : U64 }
+        \\  n2 = field 0(n1) : U64
+        \\  n3 = field 0(p0) : Builtin.Hasher
+        \\  n4 = Num.U64.to_hash(n2, n3) : Builtin.Hasher !spec
+        \\  value n4
+        \\
+    );
+}
 
-    // `to_hash : value, Hasher -> Hasher`, so the value comes first.
-    const args = staged.listNodes(staged.payloads(body)[1]);
-    try std.testing.expectEqual(@as(usize, 2), args.len);
-    try std.testing.expectEqualStrings("a", staged.strText(staged.payloads(args[0])[1]));
-    try std.testing.expectEqualStrings("hasher", staged.strText(staged.payloads(args[1])[1]));
+test "a generic method a derivation reaches dispatches on what its receiver fixes" {
+    // The method compares its quantified field, so its body forwards the
+    // `is_eq` obligation to the call that instantiated it. A derivation is
+    // no call and supplies no evidence, but the receiver fixed the field's
+    // type, so the target is the method that type declares.
+    const staged = try Staged.createRunning(std.testing.allocator,
+        \\Boxed(a) := { v : a }.{
+        \\    is_eq : Boxed(a), Boxed(a) -> Bool where [a.is_eq : a, a -> Bool]
+        \\    is_eq = |x, y| x.v == y.v
+        \\}
+        \\
+        \\wobble : { key : U64, uv : F32 } -> F32
+        \\wobble = |input|
+        \\    if { w: Boxed.({ v: input.key }) } == { w: Boxed.({ v: 7.U64 }) } input.uv else 0.0.F32
+    , "");
+    defer staged.destroy();
+
+    try staged.expectDump(
+        \\row r0 ({ key : U64, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : U64
+        \\  n3 = switch n0 : F32
+        \\    arm 7
+        \\      n1 = field 1(p0) : F32
+        \\      value n1
+        \\    default
+        \\      n2 = float 0x0 : F32
+        \\      value n2
+        \\  value n3
+        \\
+    );
+}
+
+test "an opaque nominal's own method is named, not walked" {
+    // The method's body reads the representation the type hides, and a
+    // stage is outside the type's module, so the description is the call.
+    const staged = try Staged.createRunning(std.testing.allocator,
+        \\Sealed :: { x : U64 }.{
+        \\    is_eq : Sealed, Sealed -> Bool
+        \\    is_eq = |a, b| a.x == b.x
+        \\}
+        \\
+        \\wobble : { a : Sealed, b : Sealed } -> Bool
+        \\wobble = |input| { m: input.a } == { m: input.b }
+    , "");
+    defer staged.destroy();
+
+    try staged.expectDump(
+        \\row r0 ({ a : Sealed, b : Sealed }) -> Bool
+        \\  n0 = field 0(p0) : Sealed
+        \\  n1 = field 1(p0) : Sealed
+        \\  n2 = Sealed.is_eq(n0, n1) : Bool !spec
+        \\  value n2
+        \\
+    );
 }
 
 test "a generic nominal component's own is_eq describes at the instantiation its receiver fixes" {
@@ -953,30 +962,34 @@ test "a generic nominal component's own is_eq describes at the instantiation its
     // says what the method's quantified variables stand for. The receiver says
     // it: the method's first parameter is the value the derivation compares,
     // and pairing the two binds the scheme by shape. Without that pairing the
-    // call keeps its name and the table holds no row for it.
-    const staged = try Staged.create(std.testing.allocator,
+    // call keeps its name and the table holds no row for it. The body
+    // compares only `tag`, so the description reads `input.k` and never
+    // `v`, where a derived `is_eq` would compare both.
+    const staged = try Staged.createRunning(std.testing.allocator,
         \\Boxed(a) := { v : a, tag : U64 }.{
         \\    is_eq : Boxed(a), Boxed(a) -> Bool
         \\    is_eq = |x, y| x.tag == y.tag
         \\}
         \\
-        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble : { k : U64, time : F32, uv : F32 } -> F32
         \\wobble = |input|
-        \\    if { w: Boxed.({ v: input.time, tag: 1.U64 }) } == { w: Boxed.({ v: 0.0.F32, tag: 2.U64 }) } input.uv else input.time
-    );
+        \\    if { w: Boxed.({ v: input.time, tag: input.k }) } == { w: Boxed.({ v: 0.0.F32, tag: 2.U64 }) } input.uv else input.time
+    , "");
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Call", staged.tagName(condition));
-    try std.testing.expectEqualStrings("Boxed.is_eq", staged.strText(staged.payloads(condition)[0]));
-
-    var written: ?ConstNodeId = null;
-    for (try staged.definitions()) |row| {
-        const fields = staged.recordFields(row);
-        if (std.mem.eql(u8, "Boxed.is_eq", staged.strText(fields[1]))) written = fields[0];
-    }
-    try std.testing.expectEqualStrings("Lambda", staged.tagName(written.?));
-    try std.testing.expectEqualStrings("Binop", staged.tagName(staged.payloads(written.?)[1]));
+    try staged.expectDump(
+        \\row r0 ({ k : U64, time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : U64
+        \\  n3 = switch n0 : F32
+        \\    arm 2
+        \\      n1 = field 2(p0) : F32
+        \\      value n1
+        \\    default
+        \\      n2 = field 1(p0) : F32
+        \\      value n2
+        \\  value n3
+        \\
+    );
 }
 
 test "a derived == through a builtin container calls the builtin's own is_eq" {
@@ -994,10 +1007,21 @@ test "a derived == through a builtin container calls the builtin's own is_eq" {
     , "");
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Call", staged.tagName(condition));
-    try std.testing.expectEqualStrings("List.is_eq", staged.strText(staged.payloads(condition)[0]));
-    try std.testing.expectEqual(@as(usize, 2), staged.listNodes(staged.payloads(condition)[1]).len);
+    try staged.expectDump(
+        \\row r0 ({ uv : F32, xs : List(U16), ys : List(U16) }) -> F32
+        \\  n0 = field 1(p0) : List(U16)
+        \\  n1 = field 2(p0) : List(U16)
+        \\  n2 = List.is_eq(n0, n1) : Bool
+        \\  n5 = switch n2 : F32
+        \\    arm 0
+        \\      n3 = float 0x0 : F32
+        \\      value n3
+        \\    arm 1
+        \\      n4 = field 0(p0) : F32
+        \\      value n4
+        \\  value n5
+        \\
+    );
 }
 
 test "Str.inspect of a builtin container calls the container's own to_inspect" {
@@ -1010,12 +1034,13 @@ test "Str.inspect of a builtin container calls the container's own to_inspect" {
     , "");
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Call", staged.tagName(body));
-    try std.testing.expectEqualStrings("Builtin.Dict.to_inspect", staged.strText(staged.payloads(body)[0]));
-    const args = staged.listNodes(staged.payloads(body)[1]);
-    try std.testing.expectEqual(@as(usize, 1), args.len);
-    try std.testing.expectEqualStrings("d", staged.strText(staged.payloads(args[0])[1]));
+    try staged.expectDump(
+        \\row r0 ({ d : Builtin.Dict(Str, U64), uv : F32 }) -> Str
+        \\  n0 = field 0(p0) : Builtin.Dict(Str, U64)
+        \\  n1 = Dict.to_inspect(n0) : Str !spec
+        \\  value n1
+        \\
+    );
 }
 
 test "Str.inspect of a record holding a builtin container stays a Derived node" {
@@ -1028,24 +1053,19 @@ test "Str.inspect of a record holding a builtin container stays a Derived node" 
     , "");
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Derived", staged.tagName(body));
-    try std.testing.expectEqualStrings("to_inspect", staged.strText(staged.payloads(body)[0]));
-
-    const subject = staged.payloads(body)[1];
-    try std.testing.expectEqualStrings("Record", staged.tagName(subject));
-    const subject_fields = staged.listNodes(staged.payloads(subject)[0]);
-    try std.testing.expectEqual(@as(usize, 1), subject_fields.len);
-    try std.testing.expectEqualStrings("d", staged.strText(staged.recordFields(subject_fields[0])[0]));
-
-    const args = staged.listNodes(staged.payloads(body)[2]);
-    try std.testing.expectEqual(@as(usize, 1), args.len);
-    try std.testing.expectEqualStrings("MakeRecord", staged.tagName(args[0]));
+    try staged.expectDump(
+        \\row r0 ({ d : Builtin.Dict(Str, U64), uv : F32 }) -> Str
+        \\  n0 = field 0(p0) : Builtin.Dict(Str, U64)
+        \\  n1 = record(n0) : { d : Builtin.Dict(Str, U64) }
+        \\  n2 = derived(n1) : Str !spec
+        \\  value n2
+        \\
+    );
 }
 
-test "Str.inspect of a nominal that writes an eligible to_inspect calls it" {
-    // The written method is the rendering, so its body goes into the table
-    // the way any other callee's does.
+test "Str.inspect of a nominal that writes an eligible to_inspect describes it" {
+    // The written method is the rendering, so the description is its body.
+    // Its row has one call, so V1 inlines it.
     const staged = try Staged.createRunning(std.testing.allocator,
         \\Meters := { m : F32 }.{
         \\    to_inspect : Meters -> Str
@@ -1057,16 +1077,12 @@ test "Str.inspect of a nominal that writes an eligible to_inspect calls it" {
     , "");
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Call", staged.tagName(body));
-    try std.testing.expectEqualStrings("Meters.to_inspect", staged.strText(staged.payloads(body)[0]));
-
-    var written: ?ConstNodeId = null;
-    for (try staged.definitions()) |row| {
-        const fields = staged.recordFields(row);
-        if (std.mem.eql(u8, "Meters.to_inspect", staged.strText(fields[1]))) written = fields[0];
-    }
-    try std.testing.expectEqualStrings("Lambda", staged.tagName(written.?));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> Str
+        \\  n0 = "meters" : Str
+        \\  value n0
+        \\
+    );
 }
 
 test "Str.inspect ignores a to_inspect that is not an inspect override" {
@@ -1084,9 +1100,15 @@ test "Str.inspect ignores a to_inspect that is not an inspect override" {
     , "");
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Derived", staged.tagName(body));
-    try std.testing.expectEqualStrings("to_inspect", staged.strText(staged.payloads(body)[0]));
+    try staged.expectDump(
+        \\row r0 ({ n : U64, uv : F32 }) -> Str
+        \\  n0 = field 0(p0) : U64
+        \\  n1 = record(n0) : { v : U64 }
+        \\  n2 = wrap(n1) : Wrap
+        \\  n3 = derived(n2) : Str !spec
+        \\  value n3
+        \\
+    );
 }
 
 test "a derived == through an opaque nominal component that derives its own is_eq is refused" {
@@ -1107,7 +1129,7 @@ test "a derived == through an opaque nominal component that derives its own is_e
     );
     defer staged.destroy();
 
-    try std.testing.expectError(error.StagedBodyRejected, staged.body());
+    try staged.expectRejected("a value of an opaque type");
 }
 
 test "a derived == on a type with one inhabitant is True" {
@@ -1119,11 +1141,12 @@ test "a derived == on a type with one inhabitant is True" {
     );
     defer staged.destroy();
 
-    const condition = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Lit", staged.tagName(condition));
-    const literal = staged.payloads(condition)[0];
-    try std.testing.expectEqualStrings("Bool", staged.tagName(literal));
-    try std.testing.expectEqualStrings("True", staged.tagName(staged.payloads(literal)[0]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  value n0
+        \\
+    );
 }
 
 test "an effectful staged function is refused" {
@@ -1140,13 +1163,13 @@ test "an effectful staged function is refused" {
     , "_staged = wobble!({ time: 1.0.F32, uv: 2.0.F32 })");
     defer staged.destroy();
 
-    try std.testing.expectError(error.StagedBodyRejected, staged.body());
+    try staged.expectRejected("an effectful function");
 }
 
 test "a top-level constant folds into the description where its name stands" {
     // The value is written where the name was, so a translator never learns a
     // name stood between the body and the value. The fold is by value: no
-    // capture, no closure environment, and no new `Ir` node.
+    // capture, no closure environment, and no node beyond the literal.
     const staged = try Staged.create(std.testing.allocator,
         \\threshold = 0.5.F32
         \\
@@ -1155,15 +1178,14 @@ test "a top-level constant folds into the description where its name stands" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Binop", staged.tagName(body));
-
-    const rhs = staged.payloads(body)[2];
-    try std.testing.expectEqualStrings("Lit", staged.tagName(rhs));
-    const literal = staged.payloads(rhs)[0];
-    try std.testing.expectEqualStrings("Frac", staged.tagName(literal));
-    const bits = staged.store.get(staged.payloads(literal)[0]).scalar.f64_bits;
-    try std.testing.expectEqual(@as(f64, 0.5), @as(f64, @bitCast(bits)));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = float 0x3f000000 : F32
+        \\  n2 = Num.F32.times(n0, n1) : F32
+        \\  value n2
+        \\
+    );
 }
 
 test "a name as a template argument folds to the value it holds" {
@@ -1182,17 +1204,19 @@ test "a name as a template argument folds to the value it holds" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    const rhs = staged.payloads(body)[2];
-    try std.testing.expectEqualStrings("Lit", staged.tagName(rhs));
-    const literal = staged.payloads(rhs)[0];
-    const bits = staged.store.get(staged.payloads(literal)[0]).scalar.f64_bits;
-    try std.testing.expectEqual(@as(f64, 3.5), @as(f64, @bitCast(bits)));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = float 0x40600000 : F32
+        \\  n2 = Num.F32.times(n0, n1) : F32
+        \\  value n2
+        \\
+    );
 }
 
-test "a top-level name the compiler cannot fix stays refused" {
-    // The boundary is the one a template argument already drew: a value the
-    // compiler fixes folds, and a value the running program computes does not.
+test "a computed top-level value folds to the computation its definition wrote" {
+    // The definition names only things the compiler fixes, so it is walked
+    // where the name stands, the way a call to a top-level function is.
     const staged = try Staged.create(std.testing.allocator,
         \\grow : F32 -> F32
         \\grow = |x| x + 1.0.F32
@@ -1204,25 +1228,62 @@ test "a top-level name the compiler cannot fix stays refused" {
     );
     defer staged.destroy();
 
-    try std.testing.expectError(error.StagedBodyRejected, staged.body());
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = float 0x3f000000 : F32
+        \\  n2 = float 0x3f800000 : F32
+        \\  n3 = Num.F32.plus(n1, n2) : F32
+        \\  n4 = Num.F32.times(n0, n3) : F32
+        \\  value n4
+        \\
+    );
+}
+
+test "a top-level value that computes a function stays refused" {
+    // A function a call hands back names no definition, so there is no row
+    // for the call on it to name.
+    const staged = try Staged.create(std.testing.allocator,
+        \\make : F32 -> (F32 -> F32)
+        \\make = |k| |x| x * k
+        \\
+        \\doubler = make(2.0.F32)
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| doubler(input.uv)
+    );
+    defer staged.destroy();
+
+    try staged.expectRejected("a top-level constant that computes a function");
 }
 
 test "a default operand describes as the match it desugars to" {
     // `??` canonicalizes to a match with an `Ok` passthrough branch, and the
     // name that branch binds is the compiler's. The walk gives it one of its
     // own rather than refusing the branch.
-    const staged = try Staged.create(std.testing.allocator,
+    const staged = try Staged.createRunning(std.testing.allocator,
         \\pick : Try(F32, [Bad]), F32 -> F32
         \\pick = |t, fallback| t ?? fallback
         \\
-        \\wobble : { time : F32, uv : F32 } -> F32
-        \\wobble = |input| pick(Ok(input.time), input.uv)
-    );
+        \\wobble : { t : Try(F32, [Bad]), uv : F32 } -> F32
+        \\wobble = |input| pick(input.t, input.uv)
+    , "");
     defer staged.destroy();
 
-    // `pick` describes as a row of its own, and the call in `wobble` names it.
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Call", staged.tagName(body));
+    try staged.expectDump(
+        \\row r0 ({ t : Builtin.Try, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : Builtin.Try
+        \\  n1 = unwrap(n0) : [Err([Bad]), Ok(F32)]
+        \\  n4 = switch n1 : F32 !spec
+        \\    arm 0
+        \\      n2 = field 1(p0) : F32
+        \\      value n2
+        \\    arm 1
+        \\      n3 = payload Ok.0(n1) : F32 !spec
+        \\      value n3
+        \\  value n4
+        \\
+    );
 }
 
 test "an as pattern keeps the name it binds beside the pattern it renames" {
@@ -1234,26 +1295,79 @@ test "an as pattern keeps the name it binds beside the pattern it renames" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Match", staged.tagName(body));
-    const branches = staged.listNodes(staged.payloads(body)[1]);
-    try std.testing.expectEqual(@as(usize, 1), branches.len);
-    // A `Branch` is `{ guard, patterns, value }` in label order.
-    const patterns = staged.listNodes(staged.recordFields(branches[0])[1]);
-    try std.testing.expectEqualStrings("PatAs", staged.tagName(patterns[0]));
-    try std.testing.expectEqualStrings("PatRecord", staged.tagName(staged.payloads(patterns[0])[0]));
-    try std.testing.expectEqualStrings("whole", staged.strText(staged.payloads(patterns[0])[1]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  value n0
+        \\
+    );
 }
 
-test "a `?` written inside an expression lifts the match out past the expression" {
+test "a `?` written inside an expression is an exiting switch whose continuation is the expression" {
     // `?` desugars to the same match `??` does, with the `Err` branch
-    // returning early instead of holding a default. Written inside an
-    // expression the transfer would skip that expression, and the `Ir` has
-    // no node that skips work. Lifting the match out past it leaves the
-    // surviving branch holding the whole expression, and no transfer at all.
-    const staged = try Staged.create(std.testing.allocator,
+    // returning early instead of holding a default. The switch exits, and
+    // the rest of the expression continues in its join; the exit rules move
+    // that join into the `Ok` arm, so both arms end the row with a value.
+    // The body's own type has an empty error row, because the checker
+    // composes the `?` result from it (design.md "Try Return-Row
+    // Composition"), so the `Ok` is built at the function's result. `pick`
+    // has one call, so V1 inlines it, and the site's `match` reads the
+    // switch the exit rules built.
+    const staged = try Staged.createRunning(std.testing.allocator,
         \\pick : Try(F32, [Bad]) -> Try(F32, [Bad])
         \\pick = |t| Ok(t? * 2.0.F32)
+        \\
+        \\wobble : { t : Try(F32, [Bad]), uv : F32 } -> F32
+        \\wobble = |input| match pick(input.t) {
+        \\    Ok(v) => v
+        \\    Err(_) => input.uv
+        \\}
+    , "");
+    defer staged.destroy();
+
+    try staged.expectDump(
+        \\row r0 ({ t : Builtin.Try, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : Builtin.Try
+        \\  n1 = unwrap(n0) : [Err([Bad]), Ok(F32)]
+        \\  n10 = switch n1 : Builtin.Try !spec
+        \\    arm 0
+        \\      n2 = payload Err.0(n1) : [Bad] !spec
+        \\      n3 = tag Err(n2) : [Err([Bad]), Ok(F32)]
+        \\      n4 = wrap(n3) : Builtin.Try
+        \\      value n4
+        \\    arm 1
+        \\      n5 = payload Ok.0(n1) : F32 !spec
+        \\      n6 = float 0x40000000 : F32
+        \\      n7 = Num.F32.times(n5, n6) : F32
+        \\      n8 = tag Ok(n7) : [Err([Bad]), Ok(F32)]
+        \\      n9 = wrap(n8) : Builtin.Try
+        \\      value n9
+        \\  n11 = unwrap(n10) : [Err([Bad]), Ok(F32)]
+        \\  n14 = switch n11 : F32 !spec
+        \\    arm 0
+        \\      n12 = field 1(p0) : F32
+        \\      value n12
+        \\    arm 1
+        \\      n13 = payload Ok.0(n11) : F32 !spec
+        \\      value n13
+        \\  value n14
+        \\
+    );
+}
+
+test "a `?` body that delivers a name of its narrower row conforms to the result" {
+    // The body's value is bound before it is returned, so no constructor
+    // stands at the return to build at the function's result. The value
+    // keeps its own empty error row, and no node takes it to the result's
+    // (design.md "Row Coercion Primitive": the value-only sibling of the `?`
+    // return boundary). The tag keeps its name, so the `match` reads it
+    // through the `Wrap` and `Unwrap` and decides on `Ok`.
+    const staged = try Staged.create(std.testing.allocator,
+        \\pick : Try(F32, [Bad]) -> Try(F32, [Bad])
+        \\pick = |t| {
+        \\    x = Ok(t? * 2.0.F32)
+        \\    x
+        \\}
         \\
         \\wobble : { time : F32, uv : F32 } -> F32
         \\wobble = |input| match pick(Ok(input.time)) {
@@ -1263,23 +1377,165 @@ test "a `?` written inside an expression lifts the match out past the expression
     );
     defer staged.destroy();
 
-    var lambda: ?ConstNodeId = null;
-    for (try staged.definitions()) |row| {
-        const fields = staged.recordFields(row);
-        if (std.mem.eql(u8, "main.pick", staged.strText(fields[1]))) lambda = fields[0];
-    }
-    const pick = staged.payloads(lambda.?)[1];
-    try std.testing.expectEqualStrings("Match", staged.tagName(pick));
-    const branches = staged.listNodes(staged.payloads(pick)[1]);
-    try std.testing.expectEqual(@as(usize, 2), branches.len);
-    // `Ok(v) => Ok(v * 2.0)`: the branch holds what the `?` was written
-    // inside, and the `Err` branch forwards the error it matched.
-    const ok = staged.recordFields(branches[0])[2];
-    try std.testing.expectEqualStrings("MakeTag", staged.tagName(ok));
-    try std.testing.expectEqualStrings("Binop", staged.tagName(staged.listNodes(staged.payloads(ok)[1])[0]));
-    const err = staged.recordFields(branches[1])[2];
-    try std.testing.expectEqualStrings("MakeTag", staged.tagName(err));
-    try std.testing.expectEqualStrings("Err", staged.strText(staged.payloads(err)[0]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x40000000 : F32
+        \\  n2 = Num.F32.times(n0, n1) : F32
+        \\  value n2
+        \\
+    );
+}
+
+test "a `?` body that delivers a name of its narrower row reaches a wider match with no node between" {
+    // The argument is not known, so the `match` stays a switch. `n8` is the
+    // tag `Ok` at the narrower union of the body, which the `Wrap` takes to
+    // the wider `Builtin.Try` by conformance. The tag keeps its name, and
+    // the `match` reads it by name.
+    const staged = try Staged.createRunning(std.testing.allocator,
+        \\pick : Try(F32, [Bad]) -> Try(F32, [Bad])
+        \\pick = |t| {
+        \\    x = Ok(t? * 2.0.F32)
+        \\    x
+        \\}
+        \\
+        \\wobble : { t : Try(F32, [Bad]), uv : F32 } -> F32
+        \\wobble = |input| match pick(input.t) {
+        \\    Ok(v) => v
+        \\    Err(_) => input.uv
+        \\}
+    , "");
+    defer staged.destroy();
+
+    try staged.expectDump(
+        \\row r0 ({ t : Builtin.Try, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : Builtin.Try
+        \\  n1 = unwrap(n0) : [Err([Bad]), Ok(F32)]
+        \\  n10 = switch n1 : Builtin.Try !spec
+        \\    arm 0
+        \\      n2 = payload Err.0(n1) : [Bad] !spec
+        \\      n3 = tag Err(n2) : [Err([Bad]), Ok(F32)]
+        \\      n4 = wrap(n3) : Builtin.Try
+        \\      value n4
+        \\    arm 1
+        \\      n5 = payload Ok.0(n1) : F32 !spec
+        \\      n6 = float 0x40000000 : F32
+        \\      n7 = Num.F32.times(n5, n6) : F32
+        \\      n8 = tag Ok(n7) : [Err([]), Ok(F32)]
+        \\      n9 = wrap(n8) : Builtin.Try
+        \\      value n9
+        \\  n11 = unwrap(n10) : [Err([Bad]), Ok(F32)]
+        \\  n14 = switch n11 : F32 !spec
+        \\    arm 0
+        \\      n12 = field 1(p0) : F32
+        \\      value n12
+        \\    arm 1
+        \\      n13 = payload Ok.0(n11) : F32 !spec
+        \\      value n13
+        \\  value n14
+        \\
+    );
+}
+
+test "a helper that closes a row, read at a wider union, describes as the same code written inline" {
+    const inline_code = try Staged.create(std.testing.allocator,
+        \\describe : [Big, Huge, Small] -> F32
+        \\describe = |tag| match tag {
+        \\    Big => 2.0.F32
+        \\    Huge => 3.0.F32
+        \\    Small => 4.0.F32
+        \\}
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| describe(match (if input.uv < 1.0.F32 Small else Big) {
+        \\    Big => Small
+        \\    Small => Big
+        \\})
+    );
+    defer inline_code.destroy();
+    const helper = try Staged.create(std.testing.allocator,
+        \\describe : [Big, Huge, Small] -> F32
+        \\describe = |tag| match tag {
+        \\    Big => 2.0.F32
+        \\    Huge => 3.0.F32
+        \\    Small => 4.0.F32
+        \\}
+        \\
+        \\size : [Big, Small] -> [Big, Small]
+        \\size = |x| match x {
+        \\    Big => Small
+        \\    Small => Big
+        \\}
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| describe(size(if input.uv < 1.0.F32 Small else Big))
+    );
+    defer helper.destroy();
+    try std.testing.expectEqualStrings(inline_code.dump.items, helper.dump.items);
+}
+
+test "a match over a helper's closed row keeps the arm of a tag only the match lists" {
+    // `size` closes its row to `[Big, Small]`, and the match lists `Huge` too.
+    // The call is read at the match's union, so the tags `size` builds are
+    // built at it once the call is inlined, and the match keeps its `Huge` arm.
+    const staged = try Staged.create(std.testing.allocator,
+        \\size : F32 -> [Big, Small]
+        \\size = |x| if x < 1.0.F32 Small else Big
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| match size(input.uv) {
+        \\    Big => input.uv
+        \\    Huge => 3.0.F32
+        \\    Small => input.time
+        \\}
+    );
+    defer staged.destroy();
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = float 0x3f800000 : F32
+        \\  n2 = Num.F32.is_lt(n0, n1) : Bool
+        \\  n5 = switch n2 : [Big, Huge, Small]
+        \\    arm 0
+        \\      n3 = tag Big() : [Big, Huge, Small]
+        \\      value n3
+        \\    arm 1
+        \\      n4 = tag Small() : [Big, Huge, Small]
+        \\      value n4
+        \\  n8 = switch n5 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      n6 = float 0x40400000 : F32
+        \\      value n6
+        \\    arm 2
+        \\      n7 = field 0(p0) : F32
+        \\      value n7
+        \\  value n8
+        \\
+    );
+}
+
+test "a match over a helper with one tag lists a tag the helper cannot build" {
+    // The helper's own union has one member, `Small`. The call is read at the
+    // match's union, and the value is known to be `Small`.
+    const staged = try Staged.create(std.testing.allocator,
+        \\only : F32 -> [Small]
+        \\only = |_x| Small
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| match only(input.uv) {
+        \\    Huge => 3.0.F32
+        \\    Small => input.time
+        \\}
+    );
+    defer staged.destroy();
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  value n0
+        \\
+    );
 }
 
 test "a numeral of the author's own type describes as the conversion that makes it" {
@@ -1302,35 +1558,7 @@ test "a numeral of the author's own type describes as the conversion that makes 
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    try std.testing.expectEqualStrings("Meters.scale", staged.strText(staged.payloads(body)[0]));
-
-    const conversion = staged.listNodes(staged.payloads(body)[1])[0];
-    try std.testing.expectEqualStrings("Call", staged.tagName(conversion));
-    try std.testing.expectEqualStrings(
-        "Meters.from_numeral",
-        staged.strText(staged.payloads(conversion)[0]),
-    );
-    // The call carries the nominal it makes, so a translator reads `Meters`
-    // from the conversion rather than from the literal under it.
-    try std.testing.expectEqualStrings(
-        "Named",
-        staged.tagName(staged.metaTy(staged.payloads(conversion)[2])),
-    );
-
-    const literal = staged.listNodes(staged.payloads(conversion)[1])[0];
-    try std.testing.expectEqualStrings("Lit", staged.tagName(literal));
-    const value = staged.payloads(literal)[0];
-    try std.testing.expectEqualStrings("Frac", staged.tagName(value));
-    try std.testing.expectEqualStrings("F64", staged.tagName(staged.payloads(value)[1]));
-    const bits = staged.store.get(staged.payloads(value)[0]).scalar.f64_bits;
-    try std.testing.expectEqual(@as(f64, 3.0), @as(f64, @bitCast(bits)));
-
-    // `from_numeral` reads `Numeral` internals, so the walk cannot describe
-    // its body and the name stands alone, the way a builtin's does.
-    for (try staged.definitions()) |row| {
-        try std.testing.expect(!std.mem.eql(u8, "Meters.from_numeral", staged.strText(staged.recordFields(row)[1])));
-    }
+    try staged.expectRejected("a conversion whose argument the compiler generates");
 }
 
 test "a whole numeral of the author's own type takes the widest integer the union holds" {
@@ -1350,13 +1578,7 @@ test "a whole numeral of the author's own type takes the widest integer the unio
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    const conversion = staged.listNodes(staged.payloads(body)[1])[0];
-    const literal = staged.listNodes(staged.payloads(conversion)[1])[0];
-    const value = staged.payloads(literal)[0];
-    try std.testing.expectEqualStrings("Int", staged.tagName(value));
-    try std.testing.expectEqualStrings("I128", staged.tagName(staged.payloads(value)[1]));
-    try std.testing.expectEqual(@as(i128, 7), staged.store.get(staged.payloads(value)[0]).scalar.i128);
+    try staged.expectRejected("a conversion whose argument the compiler generates");
 }
 
 test "a quoted literal of the author's own type describes as its conversion" {
@@ -1375,34 +1597,8 @@ test "a quoted literal of the author's own type describes as its conversion" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    const conversion = staged.listNodes(staged.payloads(body)[1])[0];
-    try std.testing.expectEqualStrings("Call", staged.tagName(conversion));
-    try std.testing.expectEqualStrings(
-        "Name.from_quote",
-        staged.strText(staged.payloads(conversion)[0]),
-    );
-
-    const literal = staged.listNodes(staged.payloads(conversion)[1])[0];
-    const value = staged.payloads(literal)[0];
-    try std.testing.expectEqualStrings("Str", staged.tagName(value));
-    try std.testing.expectEqualStrings("hi", staged.strText(staged.payloads(value)[0]));
+    try staged.expectRejected("a conversion whose argument the compiler generates");
 }
-
-/// A nominal whose `from_numeral` and `is_eq` are both written, so a literal
-/// pattern against it names both rather than expanding either.
-const count_nominal =
-    \\Count := { n : U32 }.{
-    \\    from_numeral : Numeral -> Try(Count, [InvalidNumeral(Str)])
-    \\    from_numeral = |v| match U32.from_numeral(v) {
-    \\        Ok(u) => Ok({ n: u })
-    \\        Err(e) => Err(e)
-    \\    }
-    \\    is_eq : Count, Count -> Bool
-    \\    is_eq = |a, b| a.n == b.n
-    \\}
-    \\
-;
 
 test "a numeral pattern of the author's own type carries its conversion as a condition" {
     // The checker turns the pattern into a binder and an equality against the
@@ -1417,34 +1613,7 @@ test "a numeral pattern of the author's own type carries its conversion as a con
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    const branches = staged.listNodes(staged.payloads(body)[1]);
-    // A `Branch` is `{ guard, patterns, value }` in label order.
-    const patterns = staged.listNodes(staged.recordFields(branches[0])[1]);
-    try std.testing.expectEqualStrings("PatGuard", staged.tagName(patterns[0]));
-
-    // The pattern binds the matched value under a name the walk invented,
-    // because `7` is no name an author could have written.
-    const bound = staged.payloads(patterns[0])[0];
-    try std.testing.expectEqualStrings("Bind", staged.tagName(bound));
-    try std.testing.expectEqualStrings("bind#0", staged.strText(staged.payloads(bound)[0]));
-
-    const condition = staged.payloads(patterns[0])[1];
-    try std.testing.expectEqualStrings("Binop", staged.tagName(condition));
-    try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(condition)[0]));
-
-    const lhs = staged.payloads(condition)[1];
-    try std.testing.expectEqualStrings("Local", staged.tagName(lhs));
-    try std.testing.expectEqualStrings("bind#0", staged.strText(staged.payloads(lhs)[0]));
-
-    const rhs = staged.payloads(condition)[2];
-    try std.testing.expectEqualStrings("Call", staged.tagName(rhs));
-    try std.testing.expectEqualStrings("Count.from_numeral", staged.strText(staged.payloads(rhs)[0]));
-    const literal = staged.listNodes(staged.payloads(rhs)[1])[0];
-    try std.testing.expectEqual(
-        @as(i128, 7),
-        staged.store.get(staged.payloads(staged.payloads(literal)[0])[0]).scalar.i128,
-    );
+    try staged.expectRejected("a conversion whose argument the compiler generates");
 }
 
 test "each alternative of a branch carries its own condition" {
@@ -1459,22 +1628,7 @@ test "each alternative of a branch carries its own condition" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    const branches = staged.listNodes(staged.payloads(body)[1]);
-    const patterns = staged.listNodes(staged.recordFields(branches[0])[1]);
-    try std.testing.expectEqual(@as(usize, 2), patterns.len);
-
-    // The branch keeps one branch and one value, and no guard of its own.
-    try std.testing.expectEqualStrings("NoGuard", staged.tagName(staged.recordFields(branches[0])[0]));
-
-    var names: [2][]const u8 = undefined;
-    for (patterns, 0..) |pattern, index| {
-        try std.testing.expectEqualStrings("PatGuard", staged.tagName(pattern));
-        names[index] = staged.strText(staged.payloads(staged.payloads(pattern)[0])[0]);
-        const condition = staged.payloads(pattern)[1];
-        try std.testing.expectEqualStrings(names[index], staged.strText(staged.payloads(staged.payloads(condition)[1])[0]));
-    }
-    try std.testing.expect(!std.mem.eql(u8, names[0], names[1]));
+    try staged.expectRejected("a conversion whose argument the compiler generates");
 }
 
 test "a literal pattern inside a variant keeps its condition where it stands" {
@@ -1488,12 +1642,7 @@ test "a literal pattern inside a variant keeps its condition where it stands" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    const branches = staged.listNodes(staged.payloads(body)[1]);
-    const patterns = staged.listNodes(staged.recordFields(branches[0])[1]);
-    try std.testing.expectEqualStrings("Variant", staged.tagName(patterns[0]));
-    const payload = staged.listNodes(staged.payloads(patterns[0])[1])[0];
-    try std.testing.expectEqualStrings("PatGuard", staged.tagName(payload));
+    try staged.expectRejected("a conversion whose argument the compiler generates");
 }
 
 test "a quoted pattern of the author's own type carries its conversion too" {
@@ -1513,13 +1662,7 @@ test "a quoted pattern of the author's own type carries its conversion too" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    const branches = staged.listNodes(staged.payloads(body)[1]);
-    const patterns = staged.listNodes(staged.recordFields(branches[0])[1]);
-    try std.testing.expectEqualStrings("PatGuard", staged.tagName(patterns[0]));
-    const condition = staged.payloads(patterns[0])[1];
-    const rhs = staged.payloads(condition)[2];
-    try std.testing.expectEqualStrings("Name.from_quote", staged.strText(staged.payloads(rhs)[0]));
+    try staged.expectRejected("a conversion whose argument the compiler generates");
 }
 
 test "a derived equality expands inside the condition it stands in" {
@@ -1543,13 +1686,7 @@ test "a derived equality expands inside the condition it stands in" {
     );
     defer staged.destroy();
 
-    const body = try staged.body();
-    const branches = staged.listNodes(staged.payloads(body)[1]);
-    const patterns = staged.listNodes(staged.recordFields(branches[0])[1]);
-    const condition = staged.payloads(patterns[0])[1];
-    try std.testing.expectEqualStrings("is_eq", staged.strText(staged.payloads(condition)[0]));
-    try std.testing.expectEqualStrings("Field", staged.tagName(staged.payloads(condition)[1]));
-    try std.testing.expectEqualStrings("Field", staged.tagName(staged.payloads(condition)[2]));
+    try staged.expectRejected("a conversion whose argument the compiler generates");
 }
 
 test "a string of more than one segment describes as the concatenation it is" {
@@ -1559,26 +1696,23 @@ test "a string of more than one segment describes as the concatenation it is" {
     );
     defer staged.destroy();
 
-    // The checker binds each interpolated value, so a `Let` stands between
-    // the call and the joins it wraps.
-    const cond = staged.payloads(try staged.body())[0];
-    try std.testing.expectEqualStrings("Call", staged.tagName(cond));
-    try std.testing.expectEqualStrings("Builtin.Str.is_empty", staged.strText(staged.payloads(cond)[0]));
-    const bound = staged.listNodes(staged.payloads(cond)[1])[0];
-    try std.testing.expectEqualStrings("Let", staged.tagName(bound));
-
-    // `concat(concat("p", bind), "q")`, under the name a written `a.concat(b)`
-    // takes.
-    const outer = staged.payloads(bound)[2];
-    try std.testing.expectEqualStrings("Builtin.Str.concat", staged.strText(staged.payloads(outer)[0]));
-    const outer_args = staged.listNodes(staged.payloads(outer)[1]);
-    try std.testing.expectEqualStrings("q", staged.strText(staged.payloads(staged.payloads(outer_args[1])[0])[0]));
-
-    const inner = outer_args[0];
-    try std.testing.expectEqualStrings("Builtin.Str.concat", staged.strText(staged.payloads(inner)[0]));
-    const inner_args = staged.listNodes(staged.payloads(inner)[1]);
-    try std.testing.expectEqualStrings("p", staged.strText(staged.payloads(staged.payloads(inner_args[0])[0])[0]));
-    try std.testing.expectEqualStrings("Local", staged.tagName(inner_args[1]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = "p" : Str
+        \\  n1 = field 1(p0) : F32
+        \\  n2 = Num.F32.to_str(n1) : Str !spec
+        \\  n3 = "q" : Str
+        \\  n4 = Str.concat(n0, n2, n3) : Str
+        \\  n5 = Str.is_empty(n4) : Bool !spec
+        \\  n7 = switch n5 : F32
+        \\    arm 0
+        \\      n6 = field 0(p0) : F32
+        \\      value n6
+        \\    arm 1
+        \\      value n1
+        \\  value n7
+        \\
+    );
 }
 
 test "an empty segment of an interpolated string joins nothing" {
@@ -1590,9 +1724,20 @@ test "an empty segment of an interpolated string joins nothing" {
     );
     defer staged.destroy();
 
-    const cond = staged.payloads(try staged.body())[0];
-    const bound = staged.listNodes(staged.payloads(cond)[1])[0];
-    try std.testing.expectEqualStrings("Local", staged.tagName(staged.payloads(bound)[2]));
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = Num.F32.to_str(n0) : Str !spec
+        \\  n2 = Str.is_empty(n1) : Bool !spec
+        \\  n4 = switch n2 : F32
+        \\    arm 0
+        \\      n3 = field 0(p0) : F32
+        \\      value n3
+        \\    arm 1
+        \\      value n0
+        \\  value n4
+        \\
+    );
 }
 
 test "a record update reads a subject that is already a name" {
@@ -1604,26 +1749,12 @@ test "a record update reads a subject that is already a name" {
     );
     defer staged.destroy();
 
-    const access = try staged.body();
-    try std.testing.expectEqualStrings("Field", staged.tagName(access));
-
-    const built = staged.payloads(access)[0];
-    try std.testing.expectEqualStrings("MakeRecord", staged.tagName(built));
-
-    // One entry per field of the record type, the written one holding what
-    // the update wrote and the other a read of the subject.
-    const entries = staged.listNodes(staged.payloads(built)[0]);
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
-    for (entries) |entry| {
-        const fields = staged.recordFields(entry);
-        const value = fields[1];
-        if (std.mem.eql(u8, staged.strText(fields[0]), "uv")) {
-            try std.testing.expectEqualStrings("Lit", staged.tagName(value));
-            continue;
-        }
-        try std.testing.expectEqualStrings("Field", staged.tagName(value));
-        try std.testing.expectEqualStrings("Param", staged.tagName(staged.payloads(value)[0]));
-    }
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  value n0
+        \\
+    );
 }
 
 test "a record type says which of its fields may be absent" {
@@ -1633,20 +1764,12 @@ test "a record type says which of its fields may be absent" {
     );
     defer staged.destroy();
 
-    const params = staged.listNodes(staged.payloads(try staged.root())[0]);
-    const record = staged.recordFields(params[0])[1];
-    try std.testing.expectEqualStrings("Record", staged.tagName(record));
-
-    // `{ name, presence, ty }` in label order, so presence sits in the middle.
-    for (staged.listNodes(staged.payloads(record)[0])) |entry| {
-        const fields = staged.recordFields(entry);
-        const presence = staged.tagName(fields[1]);
-        if (std.mem.eql(u8, staged.strText(fields[0]), "uv")) {
-            try std.testing.expectEqualStrings("Optional", presence);
-            continue;
-        }
-        try std.testing.expectEqualStrings("Required", presence);
-    }
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv ? F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  value n0
+        \\
+    );
 }
 
 test "a list pattern's rest splits the patterns written around it" {
@@ -1659,17 +1782,31 @@ test "a list pattern's rest splits the patterns written around it" {
     , "");
     defer staged.destroy();
 
-    const branches = staged.listNodes(staged.payloads(try staged.body())[1]);
-    const pattern = staged.listNodes(staged.recordFields(branches[0])[1])[0];
-    try std.testing.expectEqualStrings("PatListRest", staged.tagName(pattern));
-
-    // `[before, rest, after, meta]`: the rest is not one of the patterns, so
-    // one written on each side of it leaves one in each list.
-    const parts = staged.payloads(pattern);
-    try std.testing.expectEqual(@as(usize, 1), staged.listNodes(parts[0]).len);
-    try std.testing.expectEqual(@as(usize, 1), staged.listNodes(parts[2]).len);
-    try std.testing.expectEqualStrings("Named", staged.tagName(parts[1]));
-    try std.testing.expectEqualStrings("mid", staged.strText(staged.payloads(parts[1])[0]));
+    try staged.expectDump(
+        \\row r0 (List(F32)) -> F32
+        \\  n0 = List.len(p0) : U64
+        \\  n1 = 2 : U64
+        \\  n2 = Num.U64.is_lt(n0, n1) : Bool
+        \\  n15 = switch n2 : F32 !spec
+        \\    arm 0
+        \\      n3 = 0 : U64
+        \\      n4 = elem(p0, n3) : F32 !spec
+        \\      n5 = 1 : U64
+        \\      n6 = Num.U64.minus(n0, n5) : U64 !spec
+        \\      n7 = elem(p0, n6) : F32 !spec
+        \\      n8 = Num.F32.plus(n4, n7) : F32
+        \\      n9 = List.drop_first(p0, n5) : List(F32) !spec
+        \\      n10 = List.drop_last(n9, n5) : List(F32) !spec
+        \\      n11 = List.len(n10) : U64
+        \\      n12 = Num.U64.to_f32(n11) : F32 !spec
+        \\      n13 = Num.F32.plus(n8, n12) : F32
+        \\      value n13
+        \\    arm 1
+        \\      n14 = float 0x0 : F32
+        \\      value n14
+        \\  value n15
+        \\
+    );
 }
 
 test "a string pattern's capture keeps the name the author wrote in it" {
@@ -1685,20 +1822,520 @@ test "a string pattern's capture keeps the name the author wrote in it" {
     , "");
     defer staged.destroy();
 
-    const branches = staged.listNodes(staged.payloads(try staged.body())[1]);
-    const pattern = staged.listNodes(staged.recordFields(branches[0])[1])[0];
-    try std.testing.expectEqualStrings("PatStr", staged.tagName(pattern));
+    try staged.expectRejected("a string interpolation pattern");
+}
 
-    // `[prefix, steps, end, meta]`, each step `{ capture, delimiter }` in
-    // label order.
-    const parts = staged.payloads(pattern);
-    try std.testing.expectEqualStrings("a", staged.strText(parts[0]));
-    try std.testing.expectEqualStrings("Exact", staged.tagName(parts[2]));
+// L3: source pairs. Each pair is two spellings of one function under a
+// refactor in R (`roc-reify-normalization-plan.md` 5.10, M1), and the two
+// sides must describe as one normal form.
 
-    const steps = staged.listNodes(parts[1]);
-    try std.testing.expectEqual(@as(usize, 1), steps.len);
-    const step = staged.recordFields(steps[0]);
-    try std.testing.expectEqualStrings("Named", staged.tagName(step[0]));
-    try std.testing.expectEqualStrings("head", staged.strText(staged.payloads(step[0])[0]));
-    try std.testing.expectEqualStrings("z", staged.strText(step[1]));
+/// Both sources describe `wobble` to the same dump.
+fn expectSameNormalForm(left: []const u8, right: []const u8) (StagedError || error{ TestUnexpectedResult, TestExpectedEqual })!void {
+    const gpa = std.testing.allocator;
+    const a = try Staged.createRunning(gpa, left, "");
+    defer a.destroy();
+    const b = try Staged.createRunning(gpa, right, "");
+    defer b.destroy();
+    if (a.outcome != .reified or b.outcome != .reified) return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(a.dump.items, b.dump.items);
+}
+
+test "L3: a literal's spelling does not reach the normal form" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| input + 0x10 + 1_000
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| input + 16 + 1000
+    );
+}
+
+test "L3: `??` describes as the match it means" {
+    try expectSameNormalForm(
+        \\wobble : Try(U64, [Bad]) -> U64
+        \\wobble = |input| input ?? 7
+    ,
+        \\wobble : Try(U64, [Bad]) -> U64
+        \\wobble = |input| match input {
+        \\    Ok(v) => v
+        \\    Err(_) => 7
+        \\}
+    );
+}
+
+test "L3: a `var` threaded through statements is the value it ends at" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $x = input
+        \\    $x = $x + 1
+        \\    $x = $x * 2
+        \\    $x
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| (input + 1) * 2
+    );
+}
+
+test "L3: a binding inside a loop body is the value it names" {
+    try expectSameNormalForm(
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for x in input {
+        \\        d = x * 2
+        \\        $total = $total + d
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| {
+        \\    var $sum = 0
+        \\    for item in input {
+        \\        $sum = $sum + item * 2
+        \\    }
+        \\    $sum
+        \\}
+    );
+}
+
+test "L3: `a and b` is `if a b else Bool.False`" {
+    try expectSameNormalForm(
+        \\wobble : { a : Bool, b : Bool } -> Bool
+        \\wobble = |input| input.a and input.b
+    ,
+        \\wobble : { a : Bool, b : Bool } -> Bool
+        \\wobble = |input| if input.a input.b else Bool.False
+    );
+}
+
+test "L3: `a or b` is `if a Bool.True else b`" {
+    try expectSameNormalForm(
+        \\wobble : { a : Bool, b : Bool } -> Bool
+        \\wobble = |input| input.a or input.b
+    ,
+        \\wobble : { a : Bool, b : Bool } -> Bool
+        \\wobble = |input| if input.a Bool.True else input.b
+    );
+}
+
+test "L3: `return x` last is `x`" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    y = input + 1
+        \\    return y
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| input + 1
+    );
+}
+
+test "L3: an early `return` in a branch is the value of that branch" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    if input > 10 {
+        \\        return 0
+        \\    }
+        \\    input + 1
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input > 10 0 else input + 1
+    );
+}
+
+test "L3: `if c { break }; rest` is `rest` in the `else`" {
+    try expectSameNormalForm(
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for x in input {
+        \\        if x > 5 {
+        \\            break
+        \\        }
+        \\        $total = $total + x
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for x in input {
+        \\        if x > 5 {
+        \\            break
+        \\        } else {
+        \\            $total = $total + x
+        \\        }
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3: `?` is the match it means" {
+    try expectSameNormalForm(
+        \\wobble : Try(U64, [Bad]) -> Try(U64, [Bad])
+        \\wobble = |input| Ok(input? + 1)
+    ,
+        \\wobble : Try(U64, [Bad]) -> Try(U64, [Bad])
+        \\wobble = |input| match input {
+        \\    Ok(v) => Ok(v + 1)
+        \\    Err(e) => return Err(e)
+        \\}
+    );
+}
+
+test "L3: `a != b` is `!(a == b)`" {
+    try expectSameNormalForm(
+        \\wobble : { a : U64, b : U64 } -> Bool
+        \\wobble = |input| input.a != input.b
+    ,
+        \\wobble : { a : U64, b : U64 } -> Bool
+        \\wobble = |input| !(input.a == input.b)
+    );
+}
+
+// L4 and L5 over a fixed seed set: the R fuzzer and the soundness
+// differential of `roc-reify-normalization-plan.md` 5.1, run by the driver
+// the AFL target runs, on the cases `reify.fuzz_gen` generates from each seed.
+
+test "L4 and L5: every seed's two prints are one normal form, which computes what Roc computes" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var bytes: [96]u8 = undefined;
+    var verdicts = std.EnumArray(reify_fuzz.Verdict, u32).initFill(0);
+    for (0..512) |_| {
+        random.bytes(&bytes);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const ctx = CoreCtx.default(std.testing.allocator, arena.allocator(), std.testing.io);
+        verdicts.getPtr(try reify_fuzz.runCase(ctx, try sharedBuiltinModules(), tmp.dir, &bytes)).* += 1;
+    }
+    // The seeds reach both rows of the C2 table.
+    try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
+}
+
+test "L7: a refactor inside a function of another package leaves the caller's normal form unchanged" {
+    // N8h: a function of another package is a named `Prim`, so its body is
+    // not the description's, and a refactor inside it changes nothing here.
+    const gpa = std.testing.allocator;
+    const caller =
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| Lib.scale(input.a, input.b) + 1
+    ;
+    const written = try Staged.createSite(gpa, caller, "", "input",
+        \\Lib := {}.{
+        \\    scale : U64, U64 -> U64
+        \\    scale = |v, k| v * k
+        \\}
+    );
+    defer written.destroy();
+    const refactored = try Staged.createSite(gpa, caller, "", "input",
+        \\Lib := {}.{
+        \\    scale : U64, U64 -> U64
+        \\    scale = |v, k| {
+        \\        product = k * v
+        \\        product
+        \\    }
+        \\}
+    );
+    defer refactored.destroy();
+    try written.expectDump(
+        \\row r0 ({ a : U64, b : U64 }) -> U64
+        \\  n0 = field 0(p0) : U64
+        \\  n1 = field 1(p0) : U64
+        \\  n2 = Lib.scale(n0, n1) : U64 !spec
+        \\  n3 = 1 : U64
+        \\  n4 = Num.U64.plus(n2, n3) : U64 !spec
+        \\  value n4
+        \\
+    );
+    try std.testing.expectEqualStrings(written.dump.items, refactored.dump.items);
+}
+
+/// The two sources describe `wobble` to different dumps.
+fn expectOtherNormalForm(left: []const u8, right: []const u8) (StagedError || error{TestUnexpectedResult})!void {
+    const gpa = std.testing.allocator;
+    const a = try Staged.createRunning(gpa, left, "");
+    defer a.destroy();
+    const b = try Staged.createRunning(gpa, right, "");
+    defer b.destroy();
+    if (a.outcome != .reified or b.outcome != .reified) return error.TestUnexpectedResult;
+    if (std.mem.eql(u8, a.dump.items, b.dump.items)) return error.TestUnexpectedResult;
+}
+
+// M2: order and placement are canonical under C2 (plan 4, M2).
+
+test "L3 M2: independent bindings in either order are one normal form" {
+    try expectSameNormalForm(
+        \\wobble : { x : U64, y : U64 } -> U64
+        \\wobble = |input| {
+        \\    a = input.x + 1
+        \\    b = input.y * 2
+        \\    a - b
+        \\}
+    ,
+        \\wobble : { x : U64, y : U64 } -> U64
+        \\wobble = |input| {
+        \\    q = input.y * 2
+        \\    p = input.x + 1
+        \\    p - q
+        \\}
+    );
+}
+
+test "L3 M2: a value bound twice is the value bound once" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    a = input + 1
+        \\    b = input + 1
+        \\    a * b
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    a = input + 1
+        \\    a * a
+        \\}
+    );
+}
+
+test "L3 M2: an if bound twice is the if bound once" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    a = if input > 10 input - 10 else input
+        \\    b = if input > 10 input - 10 else input
+        \\    a * b
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    a = if input > 10 input - 10 else input
+        \\    a * a
+        \\}
+    );
+}
+
+test "L3 M2: a binding before a match is the binding in every arm" {
+    try expectSameNormalForm(
+        \\wobble : { tag : [A, B], n : U64 } -> U64
+        \\wobble = |input| {
+        \\    y = input.n + 1
+        \\    match input.tag {
+        \\        A => y * 2
+        \\        B => y * 3
+        \\    }
+        \\}
+    ,
+        \\wobble : { tag : [A, B], n : U64 } -> U64
+        \\wobble = |input| match input.tag {
+        \\    A => (input.n + 1) * 2
+        \\    B => (input.n + 1) * 3
+        \\}
+    );
+}
+
+test "L3 M2: a failing binding read in one branch is that branch's work" {
+    try expectSameNormalForm(
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| {
+        \\    q = input.a // input.b
+        \\    if input.a > 10 q else 0
+        \\}
+    ,
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| if input.a > 10 input.a // input.b else 0
+    );
+}
+
+test "L3 M2: a dead failing binding is dropped" {
+    try expectSameNormalForm(
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| {
+        \\    _q = input.a // input.b
+        \\    input.a + 1
+        \\}
+    ,
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| input.a + 1
+    );
+}
+
+test "L3 M2: a dominating test decides a binding written before the branch" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    y = if input > 10 1 else 2
+        \\    if input > 10 y else 0
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input > 10 1 else 0
+    );
+}
+
+test "L3 M2: failing integer work moved across a loop boundary is not in R" {
+    try expectOtherNormalForm(
+        \\wobble : { n : U64, items : List(U64) } -> U64
+        \\wobble = |input| {
+        \\    d = input.n * 2
+        \\    var $total = 0
+        \\    for x in input.items {
+        \\        $total = $total + x + d
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : { n : U64, items : List(U64) } -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for x in input.items {
+        \\        $total = $total + x + input.n * 2
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3 M2: a test that no loop turn changes is one normal form wherever it is written" {
+    try expectSameNormalForm(
+        \\wobble : { n : U64, items : List(U64) } -> U64
+        \\wobble = |input| {
+        \\    big = input.n > 5
+        \\    var $total = 0
+        \\    for x in input.items {
+        \\        if big {
+        \\            $total = $total + x
+        \\        }
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : { n : U64, items : List(U64) } -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for x in input.items {
+        \\        if input.n > 5 {
+        \\            $total = $total + x
+        \\        }
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+// L3 pairs of M3 (`roc-reify-normalization-plan.md` 4.1): rows are digests,
+// finalized before their callers, and a function an `if` chooses or a
+// record literal holds is called directly.
+
+test "L3: a function an `if` chooses is called in each branch" {
+    try expectSameNormalForm(
+        \\half : U64 -> U64
+        \\half = |x| x // 2
+        \\
+        \\twice : U64 -> U64
+        \\twice = |x| x * 2
+        \\
+        \\wobble : { c : Bool, x : U64 } -> U64
+        \\wobble = |input| (if input.c half else twice)(input.x)
+    ,
+        \\half : U64 -> U64
+        \\half = |x| x // 2
+        \\
+        \\twice : U64 -> U64
+        \\twice = |x| x * 2
+        \\
+        \\wobble : { c : Bool, x : U64 } -> U64
+        \\wobble = |input| if input.c half(input.x) else twice(input.x)
+    );
+}
+
+test "L3: a function read from a record literal is called directly" {
+    try expectSameNormalForm(
+        \\twice : U64 -> U64
+        \\twice = |x| x * 2
+        \\
+        \\wobble : U64 -> U64
+        \\wobble = |input| ({ op: twice }.op)(input)
+    ,
+        \\twice : U64 -> U64
+        \\twice = |x| x * 2
+        \\
+        \\wobble : U64 -> U64
+        \\wobble = |input| twice(input)
+    );
+}
+
+test "L3: a lambda that captures, passed to a helper that calls it, meets the helper's body over it" {
+    try expectSameNormalForm(
+        \\apply : (U64 -> U64), U64 -> U64
+        \\apply = |f, x| f(x)
+        \\
+        \\wobble : { k : U64, x : U64 } -> U64
+        \\wobble = |input| {
+        \\    k = input.k
+        \\    apply(|y| y + k, input.x)
+        \\}
+    ,
+        \\add : U64, U64 -> U64
+        \\add = |k, y| y + k
+        \\
+        \\wobble : { k : U64, x : U64 } -> U64
+        \\wobble = |input| add(input.k, input.x)
+    );
+}
+
+test "a call of a function parameter no call fixes refuses the site" {
+    const staged = try Staged.createRunning(std.testing.allocator,
+        \\wobble : { f : U64 -> U64, x : U64 } -> U64
+        \\wobble = |input| (input.f)(input.x)
+    , "");
+    defer staged.destroy();
+
+    try staged.expectRejected("a call to a function value that no simplification resolves");
+}
+
+test "P1: a template is normalized once per argument digest, however many calls it has" {
+    const gpa = std.testing.allocator;
+    const self = try Staged.createChecked(gpa,
+        \\wobble : F32 -> Code({ time : F32, uv : F32 } -> F32)
+        \\wobble = |factor| |input| input.uv * factor
+    , "_a = wobble(3.5.F32)\n_b = wobble(1.5.F32)");
+    self.store = ConstStore.init(gpa);
+    const artifact = self.coord.appRootCheckedArtifact();
+    self.foreign = .{ .artifact = artifact, .builtins = &(try sharedBuiltinModules()).checked_artifact };
+    self.walk = CodeReifier.Walk.init(gpa, &self.store, self.foreign.lookup());
+    defer self.destroy();
+    self.reifier = try self.walk.reader(.{
+        .sources = CodeReifier.Reifier.artifactSources(artifact),
+        .env = self.env,
+    });
+    const template = templateLambda(artifact, self.env, 1) orelse return error.StagedLambdaNotFound;
+
+    // Five calls over two argument lists.
+    var graphs: [5]ConstNodeId = undefined;
+    for ([_][]const u8{ "3.5.F32", "1.5.F32", "3.5.F32", "3.5.F32", "1.5.F32" }, &graphs) |text, *graph| {
+        const arg = checkedExprWithSource(artifact, self.env, text) orelse return error.StagedLambdaNotFound;
+        var values = std.ArrayList(CodeReifier.Reifier.TemplateArg).empty;
+        defer values.deinit(gpa);
+        defer self.reifier.releaseTemplateArgs(values.items);
+        if (try self.reifier.reifyConstants(&.{arg}, &values, gpa)) |_| return error.TestUnexpectedResult;
+        const outcome = try self.reifier.reifyTemplateCall(template, values.items, .zero());
+        if (outcome != .reified) return error.TestUnexpectedResult;
+        graph.* = self.store.get(outcome.reified).record[0];
+    }
+    try std.testing.expectEqual(@as(u32, 2), self.walk.normalizations);
+    try std.testing.expectEqual(graphs[0], graphs[2]);
+    try std.testing.expectEqual(graphs[1], graphs[4]);
+    try std.testing.expect(graphs[0] != graphs[1]);
 }

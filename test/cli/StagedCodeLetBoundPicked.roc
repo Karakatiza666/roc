@@ -5,10 +5,7 @@
 # checker meets between a function and a `Code(U16 -> U16)`.
 Stage := {}.{
 	describe : Code(U16 -> U16) -> Str
-	describe = |code| match Code.ir(code) {
-		Lambda(_p, _b, _r) => "lambda"
-		_ => "other"
-	}
+	describe = |code| "lambda/${Code.graph(code).root_row().params.len().to_str()}"
 }
 
 picked : Str

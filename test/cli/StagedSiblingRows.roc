@@ -28,10 +28,7 @@ Stage := {}.{
 	params_of = |_, code| Stage.signature(code)
 
 	signature : Code(f) -> Str
-	signature = |code| match code.ir() {
-		Lambda(params, _, _) => Str.join_with(params.map(|param| param.ty.name()), " | ")
-		_ => "other"
-	}
+	signature = |code| Str.join_with(Code.graph(code).root_row().params.map(|param| param.name()), " | ")
 }
 
 Row : { id : I64, name : Str, score : I64 }

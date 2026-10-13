@@ -1,0 +1,34 @@
+// The signatures of `roc-reify-rule-derivation.md` 5. The tool refuses a
+// signature whose sorts or ops it does not build yet, naming them.
+.{
+    .{
+        .name = "S1",
+        .milestone = "M4",
+        .k = 5,
+        .sorts = .{ .bool, .i64, .union_ab, .record_xy, .tuple_ib, .nominal_i64 },
+        .ops = .{ .not, .and_, .or_, .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .switch_bool, .switch_union, .tag, .payload, .record, .field, .tuple, .index, .wrap, .unwrap },
+        .lits = .{ .{ .int = 0 }, .{ .int = 1 }, .{ .bool = true }, .{ .bool = false } },
+    },
+    .{
+        .name = "S2",
+        .milestone = "M5",
+        .k = 5,
+        // S2 is built in stages (`roc-reify-rule-derivation.md` 5.2); it holds
+        // the stages built so far, and 5 states the whole signature.
+        .sorts = .{ .bool, .i64, .union_ab, .record_xy, .tuple_ib, .nominal_i64 },
+        .ops = .{ .not, .and_, .or_, .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .switch_bool, .switch_union, .tag, .payload, .record, .field, .tuple, .index, .wrap, .unwrap, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .switch_lit },
+        .lits = .{ .{ .int = 0 }, .{ .int = 1 }, .{ .int = -1 }, .{ .bool = true }, .{ .bool = false } },
+        .chains = .{ .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor },
+        .chain_lits = .{.{ .int = -1 }},
+    },
+    .{
+        .name = "S3",
+        .milestone = "M6",
+        .k = 4,
+        .sorts = .{ .bool, .i64, .union_ab, .record_xy, .tuple_ib, .nominal_i64, .f64, .str, .union_abc, .list_i64 },
+        .ops = .{ .not, .and_, .or_, .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .switch_bool, .switch_union, .tag, .payload, .record, .field, .tuple, .index, .wrap, .unwrap, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .switch_lit, .len, .get },
+        .lits = .{ .{ .int = 0 }, .{ .int = 1 }, .{ .int = -1 }, .{ .bool = true }, .{ .bool = false } },
+        .chains = .{ .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor },
+        .chain_lits = .{.{ .int = -1 }},
+    },
+}

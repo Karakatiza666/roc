@@ -6055,6 +6055,7 @@ pub const MonoLlvmCodeGen = struct {
             .ptr_load => try self.emitPtrLoad(target, GuardedList.at(arg_locals, 0)),
             .ptr_cast => try self.emitPtrCast(target, GuardedList.at(arg_locals, 0)),
             .crash => try self.emitCrashBytes("Roc crashed"),
+            .code_refuse => unreachable, // lowering makes `code_refuse` a crash statement, so LIR never holds it
             // Every remaining op is a numeric conversion; the comptime check keeps
             // this switch exhaustive when a non-conversion op is added.
             inline .u8_to_i8_wrap,

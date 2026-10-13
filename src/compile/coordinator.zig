@@ -706,6 +706,10 @@ pub const ModuleState = struct {
     /// that every environment installed for this module borrows as its
     /// `qualified_module_name`; no cache entry carries it.
     qualified_name: []const u8,
+    /// Name of the package that holds this module (e.g., "pf"), borrowed from
+    /// the package state. Workspace information like `qualified_name`, which
+    /// every installed environment borrows as its `package_name`.
+    package_name: []const u8,
     /// Filesystem path to the .roc file
     path: []const u8,
     /// Source-relative import base override for materialized modules.
@@ -776,10 +780,11 @@ pub const ModuleState = struct {
     /// checked artifact, excluding compile-time evaluation run inside the check.
     type_check_ns: u64 = 0,
 
-    pub fn init(name: []const u8, qualified_name: []const u8, path: []const u8) ModuleState {
+    pub fn init(name: []const u8, qualified_name: []const u8, package_name: []const u8, path: []const u8) ModuleState {
         return .{
             .name = name,
             .qualified_name = qualified_name,
+            .package_name = package_name,
             .path = path,
             .cached_ast = null,
             .phase = .Parse,
@@ -1115,7 +1120,7 @@ pub const PackageState = struct {
         const owned_path = try gpa.dupe(u8, path);
         errdefer gpa.free(owned_path);
 
-        try self.modules.append(gpa, ModuleState.init(owned_name, owned_qualified_name, owned_path));
+        try self.modules.append(gpa, ModuleState.init(owned_name, owned_qualified_name, self.name, owned_path));
         errdefer _ = self.modules.pop();
         try self.module_names.put(owned_name, id);
 
@@ -4405,6 +4410,7 @@ pub const Coordinator = struct {
         // Identical modules in different packages share this entry, so the
         // package-qualified name comes from the module being installed.
         cached_env.qualified_module_name = mod.qualified_name;
+        cached_env.package_name = mod.package_name;
 
         const artifact_serialized: *const check.CheckedArtifact.CheckedModuleArtifact.Serialized = @ptrCast(@alignCast(artifact_buffer.ptr));
         // L-10: bounds-check every relocatable marker against the body before any
@@ -5094,6 +5100,7 @@ pub const Coordinator = struct {
             // The bare `display_module_name_idx` is unchanged, and it keeps
             // any directory segments the logical module name carries.
             env.qualified_module_name = mod.qualified_name;
+            env.package_name = mod.package_name;
 
             if (can.BuiltinLowLevel.isBuiltinModule(env)) {
                 try can.BuiltinLowLevel.apply(env);

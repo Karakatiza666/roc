@@ -955,6 +955,7 @@ fn tidyBannedCoreCtxCreation(file: SourceFile, errors: *Errors) void {
         "src/lsp/syntax.zig",
         "src/ctx/CoreCtx.zig",
         "test/downstream-compiler/main.zig",
+        "test/fuzzing/fuzz-reify.zig",
     };
 
     // Don't ban ourselves (this file contains the banned strings as literals)

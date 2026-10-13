@@ -177,6 +177,7 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
     // We need to find the actual ident that was created during canonicalization
     for ([_]NamedLowLevel{
         .{ "Builtin.Str.is_eq", .str_is_eq },
+        .{ "Builtin.Code.refuse", .code_refuse },
         .{ "Builtin.Str.concat", .str_concat },
         .{ "Builtin.Str.contains", .str_contains },
         .{ "Builtin.Str.trim", .str_trim },

@@ -117,6 +117,7 @@ pub const StagedCode = types.StagedCode;
 pub const ComptimeInvalidQuote = types.ComptimeInvalidQuote;
 pub const ComptimeInvalidInterpolation = types.ComptimeInvalidInterpolation;
 pub const ComptimeExpectFailed = types.ComptimeExpectFailed;
+pub const TranslationRefused = types.TranslationRefused;
 pub const ComptimeEvalError = types.ComptimeEvalError;
 
 // Generic errors

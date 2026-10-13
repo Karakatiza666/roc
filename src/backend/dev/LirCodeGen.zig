@@ -4964,6 +4964,7 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                     // or LEAVE IT AS A PANIC.
                     @panic("TODO: ll.crash message forwarding is not implemented");
                 },
+                .code_refuse => base.invariant("Dev/codegen invariant violated: code_refuse reached codegen; lowering makes it a crash statement", .{}),
             }
         }
 
@@ -20799,11 +20800,16 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                         },
 
                         .crash => |crash| {
+                            const refusal = self.store.stmtRowOrDefault(crash.extra).refusal;
                             switch (crash.msg) {
-                                .literal => |literal| if (crash.checked_error)
-                                    try self.emitCheckedErrorCrash(self.store.getString(literal))
-                                else
-                                    try self.emitRocCrash(self.store.getString(literal)),
+                                .literal => |literal| {
+                                    // Lowering gives a refusal the translator's message local.
+                                    std.debug.assert(refusal == null);
+                                    if (crash.checked_error)
+                                        try self.emitCheckedErrorCrash(self.store.getString(literal))
+                                    else
+                                        try self.emitRocCrash(self.store.getString(literal));
+                                },
                                 .local => |message| {
                                     const msg_loc = try self.emitValueLocal(message);
                                     const msg_offset = switch (msg_loc) {
@@ -20824,7 +20830,9 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
                                             .{@backingInt(message)},
                                         ),
                                     };
-                                    if (crash.checked_error)
+                                    if (refusal) |refused|
+                                        try self.emitCodeRefusedFromStackStr(msg_offset, refused)
+                                    else if (crash.checked_error)
                                         try self.emitCheckedErrorCrashFromStackStr(msg_offset)
                                     else
                                         try self.emitRocCrashFromStackStr(msg_offset);
@@ -21707,6 +21715,20 @@ pub fn LirCodeGen(comptime target: RocTarget) type {
             defer builder.deinit();
             try builder.addLeaArg(frame_ptr, str_offset);
             try self.callBuiltin(&builder, .crash_str);
+        }
+
+        /// Crash with the `RocStr` at `str_offset` as a `Code.refuse_at`,
+        /// naming the refused node to the in-process host first.
+        fn emitCodeRefusedFromStackStr(self: *Self, str_offset: i32, refusal: lir.LIR.Refusal) Allocator.Error!void {
+            try self.spillAllVectorLocals();
+            var regs: [3]GeneralReg = undefined;
+            for (refusal.locals(), &regs) |local, *reg| reg.* = try self.ensureInGeneralReg(try self.emitValueLocal(local));
+            defer for (regs) |reg| self.codegen.freeGeneral(reg);
+            var builder = try Builder.init(&self.codegen.emit, &self.codegen.stack_offset);
+            defer builder.deinit();
+            try builder.addLeaArg(frame_ptr, str_offset);
+            for (regs) |reg| try builder.addRegArg(reg);
+            try self.callBuiltin(&builder, .code_refused_str);
         }
 
         fn emitCheckedErrorCrashFromStackStr(self: *Self, str_offset: i32) Allocator.Error!void {

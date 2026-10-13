@@ -11760,6 +11760,7 @@ fn generateLowLevel(self: *Self, ll: anytype) Allocator.Error!void {
         .crash => {
             self.currentCode().append(self.allocator, Op.@"unreachable") catch return error.OutOfMemory;
         },
+        .code_refuse => base.invariant("wasm codegen invariant violated: code_refuse reached LIR; lowering makes it a crash statement", .{}),
 
         // Integer try conversions—return Result(TargetInt, {}) tag union
         // Layout: payload at offset 0, discriminant (1 byte) after payload. Ok=1, Err=0.
