@@ -632,6 +632,32 @@ pub fn roc_builtins_expect_err_str(str_ptr: *const RocStr, region_start: u32, re
     roc_ops.crash(str_ptr.asSlice());
 }
 
+const CodeRefusalRecorder = in_process_host.CodeRefusalRecorder;
+
+/// The recorder for a refused node, resolved exactly like
+/// `expectErrRegionRecorder`.
+inline fn codeRefusalRecorder() ?CodeRefusalRecorder {
+    if (in_process_host.codeRefusalRecorder()) |recorder| return recorder;
+    if (comptime builtin.target.cpu.arch != .wasm64) return null;
+    const recorder = @extern(CodeRefusalRecorder, .{ .name = in_process_host.roc_code_refused, .linkage = .weak });
+    var address: usize = if (recorder) |pointer| @intFromPtr(pointer) else 0;
+    asm volatile (""
+        : [address] "+r" (address),
+    );
+    if (address == 0) return null;
+    return @ptrFromInt(address);
+}
+
+/// Crash as `Code.refuse_at` with a runtime-built message, naming the refused
+/// node (the site's key, the row, and the node in it) to the compiler's
+/// process first, which reports the refusal at the node's sources. Anywhere
+/// else it is an ordinary crash.
+pub fn roc_builtins_code_refused_str(str_ptr: *const RocStr, site: u64, row: u32, node: u32) callconv(.c) void {
+    const roc_ops = in_process_host.ops();
+    if (codeRefusalRecorder()) |record| record(site, row, node);
+    roc_ops.crash(str_ptr.asSlice());
+}
+
 const CheckedErrorRecorder = in_process_host.CheckedErrorRecorder;
 
 /// The recorder for a crash at code checking rejected, resolved exactly like

@@ -66,7 +66,7 @@ NO CHANGE
 						(p-assign (ident "#interp_0"))
 						(e-lookup-local
 							(p-assign (ident "name"))))
-					(e-interpolation (constraint-fn-var 394) (dispatcher-var 15)
+					(e-interpolation (constraint-fn-var 399) (dispatcher-var 15)
 						(first
 							(e-literal (string "Hello ")))
 						(parts
@@ -88,7 +88,7 @@ NO CHANGE
 									(rest-pattern
 										(p-assign (ident "a")))))))))
 			(field (name "is_adult")
-				(e-dispatch-call (method "is_gte") (constraint-fn-var 406)
+				(e-dispatch-call (method "is_gte") (constraint-fn-var 411)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "age"))))

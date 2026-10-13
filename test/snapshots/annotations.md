@@ -266,7 +266,7 @@ NO CHANGE
 					(ty-rigid-var-lookup (ty-rigid-var (name "a")))))))
 	(d-let
 		(p-assign (ident "succeedPairSameType"))
-		(e-call (constraint-fn-var 557)
+		(e-call (constraint-fn-var 562)
 			(e-lookup-local
 				(p-assign (ident "mkPair")))
 			(e-num (value "1"))
@@ -276,7 +276,7 @@ NO CHANGE
 				(ty-lookup (name "U8") (builtin)))))
 	(d-let
 		(p-assign (ident "failPairDiffTypes"))
-		(e-call (constraint-fn-var 578)
+		(e-call (constraint-fn-var 583)
 			(e-lookup-local
 				(p-assign (ident "mkPair")))
 			(e-runtime-error (tag "erroneous_value_expr"))

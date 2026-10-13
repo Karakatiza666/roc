@@ -119,7 +119,7 @@ items = [1, 2, 3]
 			(args
 				(p-assign (ident "a"))
 				(p-assign (ident "b")))
-			(e-dispatch-call (method "plus") (constraint-fn-var 372)
+			(e-dispatch-call (method "plus") (constraint-fn-var 377)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "a"))))
@@ -128,7 +128,7 @@ items = [1, 2, 3]
 						(p-assign (ident "b")))))))
 	(d-let
 		(p-assign (ident "sum"))
-		(e-call (constraint-fn-var 392)
+		(e-call (constraint-fn-var 397)
 			(e-lookup-local
 				(p-assign (ident "add")))
 			(e-num (value "1"))

@@ -10549,6 +10549,7 @@ const TestImportViewTables = struct {
     method_registry: static_dispatch.MethodRegistry = .{},
     interface_capabilities: ModuleInterfaceCapabilities = .{},
     const_store: ConstStore,
+    code_provenance: CodeProvenanceTable = .{},
 
     fn init(allocator: Allocator) TestImportViewTables {
         if (!builtin.is_test) unreachable; // test scaffolding: only test blocks call this
@@ -10599,6 +10600,7 @@ const TestImportViewTables = struct {
             .method_registry = &self.method_registry,
             .interface_capabilities = &self.interface_capabilities,
             .const_store = &self.const_store,
+            .code_provenance = &self.code_provenance,
         };
     }
 };
@@ -28362,6 +28364,9 @@ pub const PlatformPairing = struct {
                 "interface_capabilities",
                 "top_level_values",
                 "hoisted_constants",
+                // The platform's own reification sites, which publication of
+                // the platform described.
+                "code_provenance",
                 // Value reuse metadata: borrowed from the platform. Reuse
                 // moves values between versions of a module's own entry,
                 // never into a composition.
@@ -35575,6 +35580,154 @@ pub const CompileTimeRootPortability = struct {
     pub const deinit = artifact_serialize.SliceStoreDeinit(@This()).deinit;
 };
 
+/// The provenance of the module's `Code` sites (normal-form 3.10, plan I9):
+/// per site key, where each node of the site's graph came from. Nothing a
+/// translator reads holds it; a refusal reads it to report a node at its
+/// source regions.
+///
+/// | Slice | One entry per | Holds |
+/// |---|---|---|
+/// | `sites` | site | its key, and its spans of `sources` and `rows` |
+/// | `sources` | source of a site | the module, by index into `modules`, and the region |
+/// | `rows` | row of a site's graph, in graph order | its span of `nodes` |
+/// | `nodes` | node of a row, in the row's node order | its span of `chains` |
+/// | `chains` | origin of a node | its span of `links` |
+/// | `links` | step of an origin | a source, by index into the site's sources: the node's own, then each call that reached it |
+pub const CodeProvenanceTable = struct {
+    pub const Site = extern struct { key: u64, sources: Span, rows: Span };
+    pub const Source = extern struct { module: u32, region_start: u32, region_end: u32 };
+    pub const Span = extern struct { start: u32 = 0, len: u32 = 0 };
+
+    sites: []const Site = &.{},
+    sources: []const Source = &.{},
+    modules: []const CheckedModuleArtifactKey = &.{},
+    rows: []const Span = &.{},
+    nodes: []const Span = &.{},
+    chains: []const Span = &.{},
+    links: []const u32 = &.{},
+
+    pub const Serialized = extern struct {
+        sites: SerializedSlice(Site) = .{},
+        sources: SerializedSlice(Source) = .{},
+        modules: SerializedSlice(CheckedModuleArtifactKey) = .{},
+        rows: SerializedSlice(Span) = .{},
+        nodes: SerializedSlice(Span) = .{},
+        chains: SerializedSlice(Span) = .{},
+        links: SerializedSlice(u32) = .{},
+        const Serde = artifact_serialize.SliceStoreSerde(CodeProvenanceTable, @This());
+        pub const serialize = Serde.serialize;
+        pub const deserialize = Serde.deserialize;
+    };
+
+    /// The table of the sites `published` describes, in their order.
+    pub fn init(allocator: Allocator, published: []const code_reifier.SiteProvenance) Allocator.Error!CodeProvenanceTable {
+        var sites: std.ArrayList(Site) = .empty;
+        defer sites.deinit(allocator);
+        var sources: std.ArrayList(Source) = .empty;
+        defer sources.deinit(allocator);
+        var modules: std.ArrayList(CheckedModuleArtifactKey) = .empty;
+        defer modules.deinit(allocator);
+        var rows: std.ArrayList(Span) = .empty;
+        defer rows.deinit(allocator);
+        var nodes: std.ArrayList(Span) = .empty;
+        defer nodes.deinit(allocator);
+        var chains: std.ArrayList(Span) = .empty;
+        defer chains.deinit(allocator);
+        var links: std.ArrayList(u32) = .empty;
+        defer links.deinit(allocator);
+        for (published) |entry| {
+            const sources_start: u32 = @intCast(sources.items.len);
+            for (entry.sources) |src| {
+                const module: u32 = for (modules.items, 0..) |m, i| {
+                    if (std.meta.eql(m, src.module)) break @intCast(i);
+                } else blk: {
+                    try modules.append(allocator, src.module);
+                    break :blk @intCast(modules.items.len - 1);
+                };
+                try sources.append(allocator, .{ .module = module, .region_start = src.region.start.offset, .region_end = src.region.end.offset });
+            }
+            const rows_start: u32 = @intCast(rows.items.len);
+            const emitted = &entry.origins;
+            for (emitted.rows.items) |row| {
+                const nodes_start: u32 = @intCast(nodes.items.len);
+                for (emitted.nodes.items[row.start..][0..row.len]) |node| {
+                    const chains_start: u32 = @intCast(chains.items.len);
+                    for (emitted.chains.items[node.start..][0..node.len]) |chain| {
+                        const links_start: u32 = @intCast(links.items.len);
+                        for (emitted.links.items[chain.start..][0..chain.len]) |link| try links.append(allocator, link.index());
+                        try chains.append(allocator, .{ .start = links_start, .len = chain.len });
+                    }
+                    try nodes.append(allocator, .{ .start = chains_start, .len = node.len });
+                }
+                try rows.append(allocator, .{ .start = nodes_start, .len = row.len });
+            }
+            try sites.append(allocator, .{
+                .key = entry.key,
+                .sources = .{ .start = sources_start, .len = @intCast(entry.sources.len) },
+                .rows = .{ .start = rows_start, .len = @intCast(emitted.rows.items.len) },
+            });
+        }
+        var table: CodeProvenanceTable = .{};
+        errdefer table.deinit(allocator);
+        table.sites = try sites.toOwnedSlice(allocator);
+        table.sources = try sources.toOwnedSlice(allocator);
+        table.modules = try modules.toOwnedSlice(allocator);
+        table.rows = try rows.toOwnedSlice(allocator);
+        table.nodes = try nodes.toOwnedSlice(allocator);
+        table.chains = try chains.toOwnedSlice(allocator);
+        table.links = try links.toOwnedSlice(allocator);
+        return table;
+    }
+
+    /// The site whose `Code` value carries `key`.
+    pub fn site(self: CodeProvenanceTable, key: u64) ?Site {
+        for (self.sites) |s| if (s.key == key) return s;
+        return null;
+    }
+
+    /// The origins of node `node` of row `row` of `s`'s graph, each a span of
+    /// `links`, or null where the graph has no such node.
+    pub fn origins(self: CodeProvenanceTable, s: Site, row: u32, node: u32) ?[]const Span {
+        if (row >= s.rows.len) return null;
+        const r = self.rows[s.rows.start + row];
+        if (node >= r.len) return null;
+        const n = self.nodes[r.start + node];
+        return self.chains[n.start..][0..n.len];
+    }
+
+    /// One step of an origin: the source it names in `s`.
+    pub fn source(self: CodeProvenanceTable, s: Site, link: u32) Source {
+        return self.sources[s.sources.start + link];
+    }
+
+    pub fn validate(self: CodeProvenanceTable) error{CorruptArtifact}!void {
+        const inside = struct {
+            fn check(span: Span, len: usize) error{CorruptArtifact}!void {
+                if (span.start > len or span.len > len - span.start) return error.CorruptArtifact;
+            }
+        };
+        for (self.sites) |s| {
+            try inside.check(s.sources, self.sources.len);
+            try inside.check(s.rows, self.rows.len);
+        }
+        for (self.sources) |src| if (src.module >= self.modules.len or src.region_start > src.region_end) return error.CorruptArtifact;
+        for (self.rows) |r| try inside.check(r, self.nodes.len);
+        for (self.nodes) |n| try inside.check(n, self.chains.len);
+        for (self.chains) |c| try inside.check(c, self.links.len);
+    }
+
+    pub fn deinit(self: *CodeProvenanceTable, allocator: Allocator) void {
+        allocator.free(self.sites);
+        allocator.free(self.sources);
+        allocator.free(self.modules);
+        allocator.free(self.rows);
+        allocator.free(self.nodes);
+        allocator.free(self.chains);
+        allocator.free(self.links);
+        self.* = .{};
+    }
+};
+
 /// Checked module publication, including typed stores and compile-time observations.
 pub const CheckedModuleArtifact = struct {
     key: CheckedModuleArtifactKey,
@@ -35626,6 +35779,7 @@ pub const CheckedModuleArtifact = struct {
     compile_time_root_reads: CompileTimeRootReadTable = .{},
     compile_time_root_identities: CompileTimeRootIdentityTable = .{},
     compile_time_root_portability: CompileTimeRootPortability = .{},
+    code_provenance: CodeProvenanceTable = .{},
     /// Process-local publication state; cache entries always contain finalized output.
     evaluation_state: enum { prepared, finalized } = .finalized,
     /// Owns the evaluation columns of a finalized artifact that a compilation
@@ -35866,6 +36020,7 @@ pub const CheckedModuleArtifact = struct {
         compile_time_root_reads: CompileTimeRootReadTable.Serialized,
         compile_time_root_identities: CompileTimeRootIdentityTable.Serialized,
         compile_time_root_portability: CompileTimeRootPortability.Serialized,
+        code_provenance: CodeProvenanceTable.Serialized,
 
         pub const root_contract: collections.serde_validation.RootContract = .{
             .Owner = CheckedModuleArtifact,
@@ -35899,8 +36054,9 @@ pub const CheckedModuleArtifact = struct {
             // two pools of their own. Template demand vectors add one. Test outcome
             // identities add roots, context, definition summaries, report sites and declaration identities.
             // Literal arguments add the literal requirement pool, the demand pool, and the root lookup table.
-            // Nominal relocation adds checked type fingerprints and committed occurrence identities.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 258);
+            // Nominal relocation adds checked type fingerprints and committed occurrence identities. The
+            // code provenance table adds its seven slices.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 265);
         }
 
         /// Every field but the inline POD `key`, `source_hash`, and
@@ -35964,6 +36120,7 @@ pub const CheckedModuleArtifact = struct {
             try self.compile_time_root_identities.deserialize(base_addr).validate(roots.roots.len);
             try self.compile_time_root_identities.deserialize(base_addr).validateTypes(self.checked_types.payloads.deserialize(base_addr));
             try self.compile_time_root_portability.deserialize(base_addr).validate(roots.roots.len);
+            try self.code_provenance.deserialize(base_addr).validate();
         }
 
         pub fn deserialize(
@@ -37230,6 +37387,7 @@ pub const CheckedModuleArtifact = struct {
     pub fn verifyComplete(self: *const CheckedModuleArtifact) Allocator.Error!void {
         if (self.evaluation_state != .finalized) checkedArtifactInvariant("complete checked module still awaits evaluation", .{});
         self.compile_time_debug.validate(self.compile_time_roots.roots.len) catch checkedArtifactInvariant("compile-time debug observation has an invalid root or message range", .{});
+        self.code_provenance.validate() catch checkedArtifactInvariant("code provenance has a span outside its table", .{});
         if (builtin.mode != .debug) return;
 
         std.debug.assert(self.module_identity.module_idx != std.math.maxInt(u32));
@@ -37888,6 +38046,9 @@ pub const ImportedModuleView = struct {
     const_store: *const ConstStore,
     compile_time_root_reads: *const CompileTimeRootReadTable = &no_compile_time_root_reads,
     compile_time_root_identities: *const CompileTimeRootIdentityTable = &no_compile_time_root_identities,
+    /// The provenance of the module's reification sites, which a refusal
+    /// report reads (I9c).
+    code_provenance: *const CodeProvenanceTable = &no_code_provenance,
 
     /// The keys of the modules this module imports directly.
     pub fn directImportKeys(self: ImportedModuleView) []const CheckedModuleArtifactKey {
@@ -37897,6 +38058,7 @@ pub const ImportedModuleView = struct {
 
 const no_compile_time_root_reads: CompileTimeRootReadTable = .{};
 const no_compile_time_root_identities: CompileTimeRootIdentityTable = .{};
+const no_code_provenance: CodeProvenanceTable = .{};
 
 /// Public `LoweringModuleView` declaration.
 pub const LoweringModuleView = struct {
@@ -37950,6 +38112,7 @@ pub fn importedView(artifact: *const CheckedModuleArtifact) ImportedModuleView {
         .const_store = &artifact.const_store,
         .compile_time_root_reads = &artifact.compile_time_root_reads,
         .compile_time_root_identities = &artifact.compile_time_root_identities,
+        .code_provenance = &artifact.code_provenance,
     };
 }
 
@@ -39187,7 +39350,9 @@ const ForeignStagedLookup = struct {
         return .{
             .context = self,
             .resolve = resolve,
+            .resolve_alias = resolveAlias,
             .resolve_exported = resolveExported,
+            .resolve_exported_alias = resolveExportedAlias,
             .resolve_constant = resolveConstant,
             .resolve_method = resolveMethod,
             .resolve_inspect_override = resolveInspectOverride,
@@ -39282,6 +39447,18 @@ const ForeignStagedLookup = struct {
         return exportedDefinition(import_artifact.view, @fromBackingInt(@intCast(target_node_idx)));
     }
 
+    /// An exact function alias a staged site names through an import.
+    fn resolveAlias(
+        context: *const anyopaque,
+        import_idx: CIR.Import.Idx,
+        target_node_idx: u32,
+    ) ?code_reifier.ForeignAlias {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        const resolved_module_idx = self.module.resolvedImportModule(import_idx) orelse return null;
+        const import_artifact = publishImportForModule(self.imports, resolved_module_idx) orelse return null;
+        return exportedAlias(import_artifact.view, @fromBackingInt(@intCast(target_node_idx)));
+    }
+
     /// A definition of a named artifact, which a call inside a description
     /// reaches. The binding the producer resolved names the artifact rather
     /// than an import, and may name one this module never imported itself, so
@@ -39299,6 +39476,25 @@ const ForeignStagedLookup = struct {
         for (self.available) |view| {
             if (!std.meta.eql(view.key.bytes, artifact.bytes)) continue;
             return exportedDefinition(view, def);
+        }
+        return null;
+    }
+
+    /// An exact function alias of a named artifact, which a call reaches the
+    /// way it reaches a definition.
+    fn resolveExportedAlias(
+        context: *const anyopaque,
+        artifact: canonical.ArtifactRef,
+        def: CIR.Def.Idx,
+    ) ?code_reifier.ForeignAlias {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        for (self.imports) |import_artifact| {
+            if (!std.meta.eql(import_artifact.key.bytes, artifact.bytes)) continue;
+            return exportedAlias(import_artifact.view, def);
+        }
+        for (self.available) |view| {
+            if (!std.meta.eql(view.key.bytes, artifact.bytes)) continue;
+            return exportedAlias(view, def);
         }
         return null;
     }
@@ -39359,33 +39555,36 @@ fn registeredMethodKey(
     };
 }
 
+/// The tables the walk reads one imported module through.
+fn foreignModule(view: ImportedModuleView) code_reifier.ForeignModule {
+    return .{
+        .sources = .{
+            .types = view.checked_types,
+            .bodies = view.checked_bodies,
+            .plans = view.static_dispatch_plans,
+            .names = view.canonical_names,
+            .artifact = view.key,
+            .value_refs = view.resolved_value_refs,
+            .procedure_bindings = view.top_level_procedure_bindings,
+            .procedure_templates = view.checked_procedure_templates,
+            .callable_eval_templates = view.callable_eval_templates,
+            .const_templates = view.const_templates,
+            .const_bodies = view.checked_const_bodies,
+        },
+        .env = view.module_env,
+    };
+}
+
 /// The body an exported constant holds, read from the owning module's own
 /// tables the way a procedure's body is.
 fn exportedConstant(view: ImportedModuleView, const_ref: ConstRef) ?code_reifier.ForeignConstant {
     const body = code_reifier.constantBody(view.const_templates, view.checked_const_bodies, const_ref) orelse
         return null;
-    return .{
-        .module = .{
-            .sources = .{
-                .types = view.checked_types,
-                .bodies = view.checked_bodies,
-                .plans = view.static_dispatch_plans,
-                .names = view.canonical_names,
-                .artifact = view.key,
-                .value_refs = view.resolved_value_refs,
-                .procedure_bindings = view.top_level_procedure_bindings,
-                .procedure_templates = view.checked_procedure_templates,
-                .const_templates = view.const_templates,
-                .const_bodies = view.checked_const_bodies,
-            },
-            .env = view.module_env,
-        },
-        .body = body,
-    };
+    return .{ .module = foreignModule(view), .body = body };
 }
 
 /// The body and the template an exported procedure holds for this definition.
-fn exportedDefinition(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.ForeignDefinition {
+pub fn exportedDefinition(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.ForeignDefinition {
     for (view.exported_procedure_templates.templates) |template| {
         if (template.def != def) continue;
         const body_id = switch (template.template_data.body) {
@@ -39393,24 +39592,26 @@ fn exportedDefinition(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.
             .intrinsic_wrapper, .entry_wrapper, .unimplemented => return null,
         };
         return .{
-            .module = .{
-                .sources = .{
-                    .types = view.checked_types,
-                    .bodies = view.checked_bodies,
-                    .plans = view.static_dispatch_plans,
-                    .names = view.canonical_names,
-                    .artifact = view.key,
-                    .value_refs = view.resolved_value_refs,
-                    .procedure_bindings = view.top_level_procedure_bindings,
-                    .procedure_templates = view.checked_procedure_templates,
-                    .const_templates = view.const_templates,
-                    .const_bodies = view.checked_const_bodies,
-                },
-                .env = view.module_env,
-            },
+            .module = foreignModule(view),
             .body = view.checked_bodies.body(body_id).root_expr,
             .template = template.template_data,
         };
+    }
+    return null;
+}
+
+/// The lookup an exported exact function alias forwards to, or null when the
+/// definition is not one. `publishCallableEvalForwarding` recorded it.
+pub fn exportedAlias(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.ForeignAlias {
+    for (view.exported_procedure_bindings.bindings) |binding| {
+        if (binding.binding.def != def) continue;
+        const template = switch (binding.body) {
+            .callable_eval_template => |template| template,
+            .direct_template, .checked_error => return null,
+        };
+        const lookup = view.callable_eval_templates.templates[@backingInt(template)].forwarded_lookup orelse
+            return null;
+        return .{ .module = foreignModule(view), .lookup = lookup };
     }
     return null;
 }
@@ -39432,14 +39633,16 @@ fn reifyStagedCode(
     value_refs: *const ResolvedValueRefTable,
     procedure_bindings: *const TopLevelProcedureBindingTable,
     procedure_templates: *const CheckedProcedureTemplateTable,
+    callable_eval_templates: *const CallableEvalTemplateTable,
     const_templates: *const ConstTemplateTable,
     const_bodies: *const CheckedConstBodyTable,
+    top_level_values: *const TopLevelValueTable,
     method_registry: *const static_dispatch.MethodRegistry,
     imports: []const PublishImportArtifact,
     available: []const ImportedModuleView,
     store: *ConstStore,
     problem_store: ?*problem.Store,
-) Allocator.Error!void {
+) Allocator.Error!CodeProvenanceTable {
     var foreign = ForeignStagedLookup{
         .module = module,
         .names = names,
@@ -39447,7 +39650,7 @@ fn reifyStagedCode(
         .imports = imports,
         .available = available,
     };
-    const outcomes = try code_reifier.reifyModuleSites(allocator, store, .{
+    var sites = try code_reifier.reifyModuleSites(allocator, store, .{
         .types = &type_publication.store,
         .bodies = checked_bodies,
         .plans = plans,
@@ -39456,13 +39659,15 @@ fn reifyStagedCode(
         .value_refs = value_refs,
         .procedure_bindings = procedure_bindings,
         .procedure_templates = procedure_templates,
+        .callable_eval_templates = callable_eval_templates,
         .const_templates = const_templates,
         .const_bodies = const_bodies,
+        .top_level_values = top_level_values,
         .site_types = type_publication,
     }, module, module_env, foreign.lookup());
-    defer allocator.free(outcomes);
+    defer sites.deinit(allocator);
 
-    for (outcomes) |site| {
+    for (sites.outcomes) |site| {
         if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
         switch (site.outcome) {
             .reified => |node| checked_bodies.attachCodeReification(site.expr, node),
@@ -39478,6 +39683,7 @@ fn reifyStagedCode(
             },
         }
     }
+    return CodeProvenanceTable.init(allocator, sites.provenance);
 }
 
 /// The reported reason for a walk that stopped.
@@ -39490,6 +39696,7 @@ fn stagedCodeReason(kind: code_reifier.Rejection.Kind) problem.StagedCode.Reason
         .effect => .performs_an_effect,
         .unresolved_reference => .definition_not_reachable,
         .argument_not_constant => .argument_not_constant,
+        .bound_exceeded => .exceeds_a_bound,
     };
 }
 
@@ -40069,7 +40276,7 @@ pub fn publishFromTypedModule(
     // reads a dispatch plan's resolution, which total resolution assigns, and
     // the body of any constant it folds, which sealing above fills in, so this
     // is the earliest point in publication it can run.
-    try reifyStagedCode(
+    var code_provenance = try reifyStagedCode(
         allocator,
         module,
         module_env,
@@ -40081,14 +40288,17 @@ pub fn publishFromTypedModule(
         &resolved_value_refs,
         &top_level_procedure_bindings,
         &checked_procedure_templates,
+        &callable_eval_templates,
         &const_templates,
         &checked_const_bodies,
+        &top_level_values,
         &method_registry,
         inputs.imports,
         inputs.available_artifacts,
         &checked_const_store,
         inputs.problem_store,
     );
+    errdefer code_provenance.deinit(allocator);
 
     var exhaustiveness_reachability = try ExhaustivenessTemplateReachability.build(
         allocator,
@@ -40294,10 +40504,13 @@ pub fn publishFromTypedModule(
         .const_templates = const_templates,
         .const_store = checked_const_store,
         .compile_time_root_identities = compile_time_root_identities,
+        .code_provenance = code_provenance,
         .evaluation_state = .prepared,
     };
     checked_const_store = ConstStore.init(allocator);
     errdefer artifact.const_store.deinit();
+    code_provenance = .{};
+    errdefer artifact.code_provenance.deinit(allocator);
 
     if (inputs.evaluation_phase == .immediate) {
         try inputs.compile_time_finalizer.run(
@@ -41435,6 +41648,7 @@ fn testVisibilityImportedView(
         .method_registry = undefined,
         .interface_capabilities = undefined,
         .const_store = undefined,
+        .code_provenance = undefined,
     };
 }
 

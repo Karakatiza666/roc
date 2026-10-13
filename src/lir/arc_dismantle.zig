@@ -2132,7 +2132,10 @@ fn classifyStatement(
         // are scalar presence words.
         .join => {},
         .ret => |stmt| try analysis.useWholeAt(stmt.value, current),
-        .crash => |stmt| if (stmt.msg.localId()) |message| try analysis.useWholeAt(message, current),
+        .crash => |stmt| {
+            if (stmt.msg.localId()) |message| try analysis.useWholeAt(message, current);
+            if (store.stmtRowOrDefault(stmt.extra).refusal) |refusal| for (refusal.locals()) |local| try analysis.useWholeAt(local, current);
+        },
         // A dynamic value is opaque: every operand of a `dyn` statement is a
         // whole use, so no container it touches dismantles.
         .dyn => |stmt| {

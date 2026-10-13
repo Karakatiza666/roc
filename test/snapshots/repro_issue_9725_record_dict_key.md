@@ -76,9 +76,9 @@ main! = |_args| {
 				(p-assign (ident "_args")))
 			(e-block
 				(s-dbg
-					(e-dispatch-call (method "insert") (constraint-fn-var 403)
+					(e-dispatch-call (method "insert") (constraint-fn-var 408)
 						(receiver
-							(e-call (constraint-fn-var 399)
+							(e-call (constraint-fn-var 404)
 								(e-lookup-external
 									(builtin))))
 						(args

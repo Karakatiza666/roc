@@ -250,6 +250,7 @@ pub const Store = struct {
                     .comptime_invalid_quote,
                     .comptime_invalid_interpolation,
                     .comptime_expect_failed,
+                    .translation_refused,
                     .comptime_eval_error,
                     .invalid_numeric_literal,
                     .tuple_access_needs_annotation,

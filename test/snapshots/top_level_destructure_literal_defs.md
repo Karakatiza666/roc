@@ -122,7 +122,7 @@ doubled = twice(base)
 		(e-lambda
 			(args
 				(p-assign (ident "s")))
-			(e-call (constraint-fn-var 408)
+			(e-call (constraint-fn-var 413)
 				(e-lookup-external
 					(builtin))
 				(e-lookup-local
@@ -142,16 +142,16 @@ doubled = twice(base)
 			(e-literal (string "n"))))
 	(d-let
 		(p-assign (ident "as_str"))
-		(e-call (constraint-fn-var 442)
+		(e-call (constraint-fn-var 447)
 			(e-lookup-local
 				(p-assign (ident "same")))
 			(e-string
 				(e-literal (string "s")))))
 	(d-let
 		(p-assign (ident "as_num"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 446)
+		(e-dispatch-call (method "plus") (constraint-fn-var 451)
 			(receiver
-				(e-call (constraint-fn-var 445)
+				(e-call (constraint-fn-var 450)
 					(e-lookup-local
 						(p-assign (ident "same")))
 					(e-lookup-local
@@ -161,7 +161,7 @@ doubled = twice(base)
 					(p-assign (ident "inner"))))))
 	(d-let
 		(p-assign (ident "doubled"))
-		(e-call (constraint-fn-var 450)
+		(e-call (constraint-fn-var 455)
 			(e-lookup-local
 				(p-assign (ident "twice")))
 			(e-lookup-local

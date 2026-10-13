@@ -7,10 +7,7 @@
 # prints is computed by a stage, not at run time.
 StagedCodePosition := {}.{
 	describe : Code(F32 -> F32) -> Str
-	describe = |code| match code.ir() {
-		Lambda(params, _, _) => "lambda/${params.len().to_str()}"
-		_ => "other"
-	}
+	describe = |code| "lambda/${Code.graph(code).root_row().params.len().to_str()}"
 }
 
 double : F32 -> F32

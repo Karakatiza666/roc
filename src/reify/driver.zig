@@ -1,0 +1,516 @@
+//! The pipeline driver (I12): the stages of plan 1.3 over one module's rows.
+//!
+//! | Stage | Runs | Does |
+//! |---|---|---|
+//! | simplify | per component of the call graph, callee first, to a fixpoint | each round rebuilds every row of the component (`rebuild.zig`) at its latest regions (`place.zig`), then runs the passes |
+//! | finalize | per component, once its fixpoint ends | splits a component that is no longer one (N8e), then orders outputs and joins, renumbers parameters (N8f), and digests and merges rows (N8g), in `rows.zig` |
+//! | number | per row, once every component is final | hoists speculatable nodes out of loops (N5b), then puts switch outputs and joins in the walk's order (N9) |
+//!
+//! A round changed its component when a row's fingerprint (`number.zig`),
+//! which does not read where nodes are placed, or a row's speculatable flag
+//! changed. A round that changed a fingerprint must have lowered the measure
+//! of normal-form 3.0. A round that changed neither ends the component. A
+//! rewrite can take away the use that placed a node in an outer region, but
+//! it changes a fingerprint, so another round places the node. A rebuild
+//! that rewrites nothing builds no node its row does not read (matching a
+//! rule builds nothing), so it leaves every row settled. The rounds per
+//! component are capped by `max_rounds`, a constant of the language version
+//! (plan 2.3). The passes are hooks, so each milestone adds its passes
+//! without changing the driver.
+//!
+//! The verifier, and the checks that no plan speculates, that the simplify
+//! stage left every row settled, and that the number stage left the
+//! numbering a fixpoint and the content digest as it was, run in builds with
+//! runtime safety.
+
+const std = @import("std");
+const collections = @import("collections");
+const ir = @import("ir.zig");
+const types_mod = @import("types.zig");
+const measure = @import("measure.zig");
+const verify = @import("verify.zig");
+const live = @import("live.zig");
+const place = @import("place.zig");
+const rebuild = @import("rebuild.zig");
+const number = @import("number.zig");
+const digest = @import("digest.zig");
+const builder_mod = @import("builder.zig");
+const rows = @import("rows.zig");
+const views = @import("views.zig");
+
+const Allocator = std.mem.Allocator;
+const RowId = ir.RowId;
+const Builder = builder_mod.Builder;
+
+/// The cap on simplify rounds per component.
+pub const max_rounds: u32 = 64;
+
+/// Whether the driver runs the verifier and its own checks.
+const checks = std.debug.runtime_safety;
+
+/// A simplify pass: rewrites the rows of a component and says whether it changed any.
+pub const Pass = struct {
+    name: []const u8,
+    run: *const fn (ctx: *anyopaque, store: *ir.Store, types: *types_mod.Types, rows: []const RowId) Allocator.Error!bool,
+    ctx: *anyopaque,
+};
+
+/// Why the driver stopped.
+pub const Error = error{
+    /// A round changed a row without lowering its measure: a compiler bug.
+    MeasureDidNotFall,
+    /// A component took more than `max_rounds` rounds.
+    RoundBoundExceeded,
+    /// A pass broke an invariant of the verifier: a compiler bug.
+    InvariantBroken,
+    /// A call through a function value that no rule resolved is left in a
+    /// row the site reaches (N8j).
+    UnresolvedApply,
+} || Allocator.Error;
+
+/// What one run of the driver did.
+pub const Stats = struct {
+    components: u32 = 0,
+    rounds: u32 = 0,
+    max_component_rounds: u32 = 0,
+};
+
+/// The components of the graph of `Call` and `Closure` references, callee
+/// first (`rows.zig`).
+pub fn components(gpa: Allocator, store: *const ir.Store) Allocator.Error![][]RowId {
+    const g = try rows.graph(gpa, store, .references);
+    defer rows.freeGraph(gpa, g);
+    const all = try gpa.alloc(RowId, store.rows.items.len);
+    defer gpa.free(all);
+    for (all, 0..) |*r, i| r.* = RowId.of(@intCast(i));
+    return rows.components(gpa, g, all);
+}
+
+/// Which rows the run leaves: the finalized rows, the `graph` view of them
+/// (V1), which a `Code(f)` site holds, or the `inline` view (V2), which a
+/// `Code.Inlined(f)` site holds.
+pub const View = enum { finalized, graph, inline_ };
+
+/// Run the simplify, finalize, view and number stages over every row of
+/// `b`'s store, whose site has the root `root`. `b` builds no row now.
+pub fn run(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass) Error!Stats {
+    return runTo(gpa, b, root, passes, .graph);
+}
+
+/// `run`, leaving the rows at `view`.
+pub fn runTo(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass, view: View) Error!Stats {
+    const store = b.store;
+    store.rows.items[root.index()].fixed_params = true;
+    var stats: Stats = .{};
+    const comps = try components(gpa, store);
+    defer rows.freeComponents(gpa, comps);
+    var fin: rows.Finalizer = .{ .gpa = gpa, .root = root, .ties = ties(b), .max_turns = max_rounds };
+    defer fin.deinit();
+    var special: Specialize = .{ .gpa = gpa, .passes = passes, .fin = &fin, .stats = &stats };
+    defer special.deinit();
+    b.specializer = .{ .ctx = &special, .run = Specialize.run };
+    defer b.specializer = null;
+    for (comps) |comp| {
+        try component(gpa, b, passes, &fin, comp, &stats);
+        if (special.failed) |err| return err;
+    }
+    if (try rows.reachesApply(gpa, store, root)) return error.UnresolvedApply;
+    switch (view) {
+        .finalized => {},
+        .graph => try viewTurns(gpa, b, passes, &fin, root, &stats, views.singleUse),
+        .inline_ => {
+            try viewTurns(gpa, b, passes, &fin, root, &stats, views.singleUse);
+            try viewTurns(gpa, b, passes, &fin, root, &stats, views.everyHelper);
+        },
+    }
+    if (special.failed) |err| return err;
+    try numberStage(gpa, b);
+    if (checks) {
+        try checkInvariants(gpa, store, b.types);
+        if (try rows.check(gpa, store, root)) |_| return error.InvariantBroken;
+    }
+    return stats;
+}
+
+// A view's turns (`views.zig`): V1 inlines every row called from one place
+// into its caller, and V2 every call of a row that is not recursive, with
+// each closure of such a row a lambda. Each turn rebuilds the callers,
+// simplifies them, and finalizes the site's rows again, callee first, from
+// a registry of their own, because a caller's digest names its callees'.
+// Every turn takes the calls and closures of the rows it picked out of the
+// rows the site reaches, so the turns end.
+fn viewTurns(
+    gpa: Allocator,
+    b: *Builder,
+    passes: []const Pass,
+    fin: *rows.Finalizer,
+    root: RowId,
+    stats: *Stats,
+    comptime turnOf: fn (Allocator, *const ir.Store, RowId) Allocator.Error!views.Turn,
+) Error!void {
+    const store = b.store;
+    while (true) {
+        var turn = try turnOf(gpa, store, root);
+        defer turn.deinit(gpa);
+        if (turn.callers.len == 0) return;
+        var returns = try live.Returns.init(gpa, store);
+        defer returns.deinit(gpa);
+        const plans = try gpa.alloc(place.Plan, turn.inlined.len + turn.lambdas.len);
+        var planned: usize = 0;
+        defer {
+            for (plans[0..planned]) |*p| p.deinit();
+            gpa.free(plans);
+        }
+        var inline_rows: collections.DenseMapUnmanaged(RowId, *const place.Plan) = .empty;
+        defer inline_rows.deinit(gpa);
+        var lambda_rows: collections.DenseMapUnmanaged(RowId, *const place.Plan) = .empty;
+        defer lambda_rows.deinit(gpa);
+        for (turn.inlined) |r| {
+            plans[planned] = try place.planWith(gpa, store, &returns, r, .simplify, ties(b));
+            try inline_rows.put(gpa, r, &plans[planned]);
+            planned += 1;
+        }
+        for (turn.lambdas) |r| {
+            plans[planned] = try place.planWith(gpa, store, &returns, r, .simplify, ties(b));
+            try lambda_rows.put(gpa, r, &plans[planned]);
+            planned += 1;
+        }
+        for (turn.callers) |c| {
+            var p = try place.planWith(gpa, store, &returns, c, .simplify, ties(b));
+            defer p.deinit();
+            try rebuild.run(gpa, b, &p, .{ .inline_rows = &inline_rows, .lambda_rows = &lambda_rows });
+        }
+        // The rows the site reaches, finalized again callee first.
+        var reached: std.ArrayList(RowId) = .empty;
+        defer reached.deinit(gpa);
+        {
+            var numberings: ir.RowTable(number.Numbering) = .empty;
+            defer {
+                for (numberings.values()) |*n| n.deinit(gpa);
+                numberings.deinit(gpa);
+            }
+            var after = try live.Returns.init(gpa, store);
+            defer after.deinit(gpa);
+            try number.siteRows(gpa, store, &after, root, &numberings);
+            try reached.appendSlice(gpa, numberings.keys());
+        }
+        fin.registry.clearRetainingCapacity();
+        for (reached.items) |r| store.rows.items[r.index()].digest = null;
+        const g = try rows.graph(gpa, store, .references);
+        defer rows.freeGraph(gpa, g);
+        const comps = try rows.components(gpa, g, reached.items);
+        defer rows.freeComponents(gpa, comps);
+        for (comps) |comp| {
+            const changed = for (comp) |r| {
+                if (std.mem.findScalar(RowId, turn.callers, r) != null) break true;
+            } else false;
+            if (changed) try component(gpa, b, passes, fin, comp, stats) else try fin.finalize(b, comp);
+        }
+    }
+}
+
+// The rows calls specialize to (N8i, N8d), each built from a finalized
+// row with one function parameter bound to a closure of a finalized row,
+// then simplified and finalized on the spot, before the call that asked
+// for it is built. Keyed by the two rows' digests, the parameter and the
+// captures' types, so two calls that pass one function share a row.
+const Specialize = struct {
+    gpa: Allocator,
+    passes: []const Pass,
+    fin: *rows.Finalizer,
+    stats: *Stats,
+    made: std.AutoHashMapUnmanaged(u128, RowId) = .empty,
+    /// The first error a specialization stopped with, which ends the run
+    /// once the caller's round is over.
+    failed: ?Error = null,
+
+    fn deinit(self: *Specialize) void {
+        self.made.deinit(self.gpa);
+    }
+
+    fn run(ctx: *anyopaque, b: *Builder, row: RowId, param: u32, closure: RowId, captures: []const ir.TyId) builder_mod.SpecializeError!?builder_mod.Specialized {
+        const self: *Specialize = @ptrCast(@alignCast(ctx));
+        const store = b.store;
+        const closure_digest = store.row(closure).digest orelse return null;
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(std.mem.asBytes(&store.row(row).digest.?));
+        h.update(std.mem.asBytes(&param));
+        h.update(std.mem.asBytes(&closure_digest));
+        h.update(std.mem.sliceAsBytes(captures));
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        const key = std.mem.readInt(u128, out[0..16], .little);
+        if (self.made.get(key)) |made| return self.specialized(store, made);
+
+        const held = b.suspendRow();
+        defer b.resumeRow(held);
+        const old = try self.gpa.dupe(ir.TyId, store.tySlice(store.row(row).params));
+        defer self.gpa.free(old);
+        const params = try std.mem.concat(self.gpa, ir.TyId, &.{ old[0..param], captures, old[param + 1 ..] });
+        defer self.gpa.free(params);
+        var returns = try live.Returns.init(self.gpa, store);
+        defer returns.deinit(self.gpa);
+        var p = try place.planWith(self.gpa, store, &returns, row, .simplify, ties(b));
+        defer p.deinit();
+        const Values = struct {
+            gpa: Allocator,
+            old: usize,
+            param: u32,
+            closure: RowId,
+            captures: usize,
+            fn_ty: ir.TyId,
+
+            fn of(v: @This(), bb: *Builder) Allocator.Error![]const ir.Ref {
+                const refs = try v.gpa.alloc(ir.Ref, v.old);
+                errdefer v.gpa.free(refs);
+                const caps = try v.gpa.alloc(ir.Ref, v.captures);
+                defer v.gpa.free(caps);
+                for (caps, 0..) |*c, k| c.* = ir.Ref.rowParam(@intCast(v.param + k));
+                for (refs, 0..) |*r, j| r.* = if (j < v.param)
+                    ir.Ref.rowParam(@intCast(j))
+                else if (j == v.param)
+                    try bb.closure(v.closure, caps, v.fn_ty)
+                else
+                    ir.Ref.rowParam(@intCast(j - 1 + v.captures));
+                return refs;
+            }
+        };
+        const values: Values = .{ .gpa = self.gpa, .old = old.len, .param = param, .closure = closure, .captures = captures.len, .fn_ty = old[param] };
+        const made = try rebuild.into(self.gpa, b, &p, params, values, Values.of);
+        try self.made.put(self.gpa, key, made);
+        const comp = [_]RowId{made};
+        component(self.gpa, b, self.passes, self.fin, &comp, self.stats) catch |err| {
+            if (self.failed == null) self.failed = err;
+            return switch (err) {
+                error.OutOfMemory => |e| e,
+                error.MeasureDidNotFall => error.MeasureDidNotFall,
+                error.RoundBoundExceeded => error.RoundBoundExceeded,
+                error.InvariantBroken, error.UnresolvedApply => error.InvariantBroken,
+            };
+        };
+        return self.specialized(store, made);
+    }
+
+    // The row `made` is now, with the order finalize gave its parameters.
+    // A row that merged took the parameters of the row it merged into, in
+    // the order `made` had them, and the merge follows the renumbering.
+    fn specialized(self: *const Specialize, store: *const ir.Store, made: RowId) builder_mod.Specialized {
+        return .{ .row = canonical(store, made), .order = self.fin.orderOf(made) };
+    }
+};
+
+// The row `r` merged into, or `r`.
+fn canonical(store: *const ir.Store, r: RowId) RowId {
+    var at = r;
+    while (store.row(at).merged_into) |next| at = next;
+    return at;
+}
+
+// One component: its fixpoint, then its parts if it split (N8e), each
+// simplified and finalized callee first, or its finalize.
+fn component(gpa: Allocator, b: *Builder, passes: []const Pass, fin: *rows.Finalizer, comp: []const RowId, stats: *Stats) Error!void {
+    stats.components += 1;
+    const rounds = try simplify(gpa, b, passes, comp);
+    stats.rounds += rounds;
+    stats.max_component_rounds = @max(stats.max_component_rounds, rounds);
+    if (checks and !try allSettled(gpa, b.store, comp)) return error.InvariantBroken;
+    const split = try rows.parts(gpa, b.store, comp);
+    defer rows.freeComponents(gpa, split);
+    if (split.len > 1) {
+        for (split) |part| try component(gpa, b, passes, fin, part, stats);
+        return;
+    }
+    try fin.finalize(b, comp);
+    if (checks and !try allSettled(gpa, b.store, comp)) return error.InvariantBroken;
+}
+
+/// What a round compares: per row, its fingerprint and its flag, and the
+/// component's measure.
+const State = struct {
+    prints: []u128,
+    flags: []bool,
+    measure: measure.Measure,
+
+    fn deinit(self: *State, gpa: Allocator) void {
+        gpa.free(self.prints);
+        gpa.free(self.flags);
+    }
+};
+
+fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, comp: []const RowId) Allocator.Error!State {
+    var returns = try live.Returns.init(gpa, store);
+    defer returns.deinit(gpa);
+    var reached = try live.ofStore(gpa, store);
+    defer reached.deinit(gpa);
+    const prints = try gpa.alloc(u128, comp.len);
+    errdefer gpa.free(prints);
+    const flags = try gpa.alloc(bool, comp.len);
+    errdefer gpa.free(flags);
+    var total: measure.Measure = .{};
+    for (comp, prints, flags) |r, *p, *f| {
+        var numbering = try number.ofRow(gpa, store, &returns, r);
+        defer numbering.deinit(gpa);
+        p.* = number.fingerprint(store, &returns, &numbering, r);
+        f.* = store.row(r).speculatable;
+        const m = try measure.ofRow(gpa, store, types, reached.nodes, r);
+        for (&total.counts, m.counts) |*t, c| t.* +|= c;
+    }
+    return .{ .prints = prints, .flags = flags, .measure = total };
+}
+
+fn simplify(gpa: Allocator, b: *Builder, passes: []const Pass, comp: []const RowId) Error!u32 {
+    const store = b.store;
+    var rounds: u32 = 0;
+    var before = try stateOf(gpa, store, b.types, comp);
+    defer before.deinit(gpa);
+    while (true) {
+        {
+            var returns = try live.Returns.init(gpa, store);
+            defer returns.deinit(gpa);
+            for (comp) |r| {
+                var p = try place.planWith(gpa, store, &returns, r, .simplify, ties(b));
+                defer p.deinit();
+                if (checks and !place.noSpeculation(&p)) return error.InvariantBroken;
+                try rebuild.run(gpa, b, &p, .{});
+            }
+        }
+        var passed = false;
+        for (passes) |p| {
+            if (try p.run(p.ctx, store, b.types, comp)) passed = true;
+        }
+        var after = try stateOf(gpa, store, b.types, comp);
+        const content = passed or !std.mem.eql(u128, before.prints, after.prints);
+        const flags = !std.mem.eql(bool, before.flags, after.flags);
+        if (!content and !flags) {
+            after.deinit(gpa);
+            return rounds;
+        }
+        rounds += 1;
+        if (content and after.measure.order(before.measure) != .lt) {
+            after.deinit(gpa);
+            return error.MeasureDidNotFall;
+        }
+        before.deinit(gpa);
+        before = after;
+        if (rounds >= max_rounds) return error.RoundBoundExceeded;
+    }
+}
+
+// Whether every row of a component, once simplified, is where placement puts it.
+fn allSettled(gpa: Allocator, store: *const ir.Store, comp: []const RowId) Allocator.Error!bool {
+    var returns = try live.Returns.init(gpa, store);
+    defer returns.deinit(gpa);
+    for (comp) |r| {
+        var p = try place.plan(gpa, store, &returns, r, .simplify);
+        defer p.deinit();
+        if (!place.settled(&p)) return false;
+    }
+    return true;
+}
+
+// The number stage of every row: hoisting (N5b), which must leave the row's
+// content digest as it was, then outputs and joins in the walk's order (N9),
+// until the numbering is a fixpoint.
+fn numberStage(gpa: Allocator, b: *Builder) Error!void {
+    const store = b.store;
+    for (0..store.rows.items.len) |i| {
+        const r = RowId.of(@intCast(i));
+        if (store.row(r).merged_into != null) continue;
+        const before = if (checks) try digest.ofRegion(gpa, store, store.row(r).body) else 0;
+        {
+            var returns = try live.Returns.init(gpa, store);
+            defer returns.deinit(gpa);
+            var p = try place.planWith(gpa, store, &returns, r, .number, ties(b));
+            defer p.deinit();
+            if (checks and !place.noSpeculation(&p)) return error.InvariantBroken;
+            try rebuild.run(gpa, b, &p, .{ .raw = true });
+        }
+        if (checks and try digest.ofRegion(gpa, store, store.row(r).body) != before) return error.InvariantBroken;
+        var turns: u32 = 0;
+        while (true) : (turns += 1) {
+            var returns = try live.Returns.init(gpa, store);
+            defer returns.deinit(gpa);
+            var numbering = try number.ofRow(gpa, store, &returns, r);
+            defer numbering.deinit(gpa);
+            if (number.inOrder(store, &numbering)) break;
+            if (turns == max_rounds) return error.InvariantBroken;
+            var p = try place.planWith(gpa, store, &returns, r, .number, ties(b));
+            defer p.deinit();
+            try rebuild.run(gpa, b, &p, .{ .raw = true, .outputs = &numbering.outputs, .joins = &numbering.joins });
+        }
+    }
+}
+
+// How placement breaks ties: at random only under the L6 test hook.
+fn ties(b: *const Builder) place.Ties {
+    if (builder_mod.hooks_enabled) if (b.hooks.shuffle) |random| return .{ .shuffled = random };
+    return .lowest;
+}
+
+fn checkInvariants(gpa: Allocator, store: *const ir.Store, types: *types_mod.Types) Error!void {
+    var report = try verify.verifyAll(gpa, store, types);
+    defer report.deinit();
+    if (!report.ok()) return error.InvariantBroken;
+}
+
+const testing = std.testing;
+
+test "components run callee first and recursion is recorded" {
+    var store = ir.Store.init(testing.allocator);
+    defer store.deinit();
+    var types = types_mod.Types.init(testing.allocator);
+    defer types.deinit();
+    var b = builder_mod.Builder.init(testing.allocator, &store, &types);
+    defer b.deinit();
+    const i64_ty = try types.intTy(.i64);
+    // r0 calls r1; r1 calls itself.
+    const leaf = try b.beginRow(&.{i64_ty}, i64_ty);
+    try b.endRow(.{ .value = &.{ir.Ref.rowParam(0)} });
+    const root = try b.beginRow(&.{i64_ty}, i64_ty);
+    const c = try b.callRow(leaf, &.{ir.Ref.rowParam(0)});
+    try b.endRow(.{ .value = &.{c} });
+    const rec = try b.beginRow(&.{i64_ty}, i64_ty);
+    const again = try b.callRow(rec, &.{ir.Ref.rowParam(0)});
+    try b.endRow(.{ .value = &.{again} });
+
+    const comps = try components(testing.allocator, &store);
+    defer {
+        for (comps) |comp| testing.allocator.free(comp);
+        testing.allocator.free(comps);
+    }
+    try testing.expectEqual(@as(usize, 3), comps.len);
+    const pos = struct {
+        fn of(cs: []const []RowId, r: RowId) usize {
+            for (cs, 0..) |comp, i| if (comp[0] == r) return i;
+            unreachable;
+        }
+    };
+    try testing.expect(pos.of(comps, leaf) < pos.of(comps, root));
+
+    const stats = try runTo(testing.allocator, &b, root, &.{}, .finalized);
+    try testing.expectEqual(@as(u32, 3), stats.components);
+    try testing.expectEqual(@as(u32, 0), stats.rounds);
+    try testing.expect(store.row(rec).recursive);
+    try testing.expect(!store.row(root).recursive);
+}
+
+test "a round that changes nothing measurable is a compiler bug" {
+    var store = ir.Store.init(testing.allocator);
+    defer store.deinit();
+    var types = types_mod.Types.init(testing.allocator);
+    defer types.deinit();
+    var b = builder_mod.Builder.init(testing.allocator, &store, &types);
+    defer b.deinit();
+    const i64_ty = try types.intTy(.i64);
+    const only = try b.beginRow(&.{i64_ty}, i64_ty);
+    try b.endRow(.{ .value = &.{ir.Ref.rowParam(0)} });
+
+    const Liar = struct {
+        fn run(_: *anyopaque, _: *ir.Store, _: *types_mod.Types, _: []const RowId) Allocator.Error!bool {
+            return true;
+        }
+    };
+    var dummy: u8 = 0;
+    const pass: Pass = .{ .name = "liar", .run = Liar.run, .ctx = &dummy };
+    try testing.expectError(error.MeasureDidNotFall, run(testing.allocator, &b, only, &.{pass}));
+}

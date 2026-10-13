@@ -9,14 +9,16 @@ and the inputs of its tests.
 
 | File | What it is |
 | --- | --- |
-| `Sql.roc` | The builder and the translator. `Code.Ir` in, SQL out. |
+| `Sql.roc` | The builder and the translator. A `Code` graph in, SQL out. |
 | `main.roc` | A shop's schema, migrations, seed rows and queries. |
 | `check.py` | Runs the printed script on SQLite and compares query results with the ones Roc computes. |
 | `expected_output.sql` | What `roc main.roc` prints. |
+| `refactored.roc` | `main.roc` with the parameters of the reified functions renamed and bindings added and reordered. It prints `expected_output.sql` byte for byte, which its last `expect` checks. |
 
 ```
 roc examples/reifying/sql/main.roc          # the SQLite script
 roc test examples/reifying/sql/main.roc     # 10 expects
+roc test examples/reifying/sql/refactored.roc  # 11 expects: the same 10, and the script is expected_output.sql
 python3 examples/reifying/sql/check.py      # run it on SQLite, compare with Roc
 ```
 
@@ -24,55 +26,75 @@ python3 examples/reifying/sql/check.py      # run it on SQLite, compare with Roc
 
 | Feature | Roc | SQL | Where |
 | --- | --- | --- | --- |
-| Binary operators | `p.price >= 20 and p.title != "Gift card"` | `(products.price >= 20.0) AND (products.title <> 'Gift card')` | `main.roc:122` |
-| `NUMERIC` arithmetic | `p.price * 1.2` over a `Dec` | `products.price * 1.2` | `main.roc:122` |
+| Binary operators | `p.price >= 20 and p.title != "Gift card"` | `(products.price >= 20.0) AND (products.title <> 'Gift card')` | `main.roc:123` |
+| `NUMERIC` arithmetic | `p.price * 1.2` over a `Dec` | `products.price * 1.2` | `main.roc:123` |
 | `NUMERIC(p, s)` columns | `.numeric(\|p\| p.price, 10, 2)` | `price NUMERIC(10, 2) NOT NULL` | `main.roc:61` |
 | `CHECK` | `.check(\|o\| o.quantity > 0 and o.discount < 1)` | `CHECK ((quantity > 0) AND ...)` | `main.roc:78` |
 | Keys | `.primary_key(\|c\| c.id)`, `.references(\|o\| o.customer_id, customers)` | `PRIMARY KEY (id)`, `FOREIGN KEY (customer_id) REFERENCES customers` | `main.roc:74` |
 | Nullable column | `email ?: Str`, added by migration 003 | `ALTER TABLE customers ADD COLUMN email TEXT` | `main.roc:82` |
-| Explicit `NULL` handling | `c.?email ?? "(none)"` | `COALESCE(customers.email, '(none)')` | `main.roc:151` |
-| Parameters | `.filter_by(\|band, p\| p.price >= band.low)`, chained | `products.price >= :low` | `main.roc:142` |
-| Three-way join | `.join(orders, \|c, o\| ..).join(products, \|(_, o), p\| ..)` | two `JOIN .. ON` | `main.roc:163` |
-| Reused Roc functions | `line_total(o, p)`, `is_bulk(o)` | expanded in place | `main.roc:171` |
-| Aggregates | `rows.len()`, `rows.map(f).sum()` over a group | `COUNT(*)`, `SUM(..)` | `main.roc:187` |
-| Seed rows | `products.insert(seed_products)` | `INSERT` per row, through a derived encoder | `main.roc:291` |
-| Refusals with a location | `c.name.count_utf8_bytes()` | `main:225:46: ... counts bytes, and SQL's length counts characters` | `main.roc:225` |
+| Explicit `NULL` handling | `c.?email ?? "(none)"` | `COALESCE(customers.email, '(none)')` | `main.roc:152` |
+| Parameters | `.filter_by(\|band, p\| p.price >= band.low)`, chained | `products.price >= :low` | `main.roc:143` |
+| Three-way join | `.join(orders, \|c, o\| ..).join(products, \|(_, o), p\| ..)` | two `JOIN .. ON` | `main.roc:164` |
+| Reused Roc functions | `line_total(o, p)`, `is_bulk(o)` | expanded in place | `main.roc:172` |
+| Aggregates | `rows.len()`, `rows.map(f).sum()` over a group | `COUNT(*)`, `SUM(..)` | `main.roc:188` |
+| Seed rows | `products.insert(seed_products)` | `INSERT` per row, through a derived encoder | `main.roc:293` |
+| Refusals | `c.name.count_utf8_bytes()` | `` `count_utf8_bytes` counts bytes, and SQL's `length` counts characters `` | `main.roc:227` |
 
 `check.py` executes the whole script on SQLite with foreign keys on. The two
 joined queries also print the rows Roc computes by calling the same functions
-over the same seed rows (`main.roc:203`). The harness requires them to agree,
+over the same seed rows (`main.roc:204`). The harness requires them to agree,
 so one definition of `line_total` has two executions and a test that they
 match.
 
 ## How it is built
 
-A clause is a function over the row, and the translator walks its body with
-each parameter bound to what it stands for (`Sql.roc:525`):
+A clause is a function over the row. The translator reads the root row of
+its `Code` graph as a tree (`Graph.to_tree`), and evaluates the tree with
+each parameter bound to what it stands for (`Sql.roc:540`). A node the tree
+keeps as a definition is evaluated once, where its block defines it:
 
 | Binding | Stands for | A field read off it is |
 | --- | --- | --- |
 | `Row(Leaf(alias))` | one table's row | the column `alias.field` |
-| `Row(Pair(l, r))` | a joined row | nothing; `.0` and `.1` pick a side (`Sql.roc:640`) |
+| `Row(Pair(l, r))` | a joined row | nothing; `.0` and `.1` pick a side (`Sql.roc:680`) |
 | `Params` | the parameter record | the placeholder `:field` |
-| `Group(source)` | a group's rows | nothing; `len` and `map(..).sum()` aggregate it (`Sql.roc:799`) |
+| `Group(source)` | a group's rows | nothing; `len` and `map(..).sum()` aggregate it (`Sql.roc:783`) |
+| `Maybe(column)` | a read of an optional field, a column that can be `NULL` | nothing; a `switch` on it is `COALESCE` or `CASE` (`Sql.roc:708`) |
 | `Fields(..)` | a record the body built | that field's binding |
 
-A call to one of the application's own functions resolves against
-`Code.definitions` and is expanded with its arguments bound the same way
-(`Sql.roc:829`). A row passes through as a row, which is why `line_total`
+A call to one of the application's own functions that two places share, or
+that recurses, is a `Call` of another row of the same graph, and is expanded
+with that row's parameters bound the same way (`Sql.roc:820`). A function that
+one place calls is already inlined in the description. A row passes through as a row, which is why `line_total`
 works inside a query unchanged.
 
+The description is a normal form, so two spellings of one computation reach
+the translator as one:
+
+| Written | Arrives as | The translator writes |
+| --- | --- | --- |
+| `o.quantity >= 10` | `Num.I64.is_lte(10, o.quantity)`: an integer literal first | `orders.quantity >= 10`: a comparison whose left operand is the only literal is mirrored back (`Sql.roc:844`) |
+| `p.title != "Gift card"` | `Bool.not(Str.is_eq(..))` | `products.title <> 'Gift card'` |
+| `{ title: p.title, price: p.price }` | a record in field-name order | `SELECT products.price AS price, products.title AS title`: result columns, and a step's `CREATE TABLE` columns, come in name order |
+
+A refusal names the construct, but not where it was written: the description
+carries no source regions, so a message cannot lead with a `main:227:46`
+location. `Code.refuse_at` reports a node at every place in the source it came
+from, but it stops the compile, where an `Err` can be tested, so this translator
+returns an `Err` instead.
+
 Migrations list their columns as a record (`|c| { id: c.id, name: c.name }`),
-so a migration keeps its meaning after the record gains a field. The row
+so a migration keeps its meaning after the record gains a field. The
+record's fields arrive in name order, so the table's columns do too. The row
 type's full field list comes from the lambda's parameter type, so
-`Sql.schema_gaps` (`Sql.roc:409`) can say which fields no migration creates:
+`Sql.schema_gaps` (`Sql.roc:405`) can say which fields no migration creates:
 
 ```roc
 expect Sql.schema_gaps(migrations.take_first(2)) == ["customers.email is never created"]
 ```
 
 Parameter and row values cross into SQL through the compiler's derived
-`encoder_for`, pointed at `Sql.Encoding` (`Sql.roc:962`). `bind` requires `p`
+`encoder_for`, pointed at `Sql.Encoding` (`Sql.roc:947`). `bind` requires `p`
 to have that encoder, so the parameter values are typed by the same record the
 filter reads.
 
@@ -129,20 +151,17 @@ one's parameter record.
 
 ```roc
 .join(products, |(_, o), p| o.product_id == p.id)
-# the condition describes as: |bind#1, p| let o = bind#1.0.1; (o.product_id is_eq p.id)
+# the condition describes as: Num.I64.is_eq(p0.1.product_id, p1.id)
 ```
 
-Destructuring in a body already described as `Let`s over `Index` and
-`Field`. A parameter written as a pattern now goes by an invented name, and
-the same reads (`destructureInto`, `src/check/code_reifier.zig:5744`) wrap the
-body (`bindParamPattern`, `wrapDestructures`). A lambda passed to one of the
-application's functions is lifted into a row named after the first name its
-patterns bind, or `Module.lambda` when they bind none (`|_| ..`).
+A parameter written as a pattern is one parameter of the row, and each name
+its pattern binds is the `Index` or `Field` read it stands for. A lambda
+passed to one of the application's functions is a row of its own.
 `test/cli/StagedPatternParams.roc` pins the shapes: nested tuples, `_`,
 records, a variant, and a lifted lambda.
 
 The example now reads joined rows through patterns: `|((c, o), p)| ..`
-(`main.roc:171`).
+(`main.roc:172`).
 
 ### 3. A lambda that failed to check (fixed)
 
@@ -209,8 +228,8 @@ In a package this panic also hid three ordinary type errors in `Sql.roc`.
 
 `Sql.roc` is about 1000 lines: 450 of builder and migrations, 450 of
 translator, 50 of encoding. As with `../glsl/`, nearly all of the translator is
-fixed cost. Its `eval` has one arm per `Code.Ir` variant (`Sql.roc:626`), and a
-new SQL function is one row in `call` (`Sql.roc:783`). Nothing in `main.roc` is
+fixed cost. Its `op` has one arm per `Code.Op` variant (`Sql.roc:655`), and a
+new SQL function is one row in `prim` (`Sql.roc:766`). Nothing in `main.roc` is
 SQL-specific except the method names. Its queries use Roc's operators, its
 `and` and `or`, its optional fields and its `??`, and each query is built from
 functions the application also calls.

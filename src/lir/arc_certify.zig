@@ -3989,7 +3989,10 @@ const Certifier = struct {
                     try self.noteProcLocal(ret_stmt.value);
                     try self.noteRestitutedParams();
                 },
-                .crash => |crash_stmt| if (crash_stmt.msg.localId()) |message| try self.noteProcLocal(message),
+                .crash => |crash_stmt| {
+                    if (crash_stmt.msg.localId()) |message| try self.noteProcLocal(message);
+                    if (self.store.stmtRowOrDefault(crash_stmt.extra).refusal) |refusal| for (refusal.locals()) |local| try self.noteProcLocal(local);
+                },
                 .dyn => |dyn_stmt| {
                     if (dyn_stmt.target) |target| try self.noteProcLocal(target);
                     try DynOps.Operands.of(self.store.stmtRow(dyn_stmt.data)).each(self.store, self, Certifier.noteProcLocal);

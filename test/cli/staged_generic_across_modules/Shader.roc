@@ -1,10 +1,7 @@
-# The module the application's staged body calls into. Both definitions are
+# The module the application's staged body calls into. The definition is
 # generic, so each row the application's table carries is one instantiation.
 
 Shader := {}.{
-	id : a -> a
-	id = |v| v
-
-	pick : a, b -> a
-	pick = |p, _q| p
+	single : a -> List(a)
+	single = |v| [v]
 }

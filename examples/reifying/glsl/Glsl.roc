@@ -3,7 +3,7 @@
 #
 # This is ordinary Roc that runs at compile time. Naming a Roc function where
 # `fragment_330` expects a `Code(f)` is what reifies it: the compiler describes
-# the function, `Code.ir` opens the description, and this emits the GLSL that
+# the function, `Code.graph` opens the description, and this emits the GLSL that
 # raylib accepts together with the interface the application binds through.
 #
 # A fragment shader takes two records. The first holds the varyings the vertex
@@ -113,28 +113,25 @@ Glsl :: {}.{
 	## Compile a reified Roc function to a GLSL 330 fragment shader.
 	##
 	## Naming a function here reifies it: the compiler describes the function
-	## during `roc build` and hands the description over as a `Code(f)`.
+	## during `roc build` and hands the description over as a `Code(f)`. The
+	## root row is the shader; `to_tree` gives it as nested expressions, with a
+	## def for each value the body reads more than once.
 	fragment_330 : Code(f) -> Try(Fragment, Error)
 	fragment_330 = |code| {
-		described = Code.ir(code)
-		shader_meta = described.node_meta()
-		lambda = match described {
-			Lambda(ps, b, _) => { params: ps, body: b }
-			_ => return Err(BadInterface("${Glsl.at(shader_meta)}a shader must be a function; this is a bare expression"))
-		}
-		inputs = match lambda.params {
+		graph = Code.graph(code)
+		row = graph.root_row()
+		inputs = match row.params {
 			[interpolated, per_draw] => { interpolated, per_draw }
-			_ => return Err(BadInterface("${Glsl.at(shader_meta)}a fragment shader takes two records: the varyings it reads, then the uniforms it reads"))
+			_ => return Err(BadInterface("a fragment shader takes two records: the varyings it reads, then the uniforms it reads"))
 		}
-		varyings = Glsl.located(Glsl.bindings_of(inputs.interpolated.ty, In), shader_meta)?
-		uniforms = Glsl.located(Glsl.bindings_of(inputs.per_draw.ty, Uniform), shader_meta)?
+		varyings = Glsl.bindings_of(inputs.interpolated, In)?
+		uniforms = Glsl.bindings_of(inputs.per_draw, Uniform)?
 		bindings = varyings.concat(uniforms)
-		body_meta = lambda.body.node_meta()
-		out_kind = Glsl.located(Glsl.kind_for(body_meta.ty), body_meta)?
+		out_kind = Glsl.kind_for(row.result)?
 		if !out_kind.is_vec4() {
-			return Err(BadType("${Glsl.at(body_meta)}a fragment shader must return Vec4; this one returns ${out_kind.to_str()}"))
+			return Err(BadType("a fragment shader must return Vec4; this one returns ${out_kind.to_str()}"))
 		}
-		rendered = Glsl.render(lambda.body, [inputs.interpolated.name, inputs.per_draw.name])?
+		rendered = Glsl.render_block(graph.to_tree(row.id), { row, locals: [] })?
 		decls = bindings.map(Glsl.declare)
 		Ok(
 			Fragment.(
@@ -220,189 +217,198 @@ Glsl :: {}.{
 		_ => Err(BadType("`${kind.to_str()}` is not built from lanes"))
 	}
 
-	## A rendered expression, plus the GLSL locals its `Let` bindings needed.
+	## A rendered block: the GLSL locals its defs needed, and its value.
 	Rendered := { statements : Str, value : Str }
 
-	## Render a reified expression. `inputs` holds the names of the shader's two
-	## parameters: a field read from either one is a shader input, so
-	## `frag.uv` renders as `uv` rather than as a field access on a struct GLSL
-	## never sees.
-	render : Code.Ir, List(Str) -> Try(Rendered, Error)
-	render = |node, inputs| match node {
-		Lit(literal, _) => Glsl.plain(Glsl.literal(literal)?)
+	## What rendering reads: the row, for the types of its parameters and
+	## nodes, and the GLSL text each def of the enclosing blocks stands for.
+	Scope : { row : Code.Row, locals : List({ id : U32, text : Str }) }
 
-		Param(name, meta) =>
-			if inputs.contains(name) {
-				Err(BadInterface("${Glsl.at(meta)}the input record `${name}` has no GLSL value of its own; read a field from it"))
-			} else {
-				Glsl.plain(name)
+	## Render a block. A def that only reads a lane or a field of a value that
+	## already has a name is written where it is read, because GLSL reads it
+	## as cheaply as a local; every other def becomes one GLSL local, so work
+	## the body shares stays shared.
+	render_block : Code.Tree, Scope -> Try(Rendered, Error)
+	render_block = |tree, scope| match tree {
+		Block(block) => {
+			start = { scope, statements: "" }
+			placed = block.defs.fold_try(
+				start,
+				|acc, def| {
+					text = Glsl.render(def.value, acc.scope)?
+					if Glsl.is_read(def.value) {
+						Ok({ ..acc, scope: { ..acc.scope, locals: acc.scope.locals.append({ id: def.id, text }) } })
+					} else {
+						kind = Glsl.kind_for(Glsl.value_ty(def.value, acc.scope)?)?
+						local = "n${def.id.to_str()}"
+						declaration = "\t${kind.to_str()} ${local} = ${text};"
+						Ok(
+							{
+								scope: { ..acc.scope, locals: acc.scope.locals.append({ id: def.id, text: local }) },
+								statements: Glsl.both(acc.statements, declaration),
+							},
+						)
+					}
+				},
+			)?
+			value = match block.end {
+				Value([only]) => Glsl.render(only, placed.scope)?
+				Value(_) => return Err(Unsupported("a value that carries a loop's or a branch's state has no GLSL expression"))
+				Jump(_) => return Err(Unsupported("a branch that continues after it is a statement this translator does not emit"))
+				Return(_) => return Err(Unsupported("a `return` is a statement this translator does not emit"))
+				Continue(_) => return Err(Unsupported("a loop is a statement this translator does not emit"))
+				Break(_) => return Err(Unsupported("a loop is a statement this translator does not emit"))
+				Branch(_) => return Err(Unsupported("a branch that leaves the shader early is a statement this translator does not emit"))
 			}
+			Ok(Rendered.({ statements: placed.statements, value }))
+		}
+		Op(_) | Param(_) | Arg(_) | Out(_) | Def(_) => Ok(Rendered.({ statements: "", value: Glsl.render(tree, scope)? }))
+	}
 
-		Local(name, _) => Glsl.plain(name)
+	## Whether a def only reads a field, a lane or a nominal's backing out of a
+	## parameter or another def.
+	is_read : Code.Tree -> Bool
+	is_read = |tree| match tree {
+		Param(_) | Def(_) => Bool.True
+		Op(node) => match (node.op, node.args) {
+			(Field(_), [inner]) | (Index(_), [inner]) | (Unwrap, [inner]) => Glsl.is_read(inner)
+			_ => Bool.False
+		}
+		Arg(_) | Out(_) | Block(_) => Bool.False
+	}
 
-		Field(receiver, name, _) => {
-			from_inputs = match receiver {
-				Param(holder, _) => inputs.contains(holder)
-				_ => Bool.False
-			}
-			if from_inputs {
-				Glsl.plain(name)
+	## The type a def is declared at. A nominal's backing is read under the
+	## nominal's name, so a def that unwraps one is a local of the nominal.
+	value_ty : Code.Tree, Scope -> Try(Code.Ty, Error)
+	value_ty = |tree, scope| match tree {
+		Op(node) => match (node.op, node.args) {
+			(Unwrap, [inner]) => Glsl.value_ty(inner, scope)
+			_ => Ok(node.ty)
+		}
+		Param(k) => match scope.row.params.get(k.to_u64()) {
+			Ok(ty) => Ok(ty)
+			Err(_) => Err(BadInterface("a read of a parameter the shader does not have"))
+		}
+		Def(n) => Ok(scope.row.node(n).ty)
+		Arg(_) | Out(_) | Block(_) => Err(Unsupported("a value that carries a loop's or a branch's state has no GLSL local"))
+	}
+
+	## Render one expression. A field read straight off one of the shader's two
+	## parameters is a shader input, so `frag.uv` renders as `uv` rather than as
+	## a field access on a struct GLSL never sees.
+	render : Code.Tree, Scope -> Try(Str, Error)
+	render = |tree, scope| match tree {
+		Param(_) => Err(BadInterface("an input record has no GLSL value of its own; read a field from it"))
+		Def(n) => match scope.locals.find_first(|local| local.id == n) {
+			Ok(local) => Ok(local.text)
+			Err(_) => Err(Unsupported("a value read before the translator placed it"))
+		}
+		Arg(_) | Out(_) => Err(Unsupported("a value that carries a loop's or a branch's state has no GLSL expression"))
+		Block(_) => {
+			inner = Glsl.render_block(tree, scope)?
+			if inner.statements.is_empty() {
+				Ok(inner.value)
 			} else {
-				inner = Glsl.render(receiver, inputs)?
-				Ok(Rendered.({ statements: inner.statements, value: "${inner.value}.${name}" }))
+				Err(Unsupported("an `if` arm that shares work between its own reads needs statements, and a GLSL `?:` holds only an expression"))
 			}
 		}
+		Op(node) => Glsl.render_op(node.op, node.args, node.ty, scope)
+	}
 
-		Index(receiver, position, meta) => {
-			inner = Glsl.render(receiver, inputs)?
+	render_op : Code.Op, List(Code.Tree), Code.Ty, Scope -> Try(Str, Error)
+	render_op = |op, args, ty, scope| match op {
+		Lit(literal) => Glsl.literal(literal)
+		Prim(prim) => Glsl.call(prim.owner, prim.method, args.map_try(|arg| Glsl.render(arg, scope))?)
+		And(_) => Ok("(${Str.join_with(args.map_try(|arg| Glsl.render(arg, scope))?, " && ")})")
+		Or(_) => Ok("(${Str.join_with(args.map_try(|arg| Glsl.render(arg, scope))?, " || ")})")
+		Wrap(_) => {
+			kind = Glsl.kind_for(ty)?
+			match args {
+				[Op({ op: Record(names), args: fields, ty: _ })] => {
+					lanes = Glsl.lanes_of(kind)?
+					rendered = lanes.map_try(
+						|lane| match names.find_first_index(|name| name == lane) {
+							Ok(at) => match fields.get(at) {
+								Ok(field) => Glsl.render(field, scope)
+								Err(_) => Err(BadType("a ${kind.to_str()} with no value for `${lane}`"))
+							}
+							Err(_) => Err(BadType("a ${kind.to_str()} is built from lanes named ${Str.join_with(lanes, ", ")}; this one has no `${lane}`")),
+						},
+					)?
+					Ok("${kind.to_str()}(${Str.join_with(rendered, ", ")})")
+				}
+				[inner] => Glsl.render(inner, scope)
+				_ => Err(BadType("a ${kind.to_str()} built from ${args.len().to_str()} values"))
+			}
+		}
+		Record(_) => Err(BadType("`${ty.name()}` is a record, and GLSL 330 builds only its vectors from lanes"))
+		Tuple => {
+			kind = Glsl.kind_for(ty)?
+			Ok("${kind.to_str()}(${Str.join_with(args.map_try(|arg| Glsl.render(arg, scope))?, ", ")})")
+		}
+		Unwrap => match args {
+			[inner] => Glsl.render(inner, scope)
+			_ => Err(Unsupported("an unwrap of more than one value"))
+		}
+		Field(name) => match args {
+			[Param(_)] => Ok(name)
+			[inner] => Ok("${Glsl.render(inner, scope)?}.${name}")
+			_ => Err(Unsupported("a field read of more than one value"))
+		}
+		Index(position) => {
 			lane = match position {
 				0 => "x"
 				1 => "y"
 				2 => "z"
 				3 => "w"
-				_ => return Err(BadType("${Glsl.at(meta)}a GLSL vector has at most four lanes"))
+				_ => return Err(BadType("a GLSL vector has at most four lanes"))
 			}
-			Ok(Rendered.({ statements: inner.statements, value: "${inner.value}.${lane}" }))
-		}
-
-		Binop(op, lhs, rhs, meta) => {
-			# The node's own type is what the operator produced, and a comparison
-			# produces a Bool, so the operand type is the one that settles the form.
-			form = Glsl.located(Glsl.operator(op, lhs.node_ty()), meta)?
-			left = Glsl.render(lhs, inputs)?
-			right = Glsl.render(rhs, inputs)?
-			Ok(
-				Rendered.(
-					{
-						statements: Glsl.both(left.statements, right.statements),
-						value: form.over(left.value, right.value),
-					},
-				),
-			)
-		}
-
-		Unary(op, operand, meta) => {
-			symbol = match op {
-				"neg" => "-"
-				"not" => "!"
-				_ => return Err(Unsupported("${Glsl.at(meta)}`${op}` has no GLSL form"))
+			match args {
+				[inner] => Ok("${Glsl.render(inner, scope)?}.${lane}")
+				_ => Err(Unsupported("a lane read of more than one value"))
 			}
-			inner = Glsl.render(operand, inputs)?
-			Ok(Rendered.({ statements: inner.statements, value: "${symbol}(${inner.value})" }))
 		}
+		Switch(sw) => Glsl.conditional(sw, args, scope)
+		Call(_) => Err(Unsupported("a shader calls builtins and `Glsl` functions, and this one calls a function of its own package"))
+		Closure(_) => Err(Unsupported("a shader cannot contain a nested function"))
+		Lambda(_) => Err(Unsupported("a shader cannot contain a nested function"))
+		List => Err(Unsupported("GLSL 330 has no list; a fixed-lane vector is built from a tuple"))
+		Item => Err(Unsupported("GLSL 330 has no list to read an element of"))
+		Tag(name) => Err(Unsupported("GLSL 330 has no tag union, so `${name}` has no GLSL form"))
+		Payload(name, _) => Err(Unsupported("GLSL 330 has no tag union, so `${name}` has no payload to read"))
+		OptField(name) => Err(Unsupported("`${name}` may be absent, and GLSL 330 has no form for a field that is not there"))
+		ForRange(_) | ForList(_) | Loop(_) => Err(Unsupported("this translator renders an expression and the declarations under it, and a loop is a statement it does not emit"))
+		Crash => Err(Unsupported("`crash` cannot run on a GPU"))
+		Derived(method, _) => Err(Unsupported("`${method}` is derived by the compiler and a shader owns no vehicle for it"))
+	}
 
-		Call(callee, args, meta) => {
-			rendered = args.map_try(|arg| Glsl.render(arg, inputs))?
-			statements = Str.join_with(rendered.map(|r| r.statements).keep_if(Glsl.is_present), "\n")
-			values = rendered.map(|r| r.value)
-			match Glsl.broadcast(callee, values) {
-				Ok(value) => Ok(Rendered.({ statements, value }))
-				Err(_) => {
-					name = Glsl.located(Glsl.builtin_name(callee, args.len()), meta)?
-					Ok(Rendered.({ statements, value: "${name}(${Str.join_with(values, ", ")})" }))
+	## A switch on a `Bool` with one value is GLSL's `?:`. Any other switch is
+	## on a tag union, a literal or a list, and GLSL 330 has none of those to
+	## switch on.
+	conditional : { arms : List({ key : Code.Key, region : Code.Region }), joins : List(Code.Region), outputs : List(Code.Ty) }, List(Code.Tree), Scope -> Try(Str, Error)
+	conditional = |sw, args, scope| {
+		shaped = match (sw.arms, sw.outputs, args) {
+			([first, second], [_], [test, first_arm, second_arm]) =>
+				if Glsl.selects(first.key) and !Glsl.selects(second.key) {
+					Ok({ test, yes: first_arm, no: second_arm })
+				} else if Glsl.selects(second.key) and !Glsl.selects(first.key) {
+					Ok({ test, yes: second_arm, no: first_arm })
+				} else {
+					Err(Unsupported("GLSL 330 has no tag union to switch on; use `if`"))
 				}
-			}
+			_ => Err(Unsupported("GLSL 330 has no tag union to switch on; use `if`"))
 		}
-
-		MakeRecord(fields, meta) => {
-			kind = Glsl.located(Glsl.kind_for(meta.ty), meta)?
-			lanes = Glsl.located(Glsl.lanes_of(kind), meta)?
-			rendered = lanes.map_try(
-				|lane| match fields.find_first(|field| field.name == lane) {
-					Ok(field) => Glsl.render(field.value, inputs)
-					Err(_) => Err(BadType("${Glsl.at(meta)}a ${kind.to_str()} is built from lanes named ${Str.join_with(lanes, ", ")}; this one has no `${lane}`"))
-				},
-			)?
-			Ok(
-				Rendered.(
-					{
-						statements: Str.join_with(rendered.map(|r| r.statements).keep_if(Glsl.is_present), "\n"),
-						value: "${kind.to_str()}(${Str.join_with(rendered.map(|r| r.value), ", ")})",
-					},
-				),
-			)
-		}
-
-		MakeTuple(elems, meta) => {
-			kind = Glsl.located(Glsl.kind_for(meta.ty), meta)?
-			rendered = elems.map_try(|elem| Glsl.render(elem, inputs))?
-			Ok(
-				Rendered.(
-					{
-						statements: Str.join_with(rendered.map(|r| r.statements).keep_if(Glsl.is_present), "\n"),
-						value: "${kind.to_str()}(${Str.join_with(rendered.map(|r| r.value), ", ")})",
-					},
-				),
-			)
-		}
-
-		If(condition, then_branch, else_branch, _) => {
-			test = Glsl.render(condition, inputs)?
-			yes = Glsl.render(then_branch, inputs)?
-			no = Glsl.render(else_branch, inputs)?
-			Ok(
-				Rendered.(
-					{
-						statements: Glsl.both(test.statements, Glsl.both(yes.statements, no.statements)),
-						value: "(${test.value} ? ${yes.value} : ${no.value})",
-					},
-				),
-			)
-		}
-
-		Let(name, bound, rest, _) => {
-			bound_meta = bound.node_meta()
-			kind = Glsl.located(Glsl.kind_for(bound_meta.ty), bound_meta)?
-			value = Glsl.render(bound, inputs)?
-			body = Glsl.render(rest, inputs)?
-			declaration = "\t${kind.to_str()} ${name} = ${value.value};"
-			Ok(
-				Rendered.(
-					{
-						statements: Glsl.both(Glsl.both(value.statements, declaration), body.statements),
-						value: body.value,
-					},
-				),
-			)
-		}
-
-		OptField(_, name, meta) => Err(Unsupported("${Glsl.at(meta)}`${name}` may be absent, and GLSL 330 has no form for a field that is not there"))
-		MakeList(_, meta) => Err(Unsupported("${Glsl.at(meta)}GLSL 330 has no list; a fixed-lane vector is built from a tuple"))
-		MakeTag(name, _, meta) => Err(Unsupported("${Glsl.at(meta)}GLSL 330 has no tag union, so `${name}` has no GLSL form"))
-		Match(_, _, meta) => Err(Unsupported("${Glsl.at(meta)}GLSL 330 has no tag union to match on; use `if`"))
-		Derived(method, _, _, meta) => Err(Unsupported("${Glsl.at(meta)}`${method}` is derived by the compiler and a shader owns no vehicle for it"))
-		Widen(_, meta) => Err(Unsupported("${Glsl.at(meta)}GLSL 330 has no tag union, so a widening between two has no GLSL form"))
-		Range(_, _, _, meta) => Err(Unsupported("${Glsl.at(meta)}a range has no GLSL value of its own; it reaches a shader as the bounds of a `for`"))
-		For(_, meta) => Err(Unsupported("${Glsl.at(meta)}this translator renders an expression and the declarations under it, and a loop is a statement it does not emit"))
-		While(_, meta) => Err(Unsupported("${Glsl.at(meta)}this translator renders an expression and the declarations under it, and a loop is a statement it does not emit"))
-		Break(_, meta) => Err(Unsupported("${Glsl.at(meta)}a `break` stands inside a loop, and this translator emits no loop for it to leave"))
-		Return(_, meta) => Err(Unsupported("${Glsl.at(meta)}a `return` node stands inside a loop, and this translator emits no loop for it to leave"))
-		Lambda(_, _, meta) => Err(Unsupported("${Glsl.at(meta)}a shader cannot contain a nested function"))
-		Crash(_, meta) => Err(Unsupported("${Glsl.at(meta)}`crash` cannot run on a GPU"))
+		parts = shaped?
+		Ok("(${Glsl.render(parts.test, scope)?} ? ${Glsl.render(parts.yes, scope)?} : ${Glsl.render(parts.no, scope)?})")
 	}
 
-	## Where a node was written, as a prefix an error message can lead with.
-	##
-	## Every [Code.Ir] node carries one, so a shader that will not compile names
-	## the line the author has to look at rather than only the construct.
-	at : Code.Meta -> Str
-	at = |meta| {
-		region = meta.region
-		"${region.module_name}:${region.start_line.to_str()}:${region.start_column.to_str()}: "
+	## Whether an arm is the one a `True` test selects.
+	selects : Code.Key -> Bool
+	selects = |key| match key {
+		Lit(Bool(flag)) => flag
+		Tag(name) => name == "True"
+		Lit(_) | Len(_) | AtLeast(_) | Default => Bool.False
 	}
-
-	## Name where a node was written on an error raised by something that knows
-	## only a type or an operator, and so cannot say it itself.
-	located : Try(a, Error), Code.Meta -> Try(a, Error)
-	located = |result, meta| match result {
-		Ok(value) => Ok(value)
-		Err(Unsupported(message)) => Err(Unsupported("${Glsl.at(meta)}${message}"))
-		Err(BadType(message)) => Err(BadType("${Glsl.at(meta)}${message}"))
-		Err(BadInterface(message)) => Err(BadInterface("${Glsl.at(meta)}${message}"))
-	}
-
-	plain : Str -> Try(Rendered, Error)
-	plain = |value| Ok(Rendered.({ statements: "", value }))
 
 	is_present : Str -> Bool
 	is_present = |text| !text.is_empty()
@@ -462,100 +468,117 @@ Glsl :: {}.{
 		}
 	}
 
-	## A `Binop` names the Roc method the operator dispatched to, so these are
-	## the method names and not the symbols.
+	## One call, by the owner and method a `Prim` carries.
 	##
-	## Two of them read differently at a float, which is why the operand type is
-	## here beside the name. Roc's `//` truncates toward zero and GLSL's `/` does
-	## that only at an integer, and GLSL 330 spells the float remainder `mod` and
-	## keeps `%` for integers. Both differences are silent in Roc: one computes
-	## another number, the other does not compile on the driver.
-	operator : Str, Code.Ty -> Try(Form, Error)
-	operator = |method, operand| {
-		whole = match operand.numeric() {
-			Ok(number) => match number.kind {
-				Int => Bool.True
-				Frac => Bool.False
-				Fixed => Bool.False
+	## A builtin's owner names its type, `Num.F32` or `Num.I32`, so the owner
+	## says which form an operator takes and the method picks the row. A `Glsl`
+	## function arrives under its own type's name, because this library is a
+	## package of its own and its bodies stay behind their names.
+	call : Str, Str, List(Str) -> Try(Str, Error)
+	call = |owner, method, values| {
+		if owner == "Bool" {
+			return match (method, values) {
+				("not", [only]) => Ok("!(${only})")
+				_ => Err(Unsupported("`Bool.${method}` has no GLSL form"))
 			}
-			Err(_) => Bool.False
 		}
-		match method {
-			"plus" => Ok(Form.Infix("+"))
-			"minus" => Ok(Form.Infix("-"))
-			"times" => Ok(Form.Infix("*"))
-			"div_by" => Ok(Form.Infix("/"))
-			"div_trunc_by" =>
-				if whole {
-					Ok(Form.Infix("/"))
-				} else {
-					Ok(Form.Truncated)
+		match Glsl.numeric_owner(owner) {
+			Ok(whole) => match (method, values) {
+				("negate", [only]) => Ok("-(${only})")
+				(_, [lhs, rhs]) => match Glsl.operator(method, whole) {
+					Ok(form) => Ok(form.over(lhs, rhs))
+					Err(_) => Glsl.function(owner, method, values)
 				}
-			"rem_by" =>
-				if whole {
-					Ok(Form.Infix("%"))
-				} else {
-					Ok(Form.Apply("mod"))
-				}
-			"is_lt" => Ok(Form.Infix("<"))
-			"is_gt" => Ok(Form.Infix(">"))
-			"is_lte" => Ok(Form.Infix("<="))
-			"is_gte" => Ok(Form.Infix(">="))
-			"is_eq" => Ok(Form.Infix("=="))
-			"and" => Ok(Form.Infix("&&"))
-			"or" => Ok(Form.Infix("||"))
-			_ => Err(Unsupported("`${method}` has no GLSL operator"))
+				_ => Glsl.function(owner, method, values)
+			}
+			Err(_) => match (Glsl.broadcast(owner, method), values) {
+				(Ok(symbol), [lhs, rhs]) => Ok("(${lhs} ${symbol} ${rhs})")
+				_ => Glsl.function(owner, method, values)
+			}
 		}
 	}
 
-	## GLSL broadcasts a scalar across a vector, which Roc has no operator for:
-	## the right operand of `*` would have to be a vector too. `scale` and
+	## Whether an owner is a builtin number type, and if so whether it is a
+	## whole-number one.
+	numeric_owner : Str -> Try(Bool, [NotNumeric])
+	numeric_owner = |owner| match owner {
+		"Num.F32" | "Num.F64" | "Num.Dec" => Ok(Bool.False)
+		"Num.I8" | "Num.U8" | "Num.I16" | "Num.U16" | "Num.I32" | "Num.U32" => Ok(Bool.True)
+		"Num.I64" | "Num.U64" | "Num.I128" | "Num.U128" => Ok(Bool.True)
+		_ => Err(NotNumeric)
+	}
+
+	## The builtin methods that are operators in GLSL. Two of them read
+	## differently at a float, which is why the owner's kind is here beside the
+	## method. Roc's `//` truncates toward zero and GLSL's `/` does that only at
+	## an integer, and GLSL 330 spells the float remainder `mod` and keeps `%`
+	## for integers. Both differences are silent in Roc: one computes another
+	## number, the other does not compile on the driver.
+	operator : Str, Bool -> Try(Form, [NotAnOperator])
+	operator = |method, whole| match method {
+		"plus" => Ok(Form.Infix("+"))
+		"minus" => Ok(Form.Infix("-"))
+		"times" => Ok(Form.Infix("*"))
+		"div_by" => Ok(Form.Infix("/"))
+		"div_trunc_by" =>
+			if whole {
+				Ok(Form.Infix("/"))
+			} else {
+				Ok(Form.Truncated)
+			}
+		"rem_by" =>
+			if whole {
+				Ok(Form.Infix("%"))
+			} else {
+				Ok(Form.Apply("mod"))
+			}
+		"is_lt" => Ok(Form.Infix("<"))
+		"is_gt" => Ok(Form.Infix(">"))
+		"is_lte" => Ok(Form.Infix("<="))
+		"is_gte" => Ok(Form.Infix(">="))
+		"is_eq" => Ok(Form.Infix("=="))
+		_ => Err(NotAnOperator)
+	}
+
+	## A `Glsl` vector's arithmetic is GLSL's own operators, and GLSL
+	## broadcasts a scalar across a vector, which Roc has no operator for: the
+	## right operand of `*` would have to be a vector too. `scale` and
 	## `offset` are the methods that say it, and they render as the operator.
-	broadcast : Str, List(Str) -> Try(Str, [NotBroadcast])
-	broadcast = |callee, values| {
-		symbol = match callee {
-			"Glsl.Vec2.scale" | "Glsl.Vec3.scale" | "Glsl.Vec4.scale" => "*"
-			"Glsl.Vec2.offset" | "Glsl.Vec3.offset" | "Glsl.Vec4.offset" => "+"
-			_ => return Err(NotBroadcast)
+	broadcast : Str, Str -> Try(Str, [NotBroadcast])
+	broadcast = |owner, method| {
+		vector = owner == "Glsl.Vec2" or owner == "Glsl.Vec3" or owner == "Glsl.Vec4"
+		if !vector {
+			return Err(NotBroadcast)
 		}
-		match values {
-			[lhs, rhs] => Ok("(${lhs} ${symbol} ${rhs})")
+		match method {
+			"plus" | "offset" => Ok("+")
+			"times" | "scale" => Ok("*")
 			_ => Err(NotBroadcast)
 		}
 	}
 
-	## The calls a fragment shader may make, each under the whole name a
-	## [Code.Ir] `Call` carries, beside the GLSL function that means the same.
-	##
-	## A `Call` name is complete, so this matches all of it. Matching the last
-	## segment instead would send any module's own `sin` to the `sin` row and
-	## emit a GLSL call to a function that computes something else.
+	## The calls a fragment shader may make, beside the GLSL function that
+	## means the same. A builtin row is keyed by its method, under an owner
+	## that is a number type; a `Glsl` row by its whole name.
 	##
 	## GLSL has more functions than these, and every one of them is missing
 	## here because Roc's `F32` has no method that means it. A shader calls what
 	## it can write, and anything else is named in the error, because a
 	## translator that silently emits an unknown GLSL function moves the failure
 	## to the driver.
-	builtin_name : Str, U64 -> Try(Str, Error)
-	builtin_name = |callee, arity| {
-		supported = [
-			{ roc: "Builtin.Num.F32.sin", glsl: "sin" },
-			{ roc: "Builtin.Num.F32.cos", glsl: "cos" },
-			{ roc: "Builtin.Num.F32.tan", glsl: "tan" },
-			{ roc: "Builtin.Num.F32.asin", glsl: "asin" },
-			{ roc: "Builtin.Num.F32.acos", glsl: "acos" },
-			{ roc: "Builtin.Num.F32.atan", glsl: "atan" },
-			{ roc: "Builtin.Num.F32.sqrt", glsl: "sqrt" },
-			{ roc: "Builtin.Num.F32.abs", glsl: "abs" },
-			{ roc: "Builtin.Num.F32.min", glsl: "min" },
-			{ roc: "Builtin.Num.F32.max", glsl: "max" },
-			{ roc: "Builtin.Num.F32.pow", glsl: "pow" },
-			{ roc: "Glsl.Sampler.texture", glsl: "texture" },
-		]
-		match supported.find_first(|row| row.roc == callee) {
-			Ok(row) => Ok(row.glsl)
-			Err(_) => Err(Unsupported("`${callee}` is not one of the ${arity.to_str()}-argument functions a fragment shader may call"))
-		}
+	function : Str, Str, List(Str) -> Try(Str, Error)
+	function = |owner, method, values| {
+		builtin = ["sin", "cos", "tan", "asin", "acos", "atan", "sqrt", "abs", "min", "max", "pow"]
+		numeric = Glsl.numeric_owner(owner).is_ok()
+		name =
+			if numeric and builtin.contains(method) {
+				method
+			} else if owner == "Glsl.Sampler" and method == "texture" {
+				"texture"
+			} else {
+				return Err(Unsupported("`${owner}.${method}` is not one of the ${values.len().to_str()}-argument functions a fragment shader may call"))
+			}
+		Ok("${name}(${Str.join_with(values, ", ")})")
 	}
 
 	## A nominal's name is complete too, so these are whole as well.

@@ -255,7 +255,7 @@ classify = |amount| match amount {
 			(e-match
 				(match
 					(cond
-						(e-call (constraint-fn-var 528)
+						(e-call (constraint-fn-var 533)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local

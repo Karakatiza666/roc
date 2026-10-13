@@ -635,6 +635,7 @@ pub fn lowLevelAccess(op: LowLevel) OpAccess {
         .ptr_load,
         .ptr_cast,
         .crash,
+        .code_refuse,
         => .{},
     };
 }

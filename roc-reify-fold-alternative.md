@@ -16,11 +16,11 @@ written against the proposed API, so `roc check` does not accept it today.
 ## 1. The open dimension
 
 `Code(f)` today fixes three things on behalf of every translator
-(`src/build/roc/Builtin.roc:21296`):
+(`src/build/roc/Builtin.roc:22491`):
 
 | Decision | Who makes it today | Consequence for a translator |
 |---|---|---|
-| The shape of the description | the compiler: `Ir`, `Pattern`, `Lit` (`src/build/roc/Builtin.roc:21639`, `:21526`, `:21511`) | converts `Ir` into its own AST, then emits from that |
+| The shape of the description | the compiler: `Ir`, `Pattern`, `Lit` (`src/build/roc/Builtin.roc:22834`, `:22721`, `:22706`) | converts `Ir` into its own AST, then emits from that |
 | The abstraction level | the compiler: `and` is an `If`, `x?` is a `Match`, interpolation is `Str.concat` | a target that has `AND` recovers it from `If(a, b, Lit(Bool(False)))` |
 | Where coverage is checked | the translator, at build time, by walking the tree | twelve refusal arms in `examples/reifying/glsl/Glsl.roc:369-380`, each formatting its own location |
 

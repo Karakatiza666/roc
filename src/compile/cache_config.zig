@@ -351,7 +351,10 @@ pub const Constants = struct {
     /// 165: compile-time reads persist placement and semantic root identity.
     /// 168: A module remembers how many lines of its source the compiler
     ///      prepended, so a region it reports names the line the author wrote.
-    pub const CACHE_VERSION = 168;
+    /// 169: A stored `Code` value holds the normal-form IR, not `Code.Ir`:
+    ///      placement and numbering are canonical, rows are digests, and the
+    ///      `graph` view inlines rows called once.
+    pub const CACHE_VERSION = 169;
 };
 
 /// Configuration for the Roc cache system.

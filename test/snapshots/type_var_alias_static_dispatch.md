@@ -392,7 +392,7 @@ from_str = |str| {
 			(e-block
 				(s-type-var-alias (alias "Thing") (type-var "thing")
 					(ty-rigid-var (name "thing")))
-				(e-type-dispatch-call (method "default") (type-dispatch-stmt 11) (constraint-fn-var 555)
+				(e-type-dispatch-call (method "default") (type-dispatch-stmt 11) (constraint-fn-var 560)
 					(args))))
 		(annotation
 			(ty-fn (effectful false)
@@ -411,7 +411,7 @@ from_str = |str| {
 			(e-block
 				(s-type-var-alias (alias "A") (type-var "a")
 					(ty-rigid-var (name "a")))
-				(e-type-dispatch-call (method "from_b") (type-dispatch-stmt 29) (constraint-fn-var 563)
+				(e-type-dispatch-call (method "from_b") (type-dispatch-stmt 29) (constraint-fn-var 568)
 					(args
 						(e-lookup-local
 							(p-assign (ident "second")))))))
@@ -436,12 +436,12 @@ from_str = |str| {
 				(e-if
 					(if-branches
 						(if-branch
-							(e-type-dispatch-call (method "validate") (type-dispatch-stmt 51) (constraint-fn-var 576)
+							(e-type-dispatch-call (method "validate") (type-dispatch-stmt 51) (constraint-fn-var 581)
 								(args
 									(e-lookup-local
 										(p-assign (ident "input")))))
 							(e-block
-								(e-type-dispatch-call (method "transform") (type-dispatch-stmt 51) (constraint-fn-var 581)
+								(e-type-dispatch-call (method "transform") (type-dispatch-stmt 51) (constraint-fn-var 586)
 									(args
 										(e-lookup-local
 											(p-assign (ident "input"))))))))
@@ -472,9 +472,9 @@ from_str = |str| {
 					(ty-rigid-var (name "x")))
 				(s-let
 					(p-assign (ident "initial"))
-					(e-type-dispatch-call (method "first") (type-dispatch-stmt 79) (constraint-fn-var 592)
+					(e-type-dispatch-call (method "first") (type-dispatch-stmt 79) (constraint-fn-var 597)
 						(args)))
-				(e-type-dispatch-call (method "second") (type-dispatch-stmt 79) (constraint-fn-var 595)
+				(e-type-dispatch-call (method "second") (type-dispatch-stmt 79) (constraint-fn-var 600)
 					(args
 						(e-lookup-local
 							(p-assign (ident "initial")))))))
@@ -503,11 +503,11 @@ from_str = |str| {
 					(ty-rigid-var (name "b")))
 				(e-tuple
 					(elems
-						(e-type-dispatch-call (method "convert") (type-dispatch-stmt 108) (constraint-fn-var 605)
+						(e-type-dispatch-call (method "convert") (type-dispatch-stmt 108) (constraint-fn-var 610)
 							(args
 								(e-lookup-local
 									(p-assign (ident "x")))))
-						(e-type-dispatch-call (method "convert") (type-dispatch-stmt 109) (constraint-fn-var 608)
+						(e-type-dispatch-call (method "convert") (type-dispatch-stmt 109) (constraint-fn-var 613)
 							(args
 								(e-lookup-local
 									(p-assign (ident "y")))))))))
@@ -536,7 +536,7 @@ from_str = |str| {
 			(e-block
 				(s-type-var-alias (alias "T") (type-var "t")
 					(ty-rigid-var (name "t")))
-				(e-type-dispatch-call (method "create") (type-dispatch-stmt 132) (constraint-fn-var 625)
+				(e-type-dispatch-call (method "create") (type-dispatch-stmt 132) (constraint-fn-var 630)
 					(args
 						(e-lookup-local
 							(p-assign (ident "name")))
@@ -560,7 +560,7 @@ from_str = |str| {
 			(e-block
 				(s-type-var-alias (alias "Thing") (type-var "thing")
 					(ty-rigid-var (name "thing")))
-				(e-type-dispatch-call (method "from_str") (type-dispatch-stmt 150) (constraint-fn-var 636)
+				(e-type-dispatch-call (method "from_str") (type-dispatch-stmt 150) (constraint-fn-var 641)
 					(args
 						(e-lookup-local
 							(p-assign (ident "str")))))))

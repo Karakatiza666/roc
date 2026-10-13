@@ -1,0 +1,929 @@
+# A DBSP circuit builder and translator: reified Roc functions in, Rust source
+# for Feldera's `dbsp` crate out.
+#
+# A relation is a `Rel(row)`, a stream of rows that an incremental engine keeps
+# current. Every combinator that takes a function takes it as a `Code(f)`, so
+# the compiler describes the function and this module writes it again as a Rust
+# closure. The combinators fix the topology of the circuit. The reified
+# functions supply the expressions it is made of.
+#
+# Rows are nominal records, `Reading := { .. }`. The translator emits one Rust
+# struct for each, with the derives `dbsp` needs.
+Dbsp :: {}.{
+
+	## Why a reified function is not a circuit. Every rejection names the
+	## construct and the stage of the view it was found in.
+	Error := [Unsupported(Str), BadType(Str), BadCircuit(Str)].{
+		is_eq : _
+	}
+
+	## What a view is made of, from its input to its last stage. A stage that
+	## takes a function keeps the description of it.
+	Plan := [
+		Source(Str),
+		Filter(Plan, Code.Graph),
+		Map(Plan, Code.Graph),
+		KeyBy(Plan, Code.Graph),
+		Count(Plan),
+		Join(Plan, Plan, Code.Graph),
+	]
+
+	## A stream of rows. Each combinator adds one stage, and none of them runs
+	## the function it was given.
+	Rel(row) :: { plan : Plan }.{
+
+		## Keep the rows the function accepts.
+		filter : Rel(row), Code(row -> Bool) -> Rel(row)
+		filter = |Rel.(r), predicate| Rel.({ plan: Plan.Filter(r.plan, Code.graph(predicate)) })
+
+		## Compute one row from each row.
+		map : Rel(a), Code(a -> b) -> Rel(b)
+		map = |Rel.(r), project| Rel.({ plan: Plan.Map(r.plan, Code.graph(project)) })
+
+		## Index the rows by what the function returns. An indexed relation is
+		## counted or joined, and is not a relation of rows itself.
+		key_by : Rel(row), Code(row -> k) -> Keyed(k, row)
+		key_by = |Rel.(r), key| Keyed.({ plan: Plan.KeyBy(r.plan, Code.graph(key)) })
+	}
+
+	## A stream of rows indexed by a key.
+	Keyed(k, row) :: { plan : Plan }.{
+
+		## How many rows each key has, as rows of the key and the count.
+		count : Keyed(k, row) -> Rel((k, I64))
+		count = |Keyed.(r)| Rel.({ plan: Plan.Count(r.plan) })
+
+		## One row for each pair of rows that share a key.
+		join : Keyed(k, a), Keyed(k, b), Code((k, a, b -> out)) -> Rel(out)
+		join = |Keyed.(left), Keyed.(right), combine| Rel.({ plan: Plan.Join(left.plan, right.plan, Code.graph(combine)) })
+	}
+
+	## The rows of the input called `name`. The application pushes them through
+	## the handle the circuit returns for it.
+	input : Str -> Rel(row)
+	input = |name| Rel.({ plan: Plan.Source(name) })
+
+	## A relation the circuit computes, under the name its output has.
+	View := { name : Str, plan : Plan }
+
+	view : Str, Rel(row) -> View
+	view = |name, Rel.(r)| View.({ name, plan: r.plan })
+
+	# ---------------------------------------------------------------- circuit
+
+	## The Rust program for a set of views: the row structs, and a
+	## `build_circuit` that adds every input and every view to a circuit. The
+	## function returns each input's handle, in order of first use, and then
+	## each view's output handle.
+	circuit : List(View) -> Try(Str, Error)
+	circuit = |views| {
+		all = views.fold_try(
+			{ done: [], helpers: [] },
+			|acc, View.(v)| {
+				one = Dbsp.lower(v.plan, "view `${v.name}`", acc.helpers)?
+				match one.source {
+					Unread(_) => Err(BadCircuit("view `${v.name}` has no stage; it is the input itself"))
+					Read => Ok({ done: acc.done.append({ name: v.name, one }), helpers: one.helpers })
+				}
+			},
+		)?
+		lowered = all.done
+		inputs = lowered.fold_try([], |seen, entry| Dbsp.merge_inputs(seen, entry.one.inputs))?
+		tys = lowered.join_map(|entry| entry.one.tys).concat(inputs.map(|source| source.ty))
+		structs = Dbsp.unique_structs(tys.join_map(Dbsp.structs_of))?
+		names = inputs.map(|source| source.name).concat(lowered.map(|entry| entry.name))
+		Dbsp.check_names(names)?
+		declared = inputs.map_try(
+			|source| {
+				ty = Dbsp.rust_type(source.ty)?
+				Ok("let (${source.name}, ${source.name}_handle) = circuit.add_input_zset::<${ty}>();")
+			},
+		)?
+		built = lowered.map(|entry| "let ${entry.name} = ${Dbsp.chain(entry.one.base, entry.one.calls)};")
+		handles = inputs.map_try(|source| Dbsp.rust_type(source.ty).map_ok(|ty| "ZSetHandle<${ty}>"))?
+		outputs = lowered.map_try(|entry| Dbsp.rust_type(entry.one.ty).map_ok(|ty| "OutputHandle<OrdZSet<${ty}>>"))?
+		returned = inputs.map(|source| "${source.name}_handle").concat(lowered.map(|entry| "${entry.name}.output()"))
+		body = Str.join_with(List.concat(declared, built).append("Ok((${Str.join_with(returned, ", ")}))"), "\n")
+		Ok(
+			Str.join_with(
+				[Dbsp.header, Str.join_with(structs.map_try(Dbsp.struct_text)?, "\n\n")]
+					.concat(all.helpers.map(|helper| helper.text))
+					.append("pub fn build_circuit(circuit: &mut RootCircuit) -> AnyResult<(${Str.join_with(handles.concat(outputs), ", ")})> {\n${Dbsp.indent(body)}\n}"),
+				"\n\n",
+			),
+		)
+	}
+
+	header : Str
+	header =
+		\\// Generated by examples/reifying/dbsp/Dbsp.roc from reified Roc functions.
+		\\// Targets the Feldera `dbsp` crate, in the form where `OrdZSet<T>` takes one type parameter.
+		\\use anyhow::Result as AnyResult;
+		\\#[allow(unused_imports)]
+		\\use dbsp::{algebra::{F32, F64}, utils::*, OrdZSet, OutputHandle, RootCircuit, ZSetHandle};
+		\\use rkyv::{Archive, Deserialize, Serialize};
+		\\use size_of::SizeOf;
+
+	merge_inputs : List({ name : Str, ty : Code.Ty }), List({ name : Str, ty : Code.Ty }) -> Try(List({ name : Str, ty : Code.Ty }), Error)
+	merge_inputs = |seen, more| more.fold_try(
+		seen,
+		|acc, source| match acc.find_first(|known| known.name == source.name) {
+			Ok(known) =>
+				if known.ty == source.ty {
+					Ok(acc)
+				} else {
+					Err(BadCircuit("input `${source.name}` is read as ${known.ty.name()} and as ${source.ty.name()}"))
+				}
+			Err(_) => Ok(acc.append(source))
+		},
+	)
+
+	## An input and a view are Rust variables, so each name is one identifier and
+	## no two are the same.
+	check_names : List(Str) -> Try({}, Error)
+	check_names = |names|
+		names.fold_try(
+			[],
+			|seen, name|
+				if !Dbsp.is_ident(name) {
+					Err(BadCircuit("`${name}` is not a snake_case Rust identifier"))
+				} else if seen.contains(name) {
+					Err(BadCircuit("the name `${name}` is used twice, and an input and a view are one Rust variable each"))
+				} else {
+					Ok(seen.append(name))
+				},
+		).map_ok(|_| {})
+
+	is_ident : Str -> Bool
+	is_ident = |name| {
+		bytes = name.to_utf8()
+		is_lower = |b| b >= 97 and b <= 122
+		digit = |b| b >= 48 and b <= 57
+		match bytes.first() {
+			Ok(first) => (is_lower(first) or first == 95) and bytes.all(|b| is_lower(b) or digit(b) or b == 95)
+			Err(_) => Bool.False
+		}
+	}
+
+	## A stream and the method calls on it, one to a line.
+	chain : Str, List(Str) -> Str
+	chain = |base, calls| Str.join_with(calls.map(|call| "\n${Dbsp.indent(call)}"), "").with_prefix(base)
+
+	indent : Str -> Str
+	indent = |text| "    ${text.replace_each("\n", "\n    ")}"
+
+	# ---------------------------------------------------------------- lowering
+
+	## A plan written as Rust. `base` is the input stream it starts from and
+	## `calls` the method calls that follow. `ty` is the row type the stream has
+	## now, and `tys` every row type a stage read or wrote, for the structs.
+	## An input's row type is the type of the first function that reads it, so
+	## `source` says whether that function has been read yet. `helpers` are the
+	## Rust functions the stages so far call, in the order they were defined.
+	Lowered : {
+		base : Str,
+		calls : List(Str),
+		ty : Code.Ty,
+		stages : U64,
+		source : [Unread(Str), Read],
+		inputs : List({ name : Str, ty : Code.Ty }),
+		tys : List(Code.Ty),
+		helpers : List(Helper),
+	}
+
+	## `known` are the helpers that earlier views and stages defined. A plan
+	## adds the helpers it needs and none twice.
+	lower : Plan, Str, List(Helper) -> Try(Lowered, Error)
+	lower = |plan, context, known| match plan {
+		Source(name) => Ok({ base: name, calls: [], ty: Code.Ty.Tuple([]), stages: 0, source: Unread(name), inputs: [], tys: [], helpers: known })
+		Filter(below, graph) => {
+			stage = Dbsp.read_stage(Dbsp.lower(below, context, known)?, graph, ["row"], "filter", context)?
+			Ok(Dbsp.extend(stage, ".filter(${Dbsp.closure(stage.names, stage.body)})", stage.lowered.ty))
+		}
+		Map(below, graph) => {
+			stage = Dbsp.read_stage(Dbsp.lower(below, context, known)?, graph, ["row"], "map", context)?
+			Ok(Dbsp.extend(stage, ".map(${Dbsp.closure(stage.names, stage.body)})", stage.row.result))
+		}
+		KeyBy(below, graph) => {
+			stage = Dbsp.read_stage(Dbsp.lower(below, context, known)?, graph, ["row"], "key_by", context)?
+			indexed = { ..stage.body, value: "(${stage.body.value}, row.clone())" }
+			Ok(Dbsp.extend(stage, ".map_index(${Dbsp.closure(stage.names, indexed)})", Code.Ty.Tuple([stage.row.result, stage.lowered.ty])))
+		}
+		Count(below) => {
+			parent = Dbsp.lower(below, context, known)?
+			place = "${context}, stage ${(parent.stages + 1).to_str()} (`count`)"
+			ty = match parent.ty {
+				Tuple([key, _]) => Code.Ty.Tuple([key, Code.Ty.I64])
+				_ => return Err(BadCircuit("${place}: a count needs an indexed relation"))
+			}
+			count_calls = [".aggregate_linear(|_| 1i64)", ".map(|(key, n)| Tup2(key.clone(), *n))"]
+			Ok({ ..parent, calls: parent.calls.concat(count_calls), ty, stages: parent.stages + 1 })
+		}
+		Join(left_plan, right_plan, graph) => {
+			left = Dbsp.lower(left_plan, context, known)?
+			right = Dbsp.lower(right_plan, "${context}, right side of the join", left.helpers)?
+			stage = Dbsp.read_stage({ ..left, helpers: right.helpers }, graph, ["key", "left", "right"], "join", context)?
+			operands = "&${Dbsp.chain(right.base, right.calls)},\n${Dbsp.closure(stage.names, stage.body)},"
+			merged = Dbsp.merge_inputs(stage.lowered.inputs, right.inputs).map_err(|error| Dbsp.blame(error, context))?
+			joined = Dbsp.extend(stage, ".join(\n${Dbsp.indent(operands)}\n)", stage.row.result)
+			Ok({ ..joined, inputs: merged, tys: joined.tys.concat(right.tys) })
+		}
+	}
+
+	## The stage's function read, and the stream it applies to. The first
+	## function that reads an input settles its row type.
+	Stage : { lowered : Lowered, row : Code.Row, names : List(Str), body : Body, helper_tys : List(Code.Ty) }
+
+	read_stage : Lowered, Code.Graph, List(Str), Str, Str -> Try(Stage, Error)
+	read_stage = |parent, graph, names, kind, context| {
+		row = graph.root_row()
+		place = "${context}, stage ${(parent.stages + 1).to_str()} (`${kind}`)"
+		params = List.map2(row.params, names, |ty, name| Dbsp.param(name, ty))
+		tree = graph.to_tree(row.id)
+		called = Dbsp.reach(graph, Dbsp.calls_in(tree), [])
+		defined = Dbsp.define(graph, called, parent.helpers).map_err(|error| Dbsp.blame(error, place))?
+		scope = { row, params, locals: [], fns: defined.names }
+		body = Dbsp.render_block(tree, scope).map_err(|error| Dbsp.blame(error, place))?
+		named = names.map_with_index(|name, at| if Dbsp.reads(tree, at.to_u32_wrap()) name else "_${name}")
+		settled = match (parent.source, row.params.first()) {
+			(Unread(name), Ok(ty)) => { ..parent, source: Read, ty, inputs: parent.inputs.append({ name, ty }) }
+			_ => parent
+		}
+		helper_tys = called.join_map(|id| graph.row(id).params.append(graph.row(id).result))
+		Ok({ lowered: { ..settled, helpers: defined.helpers }, row, names: named, body, helper_tys })
+	}
+
+	## A Rust function for a row that a `Call` names: a helper that two or more
+	## places call, or a function that calls itself. `key` is the row and every
+	## row it reaches, written with no row ids, so two stages that hold one
+	## function agree on it and the program defines it once.
+	Helper : { key : Str, name : Str, text : Str }
+
+	## The rows that a tree calls, in the order a walk meets them.
+	calls_in : Code.Tree -> List(U32)
+	calls_in = |tree| match tree {
+		Op(node) => {
+			inner = node.args.join_map(Dbsp.calls_in)
+			match node.op {
+				Call(id) => [id].concat(inner)
+				_ => inner
+			}
+		}
+		Block(block) => {
+			ends = match block.end {
+				Value(trees) | Continue(trees) | Break(trees) => trees
+				Jump(jump) => jump.args
+				Return(one) | Branch(one) => [one]
+			}
+			block.defs.join_map(|def| Dbsp.calls_in(def.value)).concat(ends.join_map(Dbsp.calls_in))
+		}
+		Param(_) | Arg(_) | Out(_) | Def(_) => []
+	}
+
+	## Every row that `pending` calls, directly or through other rows, once each,
+	## in the order a walk first meets it.
+	reach : Code.Graph, List(U32), List(U32) -> List(U32)
+	reach = |graph, pending, seen| match pending {
+		[] => seen
+		[id, .. as rest] =>
+			if seen.contains(id) {
+				Dbsp.reach(graph, rest, seen)
+			} else {
+				Dbsp.reach(graph, Dbsp.calls_in(graph.to_tree(id)).concat(rest), seen.append(id))
+			}
+	}
+
+	## The Rust name of each row in `ids`, and the helpers with the ones that
+	## `known` does not have yet added. A row is the same function as a known
+	## helper when both reach the same rows.
+	define : Code.Graph, List(U32), List(Helper) -> Try({ names : List({ row : U32, name : Str }), helpers : List(Helper) }, Error)
+	define = |graph, ids, known| {
+		keyed = ids.map_try(|id| Dbsp.canon(graph, id).map_ok(|key| { id, key }))?
+		assigned = keyed.fold(
+			{ names: [], added: [] },
+			|acc, entry| {
+				have = known.map(|helper| { key: helper.key, name: helper.name }).concat(acc.added.map(|helper| { key: helper.key, name: helper.name }))
+				match have.find_first(|helper| helper.key == entry.key) {
+					Ok(helper) => { ..acc, names: acc.names.append({ row: entry.id, name: helper.name }) }
+					Err(_) => {
+						name = "helper_${have.len().to_str()}"
+						{ names: acc.names.append({ row: entry.id, name }), added: acc.added.append({ id: entry.id, key: entry.key, name }) }
+					}
+				}
+			},
+		)
+		fresh = assigned.added.map_try(
+			|one| Dbsp.render_fn(graph, graph.row(one.id), one.name, assigned.names).map_ok(|text| { key: one.key, name: one.name, text }),
+		)?
+		Ok({ names: assigned.names, helpers: known.concat(fresh) })
+	}
+
+	## A row and every row it reaches as Rust, named by the order of the walk
+	## and not by row id.
+	canon : Code.Graph, U32 -> Try(Str, Error)
+	canon = |graph, id| {
+		local = Dbsp.reach(graph, [id], []).map_with_index(|row, at| { row, name: "f${at.to_str()}" })
+		texts = local.map_try(|entry| Dbsp.render_fn(graph, graph.row(entry.row), entry.name, local))?
+		Ok(Str.join_with(texts, "\n"))
+	}
+
+	## One row as a Rust function. A number is passed by value, and anything
+	## else by reference, so a call never moves a `String` or a row out of the
+	## stream. The body clones what it returns, as a closure's body does.
+	render_fn : Code.Graph, Code.Row, Str, List({ row : U32, name : Str }) -> Try(Str, Error)
+	render_fn = |graph, row, name, fns| {
+		tree = graph.to_tree(row.id)
+		names = row.params.map_with_index(|_, at| "p${at.to_str()}")
+		scope = { row, params: names.map(Dbsp.atom), locals: [], fns }
+		body = Dbsp.render_block(tree, scope)?
+		typed = List.map2(row.params, names, |ty, param| Dbsp.rust_type(ty).map_ok(|rust| if Dbsp.is_copy(ty) rust else "&${rust}").map_ok(|rust| (param, rust)))
+		declared = typed.map_try(|one| one)?
+		listed = declared.map_with_index(|(param, rust), at| "${if Dbsp.reads(tree, at.to_u32_wrap()) param else "_${param}"}: ${rust}")
+		result = Dbsp.rust_type(row.result)?
+		Ok("fn ${name}(${Str.join_with(listed, ", ")}) -> ${result} {\n${Dbsp.indent(Str.join_with(body.lets.append(body.value), "\n"))}\n}")
+	}
+
+	## A call of a row as a call of its Rust function.
+	call_helper : U32, List(Code.Tree), Scope -> Try(Ex, Error)
+	call_helper = |id, args, scope| match scope.fns.find_first(|known| known.row == id) {
+		Ok(callee) => {
+			passed = args.map_try(|arg| Dbsp.pass(arg, scope))?
+			Ok(Dbsp.atom("${callee.name}(${Str.join_with(passed, ", ")})"))
+		}
+		Err(_) => Err(BadCircuit("a call of a row the translator did not reach"))
+	}
+
+	## An argument of a call. A parameter that is not a number already is a
+	## reference. Any other value that is not a number is borrowed.
+	pass : Code.Tree, Scope -> Try(Str, Error)
+	pass = |tree, scope| {
+		ex = Dbsp.render(tree, scope)?
+		ty = Dbsp.tree_ty(tree, scope)?
+		match tree {
+			Param(_) => Ok(ex.text)
+			Op({ op: Lit(Str(_)), .. }) => Ok("&${ex.text}.to_string()")
+			_ =>
+				if Dbsp.is_copy(ty) {
+					Ok(ex.text)
+				} else {
+					Ok("&${Dbsp.at(ex, 8)}")
+				}
+		}
+	}
+
+	## Whether a tree reads parameter `k`. A parameter that is never read is
+	## named with a leading underscore, so the Rust has no unused variable.
+	reads : Code.Tree, U32 -> Bool
+	reads = |tree, k| match tree {
+		Param(read) => read == k
+		Op(node) => node.args.any(|arg| Dbsp.reads(arg, k))
+		Block(block) => {
+			ends = match block.end {
+				Value(trees) | Continue(trees) | Break(trees) => trees
+				Jump(jump) => jump.args
+				Return(one) | Branch(one) => [one]
+			}
+			block.defs.any(|def| Dbsp.reads(def.value, k)) or ends.any(|end| Dbsp.reads(end, k))
+		}
+		Arg(_) | Out(_) | Def(_) => Bool.False
+	}
+
+	## One more stage: the call it writes, and the row type it leaves.
+	extend : Stage, Str, Code.Ty -> Lowered
+	extend = |stage, call, ty| {
+		below = stage.lowered
+		seen = stage.row.params.append(stage.row.result).concat(stage.helper_tys)
+		{ ..below, calls: below.calls.append(call), ty, stages: below.stages + 1, tys: below.tys.concat(seen) }
+	}
+
+	## A closure over the names its parameters have in Rust.
+	closure : List(Str), Body -> Str
+	closure = |names, body| {
+		head = "|${Str.join_with(names, ", ")}|"
+		if body.lets.is_empty() {
+			"${head} ${body.value}"
+		} else {
+			"${head} {\n${Dbsp.indent(Str.join_with(body.lets.append(body.value), "\n"))}\n}"
+		}
+	}
+
+	blame : Error, Str -> Error
+	blame = |error, place| match error {
+		Unsupported(message) => Error.Unsupported("${place}: ${message}")
+		BadType(message) => Error.BadType("${place}: ${message}")
+		BadCircuit(message) => Error.BadCircuit("${place}: ${message}")
+	}
+
+	# ------------------------------------------------------------ Rust types
+
+	## One Rust struct of a row type.
+	Struct : { name : Str, fields : List({ name : Str, ty : Code.Ty, presence : [Required, Optional] }) }
+
+	## The structs a type needs, a struct after the structs of its fields.
+	structs_of : Code.Ty -> List(Struct)
+	structs_of = |ty| match ty {
+		Named(name, Record(fields)) => fields.join_map(|field| Dbsp.structs_of(field.ty)).append({ name, fields })
+		_ => ty.children().join_map(Dbsp.structs_of)
+	}
+
+	unique_structs : List(Struct) -> Try(List(Struct), Error)
+	unique_structs = |structs| structs.fold_try(
+		[],
+		|seen, one| match seen.find_first(|known| Dbsp.short(known.name) == Dbsp.short(one.name)) {
+			Ok(known) =>
+				if known == one {
+					Ok(seen)
+				} else {
+					Err(BadCircuit("two row types are both called `${Dbsp.short(one.name)}`"))
+				}
+			Err(_) => Ok(seen.append(one))
+		},
+	)
+
+	## The name a nominal has inside its module.
+	short : Str -> Str
+	short = |name| match name.split_last(".") {
+		Ok(parts) => parts.after
+		Err(_) => name
+	}
+
+	struct_text : Struct -> Try(Str, Error)
+	struct_text = |one| {
+		fields = one.fields.map_try(
+			|field| match field.presence {
+				Optional => Err(BadType("`${field.name}` of `${Dbsp.short(one.name)}` may be absent, and a Rust column is always there"))
+				Required => Dbsp.rust_type(field.ty).map_ok(|ty| "    pub ${field.name}: ${ty},")
+			},
+		)?
+		Ok(
+			Str.join_with(
+				[
+					"#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize)]",
+					"#[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd))]",
+					"pub struct ${Dbsp.short(one.name)} {",
+					Str.join_with(fields, "\n"),
+					"}",
+				],
+				"\n",
+			),
+		)
+	}
+
+	## The Rust type of a column or a row. A float is `dbsp`'s wrapper, because
+	## a bare `f64` is neither `Eq` nor `Ord`, and a row has to be both.
+	rust_type : Code.Ty -> Try(Str, Error)
+	rust_type = |ty| match ty {
+		I8 => Ok("i8")
+		U8 => Ok("u8")
+		I16 => Ok("i16")
+		U16 => Ok("u16")
+		I32 => Ok("i32")
+		U32 => Ok("u32")
+		I64 => Ok("i64")
+		U64 => Ok("u64")
+		I128 => Ok("i128")
+		U128 => Ok("u128")
+		F32 => Ok("F32")
+		F64 => Ok("F64")
+		Bool => Ok("bool")
+		Str => Ok("String")
+		Named(name, Record(_)) => Ok(Dbsp.short(name))
+		Tuple(parts) =>
+			if parts.len() >= 2 {
+				Ok("Tup${parts.len().to_str()}<${Str.join_with(parts.map_try(Dbsp.rust_type)?, ", ")}>")
+			} else {
+				Err(BadType("a tuple of ${parts.len().to_str()} has no `dbsp` row type"))
+			}
+		Dec => Err(BadType("Dec has no `dbsp` column type; use I64 or F64"))
+		Record(_) => Err(BadType("an anonymous record has no Rust struct; declare the row as a nominal, `Row := { .. }`"))
+		Named(name, _) => Err(BadType("`${name}` is a nominal over something other than a record, and only a record becomes a Rust struct"))
+		ListOf(_) => Err(BadType("a List column has no `dbsp` row type in this translator"))
+		TagUnion(_) | Fn(_, _) | Recursive(_) | Opaque(_, _) => Err(BadType("`${ty.name()}` has no `dbsp` column type"))
+	}
+
+	is_copy : Code.Ty -> Bool
+	is_copy = |ty| match ty {
+		I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | I128 | U128 | F32 | F64 | Bool => Bool.True
+		_ => Bool.False
+	}
+
+	# ------------------------------------------------------------ expressions
+
+	## A Rust expression and how tightly it binds, so that a parenthesis is
+	## written only where Rust would read the expression differently without it.
+	##
+	## | Level | Form |
+	## | --- | --- |
+	## | 9 | a name, a call, a field |
+	## | 8 | a prefix operator |
+	## | 7 | `as` |
+	## | 6 | `*` `/` `%` |
+	## | 5 | `+` `-` |
+	## | 4 | a comparison |
+	## | 3 | `&&` |
+	## | 2 | `||` |
+	## | 1 | `if`, and a block |
+	Ex : { text : Str, level : U8 }
+
+	atom : Str -> Ex
+	atom = |text| { text, level: 9 }
+
+	## The text of an expression, in parentheses when it binds looser than `level`.
+	at : Ex, U8 -> Str
+	at = |ex, level|
+		if ex.level < level {
+			"(${ex.text})"
+		} else {
+			ex.text
+		}
+
+	## A closure's parameter is a reference to its value, so a number is read
+	## through it. Anything else is read by its fields, and Rust follows the
+	## reference there.
+	param : Str, Code.Ty -> Ex
+	param = |name, ty|
+		if Dbsp.is_copy(ty) {
+			{ text: "*${name}", level: 8 }
+		} else {
+			Dbsp.atom(name)
+		}
+
+	## What a stage's expressions read: the row, for the types of its
+	## parameters and nodes, what each parameter is called in Rust, what each
+	## def of the enclosing blocks stands for, and the Rust function each row
+	## that a `Call` names is.
+	Scope : { row : Code.Row, params : List(Ex), locals : List({ id : U32, ex : Ex }), fns : List({ row : U32, name : Str }) }
+
+	## A block as Rust: the `let`s its shared work needs, and its value.
+	Body : { lets : List(Str), value : Str }
+
+	## Render a block. A def that only reads a field is written where it is
+	## read, because Rust cannot move out of the row a closure borrows. Every
+	## other def becomes one `let`, so work the body shares stays shared. The
+	## value is owned: a place that holds a `String` or a row is cloned, since
+	## the stream keeps what a closure returns.
+	render_block : Code.Tree, Scope -> Try(Body, Error)
+	render_block = |tree, scope| match tree {
+		Block(block) => {
+			placed = block.defs.fold_try(
+				{ scope, lets: [] },
+				|acc, def| {
+					ex = Dbsp.render(def.value, acc.scope)?
+					if Dbsp.is_read(def.value) {
+						Ok({ ..acc, scope: { ..acc.scope, locals: acc.scope.locals.append({ id: def.id, ex }) } })
+					} else {
+						local = "n${def.id.to_str()}"
+						Ok({
+							scope: { ..acc.scope, locals: acc.scope.locals.append({ id: def.id, ex: Dbsp.atom(local) }) },
+							lets: acc.lets.append("let ${local} = ${ex.text};"),
+						})
+					}
+				},
+			)?
+			value = match block.end {
+				Value([only]) => Dbsp.owned(only, placed.scope)?
+				Value(_) => return Err(Dbsp.no_loop)
+				Jump(_) | Return(_) | Branch(_) => return Err(Unsupported("a view's function cannot leave early; every branch delivers its value"))
+				Continue(_) | Break(_) => return Err(Dbsp.no_loop)
+			}
+			Ok({ lets: placed.lets, value: value.text })
+		}
+		_ => Ok({ lets: [], value: Dbsp.owned(tree, scope)?.text })
+	}
+
+	no_loop : Error
+	no_loop = Unsupported("a loop has no closure form; `dbsp`'s operators are the loops, so write the step as a `filter`, a `map` or a `count`")
+
+	## Whether a def only reads a field of a value that already has a name.
+	is_read : Code.Tree -> Bool
+	is_read = |tree| match tree {
+		Param(_) | Def(_) => Bool.True
+		Op(node) => match (node.op, node.args) {
+			(Field(_), [inner]) | (Index(_), [inner]) | (Unwrap, [inner]) => Dbsp.is_read(inner)
+			_ => Bool.False
+		}
+		Arg(_) | Out(_) | Block(_) => Bool.False
+	}
+
+	## Whether a tree reads a name, whose value a Rust expression would borrow
+	## and not own.
+	is_place : Code.Tree -> Bool
+	is_place = |tree| match tree {
+		Param(_) | Def(_) => Bool.True
+		Op(node) => match node.op {
+			Field(_) | Index(_) | Unwrap => Bool.True
+			_ => Bool.False
+		}
+		Arg(_) | Out(_) | Block(_) => Bool.False
+	}
+
+	tree_ty : Code.Tree, Scope -> Try(Code.Ty, Error)
+	tree_ty = |tree, scope| match tree {
+		Op(node) => Ok(node.ty)
+		Param(k) => match scope.row.params.get(k.to_u64()) {
+			Ok(ty) => Ok(ty)
+			Err(_) => Err(BadCircuit("a read of a parameter the stage does not take"))
+		}
+		Def(n) => Ok(scope.row.node(n).ty)
+		Arg(_) | Out(_) | Block(_) => Err(Dbsp.no_loop)
+	}
+
+	## An expression that owns its value.
+	owned : Code.Tree, Scope -> Try(Ex, Error)
+	owned = |tree, scope| {
+		ex = Dbsp.render(tree, scope)?
+		ty = Dbsp.tree_ty(tree, scope)?
+		match tree {
+			Op({ op: Lit(Str(_)), .. }) => Ok(Dbsp.atom("${ex.text}.to_string()"))
+			_ =>
+				if Dbsp.is_place(tree) and !Dbsp.is_copy(ty) {
+					Ok(Dbsp.atom("${Dbsp.at(ex, 9)}.clone()"))
+				} else {
+					Ok(ex)
+				}
+		}
+	}
+
+	render : Code.Tree, Scope -> Try(Ex, Error)
+	render = |tree, scope| match tree {
+		Param(k) => match scope.params.get(k.to_u64()) {
+			Ok(ex) => Ok(ex)
+			Err(_) => Err(BadCircuit("a read of a parameter the stage does not take"))
+		}
+		Def(n) => match scope.locals.find_last(|local| local.id == n) {
+			Ok(local) => Ok(local.ex)
+			Err(_) => Err(BadCircuit("a value read before its block computes it"))
+		}
+		Arg(_) | Out(_) => Err(Dbsp.no_loop)
+		Block(_) => {
+			inner = Dbsp.render_block(tree, scope)?
+			if inner.lets.is_empty() {
+				Ok(Dbsp.atom(inner.value))
+			} else {
+				Ok({ text: "{ ${Str.join_with(inner.lets, " ")} ${inner.value} }", level: 1 })
+			}
+		}
+		Op(node) => Dbsp.render_op(node.op, node.args, scope)
+	}
+
+	render_op : Code.Op, List(Code.Tree), Scope -> Try(Ex, Error)
+	render_op = |op, args, scope| match op {
+		Lit(lit) => Dbsp.literal(lit)
+		Prim(builtin) => Dbsp.prim(builtin.owner, builtin.method, args, scope)
+		And(_) => Dbsp.connective("&&", 3, args, scope)
+		Or(_) => Dbsp.connective("||", 2, args, scope)
+		Wrap(name) => match args {
+			[Op({ op: Record(names), args: fields, ty: _ })] => {
+				values = fields.map_try(|field| Dbsp.owned(field, scope).map_ok(|ex| ex.text))?
+				written = List.map2(names, values, |field, value| "${field}: ${value}")
+				Ok(Dbsp.atom("${Dbsp.short(name)} { ${Str.join_with(written, ", ")} }"))
+			}
+			_ => Err(Unsupported("`${Dbsp.short(name)}` is built from a record value, and a Rust struct is built from its fields written where it is built"))
+		}
+		Unwrap => match args {
+			[inner] => Dbsp.render(inner, scope)
+			_ => Err(Unsupported("an unwrap of more than one value"))
+		}
+		Field(name) => match args {
+			[inner] => Dbsp.render(inner, scope).map_ok(|ex| Dbsp.atom("${Dbsp.at(ex, 9)}.${name}"))
+			_ => Err(Unsupported("a field read of more than one value"))
+		}
+		Index(position) => match args {
+			[inner] => Dbsp.render(inner, scope).map_ok(|ex| Dbsp.atom("${Dbsp.at(ex, 9)}.${position.to_str()}"))
+			_ => Err(Unsupported("a tuple read of more than one value"))
+		}
+		Tuple => {
+			parts = args.map_try(|part| Dbsp.owned(part, scope).map_ok(|ex| ex.text))?
+			Ok(Dbsp.atom("Tup${args.len().to_str()}(${Str.join_with(parts, ", ")})"))
+		}
+		Switch(sw) => Dbsp.conditional(sw, args, scope)
+		Record(_) => Err(BadType("an anonymous record has no Rust struct; declare the row as a nominal, `Row := { .. }`"))
+		Call(id) => Dbsp.call_helper(id, args, scope)
+		Closure(_) | Lambda(_) => Err(Unsupported("a function inside a view's function has no closure form here"))
+		List | Item => Err(BadType("a List has no `dbsp` row type in this translator"))
+		Tag(name) => Err(Unsupported("a tag union has no Rust form here, so `${name}` is refused"))
+		Payload(name, _) => Err(Unsupported("a tag union has no Rust form here, so `${name}` has no payload to read"))
+		OptField(name) => Err(Unsupported("`${name}` may be absent, and a Rust column is always there"))
+		ForRange(_) | ForList(_) | Loop(_) => Err(Dbsp.no_loop)
+		Crash => Err(Unsupported("`crash` would stop the circuit's worker thread, and a view must have an answer for every row"))
+		Derived(method, _) => Err(Unsupported("`${method}` is derived by the compiler and has no Rust form here"))
+	}
+
+	## `and` and `or` keep every operand, in order, as Rust's `&&` and `||` do.
+	connective : Str, U8, List(Code.Tree), Scope -> Try(Ex, Error)
+	connective = |symbol, level, args, scope| {
+		parts = args.map_try(|arg| Dbsp.render(arg, scope).map_ok(|ex| Dbsp.at(ex, level + 1)))?
+		Ok({ text: Str.join_with(parts, " ${symbol} "), level })
+	}
+
+	## A switch on a `Bool` with one value is Rust's `if`. Any other switch is on
+	## a tag union, a number or a list, and this translator has no form for those.
+	conditional : { arms : List({ key : Code.Key, region : Code.Region }), joins : List(Code.Region), outputs : List(Code.Ty) }, List(Code.Tree), Scope -> Try(Ex, Error)
+	conditional = |sw, args, scope| {
+		parts = match (sw.arms, sw.outputs, args) {
+			([first, second], [_], [test, first_arm, second_arm]) =>
+				if Dbsp.selects(first.key) and !Dbsp.selects(second.key) {
+					Ok({ test, yes: first_arm, no: second_arm })
+				} else if Dbsp.selects(second.key) and !Dbsp.selects(first.key) {
+					Ok({ test, yes: second_arm, no: first_arm })
+				} else {
+					Err(Unsupported("a `match` on a tag union, a number or a string has no Rust form here; use `if`"))
+				}
+			_ => Err(Unsupported("a `match` on a tag union, a number or a string has no Rust form here; use `if`"))
+		}
+		chosen = parts?
+		test = Dbsp.render(chosen.test, scope)?
+		yes = Dbsp.arm(chosen.yes, scope)?
+		no = Dbsp.arm(chosen.no, scope)?
+		Ok({ text: "if ${test.text} { ${yes} } else { ${no} }", level: 1 })
+	}
+
+	arm : Code.Tree, Scope -> Try(Str, Error)
+	arm = |tree, scope| {
+		body = Dbsp.render_block(tree, scope)?
+		Ok(Str.join_with(body.lets.append(body.value), " "))
+	}
+
+	## Whether an arm is the one a `True` test selects.
+	selects : Code.Key -> Bool
+	selects = |key| match key {
+		Lit(Bool(flag)) => flag
+		Tag(name) => name == "True"
+		Lit(_) | Len(_) | AtLeast(_) | Default => Bool.False
+	}
+
+	literal : Code.Lit -> Try(Ex, Error)
+	literal = |value| match value {
+		Int(number, ty) => {
+			text = "${number.to_str()}${Dbsp.rust_type(ty)?}"
+			level = if number < 0 8 else 9
+			Ok({ text, level })
+		}
+		Frac(number, ty) => {
+			rendered = match ty {
+				F32 => number.to_f32_wrap().to_str()
+				_ => number.to_str()
+			}
+			digits = if rendered.contains(".") or rendered.contains("e") rendered else "${rendered}.0"
+			Ok(Dbsp.atom("${Dbsp.rust_type(ty)?}::new(${digits})"))
+		}
+		Bool(flag) => Ok(Dbsp.atom(if flag "true" else "false"))
+		Str(text) => Ok(Dbsp.atom(Dbsp.rust_str(text)))
+		Fixed(_) => Err(BadType("Dec has no `dbsp` column type; write this literal as an F64 or an I64"))
+		Bytes(_) => Err(Unsupported("a byte literal has no `dbsp` column type"))
+	}
+
+	rust_str : Str -> Str
+	rust_str = |text| {
+		escaped = text.replace_each("\\", "\\\\").replace_each("\"", "\\\"").replace_each("\n", "\\n").replace_each("\r", "\\r").replace_each("\t", "\\t")
+		"\"${escaped}\""
+	}
+
+	is_literal : Code.Tree -> Bool
+	is_literal = |tree| match tree {
+		Op({ op: Lit(_), .. }) => Bool.True
+		_ => Bool.False
+	}
+
+	# ------------------------------------------------------------- builtins
+
+	## One call of a builtin, by the owner and method it arrives as.
+	prim : Str, Str, List(Code.Tree), Scope -> Try(Ex, Error)
+	prim = |owner, method, args, scope| {
+		value = |tree| Dbsp.render(tree, scope)
+		method_call = |receiver, name, rest| {
+			text = Str.join_with(rest, ", ")
+			Ok(Dbsp.atom("${Dbsp.at(receiver, 9)}.${name}(${text})"))
+		}
+		match (owner, method, args) {
+			("Bool", "not", [operand]) => Dbsp.negation(operand, scope)
+			("Str", "concat", [a, b]) => Ok(Dbsp.atom("format!(\"{}{}\", ${value(a)?.text}, ${value(b)?.text})"))
+			("Str", "starts_with", [s, p]) => method_call(value(s)?, "starts_with", [Dbsp.pattern(p, scope)?])
+			("Str", "ends_with", [s, p]) => method_call(value(s)?, "ends_with", [Dbsp.pattern(p, scope)?])
+			("Str", "contains", [s, p]) => method_call(value(s)?, "contains", [Dbsp.pattern(p, scope)?])
+			("Str", "caseless_ascii_equals", [a, b]) => method_call(value(a)?, "eq_ignore_ascii_case", [Dbsp.pattern(b, scope)?])
+			("Str", "with_ascii_lowercased", [s]) => method_call(value(s)?, "to_ascii_lowercase", [])
+			("Str", "with_ascii_uppercased", [s]) => method_call(value(s)?, "to_ascii_uppercase", [])
+			("Str", "is_empty", [s]) => method_call(value(s)?, "is_empty", [])
+			("Str", "count_utf8_bytes", [s]) => Ok({ text: "${Dbsp.at(value(s)?, 9)}.len() as u64", level: 7 })
+			("Str", "is_eq", [a, b]) => Dbsp.binary(owner, method, a, b, scope)
+			("Bool", "is_eq", [a, b]) => Dbsp.binary(owner, method, a, b, scope)
+			("Num.Dec", _, _) => Err(BadType("Dec has no `dbsp` column type; use I64 or F64"))
+			(_, "negate", [n]) if owner.starts_with("Num.") => value(n).map_ok(|ex| { text: "-${Dbsp.at(ex, 8)}", level: 8 })
+			(_, _, [n]) if owner.starts_with("Num.") and method.starts_with("to_") => Dbsp.conversion(owner, method, value(n)?)
+			(_, _, [a, b]) if owner.starts_with("Num.") => Dbsp.binary(owner, method, a, b, scope)
+			_ => Err(Unsupported("`${owner}.${method}` has no Rust form in this translator"))
+		}
+	}
+
+	## A string's pattern argument: a literal as it is, anything else borrowed.
+	pattern : Code.Tree, Scope -> Try(Str, Error)
+	pattern = |tree, scope| {
+		ex = Dbsp.render(tree, scope)?
+		if Dbsp.is_literal(tree) {
+			Ok(ex.text)
+		} else {
+			Ok("&${Dbsp.at(ex, 8)}")
+		}
+	}
+
+	## `not` of an equality is Rust's `!=`.
+	negation : Code.Tree, Scope -> Try(Ex, Error)
+	negation = |operand, scope| match operand {
+		Op({ op: Prim({ owner: _, method: "is_eq" }), args: [a, b], .. }) => Dbsp.compare("!=", a, b, scope)
+		_ => Dbsp.render(operand, scope).map_ok(|ex| { text: "!${Dbsp.at(ex, 8)}", level: 8 })
+	}
+
+	## A two-operand builtin.
+	binary : Str, Str, Code.Tree, Code.Tree, Scope -> Try(Ex, Error)
+	binary = |owner, method, lhs, rhs, scope| {
+		symbol = Dbsp.operator(owner, method)?
+		if symbol.compares {
+			Dbsp.compare(symbol.text, lhs, rhs, scope)
+		} else {
+			left = Dbsp.render(lhs, scope)?
+			right = Dbsp.render(rhs, scope)?
+			Ok({ text: "${Dbsp.at(left, symbol.level)} ${symbol.text} ${Dbsp.at(right, symbol.level + 1)}", level: symbol.level })
+		}
+	}
+
+	## A comparison.
+	##
+	## The normal form puts a literal first, as `80.0 < celsius`. A comparison
+	## whose left operand is the only literal is written the other way round,
+	## with the mirrored operator: the same comparison, read as a test of the
+	## row.
+	compare : Str, Code.Tree, Code.Tree, Scope -> Try(Ex, Error)
+	compare = |symbol, lhs, rhs, scope| {
+		flip = Dbsp.is_literal(lhs) and !Dbsp.is_literal(rhs)
+		first = if flip rhs else lhs
+		second = if flip lhs else rhs
+		left = Dbsp.render(first, scope)?
+		right = Dbsp.render(second, scope)?
+		written = if flip Dbsp.mirror(symbol) else symbol
+		Ok({ text: "${Dbsp.at(left, 5)} ${written} ${Dbsp.at(right, 5)}", level: 4 })
+	}
+
+	mirror : Str -> Str
+	mirror = |symbol| match symbol {
+		"<" => ">"
+		">" => "<"
+		"<=" => ">="
+		">=" => "<="
+		_ => symbol
+	}
+
+	## The Rust operator of a builtin's method.
+	##
+	## Roc's `%` and Rust's agree: both take the sign of the dividend. Roc's `//`
+	## and Rust's `/` agree at an integer, where both truncate, and the float
+	## forms are refused because `dbsp`'s `F64` is a wrapper with no such method.
+	## Roc crashes on integer overflow, and Rust panics only in a debug build,
+	## which is a difference this translator does not close.
+	operator : Str, Str -> Try({ text : Str, level : U8, compares : Bool }, Error)
+	operator = |owner, method| {
+		whole = owner.starts_with("Num.I") or owner.starts_with("Num.U")
+		arithmetic = |text, level| Ok({ text, level, compares: Bool.False })
+		comparison = |text| Ok({ text, level: 4, compares: Bool.True })
+		match method {
+			"plus" => arithmetic("+", 5)
+			"minus" => arithmetic("-", 5)
+			"times" => arithmetic("*", 6)
+			"div_by" => arithmetic("/", 6)
+			"div_trunc_by" =>
+				if whole {
+					arithmetic("/", 6)
+				} else {
+					Err(Unsupported("`//` on ${owner.drop_prefix("Num.")} has no Rust form here, since `dbsp`'s float wrapper has no truncating division; divide with `/`"))
+				}
+			"rem_by" =>
+				if whole {
+					arithmetic("%", 6)
+				} else {
+					Err(Unsupported("`%` on ${owner.drop_prefix("Num.")} has no Rust form here, since `dbsp`'s float wrapper has no remainder"))
+				}
+			"is_lt" => comparison("<")
+			"is_gt" => comparison(">")
+			"is_lte" => comparison("<=")
+			"is_gte" => comparison(">=")
+			"is_eq" => comparison("==")
+			_ => Err(Unsupported("`${owner}.${method}` has no Rust operator"))
+		}
+	}
+
+	## A widening conversion between numbers. Roc's `to_<T>` never loses a
+	## value, so Rust's `as` is the same conversion.
+	conversion : Str, Str, Ex -> Try(Ex, Error)
+	conversion = |owner, method, value| {
+		target = method.drop_prefix("to_")
+		whole = owner.starts_with("Num.I") or owner.starts_with("Num.U")
+		integers = ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128"]
+		if whole and integers.contains(target) {
+			Ok({ text: "${Dbsp.at(value, 7)} as ${target}", level: 7 })
+		} else if whole and target == "f64" {
+			Ok(Dbsp.atom("F64::new(${Dbsp.at(value, 7)} as f64)"))
+		} else {
+			Err(Unsupported("`${owner}.${method}` has no Rust form in this translator"))
+		}
+	}
+}

@@ -9,8 +9,7 @@
 Sql :: {}.{
 
 	## Why a reified function is not SQL, or a schema is not one a database
-	## can create. Every rejection names the construct, and where there is one,
-	## the line it was written on.
+	## can create. Every rejection names the construct.
 	Error := [Unsupported(Str), BadSchema(Str)].{
 		is_eq : _
 	}
@@ -125,7 +124,7 @@ Sql :: {}.{
 		}
 
 		## The columns of the result. The function returns a record, and its
-		## fields name the result columns in the order they were written.
+		## fields name the result columns, in name order.
 		select : Query(p, row), Code(row -> out) -> Selected(p, out)
 		select = |Query.(q), projection| {
 			source = q.source
@@ -151,7 +150,7 @@ Sql :: {}.{
 			source = q.source
 			key = g.key
 			keys = |param| {
-				parts = Sql.expr_list(Sql.evaluate(key, [Binding.Row(source)], param)?, Sql.body_meta(key))?
+				parts = Sql.expr_list(Sql.evaluate(key, [Binding.Row(source)], param)?)?
 				Ok(Str.join_with(parts, ", "))
 			}
 			columns = |param| {
@@ -179,13 +178,11 @@ Sql :: {}.{
 		order_by : Selected(p, out), Code(out -> k), [Asc, Desc] -> Selected(p, out)
 		order_by = |Selected.(s), key, direction| {
 			clause = |param| {
-				lam = Sql.lambda_of(key)?
-				results = match lam.params {
-					[result] => Sql.result_columns(result.ty)
-					_ => return Err(Sql.at_error(lam.meta, "an ordering reads one result row"))
+				results = match Code.graph(key).root_row().params {
+					[result] => Sql.result_columns(result)
+					_ => return Err(Unsupported("an ordering reads one result row"))
 				}
-				env = Sql.env_for(key, lam.params, [results], param)
-				keys = Sql.expr_list(Sql.eval(lam.body, env)?, lam.body.node_meta())?
+				keys = Sql.expr_list(Sql.evaluate(key, [results], param)?)?
 				suffix = match direction {
 					Asc => ""
 					Desc => " DESC"
@@ -444,34 +441,35 @@ Sql :: {}.{
 
 	## The columns a step's function lists. Its body is a record whose every
 	## field reads the row's field of the same name, so the record is the
-	## column list and nothing else.
+	## column list and nothing else. A record's fields arrive in name order,
+	## so the columns do too.
 	columns_of : Code(row -> cols) -> Try({ row_fields : List(Str), columns : List(Column) }, Error)
 	columns_of = |code| {
-		lam = Sql.lambda_of(code)?
-		row = match lam.params {
+		graph = Code.graph(code)
+		root = graph.root_row()
+		row = match root.params {
 			[only] => only
-			_ => return Err(Sql.at_error(lam.meta, "a column list reads one row"))
+			_ => return Err(Unsupported("a column list reads one row"))
 		}
-		fields = Sql.record_fields(row.ty, lam.meta)?
-		entries = match lam.body {
-			MakeRecord(written, _) => written
-			other => return Err(Sql.at_error(other.node_meta(), "a column list is a record, one field per column"))
+		fields = Sql.record_fields(row)?
+		entries = match Sql.body(graph.to_tree(root.id)) {
+			Op({ op: Record(names), args, .. }) => List.map2(names, args, |name, value| { name, value })
+			_ => return Err(Unsupported("a column list is a record, one field per column"))
 		}
 		columns = entries.map_try(
 			|entry| {
-				read = match entry.value {
-					Field(Param(_, _), name, _) => name
-					OptField(Param(_, _), name, _) => name
-					other => return Err(Sql.at_error(other.node_meta(), "`${entry.name}` must read the row's field of that name"))
+				read = match Sql.row_read(entry.value) {
+					Ok(name) => name
+					Err(_) => return Err(Unsupported("`${entry.name}` must read the row's field of that name"))
 				}
 				if read != entry.name {
-					return Err(Sql.at_error(entry.value.node_meta(), "`${entry.name}` reads `${read}`; a column keeps its field's name"))
+					return Err(Unsupported("`${entry.name}` reads `${read}`; a column keeps its field's name"))
 				}
 				field = match fields.find_first(|f| f.name == read) {
 					Ok(f) => f
-					Err(_) => return Err(Sql.at_error(entry.value.node_meta(), "the row has no field `${read}`"))
+					Err(_) => return Err(Unsupported("the row has no field `${read}`"))
 				}
-				sql_type = Sql.located(Sql.column_type(field.ty), entry.value.node_meta())?
+				sql_type = Sql.column_type(field.ty)?
 				Ok({ name: read, sql_type: sql_type, nullable: field.presence == Optional })
 			},
 		)?
@@ -481,23 +479,39 @@ Sql :: {}.{
 	## The columns a key function reads: one field, or a tuple of them.
 	column_names : Code(row -> k) -> Try(List(Str), Error)
 	column_names = |code| {
-		lam = Sql.lambda_of(code)?
-		one : Code.Ir -> Try(Str, Error)
-		one = |node| match node {
-			Field(Param(_, _), name, _) => Ok(name)
-			other => Err(Sql.at_error(other.node_meta(), "a key reads a column of the row"))
+		graph = Code.graph(code)
+		one : Code.Tree -> Try(Str, Error)
+		one = |node| match Sql.row_read(node) {
+			Ok(name) => Ok(name)
+			Err(_) => Err(Unsupported("a key reads a column of the row"))
 		}
-		match lam.body {
-			MakeTuple(parts, _) => parts.map_try(one)
+		match Sql.body(graph.to_tree(graph.root_row().id)) {
+			Op({ op: Tuple, args, .. }) => args.map_try(one)
 			single => Ok([one(single)?])
 		}
 	}
 
-	record_fields : Code.Ty, Code.Meta -> Try(List({ name : Str, ty : Code.Ty, presence : [Required, Optional] }), Error)
-	record_fields = |ty, meta| match ty {
+	## The field a tree reads straight off the row parameter.
+	row_read : Code.Tree -> Try(Str, [NotARead])
+	row_read = |tree| match tree {
+		Op({ op: Field(name), args: [Param(_)], .. }) => Ok(name)
+		Op({ op: OptField(name), args: [Param(_)], .. }) => Ok(name)
+		_ => Err(NotARead)
+	}
+
+	## A row's tree without the block around it, where the block holds one
+	## value and no definitions.
+	body : Code.Tree -> Code.Tree
+	body = |tree| match tree {
+		Block({ defs: [], end: Value([one]) }) => one
+		other => other
+	}
+
+	record_fields : Code.Ty -> Try(List({ name : Str, ty : Code.Ty, presence : [Required, Optional] }), Error)
+	record_fields = |ty| match ty {
 		Record(fields) => Ok(fields)
-		Named(_, backing) => Sql.record_fields(backing, meta)
-		_ => Err(Sql.at_error(meta, "a row is a record, and this is `${ty.name()}`"))
+		Named(_, backing) => Sql.record_fields(backing)
+		_ => Err(Unsupported("a row is a record, and this is `${ty.name()}`"))
 	}
 
 	## The SQL type a Roc field type maps to when a step does not say.
@@ -517,82 +531,61 @@ Sql :: {}.{
 
 	# ------------------------------------------------------------- translator
 
-	## What a name in a reified function stands for.
+	## What a value in a reified function stands for.
 	##
 	## A row is not an SQL value: it is where columns come from, so it binds
 	## to the tables it came from, and a field read off it is the column. A
 	## joined row is a pair of those, which is what `.0` and `.1` take apart.
+	## A read of an optional field is `Maybe`: the column, which can be `NULL`.
 	Binding := [
 		Row(Source),
 		Params,
 		Group(Source),
 		Expr(Str),
+		Maybe(Str),
 		Fields(List({ name : Str, binding : Binding })),
 	]
 
 	## The tables a row is read from, as the joins nested them.
 	Source := [Leaf(Str), Pair(Source, Source)]
 
+	## What the translation of one row's tree reads: the graph its calls name,
+	## what the row's parameters and its kept nodes stand for, and how a
+	## parameter of the query is spelled.
 	Env : {
-		scope : List({ name : Str, binding : Binding }),
+		graph : Code.Graph,
+		params : List(Binding),
+		nodes : List({ id : U32, binding : Binding }),
 		param : Str -> Str,
-		defs : List(Code.Def),
 		depth : U64,
-	}
-
-	lambda_of : Code(f) -> Try({ params : List({ name : Str, ty : Code.Ty }), body : Code.Ir, meta : Code.Meta }, Error)
-	lambda_of = |code| match Code.ir(code) {
-		Lambda(params, body, meta) => Ok({ params: params, body: body, meta: meta })
-		other => Err(Sql.at_error(other.node_meta(), "a clause is a function"))
-	}
-
-	body_meta : Code(f) -> Code.Meta
-	body_meta = |code| match Code.ir(code) {
-		Lambda(_, body, _) => body.node_meta()
-		other => other.node_meta()
-	}
-
-	env_for : Code(f), List({ name : Str, ty : Code.Ty }), List(Binding), (Str -> Str) -> Env
-	env_for = |code, params, bindings, param| {
-		scope = params.map_with_index(
-			|p, i| {
-				binding = match bindings.get(i) {
-					Ok(b) => b
-					Err(_) => Binding.Expr("NULL")
-				}
-				{ name: p.name, binding: binding }
-			},
-		)
-		{ scope: scope, param: param, defs: Code.definitions(code), depth: 0 }
 	}
 
 	## A reified function applied to what its parameters stand for.
 	evaluate : Code(f), List(Binding), (Str -> Str) -> Try(Binding, Error)
 	evaluate = |code, bindings, param| {
-		lam = Sql.lambda_of(code)?
-		if lam.params.len() != bindings.len() {
-			return Err(Sql.at_error(lam.meta, "this clause takes ${bindings.len().to_str()} argument(s)"))
+		graph = Code.graph(code)
+		root = graph.root_row()
+		if root.params.len() != bindings.len() {
+			return Err(Unsupported("this clause takes ${bindings.len().to_str()} argument(s)"))
 		}
-		Sql.eval(lam.body, Sql.env_for(code, lam.params, bindings, param))
+		Sql.eval(graph.to_tree(root.id), { graph: graph, params: bindings, nodes: [], param: param, depth: 0 })
 	}
 
 	render : Code(f), List(Binding), (Str -> Str) -> Try(Str, Error)
 	render = |code, bindings, param| {
 		value = Sql.evaluate(code, bindings, param)?
-		Ok(Sql.bare(Sql.expr_of(value, Sql.body_meta(code))?))
+		Ok(Sql.bare(Sql.expr_of(value)?))
 	}
 
-	## The select list: a record whose fields are the result columns.
+	## The select list: a record whose fields are the result columns, in the
+	## name order a record's fields arrive in.
 	columns : Code(f), List(Binding), (Str -> Str) -> Try(Str, Error)
-	columns = |code, bindings, param| {
-		meta = Sql.body_meta(code)
-		match Sql.evaluate(code, bindings, param)? {
-			Fields(fields) => {
-				spelled = fields.map_try(|f| Ok("${Sql.bare(Sql.expr_of(f.binding, meta)?)} AS ${f.name}"))?
-				Ok(Str.join_with(spelled, ", "))
-			}
-			_ => Err(Sql.at_error(meta, "a result row is a record, so each column has a name"))
+	columns = |code, bindings, param| match Sql.evaluate(code, bindings, param)? {
+		Fields(fields) => {
+			spelled = fields.map_try(|f| Ok("${Sql.bare(Sql.expr_of(f.binding)?)} AS ${f.name}"))?
+			Ok(Str.join_with(spelled, ", "))
 		}
+		_ => Err(Unsupported("a result row is a record, so each column has a name"))
 	}
 
 	## A result row, as a later clause reads it: each field is the result
@@ -604,252 +597,232 @@ Sql :: {}.{
 		_ => Binding.Fields([])
 	}
 
-	expr_list : Binding, Code.Meta -> Try(List(Str), Error)
-	expr_list = |binding, meta| match binding {
-		Fields(fields) => fields.map_try(|f| Sql.expr_of(f.binding, meta).map_ok(Sql.bare))
-		other => Ok([Sql.bare(Sql.expr_of(other, meta)?)])
+	expr_list : Binding -> Try(List(Str), Error)
+	expr_list = |binding| match binding {
+		Fields(fields) => fields.map_try(|f| Sql.expr_of(f.binding).map_ok(Sql.bare))
+		other => Ok([Sql.bare(Sql.expr_of(other)?)])
 	}
 
-	expr_of : Binding, Code.Meta -> Try(Str, Error)
-	expr_of = |binding, meta| match binding {
+	expr_of : Binding -> Try(Str, Error)
+	expr_of = |binding| match binding {
 		Expr(sql) => Ok(sql)
-		Row(_) => Err(Sql.at_error(meta, "a whole row has no SQL value; read one of its columns"))
-		Params => Err(Sql.at_error(meta, "the parameter record has no SQL value; read one of its fields"))
-		Group(_) => Err(Sql.at_error(meta, "a group's rows have no SQL value; aggregate them with `len` or `map(..).sum()`"))
-		Fields(_) => Err(Sql.at_error(meta, "a record has no SQL value here; this clause takes one column"))
+		Maybe(sql) => Ok(sql)
+		Row(_) => Err(Unsupported("a whole row has no SQL value; read one of its columns"))
+		Params => Err(Unsupported("the parameter record has no SQL value; read one of its fields"))
+		Group(_) => Err(Unsupported("a group's rows have no SQL value; aggregate them with `len` or `map(..).sum()`"))
+		Fields(_) => Err(Unsupported("a record has no SQL value here; this clause takes one column"))
 	}
 
-	expr : Code.Ir, Env -> Try(Str, Error)
-	expr = |node, env| Sql.expr_of(Sql.eval(node, env)?, node.node_meta())
+	expr : Code.Tree, Env -> Try(Str, Error)
+	expr = |tree, env| Sql.expr_of(Sql.eval(tree, env)?)
 
-	eval : Code.Ir, Env -> Try(Binding, Error)
-	eval = |node, env| match node {
-		Param(name, meta) => Sql.lookup(env, name, meta)
-		Local(name, meta) => Sql.lookup(env, name, meta)
-
-		Let(name, bound, rest, _) => {
-			value = Sql.eval(bound, env)?
-			Sql.eval(rest, { ..env, scope: env.scope.append({ name: name, binding: value }) })
+	## What one tree stands for. A kept node is computed once, where its block
+	## defines it, and each read of it is what it stands for.
+	eval : Code.Tree, Env -> Try(Binding, Error)
+	eval = |tree, env| match tree {
+		Param(k) => match env.params.get(k.to_u64()) {
+			Ok(binding) => Ok(binding)
+			Err(_) => Err(Unsupported("this clause reads a parameter it does not take"))
 		}
+		Def(n) => match env.nodes.find_last(|entry| entry.id == n) {
+			Ok(entry) => Ok(entry.binding)
+			Err(_) => Err(Unsupported("a value is read before its block computes it"))
+		}
+		Arg(_) => Err(Sql.no_loop)
+		Out(_) => Err(Unsupported("a branch that delivers several values has no SQL form"))
+		Block(block) => {
+			inner = block.defs.fold_try(
+				env,
+				|acc, def| {
+					value = Sql.eval(def.value, acc)?
+					Ok({ ..acc, nodes: acc.nodes.append({ id: def.id, binding: value }) })
+				},
+			)?
+			match block.end {
+				Value([one]) => Sql.eval(one, inner)
+				Value(_) => Err(Unsupported("a branch that delivers several values has no SQL form"))
+				Return(_) | Jump(_) | Branch(_) => Err(Unsupported("a query cannot leave early; every branch delivers its value"))
+				Continue(_) | Break(_) => Err(Sql.no_loop)
+			}
+		}
+		Op(node) => Sql.op(node.op, node.args, env)
+	}
 
-		Lit(literal, meta) => Ok(Binding.Expr(Sql.located(Sql.literal(literal), meta)?))
+	no_loop : Error
+	no_loop = Unsupported("SQL has no loop; a query computes over rows, not by stepping through them")
 
-		Field(receiver, name, meta) => Sql.field(Sql.eval(receiver, env)?, name, env, meta)
-		OptField(receiver, name, meta) => Sql.field(Sql.eval(receiver, env)?, name, env, meta)
+	## One operation, over the trees of its arguments and regions.
+	op : Code.Op, List(Code.Tree), Env -> Try(Binding, Error)
+	op = |operation, args, env| {
+		first = |_| match args.first() {
+			Ok(tree) => Sql.eval(tree, env)
+			Err(_) => Err(Unsupported("an operation with no operand"))
+		}
+		match operation {
+			Lit(literal) => Ok(Binding.Expr(Sql.literal(literal)?))
+			Prim(prim) => Sql.prim(prim.owner, prim.method, args, env)
+			Call(row) => Sql.expand(row, args.map_try(|arg| Sql.eval(arg, env))?, env)
+			Closure(_) => Err(Unsupported("a function inside a query means something only as the argument of `map` over a group's rows"))
+			Record(names) => {
+				fields = List.map2(names, args, |name, value| { name, value }).map_try(|f| Ok({ name: f.name, binding: Sql.eval(f.value, env)? }))?
+				Ok(Binding.Fields(fields))
+			}
+			Tuple => Err(Unsupported("a tuple has no SQL value; a key of several columns is a record"))
+			List | Item => Err(Unsupported("SQL has no list value"))
+			Tag(name) => Err(Unsupported("SQL has no tag unions, so `${name}` has no SQL form"))
+			# A nominal is its backing to SQL.
+			Wrap(_) | Unwrap => first({})
+			Field(name) => Sql.field(first({})?, name, env)
+			OptField(name) => match Sql.field(first({})?, name, env)? {
+				Expr(column) => Ok(Binding.Maybe(column))
+				other => Ok(other)
+			}
+			Index(position) => match first({})? {
+				Row(Pair(left, right)) => if position == 0 Ok(Binding.Row(left)) else Ok(Binding.Row(right))
+				_ => Err(Unsupported("only a joined row has positions: `.0` is the rows joined so far, `.1` the table joined to them"))
+			}
+			Payload(tag, _) => match first({})? {
+				Maybe(column) if tag == "Ok" => Ok(Binding.Expr(column))
+				_ => Err(Unsupported("SQL has no tag unions, so `${tag}` has no SQL form"))
+			}
+			Switch(sw) => Sql.switch(sw.arms.map(|arm| arm.key), sw.joins.len(), sw.outputs.len(), args, env)
+			And(_) => Sql.connective("AND", args, env)
+			Or(_) => Sql.connective("OR", args, env)
+			ForRange(_) | ForList(_) | Loop(_) => Err(Sql.no_loop)
+			Lambda(_) => Err(Unsupported("a function inside a query means something only as the argument of `map` over a group's rows"))
+			Crash => Err(Unsupported("a query cannot crash"))
+			Derived(method, _) => Err(Unsupported("`${method}` is derived by the compiler and has no SQL form"))
+		}
+	}
 
-		Index(receiver, position, meta) => match Sql.eval(receiver, env)? {
-			Row(Pair(left, right)) =>
-				if position == 0 {
-					Ok(Binding.Row(left))
+	## `and` and `or` keep every operand; SQL's `AND` and `OR` do not promise
+	## an order, which is the same answer here: a query body has no effects.
+	connective : Str, List(Code.Tree), Env -> Try(Binding, Error)
+	connective = |word, args, env| {
+		parts = args.map_try(|arg| Sql.expr(arg, env))?
+		Ok(Binding.Expr("(${Str.join_with(parts, " ${word} ")})"))
+	}
+
+	## A branch: a test of an optional field, which reads the column or says
+	## what stands in for `NULL`, or a `Bool` test, which is a `CASE`.
+	switch : List(Code.Key), U64, U64, List(Code.Tree), Env -> Try(Binding, Error)
+	switch = |keys, joins, outputs, args, env| {
+		if joins != 0 or outputs != 1 {
+			return Err(Unsupported("a query cannot leave early; every branch delivers its value"))
+		}
+		scrutinee = match args.first() {
+			Ok(tree) => tree
+			Err(_) => return Err(Unsupported("a branch with nothing to test"))
+		}
+		arms = List.map2(keys, args.drop_first(1), |key, tree| { key, tree })
+		arm = |name| match arms.find_first(|a| Sql.key_is(a.key, name)) {
+			Ok(found) => Sql.expr(found.tree, env)
+			Err(_) => Err(Unsupported("a branch in a query has a `${name}` arm"))
+		}
+		match Sql.eval(scrutinee, env)? {
+			Maybe(column) => {
+				present = arm("Ok")?
+				absent = arm("Err")?
+				if present == column {
+					Ok(Binding.Expr("COALESCE(${column}, ${absent})"))
 				} else {
-					Ok(Binding.Row(right))
+					Ok(Binding.Expr("CASE WHEN ${column} IS NOT NULL THEN ${present} ELSE ${absent} END"))
 				}
-			_ => Err(Sql.at_error(meta, "only a joined row has positions: `.0` is the rows joined so far, `.1` the table joined to them"))
-		}
-
-		Binop(op, lhs, rhs, meta) => {
-			symbol = Sql.located(Sql.operator(op, lhs.node_ty()), meta)?
-			left = Sql.expr(lhs, env)?
-			right = Sql.expr(rhs, env)?
-			Ok(Binding.Expr("(${left} ${symbol} ${right})"))
-		}
-
-		Unary(op, operand, meta) =>
-			if op == "not" {
-				match operand {
-					Binop("is_eq", lhs, rhs, _) => {
-						left = Sql.expr(lhs, env)?
-						right = Sql.expr(rhs, env)?
-						Ok(Binding.Expr("(${left} <> ${right})"))
-					}
-					_ => Ok(Binding.Expr("(NOT ${Sql.expr(operand, env)?})"))
-				}
-			} else if op == "neg" {
-				Ok(Binding.Expr("(-${Sql.expr(operand, env)?})"))
-			} else {
-				Err(Sql.at_error(meta, "`${op}` has no SQL form"))
 			}
-
-		# A written `and` or `or` short-circuits, so it arrives as the `if` it
-		# stands for. SQL's `AND` and `OR` do not promise an order, which is
-		# the same answer here: a query body has no effects to order.
-		If(condition, yes, no, _) => {
-			test = Sql.expr(condition, env)?
-			if Sql.is_bool(no, Bool.False) {
-				Ok(Binding.Expr("(${test} AND ${Sql.expr(yes, env)?})"))
-			} else if Sql.is_bool(yes, Bool.True) {
-				Ok(Binding.Expr("(${test} OR ${Sql.expr(no, env)?})"))
-			} else {
-				Ok(Binding.Expr("CASE WHEN ${test} THEN ${Sql.expr(yes, env)?} ELSE ${Sql.expr(no, env)?} END"))
-			}
+			Expr(test) => Ok(Binding.Expr("CASE WHEN ${test} THEN ${arm("True")?} ELSE ${arm("False")?} END"))
+			_ => Err(Unsupported("SQL has no tag unions; a branch in a query tests a condition or an optional field"))
 		}
-
-		Call(callee, args, meta) => Sql.call(callee, args, env, meta)
-
-		Match(subject, branches, meta) => match subject {
-			OptField(_, _, _) => Sql.optional(Sql.expr(subject, env)?, branches, env, meta)
-			_ => Err(Sql.at_error(meta, "SQL has no tag unions; a `match` in a query reads an optional field"))
-		}
-
-		MakeRecord(entries, _) => {
-			fields = entries.map_try(|entry| Ok({ name: entry.name, binding: Sql.eval(entry.value, env)? }))?
-			Ok(Binding.Fields(fields))
-		}
-
-		MakeTuple(_, meta) => Err(Sql.at_error(meta, "a tuple has no SQL value; a key of several columns is a record"))
-		MakeList(_, meta) => Err(Sql.at_error(meta, "SQL has no list value"))
-		MakeTag(name, _, meta) => Err(Sql.at_error(meta, "SQL has no tag unions, so `${name}` has no SQL form"))
-		Lambda(_, _, meta) => Err(Sql.at_error(meta, "a function inside a query means something only as the argument of `map` over a group's rows"))
-		Crash(_, meta) => Err(Sql.at_error(meta, "a query cannot crash"))
-		Derived(method, _, _, meta) => Err(Sql.at_error(meta, "`${method}` is derived by the compiler and has no SQL form"))
-		Widen(_, meta) => Err(Sql.at_error(meta, "SQL has no tag unions, so a widening between two has no SQL form"))
-		Range(_, _, _, meta) => Err(Sql.at_error(meta, "a range has no SQL form"))
-		For(_, meta) => Err(Sql.at_error(meta, "SQL has no loop; a query computes over rows, not by stepping through them"))
-		While(_, meta) => Err(Sql.at_error(meta, "SQL has no loop; a query computes over rows, not by stepping through them"))
-		Break(_, meta) => Err(Sql.at_error(meta, "SQL has no loop to leave"))
-		Return(_, meta) => Err(Sql.at_error(meta, "SQL has no loop to leave"))
 	}
 
-	lookup : Env, Str, Code.Meta -> Try(Binding, Error)
-	lookup = |env, name, meta| match env.scope.find_last(|entry| entry.name == name) {
-		Ok(entry) => Ok(entry.binding)
-		Err(_) => Err(Sql.at_error(meta, "`${name}` is not bound here"))
+	key_is : Code.Key, Str -> Bool
+	key_is = |key, name| match key {
+		Tag(tag) => tag == name
+		Lit(Bool(flag)) => (if flag "True" else "False") == name
+		Lit(_) | Len(_) | AtLeast(_) | Default => Bool.False
 	}
 
-	field : Binding, Str, Env, Code.Meta -> Try(Binding, Error)
-	field = |holder, name, env, meta| match holder {
+	field : Binding, Str, Env -> Try(Binding, Error)
+	field = |holder, name, env| match holder {
 		Row(Leaf(alias)) =>
 			if alias.is_empty() {
 				Ok(Binding.Expr(name))
 			} else {
 				Ok(Binding.Expr("${alias}.${name}"))
 			}
-		Row(Pair(_, _)) => Err(Sql.at_error(meta, "a joined row is a pair; take `.0` or `.1` before reading `${name}`"))
+		Row(Pair(_, _)) => Err(Unsupported("a joined row is a pair; take `.0` or `.1` before reading `${name}`"))
 		Params => {
 			spell = env.param
 			Ok(Binding.Expr(spell(name)))
 		}
 		Fields(fields) => match fields.find_first(|f| f.name == name) {
 			Ok(f) => Ok(f.binding)
-			Err(_) => Err(Sql.at_error(meta, "this record has no `${name}`"))
+			Err(_) => Err(Unsupported("this record has no `${name}`"))
 		}
-		Group(_) => Err(Sql.at_error(meta, "a group's rows have no single `${name}`; aggregate them with `len` or `map(..).sum()`"))
-		Expr(_) => Err(Sql.at_error(meta, "`${name}` is read from a value that is not a row"))
+		Group(_) => Err(Unsupported("a group's rows have no single `${name}`; aggregate them with `len` or `map(..).sum()`"))
+		Expr(_) | Maybe(_) => Err(Unsupported("`${name}` is read from a value that is not a row"))
 	}
 
-	## `x ?? d`, and a `match` that tests whether an optional field is there,
-	## are the two ways Roc reads one. Both say what happens when it is absent,
-	## which is exactly what SQL's `NULL` leaves unsaid.
-	optional : Str, List(Code.Branch), Env, Code.Meta -> Try(Binding, Error)
-	optional = |column, branches, env, meta| {
-		present = branches.find_first(|b| Sql.branch_is(b, "Ok"))
-		absent = branches.find_first(|b| Sql.branch_is(b, "Err"))
-		match (present, absent) {
-			(Ok(yes), Ok(no)) => {
-				bound = match yes.patterns {
-					[Variant(_, [Bind(name, _)], _)] => name
-					_ => return Err(Sql.at_error(meta, "a present optional field is read by binding it: `Ok(value) =>`"))
-				}
-				otherwise = Sql.expr(no.value, env)?
-				match yes.value {
-					Local(name, _) if name == bound => Ok(Binding.Expr("COALESCE(${column}, ${otherwise})"))
-					_ => {
-						inner = Sql.expr(yes.value, { ..env, scope: env.scope.append({ name: bound, binding: Binding.Expr(column) }) })?
-						Ok(Binding.Expr("CASE WHEN ${column} IS NOT NULL THEN ${inner} ELSE ${otherwise} END"))
-					}
-				}
-			}
-			_ => Err(Sql.at_error(meta, "a `match` on an optional field has an `Ok` branch and an `Err` branch"))
-		}
-	}
-
-	branch_is : Code.Branch, Str -> Bool
-	branch_is = |branch, tag| match branch.patterns {
-		[Variant(name, _, _)] => name == tag and branch.guard == NoGuard
-		_ => Bool.False
-	}
-
-	is_bool : Code.Ir, Bool -> Bool
-	is_bool = |node, wanted| match node {
-		Lit(Bool(b), _) => b == wanted
-		_ => Bool.False
-	}
-
-	## The calls a query may make, each under the whole name a `Call` carries.
-	##
-	## A call to a definition of the application's own is expanded in place,
-	## so a predicate or a computation written once in Roc is reused in any
-	## query that calls it.
-	call : Str, List(Code.Ir), Env, Code.Meta -> Try(Binding, Error)
-	call = |callee, args, env, meta| {
+	## The builtins a query may call, by owner and method.
+	prim : Str, Str, List(Code.Tree), Env -> Try(Binding, Error)
+	prim = |owner, method, args, env| {
 		sql = |node| Sql.expr(node, env)
-		match (callee, args) {
-			("Builtin.Str.concat", [a, b]) => Ok(Binding.Expr("(${sql(a)?} || ${sql(b)?})"))
-			("Builtin.Str.starts_with", [s, prefix]) => {
+		match ("${owner}.${method}", args) {
+			("Str.concat", [a, b]) => Ok(Binding.Expr("(${sql(a)?} || ${sql(b)?})"))
+			("Str.starts_with", [s, prefix]) => {
 				p = sql(prefix)?
 				Ok(Binding.Expr("(substr(${sql(s)?}, 1, length(${p})) = ${p})"))
 			}
-			("Builtin.Str.count_utf8_bytes", _) =>
-				Err(Sql.at_error(meta, "`count_utf8_bytes` counts bytes, and SQL's `length` counts characters; the two disagree on any non-ASCII text"))
-			("Builtin.Try.is_ok", [opt]) => Sql.null_test(opt, "IS NOT NULL", env, meta)
-			("Builtin.Try.is_err", [opt]) => Sql.null_test(opt, "IS NULL", env, meta)
-			("Builtin.List.len", [rows]) => match Sql.eval(rows, env)? {
+			("Str.count_utf8_bytes", _) =>
+				Err(Unsupported("`count_utf8_bytes` counts bytes, and SQL's `length` counts characters; the two disagree on any non-ASCII text"))
+			("Try.is_ok", [opt]) => Sql.null_test(opt, "IS NOT NULL", env)
+			("Try.is_err", [opt]) => Sql.null_test(opt, "IS NULL", env)
+			("List.len", [rows]) => match Sql.eval(rows, env)? {
 				Group(_) => Ok(Binding.Expr("COUNT(*)"))
-				_ => Err(Sql.at_error(meta, "`len` counts a group's rows, and this is not one"))
+				_ => Err(Unsupported("`len` counts a group's rows, and this is not one"))
 			}
-			("Builtin.List.sum", [Call("Builtin.List.map", [rows, Lambda([row], body, _)], _)]) =>
-				match Sql.eval(rows, env)? {
-					Group(source) => {
-						inner = Sql.expr(body, { ..env, scope: env.scope.append({ name: row.name, binding: Binding.Row(source) }) })?
-						Ok(Binding.Expr("SUM(${Sql.bare(inner)})"))
-					}
-					_ => Err(Sql.at_error(meta, "`map(..).sum()` sums over a group's rows, and this is not one"))
-				}
-			_ =>
-				if callee.starts_with("Builtin.Num.") and callee.ends_with(".to_dec") {
-					match args {
-						[n] => Ok(Binding.Expr("CAST(${sql(n)?} AS NUMERIC)"))
-						_ => Err(Sql.at_error(meta, "`to_dec` takes one number"))
-					}
-				} else {
-					Sql.expand(callee, args, env, meta)
-				}
+			("List.sum", [mapped]) => Sql.sum(mapped, env)
+			("Bool.not", [operand]) => match operand {
+				Op({ op: Prim({ owner: _, method: "is_eq" }), args: [lhs, rhs], .. }) => Ok(Binding.Expr("(${sql(lhs)?} <> ${sql(rhs)?})"))
+				_ => Ok(Binding.Expr("(NOT ${sql(operand)?})"))
+			}
+			(_, [n]) if method == "to_dec" and owner.starts_with("Num.") => Ok(Binding.Expr("CAST(${sql(n)?} AS NUMERIC)"))
+			(_, [n]) if method == "negate" => Ok(Binding.Expr("(-${sql(n)?})"))
+			(_, [lhs, rhs]) => Sql.binary(owner, method, lhs, rhs, env)
+			_ => Err(Unsupported("`${owner}.${method}` has no SQL form"))
 		}
 	}
 
-	null_test : Code.Ir, Str, Env, Code.Meta -> Try(Binding, Error)
-	null_test = |node, test, env, meta| match node {
-		OptField(_, _, _) => Ok(Binding.Expr("(${Sql.expr(node, env)?} ${test})"))
-		_ => Err(Sql.at_error(meta, "a query tests presence only on an optional field"))
+	## `rows.map(f).sum()` over a group's rows is `SUM` of `f`, with `f`'s
+	## row read as the group's row.
+	sum : Code.Tree, Env -> Try(Binding, Error)
+	sum = |mapped, env| match mapped {
+		Op({ op: Prim({ owner: "List", method: "map" }), args: [rows, Op({ op: Closure(row), args: captured, .. })], .. }) =>
+			match Sql.eval(rows, env)? {
+				Group(source) => {
+					values = captured.map_try(|c| Sql.eval(c, env))?
+					inner = Sql.expr_of(Sql.expand(row, values.append(Binding.Row(source)), env)?)?
+					Ok(Binding.Expr("SUM(${Sql.bare(inner)})"))
+				}
+				_ => Err(Unsupported("`map(..).sum()` sums over a group's rows, and this is not one"))
+			}
+		_ => Err(Unsupported("`sum` adds up a group's rows through `map`"))
 	}
 
-	## A call to one of the application's own definitions, expanded with its
-	## arguments bound to what they stand for. A row passes through as a row,
-	## so a helper over `Order` reads the order's columns.
-	expand : Str, List(Code.Ir), Env, Code.Meta -> Try(Binding, Error)
-	expand = |callee, args, env, meta| {
-		if env.depth > 32 {
-			return Err(Sql.at_error(meta, "`${callee}` calls itself, and SQL has no recursion to spell it with"))
+	null_test : Code.Tree, Str, Env -> Try(Binding, Error)
+	null_test = |tree, test, env| match Sql.eval(tree, env)? {
+		Maybe(column) => Ok(Binding.Expr("(${column} ${test})"))
+		_ => Err(Unsupported("a query tests presence only on an optional field"))
+	}
+
+	## A call to one of the application's own functions, expanded with its
+	## parameters bound to what the arguments stand for. A row passes through
+	## as a row, so a helper over `Order` reads the order's columns.
+	expand : U32, List(Binding), Env -> Try(Binding, Error)
+	expand = |row, values, env| {
+		if env.depth > 32 or env.graph.row(row).recursive {
+			return Err(Unsupported("a function that calls itself has no SQL form; SQL has no recursion to spell it with"))
 		}
-		match env.defs.find_first(|def| def.name == callee) {
-			Ok(def) => match def.ir {
-				Lambda(params, body, _) => {
-					values = args.map_try(|arg| Sql.eval(arg, env))?
-					scope = params.map_with_index(
-						|p, i| {
-							binding = match values.get(i) {
-								Ok(v) => v
-								Err(_) => Binding.Expr("NULL")
-							}
-							{ name: p.name, binding: binding }
-						},
-					)
-					Sql.eval(body, { ..env, scope: scope, depth: env.depth + 1 })
-				}
-				_ => Err(Sql.at_error(meta, "`${callee}` is not a function"))
-			}
-			Err(_) => Err(Sql.at_error(meta, "`${callee}` has no SQL form"))
-		}
+		Sql.eval(env.graph.to_tree(row), { ..env, params: values, nodes: [], depth: env.depth + 1 })
 	}
 
 	literal : Code.Lit -> Try(Str, Error)
@@ -862,16 +835,45 @@ Sql :: {}.{
 		Bytes(_) => Err(Unsupported("a byte literal has no portable SQL form"))
 	}
 
-	## A `Binop` names the Roc method the operator dispatched to.
+	## A two-operand builtin, as the SQL operator for its method.
+	##
+	## The normal form puts an integer literal first in a comparison, as
+	## `10 <= quantity`. SQL reads as a column test, so a comparison whose
+	## left operand is the only literal is written the other way round, with
+	## the mirrored operator: the same comparison.
+	binary : Str, Str, Code.Tree, Code.Tree, Env -> Try(Binding, Error)
+	binary = |owner, method, lhs, rhs, env| {
+		mirrored = Sql.mirror(method)
+		flip = Sql.is_literal(lhs) and !Sql.is_literal(rhs) and !mirrored.is_empty()
+		symbol = Sql.operator(owner, if flip mirrored else method)?
+		left = Sql.expr(if flip rhs else lhs, env)?
+		right = Sql.expr(if flip lhs else rhs, env)?
+		Ok(Binding.Expr("(${left} ${symbol} ${right})"))
+	}
+
+	mirror : Str -> Str
+	mirror = |method| match method {
+		"is_lt" => "is_gt"
+		"is_gt" => "is_lt"
+		"is_lte" => "is_gte"
+		"is_gte" => "is_lte"
+		"is_eq" => "is_eq"
+		_ => ""
+	}
+
+	is_literal : Code.Tree -> Bool
+	is_literal = |tree| match tree {
+		Op({ op: Lit(_), .. }) => Bool.True
+		_ => Bool.False
+	}
+
+	## The SQL operator of a builtin's method.
 	##
 	## Roc's `%` and SQL's agree: both follow the sign of the dividend. Roc's
 	## `//` and SQL's `/` agree only at an integer, where both truncate.
-	operator : Str, Code.Ty -> Try(Str, Error)
-	operator = |method, operand| {
-		whole = match operand.numeric() {
-			Ok(number) => number.kind == Int
-			Err(_) => Bool.False
-		}
+	operator : Str, Str -> Try(Str, Error)
+	operator = |owner, method| {
+		whole = owner.starts_with("Num.I") or owner.starts_with("Num.U")
 		match method {
 			"plus" => Ok("+")
 			"minus" => Ok("-")
@@ -894,8 +896,7 @@ Sql :: {}.{
 			"is_lte" => Ok("<=")
 			"is_gte" => Ok(">=")
 			"is_eq" => Ok("=")
-			"and" => Ok("AND")
-			_ => Err(Unsupported("`${method}` has no SQL operator"))
+			_ => Err(Unsupported("`${owner}.${method}` has no SQL operator"))
 		}
 	}
 
@@ -930,23 +931,6 @@ Sql :: {}.{
 
 	quote : Str -> Str
 	quote = |text| "'${text.replace_each("'", "''")}'"
-
-	## Where a node was written, as a prefix an error message can lead with.
-	at : Code.Meta -> Str
-	at = |meta| {
-		region = meta.region
-		"${region.module_name}:${region.start_line.to_str()}:${region.start_column.to_str()}: "
-	}
-
-	at_error : Code.Meta, Str -> Error
-	at_error = |meta, message| Unsupported("${Sql.at(meta)}${message}")
-
-	located : Try(a, Error), Code.Meta -> Try(a, Error)
-	located = |result, meta| match result {
-		Ok(value) => Ok(value)
-		Err(Unsupported(message)) => Err(Unsupported("${Sql.at(meta)}${message}"))
-		Err(BadSchema(message)) => Err(BadSchema("${Sql.at(meta)}${message}"))
-	}
 
 	# --------------------------------------------------------------- encoding
 

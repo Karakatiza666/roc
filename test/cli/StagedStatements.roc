@@ -1,50 +1,85 @@
 # The statements a reified body can hold, and what each describes as.
 #
-# Every one of them needs a name the author did not write, which is why they
-# are one fixture: a destructuring binding names the fields it reads, a `var`
-# names each version it settles, and a loop names the state it carries from
-# one turn to the next. The `Ir` has no assignment, so each of these describes
-# as a binding rather than as a statement.
+# The normal form keeps no names and no statements: a destructuring binding is
+# the reads it names, each version of a `var` is the value it holds, and a loop
+# carries its state in slots from one turn to the next. A value read more than
+# once stays one node.
 #
-# `test/cli/StagedLoops.roc` pins what leaves a loop, which is the one thing
-# here that takes a node of its own.
+# `test/cli/StagedLoops.roc` pins what leaves a loop.
 Stage := {}.{
 	describe : Code(f) -> Str
-	describe = |code| Stage.node(code.ir())
-
-	node : Code.Ir -> Str
-	node = |ir| match ir {
-		Lambda(_, body, _) => Stage.node(body)
-		Param(name, _) => name
-		Local(name, _) => name
-		Let(name, bound, rest, _) => "let ${name} = ${Stage.node(bound)}; ${Stage.node(rest)}"
-		Field(record, name, _) => "${Stage.node(record)}.${name}"
-		Index(tuple, at, _) => "${Stage.node(tuple)}.${at.to_str()}"
-		Binop(op, lhs, rhs, _) => "(${Stage.node(lhs)} ${op} ${Stage.node(rhs)})"
-		If(cond, then, els, _) => "if ${Stage.node(cond)} { ${Stage.node(then)} } else { ${Stage.node(els)} }"
-		Match(subject, branches, _) =>
-			"match ${Stage.node(subject)} { ${Str.join_with(branches.map(Stage.branch), " ")} }"
-		MakeTag(name, args, _) => "${name}(${Str.join_with(args.map(Stage.node), " ")})"
-		MakeTuple(items, _) => "(${Str.join_with(items.map(Stage.node), " ")})"
-		Range(from, to, reach, _) => "${Stage.node(from)}${Stage.reach(reach)}${Stage.node(to)}"
-		For(loop, _) =>
-			"for ${loop.item} in ${Stage.node(loop.source)} carrying ${Stage.carried(loop.carried)} { ${Stage.node(loop.body)} }"
-		While(loop, _) =>
-			"while ${Stage.carried(loop.carried)} as long as ${Stage.node(loop.cond)} { ${Stage.node(loop.body)} }"
-		Lit(value, _) => Stage.lit(value)
-		_ => "other"
+	describe = |code| {
+		graph = Code.graph(code)
+		first = graph.root_row()
+		others = graph.rows().keep_if(|other| other.id != first.id)
+		shown = [first].concat(others).map(|each| "r${each.id.to_str()} = ${Stage.row(graph, each)}")
+		Str.join_with(shown, " ; ")
 	}
 
-	carried : List({ initial : Code.Ir, name : Str }) -> Str
-	carried = |entries| "[${Str.join_with(entries.map(Stage.entry), ", ")}]"
+	row : Code.Graph, Code.Row -> Str
+	row = |graph, described| {
+		params = Str.join_with(described.params.map(|param| param.name()), ", ")
+		"|${params}| -> ${described.result.name()} ${Stage.tree(graph.to_tree(described.id))}"
+	}
 
-	entry : { initial : Code.Ir, name : Str } -> Str
-	entry = |e| "${e.name} = ${Stage.node(e.initial)}"
+	tree : Code.Tree -> Str
+	tree = |t| match t {
+		Op(o) => Stage.op(o.op, o.args)
+		Param(k) => "p${k.to_str()}"
+		Arg(a) => "s${a.owner.to_str()}.${a.k.to_str()}"
+		Out(o) => "n${o.node.to_str()}.${o.k.to_str()}"
+		Def(n) => "n${n.to_str()}"
+		Block(b) => {
+			defs = b.defs.map(|d| "n${d.id.to_str()} = ${Stage.tree(d.value)}; ")
+			last = match b.end {
+				Value(vals) => Stage.all(vals)
+				Jump(j) => "jump j${j.join.to_str()}(${Stage.all(j.args)})"
+				Return(v) => "return ${Stage.tree(v)}"
+				Continue(vals) => "continue(${Stage.all(vals)})"
+				Break(vals) => "break(${Stage.all(vals)})"
+				Branch(sw) => Stage.tree(sw)
+			}
+			if defs.is_empty() last else "{ ${Str.join_with(defs, "")}${last} }"
+		}
+	}
 
-	reach : [Exclusive, Inclusive] -> Str
-	reach = |end| match end {
-		Exclusive => "..<"
-		Inclusive => "..="
+	all : List(Code.Tree) -> Str
+	all = |ts| Str.join_with(ts.map(Stage.tree), ", ")
+
+	op : Code.Op, List(Code.Tree) -> Str
+	op = |o, args| match o {
+		Lit(l) => Stage.lit(l)
+		Prim(p) => "${p.owner}.${p.method}(${Stage.all(args)})"
+		Call(r) => "r${r.to_str()}(${Stage.all(args)})"
+		Closure(r) => "closure r${r.to_str()}(${Stage.all(args)})"
+		Record(names) => {
+			fields = List.map2(names, args, |name, arg| "${name}: ${Stage.tree(arg)}")
+			if fields.is_empty() "{}" else "{ ${Str.join_with(fields, ", ")} }"
+		}
+		Tuple => "(${Stage.all(args)})"
+		List => "[${Stage.all(args)}]"
+		Tag(name) => "${name}(${Stage.all(args)})"
+		Wrap(name) => "${name}.(${Stage.all(args)})"
+		Unwrap => "unwrap(${Stage.all(args)})"
+		Field(name) => "${Stage.all(args)}.${name}"
+		Index(i) => "${Stage.all(args)}.${i.to_str()}"
+		Payload(name, i) => "${Stage.all(args)}.${name}.${i.to_str()}"
+		Item => "item(${Stage.all(args)})"
+		OptField(name) => "${Stage.all(args)}.?${name}"
+		Switch(sw) => {
+			scrutinee = Stage.all(args.take_first(1))
+			arms = List.map2(sw.arms, args.drop_first(1), |arm, body| "${Stage.key(arm.key)} => ${Stage.tree(body)}")
+			joins = args.drop_first(1 + sw.arms.len()).map_with_index(|body, i| " j${i.to_str()}: ${Stage.tree(body)}")
+			"switch ${scrutinee} { ${Str.join_with(arms, " | ")} }${Str.join_with(joins, "")}"
+		}
+		And(_) => "and(${Stage.all(args)})"
+		Or(_) => "or(${Stage.all(args)})"
+		ForRange(r) => "for_range${if r.inclusive "=" else "<"}(${Stage.all(args)})"
+		ForList(_) => "for_list(${Stage.all(args)})"
+		Loop(_) => "loop(${Stage.all(args)})"
+		Lambda(_) => "lambda(${Stage.all(args)})"
+		Crash => "crash(${Stage.all(args)})"
+		Derived(name, _) => "derived ${name}(${Stage.all(args)})"
 	}
 
 	lit : Code.Lit -> Str
@@ -54,18 +89,16 @@ Stage := {}.{
 		Frac(number, _) => number.to_str()
 		Fixed(number) => number.to_str()
 		Str(text) => "'${text}'"
-		Bytes(bytes) => "bytes(${bytes.len().to_str()})"
+		Bytes(bytes) => "bytes[${Str.join_with(bytes.map(|b| b.to_str()), " ")}]"
 	}
 
-	branch : Code.Branch -> Str
-	branch = |b| "${Str.join_with(b.patterns.map(Stage.pattern), " | ")} => ${Stage.node(b.value)}"
-
-	pattern : Code.Pattern -> Str
-	pattern = |p| match p {
-		Bind(name, _) => name
-		Anything(_) => "_"
-		Variant(name, args, _) => "${name}(${Str.join_with(args.map(Stage.pattern), " ")})"
-		_ => "?"
+	key : Code.Key -> Str
+	key = |k| match k {
+		Tag(name) => name
+		Lit(l) => Stage.lit(l)
+		Len(n) => "len ${n.to_str()}"
+		AtLeast(n) => "len >= ${n.to_str()}"
+		Default => "_"
 	}
 }
 

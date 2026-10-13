@@ -546,7 +546,10 @@ pub fn forEachStmtRead(
             note(ctx, s.payload);
         },
         inline .str_match, .str_match_set => |s| note(ctx, s.source),
-        .crash => |s| if (s.msg.localId()) |message| note(ctx, message),
+        .crash => |s| {
+            if (s.msg.localId()) |message| note(ctx, message);
+            if (store.stmtRowOrDefault(s.extra).refusal) |refusal| for (refusal.locals()) |local| note(ctx, local);
+        },
         .decref_if_initialized => |s| {
             note(ctx, s.cond);
             note(ctx, s.value);
@@ -1805,7 +1808,7 @@ pub fn BodyCloner(comptime Rewriter: type) type {
                         .literal => |literal| .{ .literal = literal },
                         .local => |local| .{ .local = try self.mapLocal(local) },
                     },
-                    .extra = s.extra,
+                    .extra = try self.mapCrashExtra(s.extra),
                 } }, origin),
                 .init_uninitialized, .assign_ref, .assign_literal, .assign_call, .assign_call_erased, .assign_packed_erased_fn, .assign_low_level, .assign_list, .assign_struct, .assign_tag, .store_struct, .store_tag, .set_local, .dyn, .debug, .expect, .incref, .decref, .decref_if_initialized, .free, .switch_stmt, .switch_initialized_payload, .str_match, .str_match_set, .join => null,
             };
@@ -2253,6 +2256,19 @@ pub fn BodyCloner(comptime Rewriter: type) type {
             return self.store.addOptionalStmtRow(LIR.CallExtra, .{
                 .is_cold = extra.is_cold,
             });
+        }
+
+        /// A crash's out-of-line facts with the refusal's locals renamed. A
+        /// crash without a refusal keeps its row, which names no local.
+        pub fn mapCrashExtra(self: *Self, id: LIR.StmtRowId(LIR.CrashExtra)) Allocator.Error!LIR.StmtRowId(LIR.CrashExtra) {
+            var extra = self.store.stmtRowOrDefault(id);
+            const refusal = extra.refusal orelse return id;
+            extra.refusal = .{
+                .site = try self.mapLocal(refusal.site),
+                .row = try self.mapLocal(refusal.row),
+                .node = try self.mapLocal(refusal.node),
+            };
+            return self.store.addStmtRow(LIR.CrashExtra, extra);
         }
 
         pub fn mapJoinExtra(self: *Self, id: LIR.StmtRowId(LIR.JoinExtra)) Allocator.Error!LIR.StmtRowId(LIR.JoinExtra) {
