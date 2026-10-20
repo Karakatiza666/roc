@@ -19261,6 +19261,8 @@ const EvidencePass = struct {
             try self.resolveIteratorPlan(@fromBackingInt(@intCast(raw)), &.{}, true);
         }
 
+        try self.publishNamedCodeSiteSubstitutions();
+
         std.mem.sort(static_dispatch.SiteEvidenceEntry, self.site_evidence.items, {}, siteEvidenceLessThan);
 
         self.plan_table.evidence_nodes = try self.evidence_nodes.toOwnedSlice(self.allocator);
@@ -21720,6 +21722,33 @@ const EvidencePass = struct {
             .subst_start = subst.start,
             .subst_len = subst.len,
         });
+    }
+
+    /// A name at a `Code` position is described, not lowered, so no template
+    /// walk above reaches its node. The description reads what the use
+    /// copied each quantified variable of the definition to, including one
+    /// only a `where` obligation names, which the type at the position does
+    /// not hold. The entry carries that substitution and no evidence.
+    fn publishNamedCodeSiteSubstitutions(self: *EvidencePass) Allocator.Error!void {
+        const module_env = self.module.moduleEnvConst();
+        for (module_env.store.codeReificationSites()) |site| {
+            if (site.kind != .named_function) continue;
+            const record_idx = self.value_use_by_node.get(site.node_idx) orelse continue;
+            const checked_expr = self.checked_bodies.exprIdForSource(@fromBackingInt(@intCast(site.node_idx))) orelse continue;
+            const site_key = @backingInt(checked_expr);
+            if (self.site_seen.contains(site_key)) continue;
+            const record = module_env.scheme_uses.items.items[record_idx];
+            const pairs = module_env.scheme_use_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+            const subst = try self.appendSiteSubstitution(@fromBackingInt(@intCast(record.scheme_root)), pairs, &.{});
+            try self.site_seen.put(site_key, {});
+            try self.site_evidence.append(self.allocator, .{
+                .key = site_key,
+                .start = 0,
+                .len = 0,
+                .subst_start = subst.start,
+                .subst_len = subst.len,
+            });
+        }
     }
 
     fn emitSchemeUseSiteEvidence(
@@ -38137,16 +38166,62 @@ fn reifyStagedCode(
             .rejected => |rejection| {
                 checked_bodies.attachCodeReification(site.expr, null);
                 const problems = problem_store orelse continue;
-                const detail = try problems.putExtraString(rejection.detail);
+                const detail = if (rejection.open) |open|
+                    try openVariableDetail(allocator, problems, open)
+                else
+                    try problems.putExtraString(rejection.detail);
                 _ = try problems.appendProblem(.{ .staged_code = .{
                     .reason = stagedCodeReason(rejection.kind),
                     .region = rejection.region,
                     .detail = detail,
+                    .open = if (rejection.open) |open| .{
+                        .cause = switch (open.cause) {
+                            .use_leaves_open => .use_leaves_open,
+                            .annotation_leaves_open => .annotation_leaves_open,
+                            .inferred => .inferred,
+                            .inferred_use_leaves_open => .inferred_use_leaves_open,
+                        },
+                        .place = switch (open.place) {
+                            .parameter => .parameter,
+                            .result => .result,
+                            .expression => .expression,
+                            .use => .use,
+                        },
+                    } else null,
                 } });
             },
         }
     }
     return CodeProvenanceTable.init(allocator, sites.provenance);
+}
+
+/// What a refusal at a type variable names: the variable, as its annotation
+/// wrote it, and the place in the function it stands in.
+fn openVariableDetail(
+    allocator: Allocator,
+    problems: *problem.Store,
+    open: code_reifier.OpenVariable,
+) Allocator.Error!problem.ExtraStringIdx {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+    if (open.name) |name| {
+        try text.print(allocator, "the type variable {s}", .{name});
+    } else {
+        try text.appendSlice(allocator, "an unnamed type variable");
+    }
+    switch (open.place) {
+        .parameter => |parameter| switch (parameter) {
+            .name => |name| try text.print(allocator, ", in the type of the parameter {s}", .{name}),
+            .position => |position| try text.print(allocator, ", in the type of parameter {d}", .{position}),
+        },
+        .result => try text.appendSlice(allocator, ", in the type the function returns"),
+        .expression => try text.appendSlice(allocator, ", in the type of this expression"),
+        .use => |use| try text.appendSlice(allocator, switch (use) {
+            .call => ", which this call does not fix",
+            .site => ", which this Code position does not fix",
+        }),
+    }
+    return problems.putExtraString(text.items);
 }
 
 /// The reported reason for a walk that stopped.

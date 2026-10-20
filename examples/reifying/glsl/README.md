@@ -29,11 +29,11 @@ post_process = |frag, settings| ...
 Glsl.fragment_330(post_process)
 ```
 
-`fragment_330` takes a `Code(f)`, so `post_process` is checked against the
-function type inside it rather than against `Code` itself. The compiler then
-describes `post_process` and hands the description over; `Code.graph` opens it,
-and `to_tree` gives the root row as nested expressions. The shader is compiled
-during the build, not on the way to the first frame.
+`fragment_330` takes a `Code.Inlined(f)`, so `post_process` is checked against
+the function type inside it rather than against `Code.Inlined` itself. The
+compiler then describes `post_process` and hands the description over;
+`inline` opens it, and `to_tree` gives the root row as nested expressions. The
+shader is compiled during the build, not on the way to the first frame.
 
 `main.roc` reaches `Glsl` as a package, `glsl: "package.roc"`, and not as a
 module of its own package. A function of another package reaches the
@@ -94,10 +94,14 @@ line. `Code.refuse_at` reports a node at every place in the source it came from,
 but it stops the compile, where an `Err` can be tested, so this translator
 returns an `Err` instead.
 
-A helper function of the shader's own package that two places call stays a
-`Call` row in the `graph` view, and `Glsl.roc` refuses it (`Glsl.roc:372`). A
-helper that one place calls is inlined, and so is every one that a
-`Code.Inlined(f)` parameter would receive, which this translator does not use.
+A helper function of the shader's own package is inlined at every call, however
+many calls it has, because `fragment_330` takes a `Code.Inlined(f)` and reads
+its `inline` view. A shader that calls `ripple` twice needs no GLSL function,
+and the work the two calls share is still one local (`main.roc:152`). Only a
+helper that reaches itself stays a `Call` row, and `Glsl.roc` refuses it with
+that reason, because GLSL 330 has no recursion (`Glsl.roc:373`, `main.roc:178`).
+A translator that emitted GLSL functions would take a `Code(f)` and read the
+`graph` view instead, where a helper called from two places is a `Call` row.
 
 ## Two ways to run a shader on the CPU
 
@@ -127,7 +131,7 @@ shader a function. The accounting, in three parts.
 
 Most of the gap is coverage the demo never reaches. Strip `render` to the node
 kinds this one shader uses, trim the builtin table from 34 names to the 2 it
-calls, and the translator is 282 lines and still passes all five expects. Drop
+calls, and the translator is 282 lines and still passes all five expects it had then (`main.roc` has eight now). Drop
 source regions and interface derivation on top of that, which is what the DSL
 has, and it is 244 lines emitting the same shader byte for byte. Two of the five
 expects die there, and neither is a test the DSL could have written.
@@ -180,13 +184,8 @@ entry in the translator that maps the name.
 
 ## Status
 
-`roc test examples/reifying/glsl/main.roc` passes six expects and
+`roc test examples/reifying/glsl/main.roc` passes eight expects and
 `roc examples/reifying/glsl/main.roc` prints the shader. The whole shader is a
-compile-time constant, so `roc check` reports
-
-```
-● unconditional condition
-This match value is known at compile time
-```
-
-on the driver's `match`, which is the point.
+compile-time constant. `roc check`, `roc test` and `roc build` exit with status
+0 and print no warning for the driver's `match`: the result of a translator is
+known at compile time by design, and a `match` is how a program reads it.

@@ -23746,9 +23746,14 @@ Builtin :: [].{
 			## This type, spelled the way Roc spells it, so a translator that
 			## refuses a type names the one it refused.
 			##
-			## A `Named` and an `Opaque` are their own names, so a nominal is
-			## never printed as the shape it was declared over, and a `Recursive`
-			## is the name it refers back to.
+			## A `Named` is its nominal's name as the compiler holds it, with
+			## the module in front (`Builtin.Try`, `Math.Vec2`), so a nominal is
+			## never printed as the shape it was declared over. The name has no
+			## type arguments, because a `Named` does not carry them: a `Try` of
+			## an `I64` and a `Str` is `Builtin.Try`. A translator that needs the
+			## arguments reads them from the backing. An `Opaque` carries its
+			## arguments, so it is spelled with them. A `Recursive` is the name
+			## it refers back to.
 			name : Ty -> Str
 			name = |ty| match ty {
 				I8 => "I8"
@@ -23902,7 +23907,7 @@ Builtin :: [].{
 		## | Op | Args |
 		## |---|---|
 		## | `Lit` | none |
-		## | `Prim` | the builtin's arguments, in its parameter order |
+		## | `Prim` | the builtin's arguments, in its parameter order; a chain of an associative builtin has all its operands (see below) |
 		## | `Call` | the row's parameters |
 		## | `Closure` | the captured values; the row takes them first |
 		## | `Record`, `Tuple`, `List`, `Tag` | the components; a `Record`'s in its field order |
@@ -23920,6 +23925,24 @@ Builtin :: [].{
 		## `Prim` names a builtin, or a function of another package, by its owner
 		## and method apart: `Num.F32` and `sin`, `Glsl.Vec3` and `scale`. A
 		## translator keys its table by method and reads the type from the node.
+		##
+		## The normal form rewrites some expressions before a translator reads
+		## them, so a node is not always the call that was written. Each form
+		## below is a rule of the normal form, so it holds for every `Code` of
+		## one [Code.version]. A new version can add, change or remove a rule,
+		## so a translator matches the forms it knows and refuses the rest by
+		## name.
+		##
+		## | Written | Arrives |
+		## |---|---|
+		## | `"a${x}b${y}"`, or a chain of `Str.concat` | one `Prim` `concat` with every part in `args`: `a`, `x`, `b`, `y`. The same holds for `List.concat` and for a chain of `plus_wrap`, `times_wrap`, `bitwise_and`, `bitwise_or` or `bitwise_xor`. An `And` or an `Or` flattens too. |
+		## | `a > b`, `a >= b` | `is_lt(b, a)`, `is_lte(b, a)`. No node is `is_gt` or `is_gte`. |
+		## | `if a >= b` over integers | a `Switch` on `is_lt(a, b)` with the two arms swapped |
+		## | `!(a <= b)` over integers | `is_lt(b, a)` |
+		## | `a != b` | `Bool.not` of `is_eq(a, b)` |
+		## | `1 + x`, `1 * x`, `10 == x` over integers, `"a" == s` | `plus(x, 1)`, `times(x, 1)`, `is_eq(x, 10)`, `is_eq(s, "a")`: a literal is last. Two parameters of the root row are in parameter order. |
+		## | `Ok(v)`, and any value of a nominal type | a `Tag` inside a `Wrap` of the nominal's name, for example `Builtin.Try`. A nominal is read with `Unwrap`, and `?`, `??` and `match` on a `Try` are a `Switch` on that. |
+		##
 		## A `Switch` with outputs is a value switch, whose arms end in `Value`;
 		## one without is an exiting switch, whose arms end in a terminator or
 		## in a `Jump` to one of its joins. An `And` operand runs only if every
@@ -24048,7 +24071,7 @@ Builtin :: [].{
 			uses : Row -> List({ users : List(U32), count : U64 })
 			uses = |row| {
 				empty = List.repeat({ users: [], count: 0 }, row.nodes.len())
-				Code.uses_in(row, row.body, empty)
+				code_uses_in(row, row.body, empty)
 			}
 		}
 
@@ -24077,7 +24100,7 @@ Builtin :: [].{
 			## root does not take one record.
 			inputs : Graph -> List({ name : Str, ty : Ty })
 			inputs = |graph| match graph.root_row().params {
-				[single] => Code.record_fields(single)
+				[single] => code_record_fields(single)
 				_ => []
 			}
 
@@ -24086,8 +24109,8 @@ Builtin :: [].{
 			to_tree = |graph, id| {
 				described = graph.row(id)
 				zeros = List.repeat(0, described.nodes.len())
-				info = Code.depths_in(described, described.body, 0, { uses: zeros, use_depth: zeros, def_depth: zeros })
-				Code.block_tree(described, info, described.body)
+				info = code_depths_in(described, described.body, 0, { uses: zeros, use_depth: zeros, def_depth: zeros })
+				code_block_tree(described, info, described.body)
 			}
 		}
 
@@ -24155,7 +24178,7 @@ Builtin :: [].{
 			## Refuse node `at.node` of row `at.row` of the `inline` view, as
 			## [Code.refuse_at] refuses one of the `graph` view.
 			refuse_at : Inlined(_fn), { row : U32, node : U32 }, Str -> _a
-			refuse_at = |Inlined.(inner), at, message| Code.refuse(inner.site, at.row, at.node, message)
+			refuse_at = |Inlined.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
 		}
 
 		## The rows the site's description reaches.
@@ -24186,156 +24209,158 @@ Builtin :: [].{
 		## source the node came from, with the calls that reached it. A
 		## translator that runs when the program runs crashes with `message`.
 		refuse_at : Code(_fn), { row : U32, node : U32 }, Str -> _a
-		refuse_at = |Code.(inner), at, message| Code.refuse(inner.site, at.row, at.node, message)
-
-		# The refusal of node `node` of row `row` of the site keyed `site`.
-		refuse : U64, U32, U32, Str -> _a
-
-		# The fields of a record type, looking through a nominal.
-		record_fields : Ty -> List({ name : Str, ty : Ty })
-		record_fields = |ty| match ty {
-			Record(fields) => fields.map(|field| { name: field.name, ty: field.ty })
-			Named(_, backing) => Code.record_fields(backing)
-			I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | I128 | U128 => []
-			F32 | F64 | Dec | Bool | Str | ListOf(_) | Tuple(_) | Fn(_, _) | Recursive(_) | TagUnion(_) | Opaque(_, _) => []
-		}
-
-		# One read of `val` by `user`, or by a region's end when `user` is null.
-		read_in : List({ users : List(U32), count : U64 }), Val, [User(U32), End] -> List({ users : List(U32), count : U64 })
-		read_in = |table, val, user| match val {
-			Node(n) | Out({ node: n, k: _ }) => {
-				at = n.to_u64()
-				entry = match table.get(at) {
-					Ok(found) => found
-					Err(_) => crash "Code.Row.uses: a read of a node past the row"
-				}
-				users = match user {
-					User(u) => entry.users.append(u)
-					End => entry.users
-				}
-				match table.set(at, { users, count: entry.count + 1 }) {
-					Ok(updated) => updated
-					Err(_) => crash "Code.Row.uses: a read of a node past the row"
-				}
-			}
-			Param(_) | Arg(_) => table
-		}
-
-		uses_in : Row, Region, List({ users : List(U32), count : U64 }) -> List({ users : List(U32), count : U64 })
-		uses_in = |row, region, start| {
-			after_nodes = region.nodes.fold(
-				start,
-				|table, n| {
-					node = row.node(n)
-					read = node.args.fold(table, |acc, arg| Code.read_in(acc, arg, User(n)))
-					node.op.regions().fold(read, |acc, sub| Code.uses_in(row, sub, acc))
-				},
-			)
-			Code.end_vals(region.end).fold(after_nodes, |acc, val| Code.read_in(acc, val, End))
-		}
-
-		# The values a region's end reads.
-		end_vals : End -> List(Val)
-		end_vals = |end| match end {
-			Value(vals) | Continue(vals) | Break(vals) => vals
-			Jump(jump) => jump.args
-			Return(val) => [val]
-			Branch(_) => []
-		}
-
-		# What `to_tree` reads about each node: how often it is read, and at
-		# what loop depth it stands and is last read.
-		TreeInfo : { uses : List(U64), use_depth : List(U64), def_depth : List(U64) }
-
-		at_index : List(U64), U64 -> U64
-		at_index = |list, at| match list.get(at) {
-			Ok(value) => value
-			Err(_) => crash "Code.Graph.to_tree: a node index past the row"
-		}
-
-		put_index : List(U64), U64, U64 -> List(U64)
-		put_index = |list, at, value| match list.set(at, value) {
-			Ok(updated) => updated
-			Err(_) => crash "Code.Graph.to_tree: a node index past the row"
-		}
-
-		read_depth : TreeInfo, Val, U64 -> TreeInfo
-		read_depth = |info, val, depth| match val {
-			Node(n) | Out({ node: n, k: _ }) => {
-				at = n.to_u64()
-				{ ..info, uses: Code.put_index(info.uses, at, Code.at_index(info.uses, at) + 1), use_depth: Code.put_index(info.use_depth, at, depth) }
-			}
-			Param(_) | Arg(_) => info
-		}
-
-		depths_in : Row, Region, U64, TreeInfo -> TreeInfo
-		depths_in = |row, region, depth, start| {
-			after_nodes = region.nodes.fold(
-				start,
-				|info, n| {
-					node = row.node(n)
-					placed = { ..info, def_depth: Code.put_index(info.def_depth, n.to_u64(), depth) }
-					read = node.args.fold(placed, |acc, arg| Code.read_depth(acc, arg, depth))
-					inner = if node.op.repeats() depth + 1 else depth
-					node.op.regions().fold(read, |acc, sub| Code.depths_in(row, sub, inner, acc))
-				},
-			)
-			Code.end_vals(region.end).fold(after_nodes, |acc, val| Code.read_depth(acc, val, depth))
-		}
-
-		# Whether `to_tree` keeps node `n` as a def rather than substituting it.
-		kept : Row, TreeInfo, U32 -> Bool
-		kept = |row, info, n| {
-			node = row.node(n)
-			at = n.to_u64()
-			substituted = match node.op {
-				Lit(_) => Bool.True
-				# An exiting switch is the `Branch` end of its block.
-				Switch(sw) => sw.outputs.is_empty()
-				Prim(_) | Call(_) | Closure(_) | Record(_) | Tuple | List | Tag(_) | Wrap(_) | Unwrap => Bool.False
-				Field(_) | Index(_) | Payload(_, _) | Item | OptField(_) | And(_) | Or(_) => Bool.False
-				ForRange(_) | ForList(_) | Loop(_) | Lambda(_) | Crash | Derived(_, _) => Bool.False
-			}
-			if substituted {
-				Bool.False
-			} else {
-				Code.at_index(info.uses, at) != 1 or Code.at_index(info.use_depth, at) != Code.at_index(info.def_depth, at) or node.outputs() != 1
-			}
-		}
-
-		val_tree : Row, TreeInfo, Val -> Tree
-		val_tree = |row, info, val| match val {
-			Param(k) => Param(k)
-			Arg(arg) => Arg(arg)
-			Out(out) => Out(out)
-			Node(n) => if Code.kept(row, info, n) Def(n) else Code.node_tree(row, info, n)
-		}
-
-		node_tree : Row, TreeInfo, U32 -> Tree
-		node_tree = |row, info, n| {
-			node = row.node(n)
-			values = node.args.map(|arg| Code.val_tree(row, info, arg))
-			blocks = node.op.regions().map(|sub| Code.block_tree(row, info, sub))
-			Op({ op: node.op, args: List.concat(values, blocks), ty: node.ty })
-		}
-
-		block_tree : Row, TreeInfo, Region -> Tree
-		block_tree = |row, info, region| {
-			defs = region.nodes.keep_if(|n| Code.kept(row, info, n)).map(|n| { id: n, value: Code.node_tree(row, info, n) })
-			trees : List(Val) -> List(Tree)
-			trees = |vals| vals.map(|val| Code.val_tree(row, info, val))
-			end = match region.end {
-				Value(vals) => Value(trees(vals))
-				Jump(jump) => Jump({ join: jump.join, args: trees(jump.args) })
-				Return(val) => Return(Code.val_tree(row, info, val))
-				Continue(vals) => Continue(trees(vals))
-				Break(vals) => Break(trees(vals))
-				Branch(n) => Branch(Code.node_tree(row, info, n))
-			}
-			Block({ defs, end })
-		}
+		refuse_at = |Code.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
 	}
 
+}
+
+# Private declarations of the Code API. They stay out of the public surface of `Code`, which a translator reads, because a top-level declaration of this file is visible to this file only.
+
+# The refusal of node `node` of row `row` of the site keyed `site`.
+code_refuse : U64, U32, U32, Str -> _a
+
+# The fields of a record type, looking through a nominal.
+code_record_fields : Code.Ty -> List({ name : Str, ty : Code.Ty })
+code_record_fields = |ty| match ty {
+	Record(fields) => fields.map(|field| { name: field.name, ty: field.ty })
+	Named(_, backing) => code_record_fields(backing)
+	I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | I128 | U128 => []
+	F32 | F64 | Dec | Bool | Str | ListOf(_) | Tuple(_) | Fn(_, _) | Recursive(_) | TagUnion(_) | Opaque(_, _) => []
+}
+
+# One read of `val` by `user`, or by a region's end when `user` is null.
+code_read_in : List({ users : List(U32), count : U64 }), Code.Val, [User(U32), End] -> List({ users : List(U32), count : U64 })
+code_read_in = |table, val, user| match val {
+	Node(n) | Out({ node: n, k: _ }) => {
+		at = n.to_u64()
+		entry = match table.get(at) {
+			Ok(found) => found
+			Err(_) => crash "Code.Row.uses: a read of a node past the row"
+		}
+		users = match user {
+			User(u) => entry.users.append(u)
+			End => entry.users
+		}
+		match table.set(at, { users, count: entry.count + 1 }) {
+			Ok(updated) => updated
+			Err(_) => crash "Code.Row.uses: a read of a node past the row"
+		}
+	}
+	Param(_) | Arg(_) => table
+}
+
+code_uses_in : Code.Row, Code.Region, List({ users : List(U32), count : U64 }) -> List({ users : List(U32), count : U64 })
+code_uses_in = |row, region, start| {
+	after_nodes = region.nodes.fold(
+		start,
+		|table, n| {
+			node = row.node(n)
+			read = node.args.fold(table, |acc, arg| code_read_in(acc, arg, User(n)))
+			node.op.regions().fold(read, |acc, sub| code_uses_in(row, sub, acc))
+		},
+	)
+	code_end_vals(region.end).fold(after_nodes, |acc, val| code_read_in(acc, val, End))
+}
+
+# The values a region's end reads.
+code_end_vals : Code.End -> List(Code.Val)
+code_end_vals = |end| match end {
+	Value(vals) | Continue(vals) | Break(vals) => vals
+	Jump(jump) => jump.args
+	Return(val) => [val]
+	Branch(_) => []
+}
+
+# What `to_tree` reads about each node: how often it is read, and at
+# what loop depth it stands and is last read.
+CodeTreeInfo : { uses : List(U64), use_depth : List(U64), def_depth : List(U64) }
+
+code_at_index : List(U64), U64 -> U64
+code_at_index = |list, at| match list.get(at) {
+	Ok(value) => value
+	Err(_) => crash "Code.Graph.to_tree: a node index past the row"
+}
+
+code_put_index : List(U64), U64, U64 -> List(U64)
+code_put_index = |list, at, value| match list.set(at, value) {
+	Ok(updated) => updated
+	Err(_) => crash "Code.Graph.to_tree: a node index past the row"
+}
+
+code_read_depth : CodeTreeInfo, Code.Val, U64 -> CodeTreeInfo
+code_read_depth = |info, val, depth| match val {
+	Node(n) | Out({ node: n, k: _ }) => {
+		at = n.to_u64()
+		{ ..info, uses: code_put_index(info.uses, at, code_at_index(info.uses, at) + 1), use_depth: code_put_index(info.use_depth, at, depth) }
+	}
+	Param(_) | Arg(_) => info
+}
+
+code_depths_in : Code.Row, Code.Region, U64, CodeTreeInfo -> CodeTreeInfo
+code_depths_in = |row, region, depth, start| {
+	after_nodes = region.nodes.fold(
+		start,
+		|info, n| {
+			node = row.node(n)
+			placed = { ..info, def_depth: code_put_index(info.def_depth, n.to_u64(), depth) }
+			read = node.args.fold(placed, |acc, arg| code_read_depth(acc, arg, depth))
+			inner = if node.op.repeats() depth + 1 else depth
+			node.op.regions().fold(read, |acc, sub| code_depths_in(row, sub, inner, acc))
+		},
+	)
+	code_end_vals(region.end).fold(after_nodes, |acc, val| code_read_depth(acc, val, depth))
+}
+
+# Whether `to_tree` keeps node `n` as a def rather than substituting it.
+code_kept : Code.Row, CodeTreeInfo, U32 -> Bool
+code_kept = |row, info, n| {
+	node = row.node(n)
+	at = n.to_u64()
+	substituted = match node.op {
+		Lit(_) => Bool.True
+		# An exiting switch is the `Branch` end of its block.
+		Switch(sw) => sw.outputs.is_empty()
+		Prim(_) | Call(_) | Closure(_) | Record(_) | Tuple | List | Tag(_) | Wrap(_) | Unwrap => Bool.False
+		Field(_) | Index(_) | Payload(_, _) | Item | OptField(_) | And(_) | Or(_) => Bool.False
+		ForRange(_) | ForList(_) | Loop(_) | Lambda(_) | Crash | Derived(_, _) => Bool.False
+	}
+	if substituted {
+		Bool.False
+	} else {
+		code_at_index(info.uses, at) != 1 or code_at_index(info.use_depth, at) != code_at_index(info.def_depth, at) or node.outputs() != 1
+	}
+}
+
+code_val_tree : Code.Row, CodeTreeInfo, Code.Val -> Code.Tree
+code_val_tree = |row, info, val| match val {
+	Param(k) => Param(k)
+	Arg(arg) => Arg(arg)
+	Out(out) => Out(out)
+	Node(n) => if code_kept(row, info, n) Def(n) else code_node_tree(row, info, n)
+}
+
+code_node_tree : Code.Row, CodeTreeInfo, U32 -> Code.Tree
+code_node_tree = |row, info, n| {
+	node = row.node(n)
+	values = node.args.map(|arg| code_val_tree(row, info, arg))
+	blocks = node.op.regions().map(|sub| code_block_tree(row, info, sub))
+	Op({ op: node.op, args: List.concat(values, blocks), ty: node.ty })
+}
+
+code_block_tree : Code.Row, CodeTreeInfo, Code.Region -> Code.Tree
+code_block_tree = |row, info, region| {
+	defs = region.nodes.keep_if(|n| code_kept(row, info, n)).map(|n| { id: n, value: code_node_tree(row, info, n) })
+	trees : List(Code.Val) -> List(Code.Tree)
+	trees = |vals| vals.map(|val| code_val_tree(row, info, val))
+	end = match region.end {
+		Value(vals) => Value(trees(vals))
+		Jump(jump) => Jump({ join: jump.join, args: trees(jump.args) })
+		Return(val) => Return(code_val_tree(row, info, val))
+		Continue(vals) => Continue(trees(vals))
+		Break(vals) => Break(trees(vals))
+		Branch(n) => Branch(code_node_tree(row, info, n))
+	}
+	Block({ defs, end })
 }
 
 hasher_start : U64 -> Hasher

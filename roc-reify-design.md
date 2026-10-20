@@ -204,6 +204,30 @@ one translator a rejection, and a refusal costs every author the construct.
       function this call does not fix", except a row variable, which a call
       may leave unbound because no description names a row
       (`src/check/code_reifier.zig:3171`).
+      A lambda written in the generic callee is part of that callee, so its
+      row is built under the instantiation of the callee's row: the same
+      substitution, the same evidence, and a key that extends the callee's
+      own (`enclosedLambda`, `src/check/code_reifier.zig:1307`). `firsts =
+      |xs| xs.map(|p| p.0)` called at `(I64, Str)` describes, a nested lambda
+      and one that captures a parameter of the callee too, and two
+      instantiations give two rows for the lambda. A lambda the callee's
+      block generalized adds its own lookup's substitution on top. A row that
+      a `where` method's type stands on, such as the open error row of
+      `from_numeral`, is a row of the scheme, so a call may leave it unbound
+      (`src/check/code_reifier.zig:5669`). Pinned by the staging cases "a
+      lambda in a generic callee describes at each instantiation" and "a
+      lambda in a where-constrained generic callee dispatches at the fixed
+      type".
+- [x] A function parameter a call fixed, captured by a lambda. In
+      `apply_all = |xs, f| xs.map(|x| f(x))` called with `|x| x * 3`, `f` is
+      bound to that lambda's row, and the lambda `List.map` receives captures
+      `f`. The lifted lambda carries the binding as a bound callee for the
+      captured name, not as a captured value, so a call of `f` inside it names
+      the row, and the closure takes nothing for `f` (`enclosedLambda`,
+      `src/check/code_reifier.zig:1359`). A lambda that captures only such
+      names can also be passed on to another definition. `xs.map(f)` passes
+      the bound row as a closure. Pinned by the staging case "a lambda that
+      captures a fixed function parameter names its definition".
 - [x] A call to a function written inside another function, lifted into a row
       of its own (`src/check/code_reifier.zig:2856`). The binding leaves no
       `Let` behind, because the `Ir` is first order. What the lambda captured
@@ -503,11 +527,39 @@ one translator a rejection, and a refusal costs every author the construct.
       and hands `describeDefinition` the substitution
       (`src/check/code_reifier.zig:696`), so `twin : a -> (a, a)` named at
       `Code(Str -> (Str, Str))` describes with `a` at `Str`. A variable `f`
-      does not reach is still refused (`src/check/code_reifier.zig:6640`), and
-      so is a literal whose type only the method it feeds fixes: unannotated,
-      `double = |x| x * 2` at a `U16` site leaves the literal open, because
-      matching fixes the signature's variables and not the one `times` would.
-      An annotation fixes both. The description takes the type the site holds
+      does not reach is still refused (`src/check/code_reifier.zig:6640`). A
+      variable only a `where` obligation names, such as the literal of an
+      unannotated `double = |x| x * 2`, is not in `f`, so matching cannot
+      reach it. The checker recorded what the use copied every variable to,
+      and the dispatch the obligation selected fixed the copy: the walk binds
+      such a variable from that record (`siteSubstitution`,
+      `src/check/code_reifier.zig:5686`). A call's record is keyed by its
+      callee expression. A named site is no expression any template lowers,
+      so publication writes its record as an entry with a substitution and
+      no evidence (`publishNamedCodeSiteSubstitutions`,
+      `src/check/checked_artifact.zig:22012`). So `double` describes at `Dec`
+      at a free site and at `U8` called from a `U8 -> U8` function. A use
+      through an exact alias instantiates the alias's scheme, so it takes no
+      such binding. Pinned by the staging case "a literal of an unannotated
+      helper describes at the type each use fixed".
+- [x] The numeric default at a site. A parameter that only an arithmetic
+      operator constrains (`x` in `|x| x * 2`) is a variable no edge can pin,
+      and design.md's default rule settles it to `Dec`. A compiled function
+      meets the rule when Monotype seals the variable, but a description is
+      read at the types checking leaves. So the checker commits the default
+      for every such receiver a described site's `f` reaches, when the
+      binding that holds the site generalizes and after that boundary's
+      literal defaulting, or at the end of checking
+      (`defaultPendingStagedReceivers`, `src/check/Check.zig:56660`). It
+      commits only through a probe that every constraint of the receiver
+      accepts, and it leaves a variable the binding's interface reaches open,
+      because a caller can still fix it. `|x| x * 2` describes as
+      `|Dec| -> Dec`, the same as `|x| x > 0`. `same = |x| x` has no default and
+      `|x| x * 2.U8` has none that fits, so both stay refused as polymorphic.
+      Pinned by the staging case "an arithmetic parameter no literal pins
+      describes at Dec" and, on the refused side, by
+      `test/cli/StagedOpenTypeVariable.roc` (`same = |x| x`).
+      The description takes the type the site holds
       when this module finishes checking, so narrowing that arrives from a
       later module does not reach it.
       Where a site widens a row the description carries the definition's own
@@ -521,6 +573,20 @@ one translator a rejection, and a refusal costs every author the construct.
       dispatches is named `Meters.size`. The reifier holds no refusal of its
       own for a constraint: a constrained variable no site fixes is refused as
       a type variable, above.
+- [x] The report of a type variable left open names the variable as the
+      annotation wrote it (or "an unnamed type variable"), and the place it
+      stands in: a parameter by its name, the result, an expression, or the
+      call or `Code` position that does not fix it. A parameter's refusal
+      points at the parameter. The fix the report gives follows the cause: an
+      annotated variable the use leaves open, an annotated variable nothing
+      fixes, an inferred variable the use leaves open, or an inferred one
+      nothing fixes (`rejectOpen`,
+      `src/check/code_reifier.zig:5523`, and `renderOpenTypeHint`,
+      `src/check/report.zig:5570`). So `.filter_by(|_band, p| ..)` reads
+      "the type variable p, in the type of the parameter _band" and is told
+      to fix the type of the value the parameter receives. Pinned by
+      `test/cli/StagedOpenTypeVariable.roc` and
+      `test/cli/StagedPolymorphicFunction.roc`.
 - [x] A row a sibling argument or a later clause fixes. A site's rows close
       when the binding holding it generalizes (`src/check/Check.zig:43017`),
       not when the site finishes, so `join(orders, |c, o| ..)` takes its row

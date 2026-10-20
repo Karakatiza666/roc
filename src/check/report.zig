@@ -3192,6 +3192,19 @@ pub const ReportBuilder = struct {
             }, self, &report);
         }
 
+        // A number where a `Code` is expected is a call-site slip that the type
+        // text alone does not explain, because a `Code` stands for a function.
+        if (self.isCodeType(data.dispatcher_var)) {
+            try report.document.addLineBreak();
+            try D.renderSlice(&.{
+                D.bytes("A"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("describes a function. Write the name of a function, or a lambda, where the"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("is expected."),
+            }, self, &report);
+        }
+
         return report;
     }
 
@@ -3278,6 +3291,14 @@ pub const ReportBuilder = struct {
             return null;
         }
         return null;
+    }
+
+    /// Whether `var_` is a `Code` or a `Code.Inlined`.
+    fn isCodeType(self: *Self, var_: Var) bool {
+        const nominal = self.module_env.types.resolveVar(var_).desc.content.unwrapNominalType() orelse return false;
+        if (!nominal.originIsBuiltin()) return false;
+        const ident = nominal.ident.ident_idx;
+        return ident.eql(self.module_env.idents.builtin_code) or ident.eql(self.module_env.idents.builtin_code_inlined);
     }
 
     fn buildInvalidNumericLiteralReport(
@@ -5938,11 +5959,7 @@ pub const ReportBuilder = struct {
                 D.bytes("match every shape it might meet. Use a type the subset has, or move"),
                 D.bytes("this value out of the reified function."),
             }, self, &report),
-            .unresolved_type => try D.renderSlice(&.{
-                D.bytes("A description is built for one concrete type at a time, so a type"),
-                D.bytes("variable has no shape to describe. Use this function where its types"),
-                D.bytes("are already fixed, or write a type annotation that fixes them."),
-            }, self, &report),
+            .unresolved_type => try self.renderOpenTypeHint(data.open, &report),
             .captures_a_binding => try D.renderSlice(&.{
                 D.bytes("A translator receives the description on its own, without the scope the"),
                 D.bytes("function was written in. Pass this value as a parameter instead."),
@@ -5979,8 +5996,12 @@ pub const ReportBuilder = struct {
                 D.bytes("Code").withAnnotation(.emphasized),
                 D.bytes("exists only while the compiler runs, so it names a function"),
                 D.bytes("parameter, which takes a description, or what a function returns,"),
-                D.bytes("which makes that function a template the compiler calls. A record"),
-                D.bytes("field and a list element have nothing to hold."),
+                D.bytes("which makes that function a template the compiler calls. A value,"),
+                D.bytes("a record field and a list element have nothing to hold it. To"),
+                D.bytes("describe a function, write the function with its own type, and pass"),
+                D.bytes("it to a parameter of type"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes(".").withNoPrecedingSpace(),
             }, self, &report),
         }
 
@@ -6000,6 +6021,61 @@ pub const ReportBuilder = struct {
         }
 
         return report;
+    }
+
+    /// The fix a report of an open type variable gives, picked by why the
+    /// variable stayed open and where it stands.
+    fn renderOpenTypeHint(self: *Self, open: ?StagedCode.Open, report: *Report) Allocator.Error!void {
+        const lead = D.bytes("A description is built for one concrete type at a time.");
+        const known = open orelse return D.renderSlice(&.{
+            lead,
+            D.bytes("A type variable has no shape to describe. Use this function where its"),
+            D.bytes("types are already fixed, or write a type annotation that fixes them."),
+        }, self, report);
+        switch (known.cause) {
+            .use_leaves_open => try D.renderSlice(&.{
+                lead,
+                D.bytes("The annotation of this function writes a type variable, and the place"),
+                D.bytes("that uses the function does not fix it to one type. Use the function"),
+                D.bytes("where a call or a"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("fixes it, for example from a function whose annotation"),
+                D.bytes("names the concrete type."),
+            }, self, report),
+            .annotation_leaves_open => try D.renderSlice(&.{
+                lead,
+                D.bytes("The annotation writes this type variable, and nothing that uses the"),
+                D.bytes("function fixes it. Name a function whose annotation fixes it, for"),
+                D.bytes("example one that calls this function at the type you need."),
+            }, self, report),
+            .inferred_use_leaves_open => try D.renderSlice(&.{
+                lead,
+                D.bytes("Checking inferred this function's type, and this use leaves one of"),
+                D.bytes("its type variables open. Write a type annotation for the function that"),
+                D.bytes("fixes it, or use the function where its types are already fixed."),
+            }, self, report),
+            .inferred => switch (known.place) {
+                .parameter => try D.renderSlice(&.{
+                    lead,
+                    D.bytes("Nothing fixes the type of this parameter. A parameter the function"),
+                    D.bytes("does not read takes its type only from the place that uses the"),
+                    D.bytes("function, and that place leaves it open. Fix the type of the value"),
+                    D.bytes("this parameter receives, or name a function whose annotation fixes it."),
+                }, self, report),
+                .use => try D.renderSlice(&.{
+                    lead,
+                    D.bytes("Checking inferred this function's type, and this use leaves one of"),
+                    D.bytes("its type variables open. Write a type annotation for the function that"),
+                    D.bytes("fixes it, or use the function where its types are already fixed."),
+                }, self, report),
+                .result, .expression => try D.renderSlice(&.{
+                    lead,
+                    D.bytes("Checking left this type open, because nothing in the function fixes"),
+                    D.bytes("it. Write a type annotation that fixes it, or use this function where"),
+                    D.bytes("its types are already fixed."),
+                }, self, report),
+            },
+        }
     }
 
     /// How a staged-code report introduces the name the walk recorded. Null for

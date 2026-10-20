@@ -138,10 +138,10 @@ main = {
 (inferred-types
 	(defs
 		(patt (type "c -> c"))
-		(patt (type "(Dec -> Dec, Dec -> Dec)"))
+		(patt (type "((Dec -> Dec), (Dec -> Dec))"))
 		(patt (type "(Dec, Dec, Dec)")))
 	(expressions
 		(expr (type "c -> c"))
-		(expr (type "(Dec -> Dec, Dec -> Dec)"))
+		(expr (type "((Dec -> Dec), (Dec -> Dec))"))
 		(expr (type "(Dec, Dec, Dec)"))))
 ~~~

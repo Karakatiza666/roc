@@ -368,6 +368,29 @@ pub const StagedCode = struct {
     /// Names the construct, binding or type that stopped the walk, as the walk
     /// recorded it. Empty for a reason that names nothing beyond itself.
     detail: ExtraStringIdx = .{ .start = 0, .count = 0 },
+    /// For `unresolved_type` at a type variable: why the variable stayed
+    /// open and where it stands, which picks the fix the report gives. Null
+    /// for every other refusal.
+    open: ?Open = null,
+
+    /// Why a type variable stayed open, and the kind of place it stands in.
+    pub const Open = struct {
+        cause: Cause,
+        place: Place,
+
+        pub const Cause = enum {
+            /// An annotation wrote the variable, and the use does not fix it.
+            use_leaves_open,
+            /// An annotation wrote the variable, and nothing fixes it.
+            annotation_leaves_open,
+            /// Checking inferred the variable, and nothing fixes it.
+            inferred,
+            /// Checking inferred the variable, and the use does not fix it.
+            inferred_use_leaves_open,
+        };
+
+        pub const Place = enum { parameter, result, expression, use };
+    };
 
     pub const Reason = enum {
         /// Only a function the compiler can see the definition of may be

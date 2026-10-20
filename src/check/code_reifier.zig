@@ -65,6 +65,9 @@ pub const Rejection = struct {
     /// Names the offending construct, binding or type. Borrowed from a name
     /// store or a static string; valid as long as the artifact is.
     detail: []const u8,
+    /// For `unresolved_type` met at a type variable: which variable, and
+    /// where it stands. Null for every other refusal.
+    open: ?OpenVariable = null,
 
     pub const Kind = enum {
         /// An expression form the normal form has no node for (`detail` names the form).
@@ -86,6 +89,42 @@ pub const Rejection = struct {
         /// (`detail` names the bound), so the site is refused rather than
         /// normalized without end.
         bound_exceeded,
+    };
+};
+
+/// A type variable a refusal names, and where it stands.
+pub const OpenVariable = struct {
+    /// The name the annotation wrote for the variable, or null for one the
+    /// checker introduced without a name.
+    name: ?[]const u8,
+    place: Place,
+    cause: Cause,
+
+    pub const Place = union(enum) {
+        /// A parameter of the function, by its name, or by its position
+        /// (from 1) for a pattern that binds no single name.
+        parameter: union(enum) { name: []const u8, position: u32 },
+        /// What the function returns.
+        result,
+        /// An expression inside the body.
+        expression,
+        /// The type a call or a `Code` position gives the function, which
+        /// leaves one of its quantified variables unbound.
+        use: enum { call, site },
+    };
+
+    pub const Cause = enum {
+        /// An annotation wrote the variable, and the call or the `Code`
+        /// position that uses the function does not fix it.
+        use_leaves_open,
+        /// An annotation wrote the variable, and nothing that uses the
+        /// function fixes it.
+        annotation_leaves_open,
+        /// Checking inferred the variable, and nothing fixes it.
+        inferred,
+        /// Checking inferred the variable, and the call or the `Code`
+        /// position that uses the function does not fix it.
+        inferred_use_leaves_open,
     };
 };
 
@@ -254,6 +293,10 @@ pub const Reifier = struct {
     /// Borrowed from the call that fixed them, and restored on the way out, so
     /// one reader walks the same body once per instantiation.
     substitution: Substitution = .empty,
+    /// The key of the instantiation `substitution` holds, zero where it is
+    /// empty. A lambda written in the row extends it, so each instantiation
+    /// of the definition keys its lambdas' rows apart.
+    instance_key: [32]u8 = @splat(0),
     /// How often `substitution` has answered, so a type can tell whether it
     /// means anything beyond its own checked id.
     substitution_uses: u32 = 0,
@@ -314,14 +357,17 @@ pub const Reifier = struct {
     const Unfixed = struct {
         missing: []const u8,
         partial: []const u8,
+        use: @FieldType(OpenVariable.Place, "use"),
 
         const call = Unfixed{
             .missing = "the type this call gives its callee",
             .partial = "a type variable this call does not fix",
+            .use = .call,
         };
         const site = Unfixed{
             .missing = "the type of this Code position",
             .partial = "a type variable at this Code position",
+            .use = .site,
         };
     };
 
@@ -377,9 +423,17 @@ pub const Reifier = struct {
     /// One function parameter of a callee, fixed to the definition the call
     /// passed for it.
     const BoundCallee = struct {
-        /// Which parameter this fixed, in the callee's own order.
-        param: u32,
+        param: Slot,
         target: CalleeTarget,
+
+        /// What the definition fixes: a parameter, in the callee's own order,
+        /// or a name a lifted lambda captured from a row where a call had
+        /// fixed it. The lambda then names the definition, as the row did,
+        /// and takes nothing for the name.
+        const Slot = union(enum) {
+            position: u32,
+            capture: CheckedPatternId,
+        };
     };
 
     /// What a call's callee is: a definition the walk builds a row for, a
@@ -580,6 +634,10 @@ pub const Reifier = struct {
         /// takes it as its own function type too, which a lambda written at
         /// the site needs because its node holds the `Code`.
         fixed: ?CheckedTypeId,
+        /// The expression the site is written at, which the checker keyed
+        /// what the use copied the root's quantified variables to by. Null
+        /// for a lambda written at the site.
+        use: ?CheckedExprId = null,
         region: base.Region,
     };
 
@@ -610,7 +668,7 @@ pub const Reifier = struct {
         // quantified variables the way a call fixes a callee's. The walk of
         // the root's body borrows the substitution and finishes here.
         var instance = if (site.scheme) |scheme|
-            try self.instantiationOf(scheme, site.caller, site.fixed, site.region, .site)
+            try self.instantiationOf(scheme, site.caller, site.fixed, site.use, site.region, .site)
         else
             null;
         defer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
@@ -719,7 +777,7 @@ pub const Reifier = struct {
                     return self.rejectError(.unresolved_reference, region, "this argument");
                 if (self.blockLambdaOf(binder)) |lambda| {
                     const binding = Binding{ .binder = binder, .kind = .{ .function = lambda } };
-                    var lifted = (try self.liftedTarget(binding, arg.ty, region)).definition;
+                    var lifted = (try self.liftedTarget(binding, arg.ty, arg_id, region)).definition;
                     lifted.key.replayed = true;
                     lifted.captures = &.{};
                     lifted.at = arg.ty;
@@ -825,7 +883,7 @@ pub const Reifier = struct {
                 .value => |constant| try self.bindName(pattern_id, .{ .constant = constant }, region),
                 .callee => |target| {
                     try self.bindName(pattern_id, .{ .callee = @intCast(bound.items.len) }, region);
-                    try bound.append(self.gpa, .{ .param = @intCast(index), .target = target });
+                    try bound.append(self.gpa, .{ .param = .{ .position = @intCast(index) }, .target = target });
                 },
             }
         }
@@ -972,9 +1030,40 @@ pub const Reifier = struct {
     /// call fixed it at all.
     fn boundCallee(self: *Reifier, index: usize) ?u32 {
         for (self.bound, 0..) |entry, slot| {
-            if (entry.param == index) return @intCast(slot);
+            switch (entry.param) {
+                .position => |position| if (position == index) return @intCast(slot),
+                .capture => {},
+            }
         }
         return null;
+    }
+
+    /// The bound callee a capture of the lambda being described names, as an
+    /// index into the walk's bound callees.
+    fn boundCapture(self: *Reifier, lambda: CheckedExprId, pattern: CheckedPatternId) ?u32 {
+        if (self.bound_lambda != lambda) return null;
+        return capturedCallee(self.bound, pattern);
+    }
+
+    /// The entry of `bound` that fixes a captured name, as an index into it.
+    fn capturedCallee(bound: []const BoundCallee, pattern: CheckedPatternId) ?u32 {
+        for (bound, 0..) |entry, slot| {
+            switch (entry.param) {
+                .capture => |captured| if (captured == pattern) return @intCast(slot),
+                .position => {},
+            }
+        }
+        return null;
+    }
+
+    /// The bound callee a name in scope stands for, when a call fixed it.
+    fn calleeInScope(self: *Reifier, pattern: CheckedPatternId) ?u32 {
+        const binder = self.bodies.patternBinderForCheckedPattern(pattern) orelse return null;
+        const binding = self.lookupBinding(binder) orelse return null;
+        return switch (binding.kind) {
+            .callee => |index| index,
+            .value, .constant, .function => null,
+        };
     }
 
     /// The function type of a lambda.
@@ -1017,6 +1106,7 @@ pub const Reifier = struct {
         try self.walk.definitions.put(self.gpa, key, .{});
 
         const outer_substitution = self.substitution;
+        const outer_instance_key = self.instance_key;
         const outer_uses = self.substitution_uses;
         const outer_evidence = self.evidence;
         const outer_bound = self.bound;
@@ -1024,6 +1114,7 @@ pub const Reifier = struct {
         const outer_replay = self.replay;
         const replay: Replay = .{ .region = self.bodies.expr(key.body).source_region };
         self.substitution = if (instance) |fixed| fixed.substitution else .empty;
+        self.instance_key = key.instantiation;
         self.substitution_uses = 0;
         self.evidence = supplied;
         self.bound = bound;
@@ -1031,6 +1122,7 @@ pub const Reifier = struct {
         self.replay = if (at != null) &replay else null;
         defer {
             self.substitution = outer_substitution;
+            self.instance_key = outer_instance_key;
             self.substitution_uses = outer_uses;
             self.evidence = outer_evidence;
             self.bound = outer_bound;
@@ -1085,13 +1177,14 @@ pub const Reifier = struct {
         // A stage runs this description during `roc build`, where an effect has
         // nowhere to happen. `tyOf` refuses an effectful function everywhere
         // else; the staged lambda's own type is the one that never reaches it.
-        if (staged_fn.kind == .effectful) return self.rejectError(.effect, region, "an effectful function");
+        if (staged_fn.kind == .effectful) return self.rejectError(.effect, region, "this function's own type is effectful (`=>`)");
         if (staged_fn.args.len != lambda.args.len) return self.rejectError(.unsupported_expression, region, "lambda");
 
         var params = std.ArrayList(TyId).empty;
         defer params.deinit(self.gpa);
         switch (captures) {
             .parameter => for (captured) |capture| {
+                if (self.boundCapture(expr_id, capture.pattern) != null) continue;
                 const pattern = self.bodies.pattern(capture.pattern);
                 try params.append(self.gpa, try self.tyOf(pattern.ty, pattern.source_region));
             },
@@ -1110,9 +1203,10 @@ pub const Reifier = struct {
             // the row: a call on it names that definition, and the call site
             // passes nothing for it.
             if (self.bound_lambda == expr_id and self.boundCallee(index) != null) continue;
-            try params.append(self.gpa, try self.tyOf(param_ty, region));
+            const place: TypePlace = .{ .parameter = .{ .reader = self, .pattern = lambda.args[index], .position = @intCast(index) } };
+            try params.append(self.gpa, try self.placedTy(param_ty, region, place));
         }
-        const result = try self.tyOf(staged_fn.ret, region);
+        const result = try self.placedTy(staged_fn.ret, region, .result);
         const lambdas = [_]CheckedExprId{expr_id};
         return self.buildRow(params.items, result, key, .{
             .captures = if (captures == .parameter) captured else &.{},
@@ -1138,13 +1232,16 @@ pub const Reifier = struct {
             const lambda = try self.lambdaData(lambda_id);
             const fn_ty = self.functionOf(self.stagedFunctionTypeId(self.bodies.expr(lambda_id))) orelse
                 return self.rejectError(.unsupported_type, region, "a reified value that is not a function");
-            if (fn_ty.kind == .effectful) return self.rejectError(.effect, region, "an effectful function");
+            if (fn_ty.kind == .effectful) return self.rejectError(.effect, region, "this function's own type is effectful (`=>`)");
             if (fn_ty.args.len != lambda.args.len) return self.rejectError(.unsupported_expression, region, "lambda");
-            for (fn_ty.args) |arg| try params.append(self.gpa, try self.tyOf(arg, region));
+            for (fn_ty.args, 0..) |arg, index| {
+                const place: TypePlace = .{ .parameter = .{ .reader = self, .pattern = lambda.args[index], .position = @intCast(params.items.len) } };
+                try params.append(self.gpa, try self.placedTy(arg, region, place));
+            }
             ret = fn_ty.ret;
         }
         const inner = try self.lambdaData(outer.body);
-        return self.buildRow(params.items, try self.tyOf(ret, region), key, .{
+        return self.buildRow(params.items, try self.placedTy(ret, region, .result), key, .{
             .captures = self.capturesOf(expr_id),
             .lambdas = &lambdas,
             .body = inner.body,
@@ -1183,7 +1280,12 @@ pub const Reifier = struct {
 
         var next: u30 = 0;
         for (parts.captures) |capture| {
-            try self.bindName(capture.pattern, .{ .value = Ref.rowParam(next) }, self.bodies.pattern(capture.pattern).source_region);
+            const region = self.bodies.pattern(capture.pattern).source_region;
+            if (self.boundCapture(parts.lambdas[0], capture.pattern)) |slot| {
+                try self.bindName(capture.pattern, .{ .callee = slot }, region);
+                continue;
+            }
+            try self.bindName(capture.pattern, .{ .value = Ref.rowParam(next) }, region);
             next += 1;
         }
         for (parts.lambdas) |lambda_id| {
@@ -1243,24 +1345,82 @@ pub const Reifier = struct {
     fn closureExpr(self: *Reifier, expr_id: CheckedExprId) Error!Ref {
         const expr = self.bodies.expr(expr_id);
         const fn_ty = try self.tyOf(self.stagedFunctionTypeId(expr), expr.source_region);
-        return self.closureOf(.{
-            .key = .{ .artifact = self.artifact.bytes, .body = expr_id },
+        return self.closureOf(try self.enclosedLambda(expr_id, null, self.capturesOf(expr_id)), fn_ty);
+    }
+
+    /// The target of a lambda written in the row being walked.
+    ///
+    /// The lambda is part of the definition that row describes, so it
+    /// describes under the instantiation the row does: what the call fixed
+    /// the definition's quantified variables to, and how it discharged its
+    /// `where` obligations. `local` is what a lookup fixed the variables of a
+    /// lambda its block generalized to, and it extends the row's own. Such a
+    /// lambda has a dispatch scope of its own, so the row's evidence is not
+    /// its evidence. Takes `local`.
+    fn enclosedLambda(
+        self: *Reifier,
+        expr_id: CheckedExprId,
+        local: ?Instantiation,
+        captures: []const checked.CheckedCapture,
+    ) Error!CalleeTarget {
+        const evidence: SuppliedEvidence = if (local == null) self.evidence else .{};
+        var instance = local;
+        errdefer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
+
+        // A name a call fixed to a definition is that definition here too,
+        // so the lambda's row names it rather than taking a function value.
+        var bound = std.ArrayList(BoundCallee).empty;
+        errdefer {
+            self.releaseBound(bound.items);
+            bound.deinit(self.gpa);
+        }
+        for (captures) |capture| {
+            const index = self.calleeInScope(capture.pattern) orelse continue;
+            try bound.append(self.gpa, .{ .param = .{ .capture = capture.pattern }, .target = try self.boundTarget(self.bound[index].target) });
+        }
+        if (self.substitution.count() != 0) {
+            var merged = try self.substitution.clone(self.gpa);
+            errdefer merged.deinit(self.gpa);
+            var hasher = std.crypto.hash.Blake3.init(.{});
+            hasher.update(&self.instance_key);
+            if (instance) |*fixed| {
+                var entries = fixed.substitution.iterator();
+                while (entries.next()) |entry| try merged.put(self.gpa, entry.key_ptr.*, entry.value_ptr.*);
+                hasher.update(&fixed.key);
+                fixed.substitution.deinit(self.gpa);
+            }
+            var key: [32]u8 = undefined;
+            hasher.final(&key);
+            instance = .{ .substitution = merged, .key = key };
+        }
+        const callees = if (bound.items.len == 0) @as([32]u8, @splat(0)) else boundCalleesKey(bound.items);
+        return .{
+            .key = .{
+                .artifact = self.artifact.bytes,
+                .body = expr_id,
+                .instantiation = if (instance) |fixed| fixed.key else @as([32]u8, @splat(0)),
+                .callees = callees,
+            },
             .reader = self,
-            .captures = self.capturesOf(expr_id),
-        }, fn_ty);
+            .instantiation = instance,
+            .evidence = evidence,
+            .captures = captures,
+            .bound = try bound.toOwnedSlice(self.gpa),
+        };
     }
 
     /// A closure of a callee's row. What the callee captured is read here,
     /// where the lambda was written, before the row is built.
     fn closureOf(self: *Reifier, target: CalleeTarget, fn_ty: TyId) Error!Ref {
-        const values = try self.gpa.alloc(Ref, target.captures.len);
-        defer self.gpa.free(values);
-        for (target.captures, values) |capture, *value| {
+        var values = std.ArrayList(Ref).empty;
+        defer values.deinit(self.gpa);
+        for (target.captures) |capture| {
+            if (capturedCallee(target.bound, capture.pattern) != null) continue;
             const pattern = self.bodies.pattern(capture.pattern);
-            value.* = try self.lookupRef(capture.pattern, null, pattern.ty, null, pattern.source_region);
+            try values.append(self.gpa, try self.lookupRef(capture.pattern, null, pattern.ty, null, null, pattern.source_region));
         }
         const row = try self.calledRow(target);
-        return self.bld().closure(row, values, fn_ty);
+        return self.bld().closure(row, values.items, fn_ty);
     }
 
     // Scope //
@@ -1582,7 +1742,7 @@ pub const Reifier = struct {
             // A call whose result is read at a wider union has that union as its type.
             .call => |call| self.callExpr(call.func, call.args, expr_data.ty, at, region),
             // A constant a name folds to is built at `at`.
-            .lookup_local => |lookup| self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, at, region),
+            .lookup_local => |lookup| self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, expr_id, at, region),
             .lookup_external, .lookup_required => |reference| blk: {
                 if (try self.foldedConstant(reference, at, region)) |folded| break :blk folded;
                 break :blk self.exprRef(expr_id);
@@ -1627,7 +1787,7 @@ pub const Reifier = struct {
             .numeral => |data| try self.numeralExpr(data, expr_data.ty, region),
             .str_segment => |literal| try b.litStr(self.bodies.stringLiteral(literal)),
             .str => |segments| try self.interpolatedExpr(segments),
-            .lookup_local => |lookup| try self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, null, region),
+            .lookup_local => |lookup| try self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, expr_id, null, region),
             .match_ => |match_expr| (try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .value, region)).?,
             .block => |block| (try self.blockExpr(block.statements, block.final_expr, .value)).?,
             .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .value, region)).?,
@@ -2088,6 +2248,7 @@ pub const Reifier = struct {
         pattern_id: CheckedPatternId,
         resolved: ?checked.ResolvedValueRefId,
         use_ty: CheckedTypeId,
+        use_expr: ?CheckedExprId,
         at: ?TyId,
         region: base.Region,
     ) Error!Ref {
@@ -2095,7 +2256,7 @@ pub const Reifier = struct {
             return self.rejectError(.unresolved_reference, region, "this reference");
         const binding = self.lookupBinding(binder) orelse try self.replayBinding(binder) orelse
             return self.unboundRef(binder, resolved, use_ty, at, region);
-        return self.bindingValue(binding, use_ty, region);
+        return self.bindingValue(binding, use_ty, use_expr, region);
     }
 
     /// A reference no scope binds: a constant, or a top-level function used
@@ -2115,7 +2276,7 @@ pub const Reifier = struct {
         return self.rejectError(.capture, region, self.binderName(binder));
     }
 
-    fn bindingValue(self: *Reifier, binding: Binding, use_ty: CheckedTypeId, region: base.Region) Error!Ref {
+    fn bindingValue(self: *Reifier, binding: Binding, use_ty: CheckedTypeId, use_expr: ?CheckedExprId, region: base.Region) Error!Ref {
         return switch (binding.kind) {
             .value => |value| value,
             // The value the template call fixed, walked where it is read.
@@ -2124,7 +2285,7 @@ pub const Reifier = struct {
                 // A lambda the block bound is a closure of its row. A function
                 // a call handed back is that call, built where it is read.
                 if (self.lambdaOf(value_id) == null) break :blk try self.exprRef(value_id);
-                const target = (try self.liftedTarget(binding, use_ty, region)).definition;
+                const target = (try self.liftedTarget(binding, use_ty, use_expr, region)).definition;
                 break :blk try self.closureOf(target, try self.tyOf(use_ty, region));
             },
             .callee => |index| try self.closureOf(try self.boundTarget(self.bound[index].target), try self.tyOf(use_ty, region)),
@@ -3636,21 +3797,18 @@ pub const Reifier = struct {
     /// at, which is wider than the row's result where the site reads a
     /// narrower union at a wider one (design.md "Row Coercion Primitive").
     fn callOf(self: *Reifier, target: CalleeTarget, groups: []const []const CheckedExprId, at: TyId) Error!Ref {
-        var total = target.captures.len;
-        for (groups) |group| total += group.len;
-        const args = try self.gpa.alloc(Ref, total);
-        defer self.gpa.free(args);
-        for (target.captures, 0..) |capture, index| {
+        var args = std.ArrayList(Ref).empty;
+        defer args.deinit(self.gpa);
+        for (target.captures) |capture| {
+            if (capturedCallee(target.bound, capture.pattern) != null) continue;
             const pattern = self.bodies.pattern(capture.pattern);
-            args[index] = try self.lookupRef(capture.pattern, null, pattern.ty, null, pattern.source_region);
+            try args.append(self.gpa, try self.lookupRef(capture.pattern, null, pattern.ty, null, null, pattern.source_region));
         }
-        var next = target.captures.len;
         for (groups) |group| for (group) |child| {
-            args[next] = try self.exprRef(child);
-            next += 1;
+            try args.append(self.gpa, try self.exprRef(child));
         };
         const row = try self.calledRow(target);
-        return self.bld().callRowAt(row, args, at);
+        return self.bld().callRowAt(row, args.items, at);
     }
 
     /// A builtin by its export name, `Builtin.Num.I64.plus`: the `Prim` of
@@ -3747,18 +3905,20 @@ pub const Reifier = struct {
     /// callee is an `Apply`, which a known closure resolves once the caller
     /// is simplified (N8i).
     fn bindCallees(self: *Reifier, target: *CalleeTarget, operands: []const CheckedExprId, region: base.Region) Error!void {
-        var bound = std.ArrayList(BoundCallee).empty;
+        // A lifted lambda arrives with the names it captured already bound.
+        var bound = std.ArrayList(BoundCallee).fromOwnedSlice(target.bound);
+        target.bound = &.{};
         errdefer {
             self.releaseBound(bound.items);
             bound.deinit(self.gpa);
         }
+        const before = bound.items.len;
         for (operands, 0..) |operand, index| {
             if (self.functionOf(self.bodies.expr(operand).ty) == null) continue;
             const passed = try self.passedArgument(operand, region) orelse continue;
-            try bound.append(self.gpa, .{ .param = @intCast(index), .target = passed });
+            try bound.append(self.gpa, .{ .param = .{ .position = @intCast(index) }, .target = passed });
         }
-        if (bound.items.len == 0) return;
-        target.key.callees = boundCalleesKey(bound.items);
+        if (bound.items.len != before) target.key.callees = boundCalleesKey(bound.items);
         target.bound = try bound.toOwnedSlice(self.gpa);
     }
 
@@ -3778,8 +3938,13 @@ pub const Reifier = struct {
     /// that names no definition.
     fn passedArgument(self: *Reifier, operand: CheckedExprId, region: base.Region) Error!?CalleeTarget {
         if (self.lambdaOf(operand) != null) {
-            if (self.capturesOf(operand).len != 0) return null;
-            return .{ .key = .{ .artifact = self.artifact.bytes, .body = operand }, .reader = self };
+            // A lambda that captures only names a call fixed captures no
+            // value: it is the definitions those names stand for.
+            const captures = self.capturesOf(operand);
+            for (captures) |capture| {
+                if (self.calleeInScope(capture.pattern) == null) return null;
+            }
+            return try self.enclosedLambda(operand, null, captures);
         }
         return switch (try self.calleeTarget(operand, region)) {
             .definition => |definition| definition,
@@ -3794,7 +3959,16 @@ pub const Reifier = struct {
     fn boundCalleesKey(bound: []const BoundCallee) [32]u8 {
         var hasher = std.crypto.hash.Blake3.init(.{});
         for (bound) |entry| {
-            hasher.update(std.mem.asBytes(&entry.param));
+            switch (entry.param) {
+                .position => |position| {
+                    hasher.update(&[_]u8{0});
+                    hasher.update(std.mem.asBytes(&position));
+                },
+                .capture => |pattern| {
+                    hasher.update(&[_]u8{1});
+                    hasher.update(std.mem.asBytes(&pattern));
+                },
+            }
             hasher.update(&entry.target.key.artifact);
             hasher.update(std.mem.asBytes(&entry.target.key.body));
             hasher.update(&entry.target.key.instantiation);
@@ -3817,21 +3991,22 @@ pub const Reifier = struct {
     /// The arguments one call still passes, leaving out every one that fixed a
     /// function parameter. The caller owns the slice.
     fn keptOperands(self: *Reifier, operands: []const CheckedExprId, bound: []const BoundCallee) Allocator.Error![]CheckedExprId {
-        const kept = try self.gpa.alloc(CheckedExprId, operands.len - bound.len);
-        errdefer self.gpa.free(kept);
-        var next: usize = 0;
+        var kept = std.ArrayList(CheckedExprId).empty;
+        errdefer kept.deinit(self.gpa);
         for (operands, 0..) |operand, index| {
             if (fixesCallee(bound, index)) continue;
-            kept[next] = operand;
-            next += 1;
+            try kept.append(self.gpa, operand);
         }
-        return kept;
+        return kept.toOwnedSlice(self.gpa);
     }
 
     /// Whether one argument position fixed a function parameter.
     fn fixesCallee(bound: []const BoundCallee, index: usize) bool {
         for (bound) |entry| {
-            if (entry.param == index) return true;
+            switch (entry.param) {
+                .position => |position| if (position == index) return true,
+                .capture => {},
+            }
         }
         return false;
     }
@@ -3848,8 +4023,8 @@ pub const Reifier = struct {
             const local = callee.data.lookup_local;
             const binder = self.bodies.patternBinderForCheckedPattern(local.pattern) orelse
                 return self.rejectError(.unresolved_reference, region, "this call");
-            if (self.lookupBinding(binder)) |binding| return self.liftedTarget(binding, callee.ty, region);
-            if (try self.replayBinding(binder)) |binding| return self.liftedTarget(binding, callee.ty, region);
+            if (self.lookupBinding(binder)) |binding| return self.liftedTarget(binding, callee.ty, func, region);
+            if (try self.replayBinding(binder)) |binding| return self.liftedTarget(binding, callee.ty, func, region);
             const resolved = local.resolved orelse
                 return self.rejectError(.unresolved_reference, region, "this call");
             return self.resolvedTarget(resolved, binder, region);
@@ -3914,28 +4089,18 @@ pub const Reifier = struct {
     /// A lambda the block generalized is built at the type `use`, the type
     /// the lookup instantiated its scheme to, so each type it is called at
     /// keys a row of its own.
-    fn liftedTarget(self: *Reifier, binding: Binding, use: CheckedTypeId, region: base.Region) Error!Callee {
+    fn liftedTarget(self: *Reifier, binding: Binding, use: CheckedTypeId, use_expr: ?CheckedExprId, region: base.Region) Error!Callee {
         const bound = switch (binding.kind) {
             .function => |expr_id| expr_id,
             .callee => |index| return .{ .definition = try self.boundTarget(self.bound[index].target) },
             .value, .constant => return .value,
         };
         if (self.lambdaOf(bound) == null) return .value;
-        var instance = if (self.localScheme(bound)) |scheme|
-            try self.instantiationOf(scheme, self, use, region, .call)
+        const instance = if (self.localScheme(bound)) |scheme|
+            try self.instantiationOf(scheme, self, use, use_expr, region, .call)
         else
             null;
-        errdefer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
-        return .{ .definition = .{
-            .key = .{
-                .artifact = self.artifact.bytes,
-                .body = bound,
-                .instantiation = if (instance) |fixed| fixed.key else @as([32]u8, @splat(0)),
-            },
-            .reader = self,
-            .instantiation = instance,
-            .captures = self.capturesOf(bound),
-        } };
+        return .{ .definition = try self.enclosedLambda(bound, instance, self.capturesOf(bound)) };
     }
 
     /// One bound callee, copied for the call that names it.
@@ -4003,7 +4168,11 @@ pub const Reifier = struct {
                 return .{ .foreign = .{ .owner = reader.env.module_name, .method = reader.binderName(binder) } };
             }
         }
-        var instance = try reader.instantiationOf(reader.templateScheme(reached.template), self, use.source_fn_ty_payload, region, .call);
+        // What the use copied the procedure's variables to is keyed by the
+        // use, and only a use of the procedure's own scheme has it.
+        const written = self.value_refs.records[@backingInt(resolved)];
+        const use_expr = if (reached.forwarded or written.ref == .local_proc) null else written.expr;
+        var instance = try reader.instantiationOf(reader.templateScheme(reached.template), self, use.source_fn_ty_payload, use_expr, region, .call);
         errdefer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
         return .{ .definition = .{
             .key = .{
@@ -4026,6 +4195,9 @@ pub const Reifier = struct {
         /// What the procedure's own name binds in `reader`'s module. A call
         /// to a function of another package names the function by it.
         binder: ?PatternBinderId,
+        /// Whether an exact alias was followed to get here. A use then
+        /// instantiates the alias's scheme, not the procedure's.
+        forwarded: bool = false,
     };
 
     fn reachedProcedure(
@@ -4130,7 +4302,9 @@ pub const Reifier = struct {
         };
         const data = self.bodies.expr(lookup).data;
         const binder = if (data == .lookup_local) self.bodies.patternBinderForCheckedPattern(data.lookup_local.pattern) else null;
-        return self.reachedProcedure(use.binding, binder, region);
+        var reached = try self.reachedProcedure(use.binding, binder, region);
+        reached.forwarded = true;
+        return reached;
     }
 
     /// The name a function the compiler provides answers to.
@@ -4607,7 +4781,7 @@ pub const Reifier = struct {
             // One inhabitant, so both operands hold it.
             .empty_record => b.litBool(true),
             .empty_tag_union => self.rejectError(.unsupported_type, region, "derived equality on an empty tag union"),
-            .flex, .rigid => self.rejectError(.unresolved_type, region, "a type variable"),
+            .flex, .rigid => self.rejectOpen(type_id, region),
             .pending, .err => self.rejectError(.unresolved_type, region, "an unresolved type"),
             .function => self.rejectError(.unsupported_type, region, "derived equality on a function"),
         };
@@ -4993,6 +5167,9 @@ pub const Reifier = struct {
         // reached by recursion into the variable itself.
         if (self.fixedType(type_id)) |fixed| {
             self.substitution_uses += 1;
+            const outer_through = self.walk.through;
+            if (outer_through == null) self.walk.through = .{ .reader = self, .id = type_id };
+            defer self.walk.through = outer_through;
             return fixed.reader.tyOf(fixed.id, region);
         }
         if (self.ty_cache.get(type_id)) |cached| return cached;
@@ -5028,8 +5205,8 @@ pub const Reifier = struct {
             .flex => |variable| if (payload.variableSealsToRowDefault()) switch (variable.row_default.?) {
                 .empty_record => types.recordTy(&.{}),
                 .empty_tag_union => types.tagUnionTy(&.{}),
-            } else self.rejectError(.unresolved_type, region, "a type variable"),
-            .rigid => self.rejectError(.unresolved_type, region, "a type variable"),
+            } else self.rejectOpen(type_id, region),
+            .rigid => self.rejectOpen(type_id, region),
             .pending, .err => self.rejectError(.unresolved_type, region, "an unresolved type"),
             .empty_record => types.recordTy(&.{}),
             .record => |record| self.recordTy(record.fields, record.ext, region),
@@ -5348,6 +5525,71 @@ pub const Reifier = struct {
         return error.Rejected;
     }
 
+    /// Refuse a type variable, naming it and the place in the signature it
+    /// stands in. A variable reached through a substitution is named by the
+    /// quantified variable the annotation wrote, and the use left it open.
+    fn rejectOpen(self: *Reifier, type_id: CheckedTypeId, region: base.Region) error{Rejected} {
+        const named = self.walk.through orelse TypeRef{ .reader = self, .id = type_id };
+        const variable = switch (named.reader.types.payload(named.id)) {
+            .flex, .rigid => |variable| variable,
+            .pending,
+            .err,
+            .alias,
+            .record,
+            .tuple,
+            .nominal,
+            .function,
+            .empty_record,
+            .tag_union,
+            .empty_tag_union,
+            => invariant("a substitution answered for a type that is not a variable"),
+        };
+        // Through a use, the definition's own variable says whether an
+        // annotation wrote it: an annotation names each variable, and
+        // checking names none it infers. What the use put in its place says
+        // only that the use left it open.
+        const own = self.types.payload(type_id);
+        const cause: OpenVariable.Cause = if (self.walk.through != null) switch (own) {
+            .rigid => .use_leaves_open,
+            .flex => |own_variable| if (own_variable.name != null) .use_leaves_open else .inferred_use_leaves_open,
+            .pending, .err, .alias, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => invariant("a type variable was refused at a type that is not a variable"),
+        } else if (own == .rigid)
+            .annotation_leaves_open
+        else
+            .inferred;
+        const at, const place: OpenVariable.Place = switch (self.walk.place) {
+            .expression => .{ region, .expression },
+            .result => .{ region, .result },
+            .parameter => |param| blk: {
+                const pattern = param.reader.bodies.pattern(param.pattern);
+                const binder = param.reader.bodies.patternBinderForCheckedPattern(param.pattern);
+                const single = binder != null and (pattern.data == .assign or pattern.data == .as);
+                break :blk .{ pattern.source_region, .{ .parameter = if (single)
+                    .{ .name = param.reader.binderName(binder.?) }
+                else
+                    .{ .position = param.position + 1 } } };
+            },
+        };
+        if (self.walk.rejection == null) {
+            self.walk.rejection = .{
+                .kind = .unresolved_type,
+                .region = at,
+                .detail = "a type variable",
+                .open = .{ .name = variable.name, .place = place, .cause = cause },
+            };
+        }
+        return error.Rejected;
+    }
+
+    /// Build a signature type with the walk told where in the signature it
+    /// stands, so a refusal at a type variable names the place.
+    fn placedTy(self: *Reifier, type_id: CheckedTypeId, region: base.Region, place: TypePlace) Error!TyId {
+        const outer = self.walk.place;
+        self.walk.place = place;
+        defer self.walk.place = outer;
+        return self.tyOf(type_id, region);
+    }
+
     fn functionOf(self: *Reifier, type_id: CheckedTypeId) ?checked.CheckedFunctionType {
         return switch (self.types.payload(type_id)) {
             .function => |function| function,
@@ -5436,6 +5678,7 @@ pub const Reifier = struct {
         scheme: Scheme,
         caller: *Reifier,
         fixed: ?CheckedTypeId,
+        use_expr: ?CheckedExprId,
         region: base.Region,
         unfixed: Unfixed,
     ) Error!?Instantiation {
@@ -5456,6 +5699,20 @@ pub const Reifier = struct {
         errdefer substitution.deinit(self.gpa);
         try self.matchType(&substitution, scheme_vars, scheme.root, caller.resolvedType(payload));
 
+        // A variable only a `where` obligation names, such as the literal's
+        // in `f = |x| x * 2`, is not in `f`'s type, so the match cannot reach
+        // it. The checker recorded what the use copied every variable to, and
+        // the dispatch that obligation selected fixed the copy.
+        if (use_expr) |expr| {
+            if (caller.plans.siteSubstitution(expr)) |copied| {
+                if (copied.len != scheme_vars.len) invariant("a use's recorded substitution disagrees with its scheme's variables");
+                for (scheme_vars, copied) |scheme_var, copy| {
+                    if (substitution.contains(scheme_var)) continue;
+                    try substitution.put(self.gpa, scheme_var, caller.resolvedType(copy));
+                }
+            }
+        }
+
         var rows = try self.rowVars(scheme.root);
         defer rows.deinit(self.gpa);
 
@@ -5466,7 +5723,33 @@ pub const Reifier = struct {
         for (scheme_vars) |scheme_var| {
             if (substitution.contains(scheme_var)) continue;
             if (rows.contains(scheme_var)) continue;
-            return self.rejectError(.unresolved_type, region, unfixed.partial);
+            const variable = switch (self.types.payload(scheme_var)) {
+                .flex, .rigid => |variable| variable,
+                .pending,
+                .err,
+                .alias,
+                .record,
+                .tuple,
+                .nominal,
+                .function,
+                .empty_record,
+                .tag_union,
+                .empty_tag_union,
+                => invariant("a scheme quantifies over a type that is not a variable"),
+            };
+            if (self.walk.rejection == null) {
+                self.walk.rejection = .{
+                    .kind = .unresolved_type,
+                    .region = region,
+                    .detail = unfixed.partial,
+                    .open = .{
+                        .name = variable.name,
+                        .place = .{ .use = unfixed.use },
+                        .cause = if (self.types.payload(scheme_var) == .rigid) .use_leaves_open else .inferred,
+                    },
+                };
+            }
+            return error.Rejected;
         }
         return .{ .substitution = substitution, .key = instantiationKey(substitution, scheme_vars) };
     }
@@ -5511,7 +5794,10 @@ pub const Reifier = struct {
                 }
                 try self.collectRowTail(found, seen, union_ty.ext);
             },
-            .empty_record, .empty_tag_union, .flex, .rigid, .pending, .err => {},
+            // A `where` obligation is part of the scheme, and a row its
+            // method's type stands on is a row of the scheme too.
+            .flex, .rigid => |variable| for (variable.constraints) |constraint| try self.collectRowVars(found, seen, constraint.fn_ty),
+            .empty_record, .empty_tag_union, .pending, .err => {},
         }
     }
 
@@ -5876,6 +6162,14 @@ pub const Reifier = struct {
         if (self.substitution.get(type_id)) |fixed| return fixed;
         return self.nominal_args.get(type_id);
     }
+};
+
+/// Where in a row's signature a type stands. The pattern of a parameter is
+/// named in the module of `reader`.
+const TypePlace = union(enum) {
+    expression,
+    parameter: struct { reader: *Reifier, pattern: CheckedPatternId, position: u32 },
+    result,
 };
 
 /// Stop on a broken invariant of the walk: a state no input reaches.
@@ -6534,6 +6828,13 @@ pub const Walk = struct {
     /// The root row of the site last emitted, which a test dumps.
     root: ?RowId = null,
     rejection: ?Rejection = null,
+    /// The part of a row's signature whose type `tyOf` is building, which a
+    /// refusal at a type variable names. `.expression` everywhere else.
+    place: TypePlace = .expression,
+    /// The quantified variable whose substitution `tyOf` is inside, the
+    /// outermost one, or null outside every substitution. A variable the
+    /// use left open is named by the one the annotation wrote.
+    through: ?Reifier.TypeRef = null,
     /// The view the site being walked declares (plan 1.5, V6).
     view: View = .graph,
     /// Per view, digest of the rows a site's walk built, and digest of
@@ -6880,6 +7181,7 @@ fn reifyNamedSite(
     region: base.Region,
 ) Allocator.Error!Outcome {
     const fixed = local.site_types.rootForSourceVar(module, ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(fn_var)))));
+    const use = local.bodies.exprIdAtRawNode(node_idx);
 
     // An exact function alias, `same = add_one`, has no body of its own. The
     // checker recorded the lookup it forwards to, and the site describes the
@@ -6910,6 +7212,7 @@ fn reifyNamedSite(
             .in_block = false,
             .caller = reifier,
             .fixed = fixed,
+            .use = use,
             .region = region,
         });
     }
@@ -6920,6 +7223,7 @@ fn reifyNamedSite(
             .in_block = false,
             .caller = reifier,
             .fixed = fixed,
+            .use = use,
             .region = region,
         });
     }
@@ -6933,6 +7237,7 @@ fn reifyNamedSite(
             .in_block = false,
             .caller = reifier,
             .fixed = fixed,
+            .use = use,
             .region = region,
         });
     }
@@ -6948,6 +7253,7 @@ fn reifyNamedSite(
         .in_block = true,
         .caller = reifier,
         .fixed = fixed,
+        .use = use,
         .region = region,
     });
 }

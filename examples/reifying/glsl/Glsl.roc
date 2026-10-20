@@ -2,9 +2,10 @@
 # source out.
 #
 # This is ordinary Roc that runs at compile time. Naming a Roc function where
-# `fragment_330` expects a `Code(f)` is what reifies it: the compiler describes
-# the function, `Code.graph` opens the description, and this emits the GLSL that
-# raylib accepts together with the interface the application binds through.
+# `fragment_330` expects a `Code.Inlined(f)` is what reifies it: the compiler
+# describes the function, `Code.Inlined.inline` opens the description, and this
+# emits the GLSL that raylib accepts together with the interface the
+# application binds through.
 #
 # A fragment shader takes two records. The first holds the varyings the vertex
 # stage interpolates, which become `in` declarations; the second holds the
@@ -113,12 +114,14 @@ Glsl :: {}.{
 	## Compile a reified Roc function to a GLSL 330 fragment shader.
 	##
 	## Naming a function here reifies it: the compiler describes the function
-	## during `roc build` and hands the description over as a `Code(f)`. The
-	## root row is the shader; `to_tree` gives it as nested expressions, with a
-	## def for each value the body reads more than once.
-	fragment_330 : Code(f) -> Try(Fragment, Error)
+	## during `roc build` and hands the description over as a `Code.Inlined(f)`.
+	## That is the `inline` view, because GLSL needs no function form here: every
+	## call of a helper is inlined, however many calls it has. The root row is
+	## the shader; `to_tree` gives it as nested expressions, with a def for each
+	## value the body reads more than once.
+	fragment_330 : Code.Inlined(f) -> Try(Fragment, Error)
 	fragment_330 = |code| {
-		graph = Code.graph(code)
+		graph = code.inline()
 		row = graph.root_row()
 		inputs = match row.params {
 			[interpolated, per_draw] => { interpolated, per_draw }
@@ -242,12 +245,10 @@ Glsl :: {}.{
 						kind = Glsl.kind_for(Glsl.value_ty(def.value, acc.scope)?)?
 						local = "n${def.id.to_str()}"
 						declaration = "\t${kind.to_str()} ${local} = ${text};"
-						Ok(
-							{
-								scope: { ..acc.scope, locals: acc.scope.locals.append({ id: def.id, text: local }) },
-								statements: Glsl.both(acc.statements, declaration),
-							},
-						)
+						Ok({
+							scope: { ..acc.scope, locals: acc.scope.locals.append({ id: def.id, text: local }) },
+							statements: Glsl.both(acc.statements, declaration),
+						})
 					}
 				},
 			)?
@@ -332,7 +333,7 @@ Glsl :: {}.{
 								Ok(field) => Glsl.render(field, scope)
 								Err(_) => Err(BadType("a ${kind.to_str()} with no value for `${lane}`"))
 							}
-							Err(_) => Err(BadType("a ${kind.to_str()} is built from lanes named ${Str.join_with(lanes, ", ")}; this one has no `${lane}`")),
+							Err(_) => Err(BadType("a ${kind.to_str()} is built from lanes named ${Str.join_with(lanes, ", ")}; this one has no `${lane}`"))
 						},
 					)?
 					Ok("${kind.to_str()}(${Str.join_with(rendered, ", ")})")
@@ -369,7 +370,7 @@ Glsl :: {}.{
 			}
 		}
 		Switch(sw) => Glsl.conditional(sw, args, scope)
-		Call(_) => Err(Unsupported("a shader calls builtins and `Glsl` functions, and this one calls a function of its own package"))
+		Call(_) => Err(Unsupported("a shader cannot call a function that reaches itself, and GLSL 330 has no recursion"))
 		Closure(_) => Err(Unsupported("a shader cannot contain a nested function"))
 		Lambda(_) => Err(Unsupported("a shader cannot contain a nested function"))
 		List => Err(Unsupported("GLSL 330 has no list; a fixed-lane vector is built from a tuple"))

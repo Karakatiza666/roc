@@ -693,6 +693,9 @@ staged_templates: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, StagedCode) = .empty
 /// generalizes rather than when their own site finishes. See
 /// `groundPendingStagedRows`.
 pending_staged_rows: std.ArrayListUnmanaged(PendingStagedRows) = .empty,
+/// Described sites whose arithmetic receivers take their numeric default when
+/// the binding holding them generalizes. See `defaultPendingStagedReceivers`.
+pending_staged_receivers: std.ArrayListUnmanaged(PendingStagedRows) = .empty,
 /// Whether the top-level body being checked is a template's, so a lambda it
 /// writes at a `Code` position is the template's result.
 checking_template_body: bool = false,
@@ -1092,6 +1095,11 @@ compile_time_executable_root_indices: collections.DenseMapUnmanaged(CIR.Def.Idx,
 /// statement checking record a local binding candidate without storing a result
 /// on the checked expression itself.
 last_hoist_result: ?CompletedHoistResult = null,
+/// Binders whose value reads a code reification site, which is a function the
+/// compiler describes where a `Code` is expected. A condition that reads one
+/// is known at compile time by the design of the feature, so it draws no
+/// compile-time condition warning (see `warnIfComptimeConditionalExpr`).
+code_site_bindings: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, void) = .empty,
 /// Sparse conjunctions of pending procedure-promotion facts. Children always
 /// precede parents, and summaries share IDs rather than copying dependency sets.
 hoist_promotion_dependencies: std.ArrayListUnmanaged(HoistPromotionDependency) = .empty,
@@ -1740,6 +1748,7 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .predeclared_relation_vars = .keyed,
     .staged_templates = .keyed,
     .pending_staged_rows = .boundary,
+    .pending_staged_receivers = .boundary,
     .checking_template_body = .lexical,
     .predeclared_local_annotations = .lexical,
     .hole_shared_schemes = .keyed,
@@ -1828,6 +1837,7 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .executable_root_def_set = .input,
     .compile_time_executable_root_indices = .input,
     .last_hoist_result = .lexical,
+    .code_site_bindings = .keyed,
     .hoist_promotion_dependencies = .keyed,
     .hoist_promotion_conjunctions = .keyed,
     .pending_comptime_conditions = .settled,
@@ -3265,6 +3275,9 @@ const HoistFrame = struct {
     has_runtime_dependency: bool = false,
     has_contextual_dependency: bool = false,
     has_observable_effect: bool = false,
+    /// The expression contains a code reification site or reads a binder whose
+    /// value does.
+    reads_code_site: bool = false,
 
     fn eligible(self: @This()) bool {
         return self.hoist_position.allowsSemanticEligibility() and
@@ -3279,6 +3292,7 @@ const CompletedHoistResult = struct {
     eligible: bool,
     top_level_equivalent: bool,
     has_observable_effect: bool,
+    reads_code_site: bool,
     hoist_position: HoistPosition,
 };
 
@@ -5226,6 +5240,10 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         )
     else
         null;
+    // Allocate here too, so a failure leaves every hoist selection untouched.
+    if (frame.reads_code_site and frame.binding_rhs) {
+        if (frame.binding_pattern) |pattern| try self.code_site_bindings.put(self.gpa, pattern, {});
+    }
     const top_level_equivalent = semantically_eligible and !frame.has_contextual_dependency;
     const selection_allowed = frame.hoist_position.allowsSelection();
     const roles = if (top_level_equivalent)
@@ -5338,6 +5356,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         .eligible = semantically_eligible,
         .top_level_equivalent = top_level_equivalent,
         .has_observable_effect = frame.has_observable_effect,
+        .reads_code_site = frame.reads_code_site,
         .hoist_position = frame.hoist_position,
     };
     self.last_hoist_result = completed;
@@ -5345,6 +5364,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
     if (frame_index != 0) {
         const parent = &self.hoist_frames.items[frame_index - 1];
         parent.promotion_dependency = parent_dependency;
+        if (frame.reads_code_site) parent.reads_code_site = true;
         if (!completed.eligible) {
             parent.has_runtime_dependency = true;
         } else if (can_be_root and !frame.binding_rhs and selection_allowed) {
@@ -5359,6 +5379,11 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
 fn markCurrentHoistRuntimeDependency(self: *Self) void {
     if (self.hoist_frames.items.len == 0) return;
     self.hoist_frames.items[self.hoist_frames.items.len - 1].has_runtime_dependency = true;
+}
+
+fn markCurrentHoistCodeSite(self: *Self) void {
+    if (self.hoist_frames.items.len == 0) return;
+    self.hoist_frames.items[self.hoist_frames.items.len - 1].reads_code_site = true;
 }
 
 fn markCurrentHoistObservableEffect(self: *Self) void {
@@ -5376,6 +5401,9 @@ fn warnIfComptimeConditionalExpr(
 
     const completed = self.last_hoist_result orelse return;
     if (completed.expr != expr or !completed.top_level_equivalent) return;
+    // A condition built from a described function is known at compile time by
+    // design, so the author cannot act on the warning.
+    if (completed.reads_code_site) return;
 
     if (completed.promotion_dependency) |dependency| {
         try self.pending_comptime_conditions.append(self.gpa, .{
@@ -6485,6 +6513,7 @@ const HoistSelectionTestState = struct {
         checker.hoist_guarded_exprs = .{};
         checker.selected_hoisted_roots = .empty;
         checker.last_hoist_result = null;
+        checker.code_site_bindings = .{};
         checker.hoist_promotion_dependencies = .empty;
         checker.hoist_promotion_conjunctions = .empty;
         checker.pending_comptime_conditions = .empty;
@@ -6498,6 +6527,7 @@ const HoistSelectionTestState = struct {
     fn deinit(self: *HoistSelectionTestState) void {
         self.checker.hoist_promotion_dependencies.deinit(self.allocator);
         self.checker.hoist_promotion_conjunctions.deinit(self.allocator);
+        self.checker.code_site_bindings.deinit(self.allocator);
         self.checker.pending_comptime_conditions.deinit(self.allocator);
         self.checker.hoist_frames.deinit(self.allocator);
         self.checker.hoist_expr_candidates.deinit(self.allocator);
@@ -26988,6 +27018,9 @@ const ExprCheckFrame = struct {
     /// The expression still checks as an ordinary function, against this
     /// var; the node itself takes the surrounding `Code(f)` type.
     staged_code_fn_var: ?Var = null,
+    /// Whether the site at `staged_code_fn_var` is described where it stands,
+    /// rather than a template's result that each call describes.
+    staged_code_describes: bool = false,
     active: bool = true,
 
     fn deinit(self: *ExprCheckFrame, checker: *Self, env: *Env) void {
@@ -27037,10 +27070,12 @@ const ExprCheckFrame = struct {
             else
                 try checker.unifyInContext(relate_to, self.expr_var, env, anno_vars.context);
             if (self.staged_code_fn_var != null and annotation_result.isEstablished()) {
-                try checker.pending_staged_rows.append(checker.gpa, .{
+                const pending: PendingStagedRows = .{
                     .root = relate_to,
                     .region = checker.cir.store.getExprRegion(self.expr_idx),
-                });
+                };
+                try checker.pending_staged_rows.append(checker.gpa, pending);
+                if (self.staged_code_describes) try checker.pending_staged_receivers.append(checker.gpa, pending);
             }
             if (!annotation_result.isEstablished()) {
                 // Suppression by an erroneous annotation does not establish
@@ -27309,6 +27344,7 @@ fn beginExprCheckFrame(
         else
             .named_function;
         try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), staged.fn_var, kind, staged.view);
+        frame.staged_code_describes = kind != .template;
     }
 
     // A call to a template is the other way a description is built. The call
@@ -27382,6 +27418,7 @@ fn beginExprCheckFrame(
     try self.openHoistFrame(expr_idx, frame.is_binding_rhs, frame.nested_expected.hoist_position);
     frame.hoist_frame_open = true;
     self.checking_binding_rhs_pattern = null;
+    if (self.cir.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr_idx)) != null) self.markCurrentHoistCodeSite();
 
     return frame;
 }
@@ -27488,6 +27525,7 @@ fn claimOrRejectCodeCall(
     if (self.cir.store.getExpr(callee_idx) == .e_lookup_external) {
         try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), code.fn_var, .template_call, code.view);
         try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(callee_idx), code.fn_var, .template_callee, code.view);
+        self.markCurrentHoistCodeSite();
         return;
     }
 
@@ -28340,6 +28378,7 @@ fn checkLeafExpr(self: *Self, frame: *ExprCheckFrame, expected: Expected, env: *
                 if (try self.ensureHoistedBindingRoot(lookup.pattern_idx)) break :known true;
                 break :known self.markHoistContextualDependencyForLookup(lookup.pattern_idx);
             };
+            if (self.code_site_bindings.contains(lookup.pattern_idx)) self.markCurrentHoistCodeSite();
             if (!compile_time_known_binding) {
                 self.markCurrentHoistRuntimeDependency();
             } else if (self.hoist_known_values.get(lookup.pattern_idx)) |known| {
@@ -39054,6 +39093,7 @@ fn finalizeTypes(self: *Self, env: *Env, scope: FinalizeScope) std.mem.Allocator
     };
     if (run_defaults) {
         try self.finalizeLiteralDefaults(env);
+        if (scope == .module) try self.defaultPendingStagedReceivers(env, null, &.{});
 
         // Committing a default can spawn deferred static-dispatch
         // constraints (e.g. Dec.plus, Dec.to_str returning Str); resolve
@@ -41703,6 +41743,7 @@ fn defaultLiteralsAtGeneralizationBoundaryMultiRoot(
         // them and attribute what they instantiate to its own definition.
         try self.checkInstantiatedStaticDispatchConstraints(env, false, .ordinary);
         try self.quiesceConstraints(env, false);
+        try self.defaultPendingStagedReceivers(env, rank, roots);
         try self.quiesceSchemeRequirementsAtBoundary(roots, env, &boundary_codecs);
         return;
     }
@@ -41739,6 +41780,7 @@ fn defaultLiteralsAtGeneralizationBoundaryMultiRoot(
         .rank = rank,
         .pool_len = pool_vars.len,
     } });
+    try self.defaultPendingStagedReceivers(env, rank, roots);
     try self.quiesceSchemeRequirementsAtBoundary(roots, env, &boundary_codecs);
 }
 
@@ -58026,6 +58068,125 @@ fn groundStagedRowExtension(
     }
     try self.type_visit_stack.append(self.gpa, ext);
     return false;
+}
+
+/// Commit the numeric default of every arithmetic receiver a described site's
+/// `f` still leaves open and the boundary about to generalize at `rank` owns,
+/// or of all of them when `rank` is null. Runs after the boundary's literal
+/// defaulting, so a literal pins a receiver first exactly as it does in a
+/// function that is compiled.
+///
+/// A receiver no literal pins (`x` in `|x| x * 2`) is a variable no edge can
+/// pin, and the default rule ("Static Dispatch At The Checked Boundary")
+/// settles it to `Dec`. A compiled function meets that rule when Monotype
+/// seals the variable; a described one is read at the type checking leaves,
+/// before any specialization, so the rule applies here. The default commits
+/// only through a committed probe that every constraint of the receiver
+/// accepts, and a variable the binding's interface reaches is left open: a
+/// caller can still fix it, so the site is polymorphic and the walk refuses
+/// it. Returns nothing; an entry whose receiver an outer boundary owns stays
+/// queued.
+fn defaultPendingStagedReceivers(self: *Self, env: *Env, rank: ?Rank, roots: []const BoundaryRoot) std.mem.Allocator.Error!void {
+    if (self.pending_staged_receivers.items.len == 0) return;
+
+    var receivers = std.ArrayList(Var).empty;
+    defer receivers.deinit(self.gpa);
+    var kept: usize = 0;
+    var index: usize = 0;
+    while (index < self.pending_staged_receivers.items.len) : (index += 1) {
+        const pending = self.pending_staged_receivers.items[index];
+        if (try self.collectStagedReceivers(pending.root, rank, &receivers)) {
+            self.pending_staged_receivers.items[kept] = pending;
+            kept += 1;
+        }
+    }
+    self.pending_staged_receivers.shrinkRetainingCapacity(kept);
+    if (receivers.items.len == 0) return;
+
+    var interface = collections.DenseMap(Var, void).init(self.gpa);
+    defer interface.deinit();
+    for (roots) |root| try self.collectReachableVars(root.interface, &interface);
+
+    var committed_any = false;
+    for (receivers.items) |receiver| {
+        const resolved = self.types.resolveVar(receiver);
+        if (resolved.desc.content != .flex) continue;
+        if (interface.contains(resolved.var_)) continue;
+        const constraints = resolved.desc.content.flex.constraints;
+        const target = self.specializationDefaultTargetForConstraints(self.types.sliceStaticDispatchConstraints(constraints)) orelse continue;
+        const kind: CIR.NumKind = switch (target) {
+            .dec => numeral_default_candidates[0],
+            // A string default comes only from a quote or interpolation,
+            // which literal defaulting owns.
+            .str => continue,
+        };
+        if (try self.tryCommitNumeralCandidate(resolved.var_, kind, constraints, exact_numeral.FitSet.full, env) != null) {
+            committed_any = true;
+        }
+    }
+    if (!committed_any) return;
+    try self.checkInstantiatedStaticDispatchConstraints(env, false, .ordinary);
+    try self.quiesceConstraints(env, false);
+}
+
+/// Gather the arithmetic receivers a staged function's type reaches: flex
+/// variables with constraints and no literal, which literal defaulting would
+/// own. With a `rank`, only those that boundary owns. Returns whether one was
+/// left for an outer boundary.
+fn collectStagedReceivers(self: *Self, root_var: Var, rank: ?Rank, out: *std.ArrayList(Var)) std.mem.Allocator.Error!bool {
+    var visited = collections.DenseMap(Var, void).init(self.gpa);
+    defer visited.deinit();
+    const stack = &self.type_visit_stack;
+    const stack_base = stack.items.len;
+    defer stack.items.len = stack_base;
+    try stack.append(self.gpa, root_var);
+    var left_open = false;
+
+    while (stack.items.len > stack_base) {
+        const var_ = stack.pop().?;
+        const resolved = self.types.resolveVar(var_);
+        if (visited.contains(resolved.var_)) continue;
+        try visited.put(resolved.var_, {});
+
+        switch (resolved.desc.content) {
+            .flex => |flex| {
+                if (flex.constraints.len() == 0) continue;
+                if (self.varLiteralKind(resolved.var_) != null) continue;
+                if (rank) |boundary| {
+                    if (@backingInt(resolved.desc.rank) < @backingInt(boundary)) {
+                        left_open = true;
+                        continue;
+                    }
+                } else if (resolved.desc.rank == .generalized) continue;
+                try out.append(self.gpa, resolved.var_);
+            },
+            .rigid, .field_presence, .err => {},
+            .alias => |alias| {
+                try stack.append(self.gpa, self.types.getAliasBackingVar(alias));
+                try stack.appendSlice(self.gpa, self.types.sliceAliasArgs(alias));
+            },
+            .structure => |flat_type| switch (flat_type) {
+                .empty_record, .empty_tag_union => {},
+                .tuple => |tuple| try stack.appendSlice(self.gpa, self.types.sliceVars(tuple.elems)),
+                .nominal_type => |nominal| try stack.appendSlice(self.gpa, self.types.sliceNominalArgs(nominal)),
+                .fn_pure, .fn_effectful, .fn_unbound => |func| {
+                    try stack.appendSlice(self.gpa, self.types.sliceVars(func.args));
+                    try stack.append(self.gpa, func.ret);
+                },
+                .record => |record| {
+                    const fields = self.types.getRecordFieldsSlice(record.fields);
+                    for (fields.items(.presence)) |presence| try stack.append(self.gpa, presence.typeVar());
+                    try stack.append(self.gpa, record.ext);
+                },
+                .tag_union => |tag_union| {
+                    const tags = self.types.getTagsSlice(tag_union.tags);
+                    for (tags.items(.args)) |tag_args| try stack.appendSlice(self.gpa, self.types.sliceVars(tag_args));
+                    try stack.append(self.gpa, tag_union.ext);
+                },
+            },
+        }
+    }
+    return left_open;
 }
 
 /// Check if a type variable contains any error types anywhere in its structure.

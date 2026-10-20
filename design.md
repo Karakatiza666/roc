@@ -3569,11 +3569,14 @@ variable names, and comments. They may appear only in this ban. Say the
 specific operation instead, such as conversion, field read, tag payload read,
 capture slot, or wrapper function.
 
-The terms `readback`, `reification`, `value graph`,
-`compile-time value store`, and `representation repair` are also banned in new
-post-check docs and code. Compile-time evaluation stores results in
-`ConstStore`; later compilations restore cached consts from `ConstStore`.
-There is no separate phase or store under the const-related names. If two
+The terms `readback`, `value graph`, `compile-time value store`, and
+`representation repair` are also banned in new post-check docs and code, and so
+is `reification` for compile-time values (rebuilding a value from the result of
+evaluation). Code reification is a different feature, which describes a
+function for a translator and keeps its name; see "Code Reification".
+Compile-time evaluation stores results in `ConstStore`; later compilations
+restore cached consts from `ConstStore`. There is no separate phase or store
+under the const-related names. If two
 representations unexpectedly differ for the same value at the same boundary,
 that is an invariant violation; fix the producer instead of adding a later
 conversion.
@@ -6338,6 +6341,19 @@ so finalization evaluates each node once in append order without recursion or
 another CIR traversal. Eligibility for compile-time condition warnings remains
 independent of whether a condition is selected as an independent root or covered
 by an enclosing root.
+
+A condition that reads a code reification site draws no compile-time condition
+warning. A described function exists only while the compiler runs, so the
+result of a translator is known at compile time by design, and a `match` over
+it is how a program reads it. The author cannot act on the warning. The
+checker records the fact as explicit data: a hoist frame carries
+`reads_code_site`, set where a site is recorded and passed to every parent
+frame, and a binder whose right-hand side reads a site is kept in
+`code_site_bindings`, so a later lookup of that binder carries the fact. Only
+a binder named by a plain pattern is kept. Accepted: `match Stage.describe(f)`,
+a match over a top-level or local value bound to that call. Rejected: an `if`
+on a plain constant still warns. Both sides are pinned by
+test/cli/StagedTranslatorMatch.roc.
 
 Unguarded hoisted roots use the same compile-time constant rules as ordinary
 top-level constants. A failure produced while evaluating one is a checking-time
@@ -12984,6 +13000,27 @@ and outside a loop; errors for a discarded value of another type on a `var`
 (`$items.len()`), the same call on an immutable binding, and an operator on a
 `var` (`$count + n`).
 
+### Numeric Default At A Described Site
+
+A function named or written where a `Code(f)` is expected is described from the
+solved types that checking leaves, before any specialization. A flex receiver
+that `f` reaches, that carries arithmetic constraints and no literal, and that
+no edge can pin, is a variable the default rule settles to `Dec` (see "The
+default rule"). A compiled function meets that rule when Monotype seals the
+variable. A described one has no specialization, so checking applies the rule
+itself: `defaultPendingStagedReceivers` commits `Dec` to each such receiver when
+the binding holding the site generalizes, after that boundary's literal
+defaulting, or at the end of checking for a site no binding generalizes. The
+commit is a committed probe that every constraint of the receiver must accept
+(`tryCommitNumeralCandidate`). A receiver the binding's interface reaches is
+left open, because a caller can still fix it, and a receiver no candidate
+satisfies is left open too. A template's result lambda is described at each
+call, so its site takes no default. Accepted: `|x| x * 2` and `|x, y| x + y`
+describe at `Dec`. Rejected: `same = |x| x` has no default and stays
+polymorphic. The accepted side is pinned by
+src/eval/test/eval_staging_tests.zig ("an arithmetic parameter no literal pins
+describes at Dec"), the rejected side by test/cli/StagedOpenTypeVariable.roc.
+
 ### Rewrite Inventory
 
 - `finishAliasDeclarationParameters`—mechanism: completes an in-progress
@@ -13202,6 +13239,10 @@ Other solved-graph mutations:
 - `constrainInterpolationPartToStr`—policy: Builtin Str Interpolation Part
   Compatibility (above). One commit-probe unifies the part with `Str` and
   validates every attached dispatch constraint; only full success is committed.
+- `defaultPendingStagedReceivers`—policy: Numeric Default At A Described
+  Site (above). The mutation is a committed probe of ordinary unification
+  against `Dec`, accepted only when every constraint of the receiver accepts
+  it.
 - Literal defaulting (`commitLiteralDefault`, `commitLiteralGroupDefault`)
 —policy: literal defaulting as declared in Static Dispatch At The
   Checked Boundary (the `LITERAL DEFAULTED` warning) and the numeric
@@ -23504,6 +23545,42 @@ Roots that finish before the slow threshold therefore pay only monitor setup and
 signaling overhead, not the reporting period. Roots that exceed the threshold
 are reported, then the worker waits interruptibly until the next per-root report
 deadline or finalization stop.
+
+## Code Reification
+
+A function that stands where the type says `Code(f)` becomes a description of
+itself, which a translator (ordinary Roc, run while the compiler runs) reads.
+The word "reification" here is this feature. It is not the banned
+compile-time-value term (see "Source Parsing Boundary"). A described function
+is an ordinary constant in `ConstStore` once it exists. The design and the
+rules are in `roc-reify-proposal.md`, `roc-reify-normal-form.md` and
+`roc-reify-normalization-plan.md`. The user page is `docs/langref/reifying.md`.
+
+| Stage | What it does with a description | Where |
+|---|---|---|
+| Checking | Types a function at a `Code` position as usual, records a `CodeReificationSite` and a `code_from_lambda` expression, and rejects a `Code` anywhere except a function parameter or the result of a template | `src/check/Check.zig` (`stagedCode`, `checkStagedCodePositions`) |
+| Publication | Walks each site's checked bodies, solved types and dispatch plans, builds the normal form with `src/reify`, and writes the `Code` value into the module's `ConstStore`. A refusal is one `staged_code` problem, and its site holds no node | `src/check/code_reifier.zig`, `reifyStagedCode` in `src/check/checked_artifact.zig` |
+| Lowering | Restores the stored node as a constant. It walks no function and adds no report for a site that holds no node | `.code_from_lambda` in `src/postcheck/monotype/lower.zig`, `pushCodeConversion` in `src/postcheck/boxy/plan.zig` |
+| Evaluation | Runs a translator as any other Roc. `Code.refuse_at` lowers to a crash statement that carries a `Refusal`, and compile-time evaluation reports it at the source regions of the node | `src/lir/LIR.zig` (`Refusal`), `CodeProvenanceTable` in `src/check/checked_artifact.zig` |
+
+Invariants:
+
+- The walk is the only stage that reads a function body for a `Code`. It
+  consumes solved types and dispatch plans and never infers a missing one. A
+  construct with no normal form stops the walk with a named reason, and no
+  partial description exists.
+- The normal-form version, `normal_form_version` in `src/reify/mod.zig`,
+  changes exactly when the rules, the builtin table or the speculatable lists
+  change. A fingerprint test pins it. `Code.version` carries it, so a
+  translator can key a cache with it.
+- Equality and hashing of a `Code` read the normal form and the version, and
+  never the site key.
+- The provenance table that maps a node to its source regions is for the
+  compiler. A translator cannot read it.
+- Later stages treat a description as a constant. They never read its rows,
+  and they never rewrite it.
+- A condition that reads a code reification site draws no compile-time
+  condition warning (see "Checked Boundary").
 
 ## Test Root Ownership
 

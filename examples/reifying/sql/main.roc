@@ -240,6 +240,24 @@ expect {
 	}
 }
 
+# A helper one clause calls twice. Each call is expanded in place, with its
+# parameter bound to what the argument stands for.
+with_tax : Dec -> Dec
+with_tax = |price| price * 1.2
+
+taxed = Sql.from(products).select(|p| { plain: with_tax(p.price), doubled: with_tax(p.price * 2) })
+
+expect taxed.to_sql() == Ok("SELECT (products.price * 2.0) * 1.2 AS doubled, products.price * 1.2 AS plain\nFROM products")
+
+# SQL has no recursion to spell a function that calls itself with, so a call
+# of one is refused and the reason is named.
+halve_until : Dec, U8 -> Dec
+halve_until = |x, n| if n == 0 x else halve_until(x / 2, n - 1)
+
+halved = Sql.from(products).select(|p| { small: halve_until(p.price, 3) })
+
+expect halved.to_sql() == Err(Unsupported("a function that calls itself has no SQL form; SQL has no recursion to spell it with"))
+
 # A row is where columns come from, not a value a column can hold.
 whole_rows = Sql.from(products).select(|p| { product: p })
 

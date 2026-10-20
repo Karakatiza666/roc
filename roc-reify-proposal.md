@@ -59,8 +59,8 @@ Three translators ship as examples. Each one has an `expected_output` file and a
 
 | Example | It emits | `roc test` expects | Run by `parallel_cli_runner.zig` |
 |---|---|---|---|
-| `examples/reifying/glsl/` | a GLSL 330 fragment shader | 6 in `main.roc`, 1 in `refactored.roc` | both |
-| `examples/reifying/sql/` | a SQLite script for a schema, migrations, seed rows and queries | 10 in `main.roc`, 11 in `refactored.roc` | `refactored.roc` |
+| `examples/reifying/glsl/` | a GLSL 330 fragment shader | 8 in `main.roc`, 1 in `refactored.roc` | both |
+| `examples/reifying/sql/` | a SQLite script for a schema, migrations, seed rows and queries | 12 in `main.roc`, 11 in `refactored.roc` | `refactored.roc` |
 | `examples/reifying/dbsp/` | a Rust program for the `dbsp` crate, which is not compiled here | 14 in `main.roc`, 1 in `refactored.roc` | neither |
 
 `examples/reifying/shaders-without-reifying/` is the control experiment: the
@@ -84,7 +84,7 @@ The tests, in layers. The counts were taken at the time of writing.
 | Layer | Where | What it catches |
 |---|---|---|
 | Normal-form unit tests | `src/reify/` (118 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
-| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (80 tests) | a walk that describes a body wrongly |
+| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (81 tests) | a walk that describes a body wrongly |
 | Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (82 cases) | the same, for calls into other modules and builtins |
 | CLI fixtures | `test/cli/Staged*.roc` (34 files), run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
 | Fuzzers | `src/reify/fuzz_gen.zig`, `src/compile/reify_fuzz.zig`, `test/fuzzing/fuzz-reify.zig` | two spellings of one term that differ, or a normal form that computes what Roc does not |
@@ -221,8 +221,10 @@ reified, provided the compiler can read its body. These qualify:
   function body
 
 A function received as a runtime argument does not qualify, and neither does
-one chosen by an `if` or read out of a record. Those are the error cases, with
-a message that says so.
+one read from a list. Those are the error cases, with a message that says so. A
+function chosen by an `if` between known functions, or read out of a record
+literal, does qualify: each branch is described, and the call becomes a
+`Switch`.
 
 A `Code(...)` itself appears in exactly two places: a function parameter, which
 takes a description, and a function's return type, which makes that function a
@@ -405,8 +407,9 @@ inline: r0 = |U16| -> U16 Num.U16.times(Num.U16.plus(Num.U16.times(p0, 3), 1), 3
 So a translator meets a `Call` row for recursion, and in the `graph` view also
 for a helper that two places share. A translator with no function form, such as
 one that writes one expression, declares `Code.Inlined(f)` and meets `Call` for
-recursion, and for the one exception in the table. A function of another package, and a builtin, is a `Prim`
-whose body is not read, so a library that belongs to the translator, such as
+recursion, and for the one exception in the table. The GLSL example is such a
+translator. The SQL example reads the `graph` view and expands each `Call`. A
+function of another package, and a builtin, is a `Prim` whose body is not read, so a library that belongs to the translator, such as
 `Glsl.Vec3.scale`, is mapped by name. `src/reify/views.zig:3-6` states the
 two rules. A third view that picks helper boundaries from the computation alone
 is designed (`roc-reify-normal-form.md` section 5.3) and not built.
@@ -1007,11 +1010,10 @@ new surface area is small.
 ### 9.2 The prototype's shape
 
 The feature is two commits on the `reify` branch over roc-lang/roc `main` at
-`2664a27882`: `90a70ce708` reifies a pure Roc function, and `10710041d7`
-normalizes the result. The table is `git diff --stat 2664a27882 -- src/` and so
-includes the uncommitted working tree at the time of writing. It covers `src/`
-only: the translator examples, the CLI fixtures and the regenerated snapshots
-are beside it.
+`2664a27882`: `90a70ce708` reifies a pure Roc function, and `b46d3c1a55`
+normalizes the result. The table is `git diff --stat 2664a27882 HEAD -- src/`
+at `b46d3c1a55`. It covers `src/` only: the translator examples, the CLI
+fixtures and the regenerated snapshots are beside it.
 
 | File | Added | Removed | What it is |
 |---|---|---|---|
@@ -1019,7 +1021,7 @@ are beside it.
 | `src/reify/*.zig` (21 files) | 14017 | 0 | The normal form: IR, builder, verifier, rows, views, digests, evaluator, dump |
 | `src/reify/rules/` (3 files) | 3123 | 0 | The normalization rule table and its ledger |
 | `src/reify/derive/` (22 files) | 18977 | 0 | The offline rule-derivation tool. 12482 of the lines are `.zon` data. No compiler artifact depends on it |
-| `src/compile/test/code_reifier_test.zig` | 2311 | 0 | Tests |
+| `src/compile/test/code_reifier_test.zig` | 2340 | 0 | Tests |
 | `src/eval/test/eval_staging_tests.zig` | 1794 | 0 | Tests |
 | `src/compile/reify_fuzz.zig` | 435 | 0 | The fuzz driver, shared by the fixed seeds and the AFL target |
 | `src/build/roc/Builtin.roc` | 738 | 0 | `Code`, `Code.Inlined`, `Graph`, `Row`, `Node`, `Op`, `Val`, `Region`, `End`, `Key`, `Ty`, `Lit`, `Tree` and their methods |
@@ -1029,10 +1031,10 @@ are beside it.
 | `src/check/report.zig` | 276 | 0 | Refusal diagnostics |
 | `src/postcheck/monotype/lower.zig` | 85 | 63 | Net 22 lines larger |
 | `src/postcheck/boxy/lower.zig` | 61 | 23 | Net 38 lines larger |
-| 47 further files | 749 | 37 | A few lines to 130 each |
+| 47 further files | 751 | 37 | A few lines to 130 each |
 
-Of 51605 added lines, 36117 are in `src/reify/`, and 12482 of those are data.
-The walk and its two test files are 11288. The module is a bolt-on by
+Of 51636 added lines, 36117 are in `src/reify/`, and 12482 of those are data.
+The walk and its two test files are 11317. The module is a bolt-on by
 construction: the walk takes the module being published as `anytype`, reaches
 the rest of the compiler through a `ForeignLookup` vtable, reads only const
 views, mutates nothing but a `ConstStore` handed to it, and is called from

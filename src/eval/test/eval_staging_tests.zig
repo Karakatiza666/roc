@@ -220,6 +220,73 @@ const staged_generic_where = stage ++
     \\main = "${Stage.describe(label)} | ${Stage.describe(direct)}"
 ;
 
+// A lambda written in a generic callee is part of that callee, so it
+// describes under the instantiation the call fixed: one row per type, a
+// nested lambda and one that captures a parameter of the callee included.
+const staged_generic_lambdas = stage ++
+    \\firsts : List((a, b)) -> List(a)
+    \\firsts = |xs| xs.map(|p| p.0)
+    \\
+    \\pairs : List(a), b -> List((a, b))
+    \\pairs = |xs, k| xs.map(|x| (x, k))
+    \\
+    \\nested : List(List(a)) -> List(List((a, a)))
+    \\nested = |xss| xss.map(|xs| xs.map(|x| (x, x)))
+    \\
+    \\mix : List(F32), List(Str) -> U64
+    \\mix = |a, b| firsts(pairs(a, "k")).len() + firsts(pairs(b, 1.0.F32)).len() + nested([a]).len()
+    \\main = Stage.describe(mix)
+;
+
+// A lambda in a generic callee dispatches through the evidence the call
+// supplied, and a `where` obligation's own open row is a row of the scheme,
+// which no call fixes. A lambda the callee's block generalized is fixed by
+// its lookup on top of what the call fixed.
+const staged_generic_lambda_where = stage ++
+    \\bump : List(a) -> List(a) where [a.plus : a, a -> a, a.from_numeral : Numeral -> Try(a, [InvalidNumeral(Str)])]
+    \\bump = |xs| xs.map(|x| x + 1)
+    \\
+    \\dup : List(a) -> List((a, a))
+    \\dup = |xs| {
+    \\    pair = |x| (x, x)
+    \\    xs.map(|x| pair(x))
+    \\}
+    \\
+    \\go : List(U16) -> U64
+    \\go = |xs| bump(xs).len() + dup(xs).len()
+    \\main = Stage.describe(go)
+;
+
+// An arithmetic parameter no literal pins takes the numeric default, `Dec`,
+// as it would in a compiled function. A site inside a function body takes it
+// at that function's boundary.
+const staged_numeric_default = stage ++
+    \\label : U8 -> Str
+    \\label = |_n| Stage.describe(|x| x - 1)
+    \\main = "${Stage.describe(|x| x * 2)} | ${Stage.describe(|x, y| x + y)} | ${label(3)}"
+;
+
+// The literal of an unannotated helper has a type variable that only its
+// `times` obligation names. The checker's record of each use fixes it: `Dec`
+// at the site, `U8` at the call.
+const staged_unannotated_literal = stage ++
+    \\triple = |x| x * 3
+    \\small : U8 -> U8
+    \\small = |y| triple(y)
+    \\main = "${Stage.describe(triple)} | ${Stage.describe(small)}"
+;
+
+// A function parameter the call fixed stays that definition inside a lambda
+// that captures it, so the lambda a builtin receives names it.
+const staged_bound_capture = stage ++
+    \\apply_all = |xs, f| xs.map(|x| f(x))
+    \\each = |xs, f| xs.map(f)
+    \\twice = |xs, f| xs.map(|x| f(f(x)))
+    \\go : List(I64) -> (List(I64), List(I64), List(I64))
+    \\go = |xs| (apply_all(xs, |x| x * 3), each(xs, |x| x + 1), twice(xs, |x| x - 1))
+    \\main = Stage.describe(go)
+;
+
 // A type-level statement declares a name for the checker and leaves no value
 // behind, so the description passes over it and the block around it describes.
 // Naming a type before a dispatch is how a codec call is written.
@@ -1338,6 +1405,36 @@ pub const tests = [_]TestCase{
         .source_kind = .module,
         .source = staged_generic_where,
         .expected = .{ .inspect_str = "\"r0 = |F32| -> Str Num.F32.to_str(p0) | r0 = |F32| -> Str Num.F32.to_str(p0)\"" },
+    },
+    .{
+        .name = "staging - a lambda in a generic callee describes at each instantiation",
+        .source_kind = .module,
+        .source = staged_generic_lambdas,
+        .expected = .{ .inspect_str = "\"r0 = |List(F32), List(Str)| -> U64 Num.U64.plus(Num.U64.plus(List.len(List.map(List.map(p0, closure r1('k')), closure r2())), List.len(List.map(List.map(p1, closure r3(1)), closure r4()))), List.len(List.map([p0], closure r5()))) ; r1 = |Str, F32| -> (F32, Str) (p1, p0) ; r2 = |(F32, Str)| -> F32 p0.0 ; r3 = |F32, Str| -> (Str, F32) (p1, p0) ; r4 = |(Str, F32)| -> Str p0.0 ; r5 = |List(F32)| -> List((F32, F32)) List.map(p0, closure r6()) ; r6 = |F32| -> (F32, F32) (p0, p0)\"" },
+    },
+    .{
+        .name = "staging - a lambda in a where-constrained generic callee dispatches at the fixed type",
+        .source_kind = .module,
+        .source = staged_generic_lambda_where,
+        .expected = .{ .inspect_str = "\"r0 = |List(U16)| -> U64 Num.U64.plus(List.len(List.map(p0, closure r1())), List.len(List.map(p0, closure r2()))) ; r1 = |U16| -> U16 Num.U16.plus(p0, 1) ; r2 = |U16| -> (U16, U16) (p0, p0)\"" },
+    },
+    .{
+        .name = "staging - an arithmetic parameter no literal pins describes at Dec",
+        .source_kind = .module,
+        .source = staged_numeric_default,
+        .expected = .{ .inspect_str = "\"r0 = |Dec| -> Dec Num.Dec.times(p0, 2.0) | r0 = |Dec, Dec| -> Dec Num.Dec.plus(p0, p1) | r0 = |Dec| -> Dec Num.Dec.minus(p0, 1.0)\"" },
+    },
+    .{
+        .name = "staging - a literal of an unannotated helper describes at the type each use fixed",
+        .source_kind = .module,
+        .source = staged_unannotated_literal,
+        .expected = .{ .inspect_str = "\"r0 = |Dec| -> Dec Num.Dec.times(p0, 3.0) | r0 = |U8| -> U8 Num.U8.times(p0, 3)\"" },
+    },
+    .{
+        .name = "staging - a lambda that captures a fixed function parameter names its definition",
+        .source_kind = .module,
+        .source = staged_bound_capture,
+        .expected = .{ .inspect_str = "\"r0 = |List(I64)| -> (List(I64), List(I64), List(I64)) (List.map(p0, closure r1()), List.map(p0, closure r2()), List.map(p0, closure r3())) ; r1 = |I64| -> I64 Num.I64.times(p0, 3) ; r2 = |I64| -> I64 Num.I64.plus(p0, 1) ; r3 = |I64| -> I64 r4(r4(p0)) ; r4 = |I64| -> I64 Num.I64.minus(p0, 1)\"" },
     },
     .{
         .name = "staging - a type-level statement in a block leaves no node behind",

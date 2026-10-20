@@ -77,6 +77,7 @@ Sql :: {}.{
 		joins : List(Clause),
 		filters : List(Clause),
 	}.{
+
 		## An inner join with the table, on a condition over the row so far and
 		## the row of the table being joined. The result's row is the pair of
 		## the two.
@@ -936,7 +937,7 @@ Sql :: {}.{
 
 	## The requirement that a record can become SQL values: the compiler
 	## derives its encoder against [Sql.Encoding].
-	a.Bindable : where [a.encoder_for : Sql.Encoding -> (a, List(Sql.Token) -> Try(List(Sql.Token), []))]
+	a.Bindable :  where [a.encoder_for : Sql.Encoding -> (a, List(Sql.Token) -> Try(List(Sql.Token), []))]
 
 	## What the derived encoder writes: a column's name, then its value.
 	Token := [Name(Str), Val(Value)]

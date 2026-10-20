@@ -17,8 +17,8 @@ and the inputs of its tests.
 
 ```
 roc examples/reifying/sql/main.roc          # the SQLite script
-roc test examples/reifying/sql/main.roc     # 10 expects
-roc test examples/reifying/sql/refactored.roc  # 11 expects: the same 10, and the script is expected_output.sql
+roc test examples/reifying/sql/main.roc     # 12 expects
+roc test examples/reifying/sql/refactored.roc  # 11 expects: ten of those, and the script is expected_output.sql
 python3 examples/reifying/sql/check.py      # run it on SQLite, compare with Roc
 ```
 
@@ -36,8 +36,9 @@ python3 examples/reifying/sql/check.py      # run it on SQLite, compare with Roc
 | Parameters | `.filter_by(\|band, p\| p.price >= band.low)`, chained | `products.price >= :low` | `main.roc:143` |
 | Three-way join | `.join(orders, \|c, o\| ..).join(products, \|(_, o), p\| ..)` | two `JOIN .. ON` | `main.roc:164` |
 | Reused Roc functions | `line_total(o, p)`, `is_bulk(o)` | expanded in place | `main.roc:172` |
+| A helper one clause calls twice | `with_tax(p.price)` and `with_tax(p.price * 2)` | two expansions of one row | `main.roc:245` |
 | Aggregates | `rows.len()`, `rows.map(f).sum()` over a group | `COUNT(*)`, `SUM(..)` | `main.roc:188` |
-| Seed rows | `products.insert(seed_products)` | `INSERT` per row, through a derived encoder | `main.roc:293` |
+| Seed rows | `products.insert(seed_products)` | `INSERT` per row, through a derived encoder | `main.roc:311` |
 | Refusals | `c.name.count_utf8_bytes()` | `` `count_utf8_bytes` counts bytes, and SQL's `length` counts characters `` | `main.roc:227` |
 
 `check.py` executes the whole script on SQLite with foreign keys on. The two
@@ -50,30 +51,33 @@ match.
 
 A clause is a function over the row. The translator reads the root row of
 its `Code` graph as a tree (`Graph.to_tree`), and evaluates the tree with
-each parameter bound to what it stands for (`Sql.roc:540`). A node the tree
+each parameter bound to what it stands for (`Sql.roc:541`). A node the tree
 keeps as a definition is evaluated once, where its block defines it:
 
 | Binding | Stands for | A field read off it is |
 | --- | --- | --- |
 | `Row(Leaf(alias))` | one table's row | the column `alias.field` |
-| `Row(Pair(l, r))` | a joined row | nothing; `.0` and `.1` pick a side (`Sql.roc:680`) |
+| `Row(Pair(l, r))` | a joined row | nothing; `.0` and `.1` pick a side (`Sql.roc:681`) |
 | `Params` | the parameter record | the placeholder `:field` |
-| `Group(source)` | a group's rows | nothing; `len` and `map(..).sum()` aggregate it (`Sql.roc:783`) |
-| `Maybe(column)` | a read of an optional field, a column that can be `NULL` | nothing; a `switch` on it is `COALESCE` or `CASE` (`Sql.roc:708`) |
+| `Group(source)` | a group's rows | nothing; `len` and `map(..).sum()` aggregate it (`Sql.roc:784`) |
+| `Maybe(column)` | a read of an optional field, a column that can be `NULL` | nothing; a `switch` on it is `COALESCE` or `CASE` (`Sql.roc:709`) |
 | `Fields(..)` | a record the body built | that field's binding |
 
 A call to one of the application's own functions that two places share, or
 that recurses, is a `Call` of another row of the same graph, and is expanded
-with that row's parameters bound the same way (`Sql.roc:820`). A function that
-one place calls is already inlined in the description. A row passes through as a row, which is why `line_total`
-works inside a query unchanged.
+with that row's parameters bound the same way (`Sql.roc:821`). A function that
+one place calls is already inlined in the description. A helper called twice
+expands twice (`main.roc:250`). A function that calls itself is refused with
+that reason, because SQL has no recursion to spell it with (`main.roc:259`).
+A row passes through as a row, which is why `line_total` works inside a query
+unchanged.
 
 The description is a normal form, so two spellings of one computation reach
 the translator as one:
 
 | Written | Arrives as | The translator writes |
 | --- | --- | --- |
-| `o.quantity >= 10` | `Num.I64.is_lte(10, o.quantity)`: an integer literal first | `orders.quantity >= 10`: a comparison whose left operand is the only literal is mirrored back (`Sql.roc:844`) |
+| `o.quantity >= 10` | `Num.I64.is_lte(10, o.quantity)`: an integer literal first | `orders.quantity >= 10`: a comparison whose left operand is the only literal is mirrored back (`Sql.roc:845`) |
 | `p.title != "Gift card"` | `Bool.not(Str.is_eq(..))` | `products.title <> 'Gift card'` |
 | `{ title: p.title, price: p.price }` | a record in field-name order | `SELECT products.price AS price, products.title AS title`: result columns, and a step's `CREATE TABLE` columns, come in name order |
 
@@ -87,32 +91,33 @@ Migrations list their columns as a record (`|c| { id: c.id, name: c.name }`),
 so a migration keeps its meaning after the record gains a field. The
 record's fields arrive in name order, so the table's columns do too. The row
 type's full field list comes from the lambda's parameter type, so
-`Sql.schema_gaps` (`Sql.roc:405`) can say which fields no migration creates:
+`Sql.schema_gaps` (`Sql.roc:406`) can say which fields no migration creates:
 
 ```roc
 expect Sql.schema_gaps(migrations.take_first(2)) == ["customers.email is never created"]
 ```
 
 Parameter and row values cross into SQL through the compiler's derived
-`encoder_for`, pointed at `Sql.Encoding` (`Sql.roc:947`). `bind` requires `p`
+`encoder_for`, pointed at `Sql.Encoding` (`Sql.roc:948`). `bind` requires `p`
 to have that encoder, so the parameter values are typed by the same record the
 filter reads.
 
 ## Findings: what current Roc and reification cannot do ergonomically
 
 Each row was reproduced against this branch's `zig-out/bin/roc`. Rows 1, 2,
-3 and 6 are fixed on the branch; the sections below say how.
+3 and 6 are fixed on the branch; the sections below say how. Row 4 was
+reproduced again with `roc` at `debug-10710041` and no longer crashes.
 
 | # | Finding | Effect on the DSL | Kind |
 | --- | --- | --- | --- |
 | 1 | An inline lambda at a `Code` position had its record rows closed before the call related its other arguments | fixed: `join(orders, \|c, o\| ..)` checks, and `filter_by`s chain | reifier bug, fixed |
 | 2 | A destructuring pattern in a reified lambda's parameters had no description, including `_` | fixed: `\|((c, o), p)\|` and `\|_, p\|` describe | reifier gap, fixed |
 | 3 | A lambda that failed to check at a `Code` position panicked the compiler instead of reporting its type error | fixed: the type error is reported | reifier bug, fixed |
-| 4 | `List.max` in a reified body checks cleanly, then crashes with a bare "runtime error" | no `MAX` aggregate | reifier bug |
+| 4 | `List.max` in a reified body describes, and the translator has no `MAX` for it | refused: "`List.max` has no SQL form" | not a bug, a missing translator row |
 | 5 | An unused lambda parameter leaves its type open, and the site is refused as polymorphic | every parameter record field must be read | by design, sharp |
 | 6 | A recursive function annotated with a closed tag union in its result panicked post-check | fixed | compiler bug, not reification, fixed |
 | 7 | A `where` alias is not visible in nested type blocks, and an unqualified name in a `where` resolves to `Builtin` first | `bind` and `insert` spell the constraint out | language papercut |
-| 8 | `roc fmt` mis-indents a `}` after a `match` on a tuple, and doubles a space after `a.Alias :` | hand-fixed in `Sql.roc` | formatter bug |
+| 8 | `roc fmt` doubles a space after `a.Alias :`, so `a.Bindable :  where [..]` is what it writes | `Sql.roc` keeps the formatter's output, so `roc fmt --check` passes | formatter bug |
 
 ### 1. Rows closed before sibling arguments are related (fixed)
 
@@ -180,9 +185,11 @@ fix it checks.
 
 ### 4. `List.max` in a reified body
 
-`g.rows.map(|r| r.price).max()` inside a reified body passes `roc check` and
-then crashes as `runtime error`. The same call outside a reified body returns
-`Ok(2.5)`.
+`g.rows.map(|r| r.price).max()` inside a reified body once passed `roc check`
+and then crashed as `runtime error`. It no longer does. The body describes as
+`List.max(List.map(p0, closure r1()))`, and `Sql.roc` refuses it with
+"List.max has no SQL form", as it does for any builtin that has no row in
+`prim`.
 
 ### 6. A recursive function with a closed union in its result (fixed)
 
@@ -222,14 +229,15 @@ In a package this panic also hid three ordinary type errors in `Sql.roc`.
 | Captures are refused | A runtime value reaches a query only as a field of the parameter record. That makes parameters typed, which is the point; top-level constants still fold into literals |
 | No result decoding | The Echo platform has no database driver. `Selected(p, out)` keeps `out`, so a driver can decode rows with `out.parser_for` |
 | `NULL` reaches Roc only through optional fields | Non-optional fields are `NOT NULL` columns, and Roc forces `??`, `match` or `is_ok` on the optional ones, so SQL's three-valued logic never decides a predicate. An outer join would reintroduce it |
+| `SELECT` columns come in field-name order, not in the order the query wrote them | A Roc record has no field order, so a record the clause builds reaches the translator sorted by name. `{ title: .., price: .. }` selects `price` first. A reader of the result should match columns by name |
 | SQLite's `NUMERIC` arithmetic is floating point | The harness rounds to six places. A `Dec` is exact; PostgreSQL would agree exactly |
 
 ## The cost
 
 `Sql.roc` is about 1000 lines: 450 of builder and migrations, 450 of
 translator, 50 of encoding. As with `../glsl/`, nearly all of the translator is
-fixed cost. Its `op` has one arm per `Code.Op` variant (`Sql.roc:655`), and a
-new SQL function is one row in `prim` (`Sql.roc:766`). Nothing in `main.roc` is
+fixed cost. Its `op` has one arm per `Code.Op` variant (`Sql.roc:656`), and a
+new SQL function is one row in `prim` (`Sql.roc:767`). Nothing in `main.roc` is
 SQL-specific except the method names. Its queries use Roc's operators, its
 `and` and `or`, its optional fields and its `??`, and each query is built from
 functions the application also calls.

@@ -125,12 +125,10 @@ expect {
 # the interpreter read one description, and the interpreter's answer is
 # comparable with what Roc computes when it calls `banded` itself.
 expect {
-	frag = Interp.Value.Fields(
-		[
-			{ name: "fragTexCoord", value: Interp.Value.Vector([0.25, 0.5]) },
-			{ name: "fragColor", value: Interp.Value.Vector([1.0, 1.0, 1.0, 1.0]) },
-		],
-	)
+	frag = Interp.Value.Fields([
+		{ name: "fragTexCoord", value: Interp.Value.Vector([0.25, 0.5]) },
+		{ name: "fragColor", value: Interp.Value.Vector([1.0, 1.0, 1.0, 1.0]) },
+	])
 	settings = Interp.Value.Fields([{ name: "time", value: Interp.Value.Float(1.1) }])
 	direct = banded(
 		{
@@ -143,6 +141,45 @@ expect {
 	match Interp.run(Code.graph(banded), [frag, settings]) {
 		Ok(Vector([r, g, b, a])) => close(r, direct.r) and close(g, direct.g) and close(b, direct.b) and close(a, direct.a)
 		_ => Bool.False
+	}
+}
+
+## A helper the shader calls twice. The translator reads the `inline` view, so
+## each call is the helper's body in place and the shader needs no GLSL function.
+ripple : F32, F32 -> F32
+ripple = |y, t| (y * 28.0 + t * 2.0).sin() * 0.004
+
+rippled : Varyings, Uniforms -> Glsl.Vec4
+rippled = |frag, settings| {
+	dx = ripple(frag.fragTexCoord.y, settings.time)
+	dy = ripple(frag.fragTexCoord.x, settings.time)
+	Glsl.Vec4.({ r: dx, g: dy, b: 0.0, a: 1.0 })
+}
+
+expect {
+	match Glsl.fragment_330(rippled) {
+		Ok(fragment) =>
+			fragment.source.contains("sin(((fragTexCoord.y * 28.0) + n9)) * 0.004)") and fragment.source.contains("sin(((fragTexCoord.x * 28.0) + n9)) * 0.004)")
+		Err(_) => Bool.False
+	}
+}
+
+## GLSL 330 has no recursion, so a helper that reaches itself stays a call and
+## is refused for that reason.
+fade : F32, U8 -> F32
+fade = |x, n| if n == 0 x else fade(x * 0.5, n - 1)
+
+faded : Varyings, Uniforms -> Glsl.Vec4
+faded = |_frag, settings| {
+	v = fade(settings.time, 3)
+	Glsl.Vec4.({ r: v, g: v, b: v, a: 1.0 })
+}
+
+expect {
+	match Glsl.fragment_330(faded) {
+		Ok(_) => Bool.False
+		Err(Unsupported(message)) => message == "a shader cannot call a function that reaches itself, and GLSL 330 has no recursion"
+		Err(_) => Bool.False
 	}
 }
 

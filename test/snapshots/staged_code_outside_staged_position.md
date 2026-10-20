@@ -14,6 +14,9 @@ nested = |_f| "x"
 lister : List(Code(F32 -> F32)) -> Str
 lister = |_l| "x"
 
+value_site : Code(F32 -> F32)
+value_site = |x| x
+
 accepted : Code(F32 -> F32) -> Str
 accepted = |_c| "x"
 
@@ -24,6 +27,7 @@ template = |factor| |x| x * factor
 CODE IS NOT ALLOWED HERE - staged_code_outside_staged_position.md:1:21:1:37
 CODE IS NOT ALLOWED HERE - staged_code_outside_staged_position.md:4:18:4:34
 CODE IS NOT ALLOWED HERE - staged_code_outside_staged_position.md:7:15:7:31
+CODE IS NOT ALLOWED HERE - staged_code_outside_staged_position.md:10:14:10:30
 # PROBLEMS
 ~~~clojure
 (reports
@@ -44,9 +48,16 @@ CODE IS NOT ALLOWED HERE - staged_code_outside_staged_position.md:7:15:7:31
 			(reflow " ")
 			(reflow "parameter, which takes a description, or what a function returns,")
 			(reflow " ")
-			(reflow "which makes that function a template the compiler calls. A record")
+			(reflow "which makes that function a template the compiler calls. A value,")
 			(reflow " ")
-			(reflow "field and a list element have nothing to hold.")))
+			(reflow "a record field and a list element have nothing to hold it. To")
+			(reflow " ")
+			(reflow "describe a function, write the function with its own type, and pass")
+			(reflow " ")
+			(reflow "it to a parameter of type")
+			(reflow " ")
+			(annotated emphasis "Code")
+			(reflow ".")))
 	(report
 		(severity runtime_error)
 		(title "Code Is Not Allowed Here")
@@ -64,9 +75,16 @@ CODE IS NOT ALLOWED HERE - staged_code_outside_staged_position.md:7:15:7:31
 			(reflow " ")
 			(reflow "parameter, which takes a description, or what a function returns,")
 			(reflow " ")
-			(reflow "which makes that function a template the compiler calls. A record")
+			(reflow "which makes that function a template the compiler calls. A value,")
 			(reflow " ")
-			(reflow "field and a list element have nothing to hold.")))
+			(reflow "a record field and a list element have nothing to hold it. To")
+			(reflow " ")
+			(reflow "describe a function, write the function with its own type, and pass")
+			(reflow " ")
+			(reflow "it to a parameter of type")
+			(reflow " ")
+			(annotated emphasis "Code")
+			(reflow ".")))
 	(report
 		(severity runtime_error)
 		(title "Code Is Not Allowed Here")
@@ -84,9 +102,43 @@ CODE IS NOT ALLOWED HERE - staged_code_outside_staged_position.md:7:15:7:31
 			(reflow " ")
 			(reflow "parameter, which takes a description, or what a function returns,")
 			(reflow " ")
-			(reflow "which makes that function a template the compiler calls. A record")
+			(reflow "which makes that function a template the compiler calls. A value,")
 			(reflow " ")
-			(reflow "field and a list element have nothing to hold."))))
+			(reflow "a record field and a list element have nothing to hold it. To")
+			(reflow " ")
+			(reflow "describe a function, write the function with its own type, and pass")
+			(reflow " ")
+			(reflow "it to a parameter of type")
+			(reflow " ")
+			(annotated emphasis "Code")
+			(reflow ".")))
+	(report
+		(severity runtime_error)
+		(title "Code Is Not Allowed Here")
+		(region (start 10 14) (end 10 30))
+		(headline
+			(reflow "A Code can name a function's parameter, or what a function returns."))
+		(document
+			(source-region (file "staged_code_outside_staged_position.md") (start 10 14) (end 10 30) (annotation error) (line-text "value_site : Code(F32 -> F32)"))
+			(line-break)
+			(reflow "A")
+			(reflow " ")
+			(annotated emphasis "Code")
+			(reflow " ")
+			(reflow "exists only while the compiler runs, so it names a function")
+			(reflow " ")
+			(reflow "parameter, which takes a description, or what a function returns,")
+			(reflow " ")
+			(reflow "which makes that function a template the compiler calls. A value,")
+			(reflow " ")
+			(reflow "a record field and a list element have nothing to hold it. To")
+			(reflow " ")
+			(reflow "describe a function, write the function with its own type, and pass")
+			(reflow " ")
+			(reflow "it to a parameter of type")
+			(reflow " ")
+			(annotated emphasis "Code")
+			(reflow "."))))
 ~~~
 # TOKENS
 ~~~zig
@@ -96,6 +148,8 @@ LowerIdent,OpColon,OpenRound,UpperIdent,OpArrow,UpperIdent,NoSpaceOpenRound,Uppe
 LowerIdent,OpAssign,OpBar,NamedUnderscore,OpBar,StringStart,StringPart,StringEnd,
 LowerIdent,OpColon,UpperIdent,NoSpaceOpenRound,UpperIdent,NoSpaceOpenRound,UpperIdent,OpArrow,UpperIdent,CloseRound,CloseRound,OpArrow,UpperIdent,
 LowerIdent,OpAssign,OpBar,NamedUnderscore,OpBar,StringStart,StringPart,StringEnd,
+LowerIdent,OpColon,UpperIdent,NoSpaceOpenRound,UpperIdent,OpArrow,UpperIdent,CloseRound,
+LowerIdent,OpAssign,OpBar,LowerIdent,OpBar,LowerIdent,
 LowerIdent,OpColon,UpperIdent,NoSpaceOpenRound,UpperIdent,OpArrow,UpperIdent,CloseRound,OpArrow,UpperIdent,
 LowerIdent,OpAssign,OpBar,NamedUnderscore,OpBar,StringStart,StringPart,StringEnd,
 LowerIdent,OpColon,UpperIdent,OpArrow,UpperIdent,NoSpaceOpenRound,UpperIdent,OpArrow,UpperIdent,CloseRound,
@@ -158,6 +212,18 @@ EndOfFile,
 					(p-ident (raw "_l")))
 				(e-string
 					(e-string-part (raw "x")))))
+		(s-type-anno (name "value_site")
+			(ty-apply
+				(ty (name "Code"))
+				(ty-fn
+					(ty (name "F32"))
+					(ty (name "F32")))))
+		(s-decl
+			(p-ident (raw "value_site"))
+			(e-lambda
+				(args
+					(p-ident (raw "x")))
+				(e-ident (raw "x"))))
 		(s-type-anno (name "accepted")
 			(ty-fn
 				(ty-apply
@@ -237,6 +303,14 @@ NO CHANGE
 							(ty-lookup (name "F32") (builtin)))))
 				(ty-lookup (name "Str") (builtin)))))
 	(d-let
+		(p-assign (ident "value_site"))
+		(e-runtime-error (tag "erroneous_value_expr"))
+		(annotation
+			(ty-apply (name "Code") (builtin)
+				(ty-fn (effectful false)
+					(ty-lookup (name "F32") (builtin))
+					(ty-lookup (name "F32") (builtin))))))
+	(d-let
 		(p-assign (ident "accepted"))
 		(e-lambda
 			(args
@@ -261,7 +335,7 @@ NO CHANGE
 				(e-lambda
 					(args
 						(p-assign (ident "x")))
-					(e-dispatch-call (method "times") (constraint-fn-var 547)
+					(e-dispatch-call (method "times") (constraint-fn-var 563)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "x"))))
@@ -283,12 +357,14 @@ NO CHANGE
 		(patt (type "{ staged: Error } -> Str"))
 		(patt (type "(Str -> Error) -> Str"))
 		(patt (type "List(Error) -> Str"))
+		(patt (type "Error"))
 		(patt (type "Code(F32 -> F32) -> Str"))
 		(patt (type "F32 -> Code(F32 -> F32)")))
 	(expressions
 		(expr (type "{ staged: Error } -> Str"))
 		(expr (type "(Str -> Error) -> Str"))
 		(expr (type "List(Error) -> Str"))
+		(expr (type "Error"))
 		(expr (type "Code(F32 -> F32) -> Str"))
 		(expr (type "F32 -> Code(F32 -> F32)"))))
 ~~~

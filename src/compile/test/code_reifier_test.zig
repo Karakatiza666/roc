@@ -1163,7 +1163,7 @@ test "an effectful staged function is refused" {
     , "_staged = wobble!({ time: 1.0.F32, uv: 2.0.F32 })");
     defer staged.destroy();
 
-    try staged.expectRejected("an effectful function");
+    try staged.expectRejected("this function's own type is effectful (`=>`)");
 }
 
 test "a top-level constant folds into the description where its name stands" {
