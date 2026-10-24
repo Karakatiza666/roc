@@ -314,6 +314,17 @@ pub const Reifier = struct {
     /// What each parametric nominal in the type being walked fixed its
     /// declared variables to, innermost last.
     nominal_args: Substitution = .empty,
+    /// What relating each dispatch target publication selected to the
+    /// callable it was selected for fixes this module's variables to (see
+    /// `relateSelectedTargets`). A variable it answers for is no quantified
+    /// variable of any definition, so the answer holds in every row.
+    related: Substitution = .empty,
+    /// Whether `related` has been computed.
+    related_ready: bool = false,
+    /// The dispatchers whose selected target does not fit the callable it
+    /// was selected for: `x` in `|x| x * 2.U8`, whose default `Dec` has no
+    /// `times` that takes a `U8`. Such a variable has no type to seal to.
+    unfit: RowVars = .empty,
     /// What this reader shares with every other module's reader: the site's
     /// rows, who calls whom, and the first refusal.
     walk: *Walk,
@@ -374,12 +385,26 @@ pub const Reifier = struct {
     /// What one call supplied for its callee's `where` obligations, in
     /// canonical evidence-param order.
     ///
-    /// `reader` is the module the call was written in: an evidence node id
-    /// indexes that module's plan table, and the types recorded beside it are
-    /// named in that module's store.
+    /// `reader` is the module the call was written in, or null where no call
+    /// supplied any. An entry may have been recorded in another module: one
+    /// the call forwarded from its own definition's evidence is the entry the
+    /// call that instantiated that definition supplied (see `supply`).
     const SuppliedEvidence = struct {
         reader: ?*Reifier = null,
-        entries: []const static_dispatch.CheckedEvidence = &.{},
+        entries: []const SuppliedEntry = &.{},
+    };
+
+    /// How one obligation was discharged, beside what reads it.
+    ///
+    /// `reader` is the module that recorded the evidence: an evidence node id
+    /// indexes that module's plan table, and the types recorded beside it are
+    /// named in that module's store. `scope` is the evidence the walk held
+    /// where it was recorded, which the nested evidence of a target it names
+    /// forwards into.
+    const SuppliedEntry = struct {
+        reader: *Reifier,
+        evidence: static_dispatch.CheckedEvidence,
+        scope: SuppliedEvidence,
     };
 
     /// The definition a call's callee names: which one, and the reader of the
@@ -586,6 +611,8 @@ pub const Reifier = struct {
         self.open_recursions.deinit(self.gpa);
         self.nominal_in_progress.deinit(self.gpa);
         self.nominal_args.deinit(self.gpa);
+        self.related.deinit(self.gpa);
+        self.unfit.deinit(self.gpa);
         self.folding.deinit(self.gpa);
     }
 
@@ -613,6 +640,8 @@ pub const Reifier = struct {
     /// written in, and the `f` of the surrounding `Code(f)`.
     pub fn reifyLambda(self: *Reifier, root: CheckedExprId, site: Site) Allocator.Error!Outcome {
         try self.walk.startSite();
+        try site.caller.relateSelectedTargets();
+        try self.relateSelectedTargets();
         return self.outcomeOf(self.rootSite(root, site), site.region);
     }
 
@@ -855,6 +884,7 @@ pub const Reifier = struct {
         region: base.Region,
     ) Allocator.Error!Outcome {
         try self.walk.startSite();
+        try self.relateSelectedTargets();
         return self.outcomeOf(self.templateSite(template, values, region), region);
     }
 
@@ -1103,6 +1133,7 @@ pub const Reifier = struct {
         at: ?CheckedTypeId,
     ) Error!RowId {
         std.debug.assert(std.meta.eql(key.artifact, self.artifact.bytes));
+        try self.relateSelectedTargets();
         try self.walk.definitions.put(self.gpa, key, .{});
 
         const outer_substitution = self.substitution;
@@ -3780,7 +3811,7 @@ pub const Reifier = struct {
         // evidence by, so the answer to every `where` obligation of the callee
         // is in hand here and nowhere inside the body.
         if (self.plans.siteEvidence(func)) |supplied| {
-            callee.definition.evidence = .{ .reader = self, .entries = supplied };
+            callee.definition.evidence = try self.supply(supplied, self.evidence);
         }
         // A function argument the call fixes to a definition is no argument
         // of the row: the parameter binds to the definition, and the row is
@@ -3851,7 +3882,7 @@ pub const Reifier = struct {
             if (resolved != .definition) return null;
             var callee = resolved.definition;
             if (self.plans.siteEvidence(call.func)) |supplied| {
-                callee.evidence = .{ .reader = self, .entries = supplied };
+                callee.evidence = try self.supply(supplied, self.evidence);
             }
             return self.flattenedCall(callee, call.args, operands, at);
         }
@@ -4427,6 +4458,9 @@ pub const Reifier = struct {
     const DispatchEdge = struct {
         reader: *Reifier,
         node: static_dispatch.EvidenceNode,
+        /// The evidence the walk held where the edge was recorded, which the
+        /// node's nested evidence forwards into.
+        scope: SuppliedEvidence,
     };
 
     /// The instantiation edge this dispatch was discharged through, or null
@@ -4434,17 +4468,17 @@ pub const Reifier = struct {
     fn dispatchEdge(self: *Reifier, resolution: static_dispatch.CheckedCallResolution) ?DispatchEdge {
         switch (resolution) {
             .direct_closed, .direct_parametric => |direct| {
-                return .{ .reader = self, .node = self.plans.evidenceNode(direct.evidence) };
+                return .{ .reader = self, .node = self.plans.evidenceNode(direct.evidence), .scope = self.evidence };
             },
             // The body forwards the obligation to its own evidence param, so
             // the target is named by the call that instantiated the body and
             // recorded in that call's own tables.
             .evidence_dependent => |forwarded| {
                 if (forwarded.index.depth != 0) return null;
-                const caller = self.evidence.reader orelse return null;
                 if (forwarded.index.index >= self.evidence.entries.len) return null;
-                return switch (self.evidence.entries[forwarded.index.index].resolution) {
-                    .direct => |node_id| .{ .reader = caller, .node = caller.plans.evidenceNode(node_id) },
+                const entry = self.evidence.entries[forwarded.index.index];
+                return switch (entry.evidence.resolution) {
+                    .direct => |node_id| .{ .reader = entry.reader, .node = entry.reader.plans.evidenceNode(node_id), .scope = entry.scope },
                     .constraint,
                     .structural,
                     .from_callable,
@@ -4473,7 +4507,7 @@ pub const Reifier = struct {
     fn dispatchTarget(self: *Reifier, spec: DispatchSpec, region: base.Region) Error!DispatchCallee {
         const method = self.names.methodNameText(spec.method);
         if (self.dispatchEdge(spec.resolution)) |edge| {
-            return self.methodTargetCallee(edge.reader, edge.node.target, .{ .edge = edge.node }, method, spec.dispatcher_ty, region);
+            return self.methodTargetCallee(edge.reader, edge.node.target, .{ .edge = edge }, method, spec.dispatcher_ty, region);
         }
         // A body the compiler's own derivation reached is fixed by its
         // receiver, and no call supplied evidence for what it forwards. The
@@ -4492,7 +4526,7 @@ pub const Reifier = struct {
     /// obligations: off the dispatch's edge, or, for a method the compiler's
     /// own derivation reached, off the receiver's type.
     const MethodFixing = union(enum) {
-        edge: static_dispatch.EvidenceNode,
+        edge: DispatchEdge,
         receiver: TypeRef,
     };
 
@@ -4537,7 +4571,7 @@ pub const Reifier = struct {
             },
         };
         var instance = switch (fixing) {
-            .edge => |node| try owner.dispatchInstantiation(reader, found.template(), node, region),
+            .edge => |edge| try owner.dispatchInstantiation(reader, found.template(), edge.node, region),
             .receiver => |receiver| try reader.receiverInstantiation(found.template(), receiver, region),
         };
         errdefer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
@@ -4551,8 +4585,8 @@ pub const Reifier = struct {
                 .reader = reader,
                 .instantiation = instance,
                 .evidence = switch (fixing) {
-                    .edge => |node| switch (node.nested) {
-                        .resolved => .{ .reader = owner, .entries = owner.plans.nestedEvidence(node) },
+                    .edge => |edge| switch (edge.node.nested) {
+                        .resolved => try owner.supply(owner.plans.nestedEvidence(edge.node), edge.scope),
                         // The edge derives the target's evidence from its
                         // callable rather than recording it, so the walk of the
                         // body has no answer to read.
@@ -4695,12 +4729,52 @@ pub const Reifier = struct {
         }
     }
 
+    /// The evidence `entries`, recorded in this module, supply where the walk
+    /// holds `scope`. An entry that forwards to an evidence param of the
+    /// definition being walked is answered by the entry the call that
+    /// instantiated the definition supplied, as Monotype reads a forwarded
+    /// requirement off its lexical evidence chain, so a generic definition
+    /// that calls another hands it what its own caller discharged.
+    fn supply(self: *Reifier, entries: []const static_dispatch.CheckedEvidence, scope: SuppliedEvidence) Allocator.Error!SuppliedEvidence {
+        const supplied = try self.walk.site.?.evidence.allocator().alloc(SuppliedEntry, entries.len);
+        for (entries, supplied) |entry, *slot| slot.* = self.suppliedEntry(entry, scope);
+        return .{ .reader = self, .entries = supplied };
+    }
+
+    /// One entry of `supply`. A forwarded entry the walk's evidence does not
+    /// answer stays as recorded, so the dispatch it reaches names no target.
+    fn suppliedEntry(self: *Reifier, evidence: static_dispatch.CheckedEvidence, scope: SuppliedEvidence) SuppliedEntry {
+        const recorded: SuppliedEntry = .{ .reader = self, .evidence = evidence, .scope = scope };
+        const forwarded = switch (evidence.resolution) {
+            .constraint => |constraint| constraint,
+            .direct, .structural, .from_callable, .from_scheme, .checked_error, .unreachable_value => return recorded,
+        };
+        if (forwarded.index.depth != 0) return recorded;
+        if (forwarded.index.index >= scope.entries.len) return recorded;
+        const found = scope.entries[forwarded.index.index];
+        // The use's own contract for the slot, where the slot carries
+        // per-use contracts, is recorded beside the slot's evidence.
+        if (forwarded.callable_contract) |contract| {
+            const contracts = found.evidence.callable_contracts;
+            if (contracts.len != 0) {
+                std.debug.assert(contract < contracts.len);
+                const recorded_contract = found.reader.plans.evidence_refs[contracts.start + contract];
+                return found.reader.suppliedEntry(recorded_contract, found.scope);
+            }
+        }
+        // An independent callable relation rebuilds the target's nested
+        // evidence from this use's own callable, which no table records for
+        // the walk to read.
+        if (forwarded.independent_callable) return recorded;
+        return found;
+    }
+
     /// The compiler-derived implementation the instantiating call supplied for
     /// one forwarded obligation, or null when it supplied a Roc body instead.
     fn forwardedDerivation(self: *Reifier, chain: static_dispatch.EvidenceChainIndex) ?static_dispatch.StructuralDerivation {
         if (chain.depth != 0) return null;
         if (chain.index >= self.evidence.entries.len) return null;
-        return switch (self.evidence.entries[chain.index].resolution) {
+        return switch (self.evidence.entries[chain.index].evidence.resolution) {
             .structural => |structural| structural.derivation,
             .direct,
             .constraint,
@@ -4781,7 +4855,10 @@ pub const Reifier = struct {
             // One inhabitant, so both operands hold it.
             .empty_record => b.litBool(true),
             .empty_tag_union => self.rejectError(.unsupported_type, region, "derived equality on an empty tag union"),
-            .flex, .rigid => self.rejectOpen(type_id, region),
+            .flex, .rigid => |variable| blk: {
+                const sealed = try self.sealedVariable(resolved.id, variable, region) orelse break :blk self.rejectOpen(type_id, region);
+                break :blk b.primOf(try b.namedPrim(primitiveOwnerText(defaultBuiltin(sealed)).?, "is_eq"), &.{ lhs, rhs }, try self.rt().boolTy());
+            },
             .pending, .err => self.rejectError(.unresolved_type, region, "an unresolved type"),
             .function => self.rejectError(.unsupported_type, region, "derived equality on a function"),
         };
@@ -5198,15 +5275,21 @@ pub const Reifier = struct {
         const payload = self.types.payload(type_id);
         return switch (payload) {
             .alias => |alias| self.tyOf(alias.backing, region),
-            // A row variable nothing pins is the row default lowering seals it
-            // to (design.md "Row Coercion Primitive": a value keeps its own
-            // row, so a tag built before its widening holds the variable in
-            // its own type).
-            .flex => |variable| if (payload.variableSealsToRowDefault()) switch (variable.row_default.?) {
-                .empty_record => types.recordTy(&.{}),
-                .empty_tag_union => types.tagUnionTy(&.{}),
-            } else self.rejectOpen(type_id, region),
-            .rigid => self.rejectOpen(type_id, region),
+            .flex, .rigid => |variable| blk: {
+                if (try self.sealedVariable(type_id, variable, region)) |target| break :blk switch (target) {
+                    .dec => types.decTy(),
+                    .str => types.strTy(),
+                };
+                // A row variable nothing pins is the row default lowering
+                // seals it to (design.md "Row Coercion Primitive": a value
+                // keeps its own row, so a tag built before its widening holds
+                // the variable in its own type).
+                if (payload == .flex and payload.variableSealsToRowDefault()) break :blk switch (variable.row_default.?) {
+                    .empty_record => types.recordTy(&.{}),
+                    .empty_tag_union => types.tagUnionTy(&.{}),
+                };
+                break :blk self.rejectOpen(type_id, region);
+            },
             .pending, .err => self.rejectError(.unresolved_type, region, "an unresolved type"),
             .empty_record => types.recordTy(&.{}),
             .record => |record| self.recordTy(record.fields, record.ext, region),
@@ -5581,6 +5664,17 @@ pub const Reifier = struct {
         return error.Rejected;
     }
 
+    /// What a variable no substitution fixed seals to (`defaultedVariable`),
+    /// null for one with no default, or a refusal for one whose default does
+    /// not fit the dispatch that selected it.
+    fn sealedVariable(self: *Reifier, type_id: CheckedTypeId, variable: checked.CheckedTypeVariable, region: base.Region) error{Rejected}!?checked.literal_defaulting.DefaultTarget {
+        const sealed = defaultedVariable(variable) orelse return null;
+        if (self.unfit.contains(type_id)) {
+            return self.rejectError(.unresolved_type, region, "a type variable whose numeric default has no method that fits how it is used");
+        }
+        return sealed;
+    }
+
     /// Build a signature type with the walk told where in the signature it
     /// stands, so a refusal at a type variable names the place.
     fn placedTy(self: *Reifier, type_id: CheckedTypeId, region: base.Region, place: TypePlace) Error!TyId {
@@ -5626,7 +5720,8 @@ pub const Reifier = struct {
         return switch (self.types.payload(resolved.id)) {
             .alias => |alias| self.primitiveOf(alias.backing),
             .nominal => |nominal| nominal.builtin,
-            .pending, .err, .flex, .rigid, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => null,
+            .flex, .rigid => |variable| if (self.unfit.contains(resolved.id)) null else if (defaultedVariable(variable)) |sealed| defaultBuiltin(sealed) else null,
+            .pending, .err, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => null,
         };
     }
 
@@ -6160,7 +6255,189 @@ pub const Reifier = struct {
     /// variable to, or what a use fixed a nominal's declared variable to.
     fn fixedType(self: *Reifier, type_id: CheckedTypeId) ?TypeRef {
         if (self.substitution.get(type_id)) |fixed| return fixed;
-        return self.nominal_args.get(type_id);
+        if (self.nominal_args.get(type_id)) |fixed| return fixed;
+        return self.related.get(type_id);
+    }
+
+    /// Relate every monomorphic dispatch target that publication selected for
+    /// a callable checking never instantiated to that callable, once per
+    /// module.
+    ///
+    /// Such an edge is `derived_from_callable`: publication chose the target
+    /// (the numeric default owner of a dispatcher no edge pins, the procedure
+    /// an alias reaches, or a literal conversion), and the edge's contract is
+    /// that specialization relates the target's type to the callable. That is
+    /// what fixes `y` in `|x, y| x + y`: `x` seals to `Dec`, publication
+    /// selected `Dec.plus`, and `Dec.plus : Dec, Dec -> Dec` fixes the other
+    /// argument and the result. Monotype honours the contract when it lowers
+    /// the dispatch, and a description is the same specialization read
+    /// without lowering, so the walk honours it here. A generic target fixes
+    /// none of the callable's variables by its own type, so it is not related.
+    fn relateSelectedTargets(self: *Reifier) Allocator.Error!void {
+        if (self.related_ready) return;
+        self.related_ready = true;
+        var variables = std.ArrayList(CheckedTypeId).empty;
+        defer variables.deinit(self.gpa);
+        var seen: RowVars = .empty;
+        defer seen.deinit(self.gpa);
+        for (self.plans.evidence_nodes) |node| {
+            const callable = switch (node.instantiation) {
+                .derived_from_callable => |callable| callable,
+                .monomorphic, .callable, .alias => continue,
+            };
+            const procedure = switch (node.target.kind) {
+                .procedure => |procedure| procedure,
+                .local_proc, .structural => continue,
+            };
+            const target = try self.targetTemplate(procedure.template, node.target.def_idx) orelse continue;
+            if (target.reader.schemeVars(target.template).len != 0) continue;
+            const target_fn: TypeRef = .{ .reader = target.reader, .id = target.template.checked_fn_root };
+            if (!self.fitsTarget(callable, target_fn)) {
+                if (node.dispatcher_ty) |dispatcher| try self.unfit.put(self.gpa, dispatcher, {});
+                continue;
+            }
+            variables.clearRetainingCapacity();
+            seen.clearRetainingCapacity();
+            try self.collectVariables(&variables, &seen, callable);
+            try self.matchType(&self.related, variables.items, callable, target_fn);
+        }
+    }
+
+    /// Whether a monomorphic target's type agrees with a callable everywhere
+    /// the callable is not a variable, so relating the two fixes the
+    /// callable's variables rather than contradicting its concrete parts.
+    fn fitsTarget(self: *Reifier, callable: CheckedTypeId, target: TypeRef) bool {
+        const use = target.reader.resolvedType(target.id);
+        const use_payload = use.reader.types.payload(use.id);
+        switch (use_payload) {
+            .alias => |alias| return self.fitsTarget(callable, .{ .reader = use.reader, .id = alias.backing }),
+            // The target leaves this part to the callable.
+            .flex, .rigid => return true,
+            .pending, .err => return false,
+            .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => {},
+        }
+        return switch (self.types.payload(callable)) {
+            .flex, .rigid => true,
+            .alias => |alias| self.fitsTarget(alias.backing, use),
+            .pending, .err => false,
+            .empty_record => use_payload == .empty_record,
+            .empty_tag_union => use_payload == .empty_tag_union,
+            .function => |fn_ty| blk: {
+                const use_fn = switch (use_payload) {
+                    .function => |use_fn| use_fn,
+                    .pending, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .empty_record, .tag_union, .empty_tag_union => break :blk false,
+                };
+                if (fn_ty.args.len != use_fn.args.len) break :blk false;
+                for (fn_ty.args, use_fn.args) |arg, use_arg| {
+                    if (!self.fitsTarget(arg, .{ .reader = use.reader, .id = use_arg })) break :blk false;
+                }
+                break :blk self.fitsTarget(fn_ty.ret, .{ .reader = use.reader, .id = use_fn.ret });
+            },
+            .nominal => |nominal| blk: {
+                const use_nominal = switch (use_payload) {
+                    .nominal => |use_nominal| use_nominal,
+                    .pending, .err, .flex, .rigid, .alias, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
+                };
+                // Ids are each store's own, so this side's names are looked
+                // up in the target's store.
+                if (use.reader.names.lookupModuleIdentity(self.names.moduleIdentityBytes(nominal.origin_module)) != use_nominal.origin_module) break :blk false;
+                if (use.reader.names.lookupTypeName(self.names.typeNameText(nominal.name)) != use_nominal.name) break :blk false;
+                if (nominal.args.len != use_nominal.args.len) break :blk false;
+                for (nominal.args, use_nominal.args) |arg, use_arg| {
+                    if (!self.fitsTarget(arg, .{ .reader = use.reader, .id = use_arg })) break :blk false;
+                }
+                break :blk true;
+            },
+            .tuple => |parts| blk: {
+                const use_parts = switch (use_payload) {
+                    .tuple => |use_parts| use_parts,
+                    .pending, .err, .flex, .rigid, .alias, .record, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
+                };
+                if (parts.len != use_parts.len) break :blk false;
+                for (parts, use_parts) |part, use_part| {
+                    if (!self.fitsTarget(part, .{ .reader = use.reader, .id = use_part })) break :blk false;
+                }
+                break :blk true;
+            },
+            .record => |record| blk: {
+                const use_record = switch (use_payload) {
+                    .record => |use_record| use_record,
+                    .pending, .err, .flex, .rigid, .alias, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
+                };
+                if (record.fields.len != use_record.fields.len) break :blk false;
+                for (record.fields) |field| {
+                    const name = use.reader.names.lookupRecordFieldLabel(self.names.recordFieldLabelText(field.name)) orelse break :blk false;
+                    const match = for (use_record.fields) |use_field| {
+                        if (use_field.name == name) break use_field;
+                    } else break :blk false;
+                    if (!self.fitsTarget(field.ty, .{ .reader = use.reader, .id = match.ty })) break :blk false;
+                }
+                break :blk self.fitsTarget(record.ext, .{ .reader = use.reader, .id = use_record.ext });
+            },
+            .tag_union => |union_ty| blk: {
+                const use_union = switch (use_payload) {
+                    .tag_union => |use_union| use_union,
+                    .pending, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .function, .empty_record, .empty_tag_union => break :blk false,
+                };
+                if (union_ty.tags.len != use_union.tags.len) break :blk false;
+                for (union_ty.tags) |variant| {
+                    const name = use.reader.names.lookupTagLabel(self.names.tagLabelText(variant.name)) orelse break :blk false;
+                    const match = for (use_union.tags) |use_variant| {
+                        if (use_variant.name == name) break use_variant;
+                    } else break :blk false;
+                    const args = variant.argsSlice(self.types);
+                    const use_args = match.argsSlice(use.reader.types);
+                    if (args.len != use_args.len) break :blk false;
+                    for (args, use_args) |arg, use_arg| {
+                        if (!self.fitsTarget(arg, .{ .reader = use.reader, .id = use_arg })) break :blk false;
+                    }
+                }
+                break :blk self.fitsTarget(union_ty.ext, .{ .reader = use.reader, .id = use_union.ext });
+            },
+        };
+    }
+
+    /// The template one method target names and the reader of the module that
+    /// declares it, or null for a module the walk cannot read.
+    fn targetTemplate(
+        self: *Reifier,
+        template_ref: canonical.ProcedureTemplateRef,
+        def_idx: CIR.Def.Idx,
+    ) Allocator.Error!?struct { reader: *Reifier, template: checked.CheckedProcedureTemplate } {
+        if (std.meta.eql(template_ref.artifact.bytes, self.artifact.bytes)) {
+            const templates = self.procedure_templates.templates.items;
+            const raw = @backingInt(template_ref.template);
+            if (raw >= templates.len) return null;
+            return .{ .reader = self, .template = templates[raw] };
+        }
+        const definition = self.walk.foreign.findExported(.{ .bytes = template_ref.artifact.bytes }, def_idx) orelse return null;
+        return .{ .reader = try self.walk.reader(definition.module), .template = definition.template };
+    }
+
+    /// Every type variable one checked type reaches, in this reader's store.
+    fn collectVariables(self: *Reifier, found: *std.ArrayList(CheckedTypeId), seen: *RowVars, id: CheckedTypeId) Allocator.Error!void {
+        if ((try seen.getOrPut(self.gpa, id)).found_existing) return;
+        switch (self.types.payload(id)) {
+            .flex, .rigid => try found.append(self.gpa, id),
+            .alias => |alias| try self.collectVariables(found, seen, alias.backing),
+            .function => |fn_ty| {
+                for (fn_ty.args) |arg| try self.collectVariables(found, seen, arg);
+                try self.collectVariables(found, seen, fn_ty.ret);
+            },
+            .nominal => |nominal| for (nominal.args) |arg| try self.collectVariables(found, seen, arg),
+            .tuple => |parts| for (parts) |part| try self.collectVariables(found, seen, part),
+            .record => |record| {
+                for (record.fields) |field| try self.collectVariables(found, seen, field.ty);
+                try self.collectVariables(found, seen, record.ext);
+            },
+            .tag_union => |union_ty| {
+                for (union_ty.tags) |variant| {
+                    for (variant.argsSlice(self.types)) |arg| try self.collectVariables(found, seen, arg);
+                }
+                try self.collectVariables(found, seen, union_ty.ext);
+            },
+            .empty_record, .empty_tag_union, .pending, .err => {},
+        }
     }
 };
 
@@ -6171,6 +6448,29 @@ const TypePlace = union(enum) {
     parameter: struct { reader: *Reifier, pattern: CheckedPatternId, position: u32 },
     result,
 };
+
+/// The builtin a type variable stands for where nothing fixed it, or null for
+/// one with no default.
+///
+/// The walk describes a function the way Monotype specializes one: a variable
+/// a substitution fixes is read through it first (`fixedType`), and a variable
+/// still open after that is sealed by the default checking published on it,
+/// by the rule `lowerCheckedTypeVariable` seals it by. So `x` in `|x| x * 2`
+/// describes at `Dec`, and `x` in `same = |x| x`, which carries no default,
+/// stays open and is refused.
+fn defaultedVariable(variable: checked.CheckedTypeVariable) ?checked.literal_defaulting.DefaultTarget {
+    const phase = variable.numeric_default_phase orelse return null;
+    return checked.literal_defaulting.defaultTargetForPhase(phase) orelse
+        invariant("a checking-finalized numeric variable reached publication unresolved");
+}
+
+/// The builtin a default seals a variable to.
+fn defaultBuiltin(target: checked.literal_defaulting.DefaultTarget) checked.CheckedBuiltinNominal {
+    return switch (target) {
+        .dec => .dec,
+        .str => .str,
+    };
+}
 
 /// Stop on a broken invariant of the walk: a state no input reaches.
 fn invariant(comptime message: []const u8) noreturn {
@@ -6866,6 +7166,9 @@ pub const Walk = struct {
         store: ir.Store,
         types: Types,
         builder: Builder,
+        /// The evidence the site's calls supplied (`Reifier.supply`), which
+        /// lives as long as the rows that read it.
+        evidence: std.heap.ArenaAllocator,
     };
 
     pub fn init(gpa: Allocator, store: *ConstStore, foreign: ForeignLookup) Walk {
@@ -6932,6 +7235,7 @@ pub const Walk = struct {
         site.store = ir.Store.init(self.gpa);
         site.types = Types.init(self.gpa);
         site.builder = Builder.init(self.gpa, &site.store, &site.types);
+        site.evidence = std.heap.ArenaAllocator.init(self.gpa);
         self.site = site;
         self.definitions.clearRetainingCapacity();
         self.rows.clearRetainingCapacity();
@@ -6952,6 +7256,7 @@ pub const Walk = struct {
         site.builder.deinit();
         site.types.deinit();
         site.store.deinit();
+        site.evidence.deinit();
         self.gpa.destroy(site);
         self.site = null;
     }

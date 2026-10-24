@@ -18322,6 +18322,16 @@ const TemplateIteratorRefs = struct {
     default_iterator_refs: artifact_serialize.Span = .{},
     default_scheme_uses: artifact_serialize.Span = .{},
     default_scope_sites: artifact_serialize.Span = .{},
+    /// Refs collected from the bodies of lambdas written at a `Code`
+    /// position, which no template reaches: publication replaces each with
+    /// its description. Each span indexes the same pool as its per-template
+    /// counterpart above. The evidence pass publishes their use-site
+    /// evidence with no enclosing template params, which is what the
+    /// description reads at every call the lambda makes. Their dispatch
+    /// plans are resolved with every other plan no template reached.
+    staged_value_refs: artifact_serialize.Span = .{},
+    staged_scheme_uses: artifact_serialize.Span = .{},
+    staged_scope_sites: artifact_serialize.Span = .{},
 
     fn deinit(self: *TemplateIteratorRefs, allocator: Allocator) void {
         allocator.free(self.spans);
@@ -18638,6 +18648,29 @@ fn sealCheckedProcedureTemplateRefs(
         try scheme_use_scope_pool.appendSlice(allocator, collector.scheme_use_scopes.items);
     }
 
+    // A lambda written at a `Code` position is described rather than
+    // lowered, so no template body reaches it, and the calls it makes would
+    // reach the description with no record of what each use instantiated its
+    // callee to. Collect its body the way a template's is collected; the
+    // lambda node itself holds the `Code`, so only its parameters and body
+    // are read.
+    var staged_value_refs: artifact_serialize.Span = .{};
+    var staged_scheme_uses: artifact_serialize.Span = .{};
+    var staged_scope_sites: artifact_serialize.Span = .{};
+    {
+        collector.clear();
+        for (module.moduleEnvConst().store.codeReificationSites()) |site| {
+            if (site.kind != .inline_lambda) continue;
+            const checked_expr = checked_bodies.exprIdForSource(@fromBackingInt(@intCast(site.node_idx))) orelse continue;
+            try collector.collectStagedLambda(checked_expr);
+        }
+        staged_value_refs = try artifact_serialize.appendSpan(artifact_serialize.Span, ResolvedValueRefId, &value_ref_pool, allocator, collector.value_refs.items);
+        staged_scheme_uses = try artifact_serialize.appendSpan(artifact_serialize.Span, CollectedSchemeUseSite, &scheme_use_pool, allocator, collector.scheme_use_sites.items);
+        staged_scope_sites = try artifact_serialize.appendSpan(artifact_serialize.Span, CollectedScopeConstructionSite, &scope_site_pool, allocator, collector.scope_sites.items);
+        try value_ref_scope_pool.appendSlice(allocator, collector.value_ref_scopes.items);
+        try scheme_use_scope_pool.appendSlice(allocator, collector.scheme_use_scopes.items);
+    }
+
     resolved_value_refs.template_refs = try value_ref_pool.toOwnedSlice(allocator);
     static_dispatch_plans.template_refs = try dispatch_ref_pool.toOwnedSlice(allocator);
     templates.dispatch_ref_scopes = try allocator.dupe(DispatchScope, dispatch_ref_scope_pool.items);
@@ -18664,6 +18697,9 @@ fn sealCheckedProcedureTemplateRefs(
         .default_iterator_refs = default_iterator_refs,
         .default_scheme_uses = default_scheme_uses,
         .default_scope_sites = default_scope_sites,
+        .staged_value_refs = staged_value_refs,
+        .staged_scheme_uses = staged_scheme_uses,
+        .staged_scope_sites = staged_scope_sites,
     };
 }
 
@@ -19150,6 +19186,30 @@ const EvidencePass = struct {
             }
 
             const scope_span = self.template_iterator_refs.default_scope_sites;
+            for (self.template_iterator_refs.scope_sites[scope_span.start .. scope_span.start + scope_span.len]) |site| {
+                try self.emitScopeConstructionEvidence(site, .empty);
+            }
+        }
+
+        // The bodies of lambdas written at a `Code` position, collected
+        // outside every template by the seal pass. A description of one
+        // reads, at each call it makes, what that use instantiated the
+        // callee to and the evidence it supplied, as the template walk above
+        // publishes them for a named function's body.
+        {
+            const value_span = self.template_iterator_refs.staged_value_refs;
+            for (self.resolved_value_refs.template_refs[value_span.start .. value_span.start + value_span.len], 0..) |ref_id, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.value_ref_scopes[value_span.start + i], .empty);
+                try self.emitSiteEvidence(ref_id, chain);
+            }
+
+            const scheme_span = self.template_iterator_refs.staged_scheme_uses;
+            for (self.template_iterator_refs.scheme_use_sites[scheme_span.start .. scheme_span.start + scheme_span.len], 0..) |site, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.scheme_use_scopes[scheme_span.start + i], .empty);
+                try self.emitSchemeUseSiteEvidence(site.record_idx, @backingInt(site.checked_expr), chain);
+            }
+
+            const scope_span = self.template_iterator_refs.staged_scope_sites;
             for (self.template_iterator_refs.scope_sites[scope_span.start .. scope_span.start + scope_span.len]) |site| {
                 try self.emitScopeConstructionEvidence(site, .empty);
             }
@@ -22251,6 +22311,78 @@ const CheckedTemplateRefCollector = struct {
     fn collectExpr(self: *CheckedTemplateRefCollector, expr_id: CheckedExprId) Allocator.Error!void {
         const base_len = self.work.items.len;
         try self.work.append(self.allocator, .{ .expr = expr_id });
+        try self.drainWork(base_len);
+    }
+
+    /// Collect the parameters and body of a lambda written at a `Code`
+    /// position. `visitExpr` stops at the lambda's own node, which holds the
+    /// `Code` rather than a function; what the lambda computes is below it.
+    fn collectStagedLambda(self: *CheckedTemplateRefCollector, expr_id: CheckedExprId) Allocator.Error!void {
+        if (!self.staged_lambdas.contains(@backingInt(expr_id))) {
+            checkedArtifactInvariant("a Code site's lambda was not recorded as staged", .{});
+        }
+        const lambda = switch (self.checked_bodies.expr(expr_id).data) {
+            .lambda => |lambda| lambda,
+            .closure => |closure| return self.collectExpr(closure.lambda),
+            // Checking replaced a lambda that failed to check with its error,
+            // and the site is left to that error rather than described.
+            .runtime_error => return,
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_local,
+            .lookup_external,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => checkedArtifactInvariant("a lambda written at a Code position was copied as an expression that is not a lambda", .{}),
+        };
+        const base_len = self.work.items.len;
+        for (lambda.args) |arg| try self.work.append(self.allocator, .{ .pattern = arg });
+        try self.work.append(self.allocator, .{ .expr = lambda.body });
+        std.mem.reverse(Work, self.work.items[base_len..]);
+        try self.drainWork(base_len);
+    }
+
+    /// Run the work stack down to `base_len`.
+    fn drainWork(self: *CheckedTemplateRefCollector, base_len: usize) Allocator.Error!void {
         while (self.work.items.len > base_len) {
             switch (self.work.pop().?) {
                 .expr => |id| try self.visitExpr(id),

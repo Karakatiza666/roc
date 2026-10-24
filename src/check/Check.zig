@@ -693,9 +693,6 @@ staged_templates: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, StagedCode) = .empty
 /// generalizes rather than when their own site finishes. See
 /// `groundPendingStagedRows`.
 pending_staged_rows: std.ArrayListUnmanaged(PendingStagedRows) = .empty,
-/// Described sites whose arithmetic receivers take their numeric default when
-/// the binding holding them generalizes. See `defaultPendingStagedReceivers`.
-pending_staged_receivers: std.ArrayListUnmanaged(PendingStagedRows) = .empty,
 /// Whether the top-level body being checked is a template's, so a lambda it
 /// writes at a `Code` position is the template's result.
 checking_template_body: bool = false,
@@ -1748,7 +1745,6 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .predeclared_relation_vars = .keyed,
     .staged_templates = .keyed,
     .pending_staged_rows = .boundary,
-    .pending_staged_receivers = .boundary,
     .checking_template_body = .lexical,
     .predeclared_local_annotations = .lexical,
     .hole_shared_schemes = .keyed,
@@ -12914,15 +12910,17 @@ fn withdrawSupersededLiteralDefaultWarnings(self: *Self) Allocator.Error!void {
     self.problems.truncate(kept);
 }
 
-/// Poison the definition holding a reification site whose `f` has no
-/// instantiation.
+/// Poison the definition holding a reification site whose `f` is erroneous.
 ///
 /// The walk that describes a staged function runs at publication and reports
 /// there, but by then the definition holding the site is a compile-time
 /// constant, and evaluating it instantiates `f` before it ever reaches the
-/// site. An `f` that is erroneous or still holds a type variable has no
-/// instantiation, so the definition is poisoned here, while poisoning still
-/// reaches lowering.
+/// site. An erroneous `f` has no instantiation, so the definition is poisoned
+/// here, while poisoning still reaches lowering. An `f` that still holds a
+/// type variable is not poisoned: specialization seals a variable that
+/// carries a numeric default and relates a selected dispatch target to its
+/// callable, the walk reads the site by the same rules, and a variable
+/// neither fixes is the walk's refusal to report.
 fn poisonUndescribableStagedCode(self: *Self) std.mem.Allocator.Error!void {
     for (self.cir.store.codeReificationSites()) |site| {
         switch (site.kind) {
@@ -12937,9 +12935,7 @@ fn poisonUndescribableStagedCode(self: *Self) std.mem.Allocator.Error!void {
         }
 
         const fn_var = ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(site.fn_var))));
-        const erroneous = try self.canonical_key_writer.containsError(fn_var);
-        const polymorphic = (try self.canonical_key_writer.fromVar(fn_var)).contains_identity_variables;
-        if (!erroneous and !polymorphic) continue;
+        if (!try self.canonical_key_writer.containsError(fn_var)) continue;
 
         // The definition to poison is the one the site was written inside, and
         // a site is an expression of exactly one definition's body.
@@ -27018,9 +27014,6 @@ const ExprCheckFrame = struct {
     /// The expression still checks as an ordinary function, against this
     /// var; the node itself takes the surrounding `Code(f)` type.
     staged_code_fn_var: ?Var = null,
-    /// Whether the site at `staged_code_fn_var` is described where it stands,
-    /// rather than a template's result that each call describes.
-    staged_code_describes: bool = false,
     active: bool = true,
 
     fn deinit(self: *ExprCheckFrame, checker: *Self, env: *Env) void {
@@ -27070,12 +27063,10 @@ const ExprCheckFrame = struct {
             else
                 try checker.unifyInContext(relate_to, self.expr_var, env, anno_vars.context);
             if (self.staged_code_fn_var != null and annotation_result.isEstablished()) {
-                const pending: PendingStagedRows = .{
+                try checker.pending_staged_rows.append(checker.gpa, .{
                     .root = relate_to,
                     .region = checker.cir.store.getExprRegion(self.expr_idx),
-                };
-                try checker.pending_staged_rows.append(checker.gpa, pending);
-                if (self.staged_code_describes) try checker.pending_staged_receivers.append(checker.gpa, pending);
+                });
             }
             if (!annotation_result.isEstablished()) {
                 // Suppression by an erroneous annotation does not establish
@@ -27344,7 +27335,6 @@ fn beginExprCheckFrame(
         else
             .named_function;
         try self.cir.recordCodeReificationSite(ModuleEnv.nodeIdxFrom(expr_idx), staged.fn_var, kind, staged.view);
-        frame.staged_code_describes = kind != .template;
     }
 
     // A call to a template is the other way a description is built. The call
@@ -39093,7 +39083,6 @@ fn finalizeTypes(self: *Self, env: *Env, scope: FinalizeScope) std.mem.Allocator
     };
     if (run_defaults) {
         try self.finalizeLiteralDefaults(env);
-        if (scope == .module) try self.defaultPendingStagedReceivers(env, null, &.{});
 
         // Committing a default can spawn deferred static-dispatch
         // constraints (e.g. Dec.plus, Dec.to_str returning Str); resolve
@@ -41743,7 +41732,6 @@ fn defaultLiteralsAtGeneralizationBoundaryMultiRoot(
         // them and attribute what they instantiate to its own definition.
         try self.checkInstantiatedStaticDispatchConstraints(env, false, .ordinary);
         try self.quiesceConstraints(env, false);
-        try self.defaultPendingStagedReceivers(env, rank, roots);
         try self.quiesceSchemeRequirementsAtBoundary(roots, env, &boundary_codecs);
         return;
     }
@@ -41780,7 +41768,6 @@ fn defaultLiteralsAtGeneralizationBoundaryMultiRoot(
         .rank = rank,
         .pool_len = pool_vars.len,
     } });
-    try self.defaultPendingStagedReceivers(env, rank, roots);
     try self.quiesceSchemeRequirementsAtBoundary(roots, env, &boundary_codecs);
 }
 
@@ -58068,125 +58055,6 @@ fn groundStagedRowExtension(
     }
     try self.type_visit_stack.append(self.gpa, ext);
     return false;
-}
-
-/// Commit the numeric default of every arithmetic receiver a described site's
-/// `f` still leaves open and the boundary about to generalize at `rank` owns,
-/// or of all of them when `rank` is null. Runs after the boundary's literal
-/// defaulting, so a literal pins a receiver first exactly as it does in a
-/// function that is compiled.
-///
-/// A receiver no literal pins (`x` in `|x| x * 2`) is a variable no edge can
-/// pin, and the default rule ("Static Dispatch At The Checked Boundary")
-/// settles it to `Dec`. A compiled function meets that rule when Monotype
-/// seals the variable; a described one is read at the type checking leaves,
-/// before any specialization, so the rule applies here. The default commits
-/// only through a committed probe that every constraint of the receiver
-/// accepts, and a variable the binding's interface reaches is left open: a
-/// caller can still fix it, so the site is polymorphic and the walk refuses
-/// it. Returns nothing; an entry whose receiver an outer boundary owns stays
-/// queued.
-fn defaultPendingStagedReceivers(self: *Self, env: *Env, rank: ?Rank, roots: []const BoundaryRoot) std.mem.Allocator.Error!void {
-    if (self.pending_staged_receivers.items.len == 0) return;
-
-    var receivers = std.ArrayList(Var).empty;
-    defer receivers.deinit(self.gpa);
-    var kept: usize = 0;
-    var index: usize = 0;
-    while (index < self.pending_staged_receivers.items.len) : (index += 1) {
-        const pending = self.pending_staged_receivers.items[index];
-        if (try self.collectStagedReceivers(pending.root, rank, &receivers)) {
-            self.pending_staged_receivers.items[kept] = pending;
-            kept += 1;
-        }
-    }
-    self.pending_staged_receivers.shrinkRetainingCapacity(kept);
-    if (receivers.items.len == 0) return;
-
-    var interface = collections.DenseMap(Var, void).init(self.gpa);
-    defer interface.deinit();
-    for (roots) |root| try self.collectReachableVars(root.interface, &interface);
-
-    var committed_any = false;
-    for (receivers.items) |receiver| {
-        const resolved = self.types.resolveVar(receiver);
-        if (resolved.desc.content != .flex) continue;
-        if (interface.contains(resolved.var_)) continue;
-        const constraints = resolved.desc.content.flex.constraints;
-        const target = self.specializationDefaultTargetForConstraints(self.types.sliceStaticDispatchConstraints(constraints)) orelse continue;
-        const kind: CIR.NumKind = switch (target) {
-            .dec => numeral_default_candidates[0],
-            // A string default comes only from a quote or interpolation,
-            // which literal defaulting owns.
-            .str => continue,
-        };
-        if (try self.tryCommitNumeralCandidate(resolved.var_, kind, constraints, exact_numeral.FitSet.full, env) != null) {
-            committed_any = true;
-        }
-    }
-    if (!committed_any) return;
-    try self.checkInstantiatedStaticDispatchConstraints(env, false, .ordinary);
-    try self.quiesceConstraints(env, false);
-}
-
-/// Gather the arithmetic receivers a staged function's type reaches: flex
-/// variables with constraints and no literal, which literal defaulting would
-/// own. With a `rank`, only those that boundary owns. Returns whether one was
-/// left for an outer boundary.
-fn collectStagedReceivers(self: *Self, root_var: Var, rank: ?Rank, out: *std.ArrayList(Var)) std.mem.Allocator.Error!bool {
-    var visited = collections.DenseMap(Var, void).init(self.gpa);
-    defer visited.deinit();
-    const stack = &self.type_visit_stack;
-    const stack_base = stack.items.len;
-    defer stack.items.len = stack_base;
-    try stack.append(self.gpa, root_var);
-    var left_open = false;
-
-    while (stack.items.len > stack_base) {
-        const var_ = stack.pop().?;
-        const resolved = self.types.resolveVar(var_);
-        if (visited.contains(resolved.var_)) continue;
-        try visited.put(resolved.var_, {});
-
-        switch (resolved.desc.content) {
-            .flex => |flex| {
-                if (flex.constraints.len() == 0) continue;
-                if (self.varLiteralKind(resolved.var_) != null) continue;
-                if (rank) |boundary| {
-                    if (@backingInt(resolved.desc.rank) < @backingInt(boundary)) {
-                        left_open = true;
-                        continue;
-                    }
-                } else if (resolved.desc.rank == .generalized) continue;
-                try out.append(self.gpa, resolved.var_);
-            },
-            .rigid, .field_presence, .err => {},
-            .alias => |alias| {
-                try stack.append(self.gpa, self.types.getAliasBackingVar(alias));
-                try stack.appendSlice(self.gpa, self.types.sliceAliasArgs(alias));
-            },
-            .structure => |flat_type| switch (flat_type) {
-                .empty_record, .empty_tag_union => {},
-                .tuple => |tuple| try stack.appendSlice(self.gpa, self.types.sliceVars(tuple.elems)),
-                .nominal_type => |nominal| try stack.appendSlice(self.gpa, self.types.sliceNominalArgs(nominal)),
-                .fn_pure, .fn_effectful, .fn_unbound => |func| {
-                    try stack.appendSlice(self.gpa, self.types.sliceVars(func.args));
-                    try stack.append(self.gpa, func.ret);
-                },
-                .record => |record| {
-                    const fields = self.types.getRecordFieldsSlice(record.fields);
-                    for (fields.items(.presence)) |presence| try stack.append(self.gpa, presence.typeVar());
-                    try stack.append(self.gpa, record.ext);
-                },
-                .tag_union => |tag_union| {
-                    const tags = self.types.getTagsSlice(tag_union.tags);
-                    for (tags.items(.args)) |tag_args| try stack.appendSlice(self.gpa, self.types.sliceVars(tag_args));
-                    try stack.append(self.gpa, tag_union.ext);
-                },
-            },
-        }
-    }
-    return left_open;
 }
 
 /// Check if a type variable contains any error types anywhere in its structure.

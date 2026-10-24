@@ -2,8 +2,8 @@
 //!
 //! | View | Step | Rows it keeps |
 //! |---|---|---|
-//! | `graph` | V1 | recursive components, rows called from two or more places, and rows a closure names; a row called from one place is inlined there, and the count is taken again until it stops changing |
-//! | `inline` | V2 | recursive components; every call of a row that is not recursive is inlined, and a `Closure` of such a row is a `Lambda` region in place |
+//! | `graph` | V1 | recursive components, rows whose body can end in `Return` (see below), rows called from two or more places, and rows a closure names; a row called from one place is inlined there, and the count is taken again until it stops changing |
+//! | `inline` | V2 | recursive components, and rows whose body can end in `Return` (see below); every other call is inlined, and a `Closure` of a non-recursive row is a `Lambda` region in place |
 //!
 //! The driver runs V1 once every component is final, then simplifies the
 //! rows it changed and finalizes the site's rows again (plan 3.5), because
@@ -11,7 +11,8 @@
 //! arguments differed before simplification. V2 runs over the `graph` view
 //! the same way.
 //!
-//! A row whose body can end in `Return` is not inlined: inlining it would
+//! A row whose body can end in `Return`, in its own region or in any region
+//! nested in it but a lambda body, is not inlined: inlining it would
 //! turn each `Return` into a jump to the code after the call, which the
 //! rebuild does not build yet (plan 4.1, M3). Its closures still become
 //! lambdas, because a `Return` in a lambda body ends the lambda.
@@ -89,7 +90,9 @@ fn turnOf(gpa: Allocator, store: *const ir.Store, root: RowId, kind: Kind) Alloc
         const info = store.row(r);
         if (r == root or info.recursive) continue;
         const end = store.region(info.body).end;
-        const one_value = end.kind == .value and end.refs.len == 1;
+        // A `Return` nested in a loop or an arm would end the caller if
+        // the body were inlined, so such a row is not one value.
+        const one_value = end.kind == .value and end.refs.len == 1 and !returns.regionHolds(store, info.body);
         switch (kind) {
             .graph => if (calls[r.index()] == 1 and !named[r.index()] and one_value) try inlined.append(gpa, r),
             .inline_ => {

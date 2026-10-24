@@ -276,6 +276,35 @@ const staged_unannotated_literal = stage ++
     \\main = "${Stage.describe(triple)} | ${Stage.describe(small)}"
 ;
 
+// A lambda written at the site is described rather than lowered, and the
+// calls it makes still read what each use fixed its callee to: the literal of
+// `helper`, the element type of `bump`, and the local `g` its block
+// generalized all take `U64` from the call.
+const staged_inline_unannotated_calls = stage ++
+    \\helper = |x| x + 1
+    \\bump = |xs| xs.map(|x| x + 1)
+    \\local = Stage.describe(|s| {
+    \\    g = |y| y + 1
+    \\    g(g(Str.count_utf8_bytes(s)))
+    \\})
+    \\main = "${Stage.describe(|s| helper(Str.count_utf8_bytes(s)))} | ${Stage.describe(|s| bump([Str.count_utf8_bytes(s)]))} | ${local}"
+;
+
+// An unannotated helper that calls another hands it what its own caller
+// discharged its `where` obligations with: `outer2` forwards `inc`'s `plus`
+// to its own, which the site discharges at `U64`, and `outer` forwards
+// `inner`'s `times` the same way. `top` forwards through two helpers.
+const staged_generic_calls_generic = stage ++
+    \\inc = |x| x + 1
+    \\outer2 = |x| inc(x)
+    \\top = |x| outer2(x)
+    \\inner = |xs| xs.map(|x| x * 2)
+    \\outer = |xs| inner(xs)
+    \\outermost = |xs| outer(xs)
+    \\named = |s| outer([Str.count_utf8_bytes(s)])
+    \\main = "${Stage.describe(|s| outer2(Str.count_utf8_bytes(s)))} | ${Stage.describe(|s| outer([Str.count_utf8_bytes(s)]))} | ${Stage.describe(named)} | ${Stage.describe(|s| top(Str.count_utf8_bytes(s)))} | ${Stage.describe(|s| outermost([Str.count_utf8_bytes(s)]))}"
+;
+
 // A function parameter the call fixed stays that definition inside a lambda
 // that captures it, so the lambda a builtin receives names it.
 const staged_bound_capture = stage ++
@@ -918,6 +947,24 @@ const staged_recursive_call = stage ++
     \\main = Stage.describe(countdown)
 ;
 
+// `find` is called from one place, which the graph view inlines, except that
+// its loop can end the row in `Return`: inlined, that `Return` would end
+// `twice` and skip the `* 2`. So `find` stays a row and `twice` calls it.
+const staged_loop_return_call = stage ++
+    \\find : List(U8), U8 -> U8
+    \\find = |xs, a| {
+    \\    for x in xs {
+    \\        if x == a {
+    \\            return x
+    \\        }
+    \\    }
+    \\    a + 1
+    \\}
+    \\twice : List(U8), U8 -> U8
+    \\twice = |xs, a| find(xs, a) * 2
+    \\main = Stage.describe(twice)
+;
+
 // A derived `==` over a tag union is a `Switch` on the left operand, with a
 // `Switch` on the right one in each arm: the arm that matches compares the
 // payloads, and every other arm is `False`.
@@ -1431,6 +1478,18 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"r0 = |Dec| -> Dec Num.Dec.times(p0, 3.0) | r0 = |U8| -> U8 Num.U8.times(p0, 3)\"" },
     },
     .{
+        .name = "staging - a lambda written at the site calls unannotated helpers at the types it fixes",
+        .source_kind = .module,
+        .source = staged_inline_unannotated_calls,
+        .expected = .{ .inspect_str = "\"r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) List.map([Str.count_utf8_bytes(p0)], closure r1()) ; r1 = |U64| -> U64 Num.U64.plus(p0, 1) | r0 = |Str| -> U64 r1(r1(Str.count_utf8_bytes(p0))) ; r1 = |U64| -> U64 Num.U64.plus(p0, 1)\"" },
+    },
+    .{
+        .name = "staging - an unannotated helper calls another at the evidence its caller supplied",
+        .source_kind = .module,
+        .source = staged_generic_calls_generic,
+        .expected = .{ .inspect_str = "\"r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) List.map([Str.count_utf8_bytes(p0)], closure r1()) ; r1 = |U64| -> U64 Num.U64.times(p0, 2) | r0 = |Str| -> List(U64) List.map([Str.count_utf8_bytes(p0)], closure r1()) ; r1 = |U64| -> U64 Num.U64.times(p0, 2) | r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) List.map([Str.count_utf8_bytes(p0)], closure r1()) ; r1 = |U64| -> U64 Num.U64.times(p0, 2)\"" },
+    },
+    .{
         .name = "staging - a lambda that captures a fixed function parameter names its definition",
         .source_kind = .module,
         .source = staged_bound_capture,
@@ -1591,6 +1650,12 @@ pub const tests = [_]TestCase{
         .source_kind = .module,
         .source = staged_plain_call,
         .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n0 = r1(p0); Num.F32.plus(n0, r1(n0)) } ; r1 = |F32| -> F32 Num.F32.plus(p0, 1)\"" },
+    },
+    .{
+        .name = "staging - a callee whose loop can return stays a row, not inlined",
+        .source_kind = .module,
+        .source = staged_loop_return_call,
+        .expected = .{ .inspect_str = "\"r0 = |List(U8), U8| -> U8 Num.U8.times(r1(p1, p0), 2) ; r1 = |U8, List(U8)| -> U8 { n4 = for_list(p1, switch Num.U8.is_eq(s4.1, p0) { False => continue() | True => return s4.1 }); Num.U8.plus(p0, 1) }\"" },
     },
     .{
         .name = "staging - a recursive call describes, because the callee is named rather than inlined",

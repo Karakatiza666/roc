@@ -13000,27 +13000,6 @@ and outside a loop; errors for a discarded value of another type on a `var`
 (`$items.len()`), the same call on an immutable binding, and an operator on a
 `var` (`$count + n`).
 
-### Numeric Default At A Described Site
-
-A function named or written where a `Code(f)` is expected is described from the
-solved types that checking leaves, before any specialization. A flex receiver
-that `f` reaches, that carries arithmetic constraints and no literal, and that
-no edge can pin, is a variable the default rule settles to `Dec` (see "The
-default rule"). A compiled function meets that rule when Monotype seals the
-variable. A described one has no specialization, so checking applies the rule
-itself: `defaultPendingStagedReceivers` commits `Dec` to each such receiver when
-the binding holding the site generalizes, after that boundary's literal
-defaulting, or at the end of checking for a site no binding generalizes. The
-commit is a committed probe that every constraint of the receiver must accept
-(`tryCommitNumeralCandidate`). A receiver the binding's interface reaches is
-left open, because a caller can still fix it, and a receiver no candidate
-satisfies is left open too. A template's result lambda is described at each
-call, so its site takes no default. Accepted: `|x| x * 2` and `|x, y| x + y`
-describe at `Dec`. Rejected: `same = |x| x` has no default and stays
-polymorphic. The accepted side is pinned by
-src/eval/test/eval_staging_tests.zig ("an arithmetic parameter no literal pins
-describes at Dec"), the rejected side by test/cli/StagedOpenTypeVariable.roc.
-
 ### Rewrite Inventory
 
 - `finishAliasDeclarationParameters`—mechanism: completes an in-progress
@@ -13239,10 +13218,6 @@ Other solved-graph mutations:
 - `constrainInterpolationPartToStr`—policy: Builtin Str Interpolation Part
   Compatibility (above). One commit-probe unifies the part with `Str` and
   validates every attached dispatch constraint; only full success is committed.
-- `defaultPendingStagedReceivers`—policy: Numeric Default At A Described
-  Site (above). The mutation is a committed probe of ordinary unification
-  against `Dec`, accepted only when every constraint of the receiver accepts
-  it.
 - Literal defaulting (`commitLiteralDefault`, `commitLiteralGroupDefault`)
 —policy: literal defaulting as declared in Static Dispatch At The
   Checked Boundary (the `LITERAL DEFAULTED` warning) and the numeric
@@ -23569,6 +23544,26 @@ Invariants:
   consumes solved types and dispatch plans and never infers a missing one. A
   construct with no normal form stops the walk with a named reason, and no
   partial description exists.
+- A description is a specialization read without lowering, so the walk reads
+  types by Monotype's rules and checking commits nothing for it. A variable a
+  substitution fixes is read through it. A dispatch edge whose target
+  publication selected (`derived_from_callable`) relates a monomorphic
+  target's type to the edge's callable, which fixes the callable's other
+  variables (`y` in `|x, y| x + y`). A variable still open after that seals
+  to its published `numeric_default_phase` by
+  `literal_defaulting.defaultTargetForPhase` (`x` in `|x| x * 2` is `Dec`). A
+  variable with no default (`same = |x| x`), or a dispatcher whose selected
+  target does not fit its callable (`x` in `|x| x * 2.U8`), is refused. See
+  `relateSelectedTargets` and `defaultedVariable` in
+  `src/check/code_reifier.zig`.
+- A lambda written at a `Code` position is described rather than lowered, so
+  no template body holds it. The template ref seal collects its parameters
+  and body on their own (`collectStagedLambda`, the `staged_*` spans of
+  `TemplateIteratorRefs`), and the evidence pass publishes the use-site
+  evidence and substitution of every call inside it with no enclosing
+  template params, as it does for a named function's body. The walk reads
+  what each call fixed an unannotated callee to from that entry
+  (`siteSubstitution`, `siteEvidence`), never from the lambda's types.
 - The normal-form version, `normal_form_version` in `src/reify/mod.zig`,
   changes exactly when the rules, the builtin table or the speculatable lists
   change. A fingerprint test pins it. `Code.version` carries it, so a

@@ -68,6 +68,8 @@ A function parameter that a call fixes is not refused. In `apply_all = |xs, f| x
 
 Numbers default as they do in a compiled function. `Calc.to_expr(|x| x * 2)` and `Calc.to_expr(|x| x > 0)` describe at `Dec`. An unannotated helper describes at the type that each use gives it: `triple = |x| x * 3` is `Dec` at a free site, and `U8` when a `U8 -> U8` function calls it.
 
+A default has to fit how the number is used. In `|x| x * 2.U8`, `x` would default to `Dec`, but there's no `Dec` multiplication that takes a `U8`, so the lambda is refused rather than described at a type the program never had. Name and annotate it, `double : U8 -> U8`, and it describes at `U8`.
+
 A function whose types are still not fixed is refused as polymorphic, for example `|x| x`. Give the function a type annotation. A lambda parameter has no annotation syntax, so name the function and annotate it:
 
 ```roc
@@ -84,7 +86,7 @@ A description is a graph of functions, called _rows_. The translator says which 
 | View | Parameter | Read with | A call of a helper in the same package |
 | --- | --- | --- | --- |
 | `graph` | `Code(f)` | `code.graph()` | A helper called from one place is inlined there. A helper called from two or more places is a row of its own, and each call is a `Call` node. |
-| `inline` | `Code.Inlined(f)` | `code.inline()` | Inlined at every call, however many there are. Only a function that calls itself stays a row. |
+| `inline` | `Code.Inlined(f)` | `code.inline()` | Inlined at every call, however many there are. A function that calls itself stays a row. A helper with an early `return` that the compiler cannot fold into a branch also stays a row, and each call is a `Call` node. |
 | `to_tree` | either | `graph.to_tree(row.id)` | Not a view of the graph. It turns one row into nested expressions. |
 
 For a helper `helper` that `twice = |x| helper(x) + helper(x + 1)` calls two times:

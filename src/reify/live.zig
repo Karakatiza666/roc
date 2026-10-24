@@ -142,7 +142,8 @@ pub const Returns = struct {
         return store.nodes.items(.op)[n.index()].isLoop() and self.holds(store, n);
     }
 
-    fn regionHolds(self: *Returns, store: *const ir.Store, r: RegionId) bool {
+    /// Whether region `r` ends in `Return`, or holds a node that can.
+    pub fn regionHolds(self: *Returns, store: *const ir.Store, r: RegionId) bool {
         if (store.region(r).end.kind == .return_) return true;
         for (self.members[r.index()]) |m| if (self.holds(store, m)) return true;
         return false;

@@ -23672,10 +23672,9 @@ Builtin :: [].{
 			## A variant written without payloads carries an empty list, and an
 			## empty tag union is an empty list of variants.
 			##
-			## Variants arrive in the order the compiler holds them: a union a
-			## nominal declares keeps its written order, and one the solver
-			## built is in name order. A translator that needs a fixed order
-			## sorts them itself.
+			## Variants arrive in name order, for a union a nominal declares and
+			## for one the solver built. The written order of a nominal's
+			## variants is not kept.
 			TagUnion(List({ name : Str, payloads : List(Ty) })),
 
 			## A type this IR has no shape for, named the way the compiler names
