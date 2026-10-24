@@ -6860,7 +6860,7 @@ const Builder = struct {
         expr_id: checked.CheckedExprId,
         maybe_node: ?checked.ConstNodeId,
     ) Allocator.Error!void {
-        const node = maybe_node orelse return;
+        const node = maybe_node orelse unreachable; // the description walk wrote every staged site
         const store = view.const_store orelse
             boxyPlanInvariant("staged code module had no ConstStore");
         if (store.get(node) == .crash) return;
@@ -23904,6 +23904,7 @@ test "boxy planner walks callable eval finalized const function bodies" {
     const pattern_binders = [_]checked.CheckedPatternBinder{.{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     }};
     var const_store = check.ConstStore.ConstStore.init(gpa);

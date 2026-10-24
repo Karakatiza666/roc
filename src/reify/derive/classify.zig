@@ -226,7 +226,7 @@ const RowWriter = struct {
             // `Wrap` and `Unwrap` have no payload, so the table's op pattern states them.
             .wrap, .unwrap => return self.print(".{{ .op = .{{ .op = .{s}, .args = &.{{{s}}} }} }}", .{ @tagName(x.sym.op), try self.pat(x.args[0]) }),
             .tag, .payload, .record, .field, .tuple, .index => return self.fail("a pattern over a record, tuple or tag union"),
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         }
     }
 
@@ -303,7 +303,7 @@ const RowWriter = struct {
                 return self.print(".{{ .{s} = {s} }}", .{ @tagName(x.sym.op), try self.list(elems.items) });
             },
             .tag, .payload, .record, .field, .tuple, .index, .wrap, .unwrap => return self.fail("a result over a record, tuple, tag union or nominal"),
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         }
     }
 
@@ -348,7 +348,7 @@ const RowWriter = struct {
             .field => .record,
             .index => .tuple,
             .payload => .tag,
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // the root was matched as field, index or payload by the caller
         };
         if (c.sym.op != want) return self.fail("a projection of another construction");
         if (root.sym.op == .payload and c.sym.index != root.sym.index) return self.fail("a payload of another member");
@@ -409,7 +409,7 @@ const RowWriter = struct {
             .field, .index, .payload => try w.print("        .root = .{s},\n        .args = &.{{{s}}},\n", .{ @tagName(lhs.sym.op), try self.component(lhs) }),
             .wrap, .unwrap => try w.print("        .root = .{s},\n        .args = &.{{{s}}},\n", .{ @tagName(lhs.sym.op), try self.pat(lhs.args[0]) }),
             .lit, .tag, .record, .tuple => return self.fail("a left side rooted at a literal, record, tuple or tag union"),
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         }
         const result_owner: ?[]const u8 = if (lhs.sym.op == .prim and resultIsOwner(lhs.sym.method.?)) try self.owner(lhs.sym) else null;
         const result = try self.tmpl(self.eq.rhs, result_owner);

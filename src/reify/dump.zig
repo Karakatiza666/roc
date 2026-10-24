@@ -216,7 +216,7 @@ const View = struct {
                 .operand => try w.writeAll("operand"),
                 .loop_body => try w.writeAll("body"),
                 .lambda_body => try w.writeAll("lambda"),
-                .row_body => unreachable,
+                .row_body => unreachable, // row_body regions are dumped by the row, not as a node's region
             }
             const params = store.tySlice(reg.params);
             if (params.len > 0) {

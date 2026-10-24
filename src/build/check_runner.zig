@@ -226,7 +226,7 @@ const CheckTypeCheckerPatternsStep = struct {
         // code_reifier.zig tells a function of another package (N8h) by the
         // package name the coordinator records in each module. Ident indices
         // are module-local, so the two modules' names are compared as text.
-        .{ .file = "code_reifier.zig", .start = 6492, .end = 6492 },
+        .{ .file = "code_reifier.zig", .start = 6478, .end = 6478 },
         // report.zig compares already-formatted diagnostic text only to avoid
         // printing two visually identical types. This is presentation logic,
         // not a type-checking or identifier comparison.

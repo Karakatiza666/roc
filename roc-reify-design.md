@@ -1,5 +1,7 @@
 # Code reification: the pure-function surface a description covers
 
+For a short introduction to the feature, read `docs/reifying-overview.md`.
+
 A translator is a compiler written in ordinary Roc that runs during `roc build`.
 It receives a `Code(f)`: a reified, typed, closed, monomorphic description of a
 pure Roc function. The description is a `Code.Graph` of `Code.Row` values. Each
@@ -39,11 +41,15 @@ Legend
 
 | View | Type | What stays a row |
 | --- | --- | --- |
-| `graph` | `Code(f)`, read with `Code.graph` | A recursive row, a row called from two or more places, and a row a `Closure` names. |
-| `inline` | `Code.Inlined(f)`, read with `Code.Inlined.inline` | A recursive row, and a row whose body still ends in `Return` after simplification (an early `return` that does not fold into a branch). Every other row is inlined, and a `Closure` of any non-recursive row is a `Lambda` region. |
+| `graph` | `Code(f)`, read with `Code.graph` | A recursive row, a row called from two or more places, a row a `Closure` names, and a row that holds a `Return` in a loop or in a switch arm. |
+| `inline` | `Code.Inlined(f)`, read with `Code.Inlined.inline` | A recursive row, and a row that holds a `Return` in a loop or in a switch arm. Every other row is inlined, and a `Closure` of any non-recursive row is a `Lambda` region. |
 
-The `graph` view inlines a helper called from one place. The rules are in
-`src/reify/views.zig:1`. The normal-form version is 3
+The `graph` view inlines a helper called from one place, unless the helper
+holds a `Return` in a loop or in a switch arm. The `inline` view keeps such a
+row too. Inlining it would make the caller return the value of the callee and
+skip the rest of its own body. A `Return` in a lambda body ends the lambda, so
+it does not count, and a `Return` in tail position folds to a value (rule T6
+of `roc-reify-normal-form.md`). The rules are in `src/reify/views.zig:1`. The normal-form version is 3
 (`src/reify/mod.zig:33`). `Code.version` returns it.
 
 ---
@@ -295,9 +301,9 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       export row (`src/check/code_reifier.zig` (`reachedProcedure`)). An alias of a computed
       function, `f = make(2)`, has no forwarded lookup and stays refused as "a
       top-level constant that computes a function". Pinned by
-      `src/eval/test/eval_staging_tests.zig:1758` ("staging - a call through an
+      `src/eval/test/eval_staging_tests.zig:1823` ("staging - a call through an
       alias calls the row of the function it names") and
-      `src/compile/test/code_reifier_test.zig:531`.
+      `src/compile/test/code_reifier_test.zig:532`.
 - [x] A function chosen by an `if` between known functions, and then called:
       `(if c double else triple)(x)`. The call is first an `Apply` of the value,
       and simplifying turns each `Apply` whose function is a known closure into
@@ -307,7 +313,7 @@ The normal form also reorders a literal to the last place of an integer `plus`,
 - [ ] A function taken from a list and then called, `Ok(g) => g(x)` in a
       `match` on `[double].first()`. "a call to a function value that no
       simplification resolves" (`src/check/code_reifier.zig` (`normalize`), pinned by
-      `src/compile/test/code_reifier_test.zig:2304`): simplifying does not read a
+      `src/compile/test/code_reifier_test.zig:2305`): simplifying does not read a
       closure back out of a list, so the `Apply` stays.
 
 ## 5 Control flow
@@ -434,7 +440,7 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       them.
 - [x] A nullary tag as the value a reified function hands back. Pinned by the
       staging case "a reified function hands back a nullary tag"
-      (`src/eval/test/eval_staging_tests.zig:1674`). The empty aggregate is
+      (`src/eval/test/eval_staging_tests.zig:1739`). The empty aggregate is
       covered by the previous box.
 - [x] Record update, `{ ..r, b: 1 }`, expanded into the `Record` it stands
       for: the fields the update wrote, and every other field of the type read
@@ -444,7 +450,7 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       `Field` read of a field that may be absent is not that.
 - [ ] An unset record field (`b: _`). "a record literal that unsets an optional
       field" (`src/check/code_reifier.zig` (`recordExpr`)). Pinned by the staging case
-      `staged_unset_field` (`src/eval/test/eval_staging_tests.zig:1306`).
+      `staged_unset_field` (`src/eval/test/eval_staging_tests.zig:1355`).
 - [x] An optional record field (`timeout ?: U64`), as the `presence` a
       `Ty.Record` entry carries and `OptField(Str)` for the `.?timeout` that
       reads it (`src/check/code_reifier.zig` (`fieldAccessExpr`)). The read hands back the
@@ -479,7 +485,7 @@ and binds below.
 | Refused pattern | Reason |
 | --- | --- |
 | `{ a, ..others }` | "a record pattern whose `..` binds a name". It binds a record the pattern builds out of what is left rather than one it takes apart. |
-| A string interpolation pattern | "a string interpolation pattern" (`src/check/code_reifier.zig` (`patternFormName`), pinned by `src/compile/test/code_reifier_test.zig:1824`). A target that cannot split a string has nothing to read. |
+| A string interpolation pattern | "a string interpolation pattern" (`src/check/code_reifier.zig` (`patternFormName`), pinned by `src/compile/test/code_reifier_test.zig:1825`). A target that cannot split a string has nothing to read. |
 | A tag pattern on a type that is not a tag union | "a tag pattern on this type" |
 
 ## 8 Nominal and opaque types
@@ -602,12 +608,16 @@ and binds below.
       to fix the type of the value the parameter receives. Pinned by
       `test/cli/StagedOpenTypeVariable.roc` and
       `test/cli/StagedPolymorphicFunction.roc`.
-- [x] A row a sibling argument or a later clause fixes. A site's rows close
-      when the binding holding it generalizes (`groundPendingStagedRows`,
-      `src/check/Check.zig`), not when the site finishes, so
-      `join(orders, |c, o| ..)` takes its row from `orders`, and a second clause
-      reading the same parameter record adds the fields it reads. A row nothing
-      else fixes closes on exactly the fields the lambda reads.
+- [x] A row a sibling argument or a later clause fixes. Checking closes no row
+      at a `Code` site. An argument that comes before the lambda fixes the row
+      through ordinary unification, so `join(orders, |c, o| ..)` takes its row
+      from `orders`, and a second clause reading the same parameter record
+      adds the fields it reads. A row that is still open when the walk reads it
+      seals to the row default checking recorded on the variable, as Monotype
+      seals it (`tyOf`, `collectRecordFields` and
+      `CheckedTypePayload.variableSealsToRowDefault`). So a row nothing else
+      fixes holds exactly the fields the lambda reads, and an open tag row
+      seals to the empty union. Pinned by `test/cli/StagedSiblingRows.roc`.
 - [x] An open record, or a record extended by a variable. A row is a quantified
       variable, so a site fixes it the way it fixes any other. `matchRecord`
       binds the row to the record the site named
@@ -617,9 +627,9 @@ and binds below.
       `take_n : { n : U16, ..rest } -> U16` at `Code({ n : U16, m : U16 } -> U16)`
       describes its parameter as `{ n : U16, m : U16 }`, and the same
       definition at `Code({ n : U16 } -> U16)` describes it as `{ n : U16 }`,
-      in a row of its own. A site's own `f` closes its rows before the walk
-      reads them (`groundPendingStagedRows`), so the "open record" refusal
-      below is a guard that no `Code` position reaches. What the row binds to
+      in a row of its own. A row the substitution does not fix seals to its row
+      default, so the "open record" refusal below is a guard for a row that
+      carries no default. What the row binds to
       is the site's whole record
       rather than the fields the definition did not name, because the residual
       is no type the artifact holds; the two sets are the same once a field a
@@ -628,10 +638,12 @@ and binds below.
       is still refused as "an open record" (`src/check/code_reifier.zig` (`collectRecordFields`)):
       `Ty.Record` is a closed list of fields, so a record with no fixed set of
       them has no shape to write.
-- [ ] A tag union whose row is still open, so its extension is a variable the
-      checker did not close. "an open tag union"
-      (`src/check/code_reifier.zig` (`collectVariants`)): the union stands for many, and a
-      description is monomorphic.
+- [ ] A tag union whose row is still open, so its extension is a variable that
+      carries no closing mark: a rigid `..` or a variable that is constrained.
+      "an open tag union" (`src/check/code_reifier.zig` (`collectVariants`)):
+      the union stands for many, and a description is monomorphic. A flexible
+      row with a recorded row default seals to the empty union and is not
+      refused (`checkedRowVariableClosesTagRow`).
 
       What closed the open record above does not close this one, and the
       position is the difference. A record's row reaches the walk through a
@@ -858,6 +870,56 @@ auto-imported, so a user module may still be named `Ty` or `Node`.
       type declares them too, and so do `Code` and `Code.Inlined`
       (`src/build/roc/Builtin.roc:24197`, `:24171`).
 
+## 14 Code positions, unannotated helpers and reports
+
+- [x] A `Code` is a parameter of the outermost function of an annotation, or
+      what that function returns. A callback parameter, a record field and a
+      tuple item are refused with "code is not allowed here" at the `Code`
+      the user wrote (`rejectMisplacedStagedCode`, `src/check/Check.zig`).
+      Pinned by `test/cli/StagedNestedCallback.roc`.
+- [x] A `Code` behind a transparent alias, `MyCode : Code(I32 -> I32)`, is a
+      `Code` position. A parameter of type `MyCode` stages, and a record field
+      of type `MyCode` is refused (`stagedCode`, `src/check/Check.zig`). Pinned
+      by `test/cli/StagedAliasParam.roc` and `test/cli/StagedAliasPosition.roc`.
+- [x] A call is a template call only when the callee's own return type is a
+      `Code`. A generic function that takes a `Code` and hands it back is an
+      ordinary call (`claimOrRejectCodeCall`, `src/check/Check.zig`). Pinned by
+      `test/cli/StagedGenericPassThrough.roc`.
+- [x] A lambda written at a `Code` position calls an unannotated helper at the
+      types its call fixes. No compiled body holds the lambda, so the
+      checked module collects its value references and the evidence of every
+      call inside it as it does for the body of a named function
+      (`collectStagedLambda`, `src/check/checked_artifact.zig`). Pinned by the
+      staging case "a lambda written at the site calls unannotated helpers at
+      the types it fixes" and by `test/cli/StagedInlineUnannotatedCall.roc`.
+- [x] An unannotated helper calls another unannotated generic helper. An
+      evidence entry that forwards to the caller's own evidence is resolved
+      against the evidence the walk holds, the way Monotype resolves it through
+      its evidence chain (`supply`, `src/check/code_reifier.zig`). Pinned by the
+      staging case "an unannotated helper calls another at the evidence its
+      caller supplied".
+- [x] A binder keeps the name the author wrote. The canonicalizer stores the
+      identifier on the pattern, the checked module copies it to
+      `CheckedPatternBinder.name`, and the walk reads that field. It never
+      slices source text. A string pattern capture is the name inside `${ }`,
+      an `as` pattern is the name after `as`, and an associated item takes its
+      declared name. Pinned by `test/cli/StagedCaptureNames.roc`.
+- [x] A site that cannot be described becomes a `runtime_error` in the checked
+      body, whether or not the caller asked for compile-time problems. Only the
+      `staged_code` report depends on that request (`reifyStagedCode`,
+      `src/check/checked_artifact.zig`). So no later stage meets a site with no
+      description. A site whose `f` holds an error is retired earlier by
+      `poisonUndescribableStagedCode` (`src/check/Check.zig`), by the
+      definition or the top-level `expect` that owns the site. Pinned by
+      `test/cli/StagedPoisonedSite.roc` and
+      `test/cli/StagedTopLevelExpectPoison.roc`.
+- [x] A refusal by `Code.refuse_at` reports the calls that reached the node as
+      structured frames (`RefusalCall`, `src/check/problem/types.zig`). A call
+      in the reporting module keeps its region, so the report places it with
+      the same line mapping as every other region of that module. A call in
+      another module names the module, the line and the column
+      (`addRefusalCalls`, `src/check/report.zig`).
+
 ---
 
 ## What the remaining unticked boxes cost
@@ -899,15 +961,15 @@ Working on the reifier:
 
 | Task | What to know |
 | --- | --- |
-| run the GLSL example | `roc test --no-cache examples/reifying/glsl/main.roc`; the CLI suite runs the same command (`src/cli/test/parallel_cli_runner.zig:3033`) |
-| run the other examples | the CLI suite runs `hello`, `sql` and `dbsp` the same way (`src/cli/test/parallel_cli_runner.zig:3035` to `:3040`) |
-| a call into another module or a builtin | `code_reifier_test.zig` builds its walk with a `StagedLookup` (`src/compile/test/code_reifier_test.zig:142`); the paths that need more are pinned in `eval_staging_tests.zig` |
+| run the GLSL example | `roc test --no-cache examples/reifying/glsl/main.roc`; the CLI suite runs the same command (`src/cli/test/parallel_cli_runner.zig:3422`) |
+| run the other examples | the CLI suite runs `hello`, `sql` and `dbsp` the same way (`src/cli/test/parallel_cli_runner.zig:3424` to `:3429`) |
+| a call into another module or a builtin | `code_reifier_test.zig` builds its walk with a `StagedLookup` (`src/compile/test/code_reifier_test.zig:94`); the paths that need more are pinned in `eval_staging_tests.zig` |
 | a `Code` union gains a variant | the staging cases still pass with it unlisted; the GLSL example and `test/cli/StagedMatch.roc`, which match every variant, are what fail |
 | the rules of the normal form change | the version and the fingerprint table in `src/reify/mod.zig:33` to `:62` must move together, and an entry there is never edited |
-| a field added to `NodeStore` or `CommonEnv` | it moves the sizes pinned in `test/serialization_size_check.zig:41-42` and needs a `CACHE_VERSION` bump (`src/compile/cache_config.zig:316`) |
-| lines added to `Check.zig` and the other files `run-check-type-checker-patterns` scans | its excluded ranges are line numbers (`src/build/check_runner.zig:126`), so `minici` can fail at code the change never touched |
+| a field added to `NodeStore` or `CommonEnv` | it moves the sizes pinned in `test/serialization_size_check.zig:41-42` and needs a `CACHE_VERSION` bump (`src/compile/cache_config.zig:364`) |
+| lines added to `Check.zig` and the other files `run-check-type-checker-patterns` scans | its excluded ranges are line numbers (`src/build/check_runner.zig:195`), so `minici` can fail at code the change never touched |
 
-Line numbers in this file were last checked against the `reify` branch at
-`9d0514ae2a`. A line number into `src/check/code_reifier.zig`, `src/check/Check.zig`
+Line numbers into `src/build/roc/Builtin.roc`, the test files and the example
+files were last checked against the `reify` branch at `f3269bdd24`. A line number into `src/check/code_reifier.zig`, `src/check/Check.zig`
 or `src/check/report.zig` drifts with every edit, so find the function by its
 name when a number misses.

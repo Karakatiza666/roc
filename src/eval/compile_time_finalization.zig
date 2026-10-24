@@ -5589,7 +5589,7 @@ fn reportRefusal(
         _ = try store.appendProblem(.{ .translation_refused = .{
             .message = message_idx,
             .region = root_region,
-            .path = try store.putExtraString(""),
+            .path = try store.putRefusalCalls(&.{}),
             .unplaced = true,
         } });
         return;
@@ -5602,7 +5602,7 @@ fn reportRefusal(
         // that reached it.
         var region = if (place.foreign) root_region else place.region;
         var placed = !place.foreign;
-        var path: std.ArrayList(u8) = .empty;
+        var path: std.ArrayList(check.problem.RefusalCall) = .empty;
         defer path.deinit(store.gpa);
         for (links[1..]) |link| {
             const call = refusalPlace(module, imports, found, link);
@@ -5610,11 +5610,14 @@ fn reportRefusal(
                 region = call.region;
                 placed = true;
             }
-            if (path.items.len != 0) try path.append(store.gpa, '\n');
-            if (call.foreign)
-                try path.print(store.gpa, "{s} (in {s}, line {d}, column {d})", .{ call.text, call.module_name, call.line, call.column })
-            else
-                try path.print(store.gpa, "{s} (line {d}, column {d})", .{ call.text, call.line, call.column });
+            try path.append(store.gpa, .{
+                .text = try store.putExtraString(call.text),
+                .place = if (call.foreign) .{ .foreign = .{
+                    .module_name = try store.putExtraString(call.module_name),
+                    .line = call.line,
+                    .column = call.column,
+                } } else .{ .local = call.region },
+            });
         }
         _ = try store.appendProblem(.{ .translation_refused = .{
             .message = message_idx,
@@ -5624,7 +5627,7 @@ fn reportRefusal(
                 .line = place.line,
                 .column = place.column,
             } else null,
-            .path = try store.putExtraString(path.items),
+            .path = try store.putRefusalCalls(path.items),
         } });
     }
 }
@@ -5669,7 +5672,7 @@ fn refusalPlace(
     const env = if (local) module.moduleEnvConst() else for (imports) |view| {
         if (std.meta.eql(view.key, key)) break view.module_env;
     } else finalizationInvariant("a reification source names a module that finalization does not see");
-    const info = env.calcAuthoredRegionInfo(region);
+    const info = env.calcRegionInfo(region);
     const root_env = module.moduleEnvConst();
     // The bare name, unless it is the root module's own bare name. The name is
     // resolved in the root's interner before the identities are compared.

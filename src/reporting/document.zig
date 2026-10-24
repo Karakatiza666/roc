@@ -449,7 +449,13 @@ pub const Document = struct {
     /// Add a code block with proper formatting.
     pub fn addCodeBlock(self: *Document, code: []const u8) std.mem.Allocator.Error!void {
         try self.startAnnotation(.code_block);
+        try self.addCodeLines(code);
+        try self.endAnnotation();
+    }
 
+    /// Add code inside an open `.code_block` annotation, one indented line per
+    /// line of `code`, so a block can hold more than plain text.
+    pub fn addCodeLines(self: *Document, code: []const u8) std.mem.Allocator.Error!void {
         // Split code into lines and add each with proper indentation
         var lines = std.mem.splitScalar(u8, code, '\n');
         var first = true;
@@ -464,8 +470,6 @@ pub const Document = struct {
                 try self.addText(line);
             }
         }
-
-        try self.endAnnotation();
     }
 
     /// Add an inline code element.

@@ -21016,9 +21016,7 @@ const ProcBodyBuilder = struct {
         maybe_node: ?checked.ConstNodeId,
         next: LIR.CFStmtId,
     ) Allocator.Error!ExprStep {
-        // The walk refused the body and reported it before lowering; reaching
-        // a backend at all means that report was not fatal.
-        const node = maybe_node orelse return exprDone(try self.parent.result.store.addCFStmt(.runtime_error, self.origin));
+        const node = maybe_node orelse unreachable; // the description walk wrote every staged site
         return .{ .tail = .{ .const_node = .{
             .target = target,
             .store_module = self.module,
@@ -45785,6 +45783,7 @@ test "boxy lowerer emits direct calls to planned private workers" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.append(gpa, .some(@fromBackingInt(@intCast(fixtureTableIndex(0)))));
@@ -47495,6 +47494,7 @@ test "boxy lowerer binds checked tag payload match patterns before branch bodies
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(1)),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
@@ -47671,6 +47671,7 @@ test "boxy lowerer emits checked list match patterns as a length switch and elem
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(2)),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
@@ -47851,6 +47852,7 @@ test "boxy lowerer emits checked string interpolation match patterns" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(1)),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
@@ -48009,8 +48011,8 @@ test "boxy lowerer maps checked alternative binders onto representative match lo
     });
 
     try checked_module.checked_bodies.pattern_binders.appendSlice(gpa, &.{
-        .{ .id = @fromBackingInt(@intCast(fixtureTableIndex(0))), .pattern = @fromBackingInt(@intCast(1)), .reassignable = false },
-        .{ .id = @fromBackingInt(@intCast(1)), .pattern = @fromBackingInt(@intCast(3)), .reassignable = false },
+        .{ .id = @fromBackingInt(@intCast(fixtureTableIndex(0))), .pattern = @fromBackingInt(@intCast(1)), .name = null, .reassignable = false },
+        .{ .id = @fromBackingInt(@intCast(1)), .pattern = @fromBackingInt(@intCast(3)), .name = null, .reassignable = false },
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
         .none,
@@ -49986,6 +49988,7 @@ test "boxy lowerer emits block declaration bindings with checked type layouts" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.append(gpa, .some(@fromBackingInt(@intCast(fixtureTableIndex(0)))));
@@ -50102,6 +50105,7 @@ test "boxy lowerer emits uninitialized mutable block bindings" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = true,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.append(gpa, .some(@fromBackingInt(@intCast(fixtureTableIndex(0)))));
@@ -50207,6 +50211,7 @@ test "boxy lowerer emits mutable reassignment as set_local replace" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = true,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.append(gpa, .some(@fromBackingInt(@intCast(fixtureTableIndex(0)))));
@@ -50359,11 +50364,13 @@ test "boxy lowerer destructures tuple declaration patterns" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(1)),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(1)),
         .pattern = @fromBackingInt(@intCast(2)),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
@@ -50542,6 +50549,7 @@ test "boxy lowerer materializes record rest declaration patterns" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
@@ -50727,6 +50735,7 @@ test "boxy lowerer binds irrefutable list rest declaration patterns" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
@@ -51657,6 +51666,7 @@ test "boxy lowerer emits nominal boundary before backing record pattern binding"
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
@@ -52533,11 +52543,13 @@ test "boxy lowerer stores dynamic list elements with boxy storage layout" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(1)),
         .pattern = @fromBackingInt(@intCast(1)),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(gpa, &.{
@@ -53110,6 +53122,7 @@ test "boxy lowerer reuses dynamic boxes for Box(a)" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.append(gpa, .some(@fromBackingInt(@intCast(fixtureTableIndex(0)))));
@@ -53643,6 +53656,7 @@ test "boxy lowerer publishes host wrapper proc for exported roots" {
     try checked_module.checked_bodies.pattern_binders.append(gpa, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.append(gpa, .some(@fromBackingInt(@intCast(fixtureTableIndex(0)))));
@@ -53955,11 +53969,13 @@ fn lowerListMapCanReuseFixture(
     try checked_module.checked_bodies.pattern_binders.append(allocator, .{
         .id = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         .pattern = @fromBackingInt(@intCast(fixtureTableIndex(0))),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binders.append(allocator, .{
         .id = @fromBackingInt(@intCast(1)),
         .pattern = @fromBackingInt(@intCast(1)),
+        .name = null,
         .reassignable = false,
     });
     try checked_module.checked_bodies.pattern_binder_by_pattern.appendSlice(allocator, &.{

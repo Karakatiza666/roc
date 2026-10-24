@@ -479,13 +479,28 @@ pub const TranslationRefused = struct {
     region: base.Region,
     /// The source, when it is in another module.
     origin: ?ComptimeOrigin = null,
-    /// The calls the source was inlined through, innermost first, one per
-    /// line. Empty when the source is in the translated function itself.
-    path: ExtraStringIdx,
+    /// The calls the source was inlined through, innermost first. Empty when
+    /// the source is in the translated function itself.
+    path: RefusalCallsRange,
     /// The translator named a node that its graph does not have, so no
     /// source holds it.
     unplaced: bool = false,
 };
+
+/// One call a refused source was inlined through: the call's text and where
+/// it is. A call in the reporting module keeps its region, so the report
+/// places it the way it places every other region of that module; a call in
+/// another module names that module and its line and column.
+pub const RefusalCall = struct {
+    text: ExtraStringIdx,
+    place: union(enum) {
+        local: base.Region,
+        foreign: ComptimeOrigin,
+    },
+};
+
+/// A range of `RefusalCall`s in the store's `refusal_calls_backing`.
+pub const RefusalCallsRange = struct { start: usize, count: usize };
 
 /// An error that occurred during compile-time evaluation
 pub const ComptimeEvalError = struct {

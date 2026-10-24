@@ -6,6 +6,8 @@ The description has the type `Code(f)`, where `f` is the type of the function it
 
 This page is for two readers. If you use a translator, read [How a Function Becomes a Code](#how-a-function-becomes-a-code) and [Refusals](#refusals). If you write a translator, read all of it. Start with the [hello example](https://github.com/roc-lang/roc/blob/main/examples/reifying/hello/README.md). It is a translator of about 60 lines.
 
+For a short overview of the feature, with the examples and its limits, read [the overview](../reifying-overview.md).
+
 The rationale and the design alternatives are in [roc-reify-proposal.md](https://github.com/roc-lang/roc/blob/main/roc-reify-proposal.md).
 
 ## What a Code Is
@@ -18,7 +20,7 @@ A `Code(f)` is a value that holds one function's description. These facts hold f
 | It is pure | `Code(a => b)` is a type error. An effectful function cannot be reified, because an effect has nowhere to happen while the compiler runs. |
 | It is closed | The description has no scope. Everything the function reads from outside is written into the description. |
 | It is inert | There is no way to call a `Code`. It is data. |
-| It exists only while the compiler runs | You cannot build one by hand, and you cannot annotate a value with `Code`. A `Code` is a function parameter, or the return type of a [template](#templates). |
+| It exists only while the compiler runs | You cannot build one by hand, and you cannot annotate a value with `Code`. A `Code` is a parameter of a function, or the return type of a [template](#templates). Only the outermost function of an annotation takes one. A type alias of a `Code`, such as `MyCode : Code(I32 -> I32)`, is a `Code` and follows the same rule. A callback that takes a `Code`, or a record field of a function type that does, is an error, and so is a `Code` behind a type alias used anywhere else. |
 | It has equality | Two `Code` values are equal when their descriptions are equal, wherever each came from. `Code.version` says which version of the rules built it. |
 
 ```roc
@@ -49,8 +51,8 @@ These forms can stand where a `Code` is expected:
 | Form | Example |
 | --- | --- |
 | A top-level function of this module or of an imported module | `Calc.to_expr(area)` |
-| A method declared on a type | `Calc.to_expr(Meters.twice)` |
-| A function bound in a block | `add` in the block of `in_block` in the hello example |
+| A method declared on a type | `Calc.to_expr(Meters.twice)`, with `twice` declared in the body of `Meters` |
+| A function bound in a block | A `double` that the block around the call defines. See [`test/cli/StagedCodeLetBound.roc`](https://github.com/roc-lang/roc/blob/main/test/cli/StagedCodeLetBound.roc). |
 | A lambda written at the place, when the call around it fixes its types | Every clause in the SQL example |
 | A function chosen by an `if` between known functions | `g = if up inc else dbl`. The call becomes a `Switch`. |
 
@@ -66,7 +68,9 @@ These forms are refused. Most of them are a function that is only known when the
 
 A function parameter that a call fixes is not refused. In `apply_all = |xs, f| xs.map(|x| f(x))`, the call `apply_all(xs, |x| x * 3)` fixes `f`, so the description names that lambda inside the lambda that `List.map` receives. `xs.map(f)` also describes.
 
-Numbers default as they do in a compiled function. `Calc.to_expr(|x| x * 2)` and `Calc.to_expr(|x| x > 0)` describe at `Dec`. An unannotated helper describes at the type that each use gives it: `triple = |x| x * 3` is `Dec` at a free site, and `U8` when a `U8 -> U8` function calls it.
+Numbers default as they do in a compiled function. `Calc.to_expr(|x| x * 2)` and `Calc.to_expr(|x| x > 0)` describe at `Dec`. An unannotated helper describes at the type that each use gives it: `triple = |x| x * 3` is `Dec` at a free site, and `U8` when a `U8 -> U8` function calls it. This holds for a helper that a lambda written at the site calls, and for a helper that another unannotated helper calls.
+
+An open record row or an open tag row seals the way a compiled function seals it. In `|r| r.id > 0`, `r` is `{ id : Dec }`.
 
 A default has to fit how the number is used. In `|x| x * 2.U8`, `x` would default to `Dec`, but there's no `Dec` multiplication that takes a `U8`, so the lambda is refused rather than described at a type the program never had. Name and annotate it, `double : U8 -> U8`, and it describes at `U8`.
 
@@ -85,8 +89,8 @@ A description is a graph of functions, called _rows_. The translator says which 
 
 | View | Parameter | Read with | A call of a helper in the same package |
 | --- | --- | --- | --- |
-| `graph` | `Code(f)` | `code.graph()` | A helper called from one place is inlined there. A helper called from two or more places is a row of its own, and each call is a `Call` node. |
-| `inline` | `Code.Inlined(f)` | `code.inline()` | Inlined at every call, however many there are. A function that calls itself stays a row. A helper with an early `return` that the compiler cannot fold into a branch also stays a row, and each call is a `Call` node. |
+| `graph` | `Code(f)` | `code.graph()` | A helper called from one place is inlined there. A helper called from two or more places is a row of its own, and each call is a `Call` node. A helper that holds a `return` inside a loop or inside an arm is a row of its own too. |
+| `inline` | `Code.Inlined(f)` | `code.inline()` | Inlined at every call, however many there are. A function that calls itself stays a row. A helper that holds a `return` inside a loop or inside a `match` or `if` arm also stays a row, and each call is a `Call` node. |
 | `to_tree` | either | `graph.to_tree(row.id)` | Not a view of the graph. It turns one row into nested expressions. |
 
 For a helper `helper` that `twice = |x| helper(x) + helper(x + 1)` calls two times:
@@ -191,7 +195,7 @@ A translator can refuse a function it has no form for. There are two ways.
 | | Return an `Err` | `Code.refuse_at` |
 | --- | --- | --- |
 | Written as | `Err(Unsupported(reason))` | `code.refuse_at({ row: row.id, node: index }, reason)` |
-| What the user sees | Whatever the caller does with the `Err` | A `translation refused` report. It is at every source line the node came from, with the calls that reached it. |
+| What the user sees | Whatever the caller does with the `Err` | A `translation refused` report. It is at every source line the node came from, with the calls that reached it. Each call shows its line and column, and a call in another module names the module. |
 | Source line | None. The description has no source regions. | Yes. The compiler keeps a table from each node to its source, and `refuse_at` is the one reader. |
 | Test with `expect` | Yes | No. The compile stops. |
 | When the translator runs at program run time | The same | Crashes with the message. There is no report. |
@@ -222,10 +226,12 @@ A function describes when everything it names is fixed by the time checking ends
 | Excluded | Why | Report |
 | --- | --- | --- |
 | A function value that nothing fixes: a parameter, or an item of a list | There is no body to read. | `cannot reify this function`, `cannot reify this expression` |
-| A type that nothing settles: a type variable, or an open row | The body reads differently at each type, so there is no one body. | `cannot reify a polymorphic function` |
+| A type that nothing settles: a type variable with no default | The body reads differently at each type, so there is no one body. | `cannot reify a polymorphic function` |
 | A `Code` that is not fixed at build time: a template argument computed when the program runs | A description is built before the program runs. | `template needs a constant` |
 
 Effects and captured run-time values are refused for the same reason. A function can read a top-level value, a value the block around the site binds, and any named function. Each is written into the description. Everything else in pure Roc describes: recursion, generic functions at the types the program settles, `where` functions, loops, `?`, early `return`, `var`, `crash`, and opaque types.
+
+A function that is refused gives one report. The place where it stands then holds a compile error, so no later step reports it again.
 
 This is a rule and not a list of supported syntax. If you know the rule, you can predict every refusal. When Roc gains a construct, the construct describes if it names fixed things.
 
@@ -237,7 +243,7 @@ Some limits exist today and are not part of the rule:
 | --- | --- |
 | A function of another package is a `Prim` and its body is not read | A translator cannot read a helper library. It maps it by name. |
 | A lambda parameter has no annotation syntax | A lambda whose types neither the site nor the numeric default fixes needs a named, annotated function. `\|x\| x * 2` describes at `Dec`. For `U8`, write `double : U8 -> U8`. |
-| A tag union that the checker left open, a record update over a record with an optional field, a `.?` path, and a record pattern that binds its rest | Refused by name. |
+| A tag union whose row has no default to seal it, a record update over a record with an optional field, a `.?` path, and a record pattern that binds its rest | Refused by name. |
 
 ## Templates
 
@@ -250,6 +256,8 @@ add_k = |k| |x| x + k
 Calc.to_expr(add_k(5))   # Ok("(p0 + 5)")
 Calc.to_expr(add_k(7))   # Ok("(p0 + 7)")
 ```
+
+A function that only passes a `Code` on is not a template. If `pick : Bool, a, a -> a` returns one of two `Code` values it receives, a call of `pick` is an ordinary call.
 
 One template gives as many descriptions as it has calls. The `5` is a literal in the description by the time the translator reads it.
 

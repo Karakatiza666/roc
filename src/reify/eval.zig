@@ -137,7 +137,7 @@ pub const Evaluator = struct {
             .value => |vs| vs[0],
             .ret => |v| v,
             .bottom => .bottom,
-            .jump, .cont, .brk => unreachable,
+            .jump, .cont, .brk => unreachable, // a row body ends in a value, ret or bottom; jumps and loop ends are consumed by their own region
         };
     }
 
@@ -199,7 +199,7 @@ pub const Evaluator = struct {
             .most_defined => {},
         }
         return switch (end.kind) {
-            .open => unreachable,
+            .open => unreachable, // evalRegion runs on closed regions only (verify rejects open ends)
             .value => .{ .value = try self.evalRefs(frame, end.refs) },
             .jump => .{ .jump = .{ .join = RegionId.of(end.target), .args = try self.evalRefs(frame, end.refs) } },
             .return_ => .{ .ret = (try self.evalRefs(frame, end.refs))[0] },
@@ -238,7 +238,7 @@ pub const Evaluator = struct {
                 }
                 break :blk node.payload - 1;
             },
-            .bottom, .agg, .list => unreachable,
+            .bottom, .agg, .list => unreachable, // evalSwitch handles a bottom scrutinee before armFor; aggs and lists are never switched on
         };
         return regions[arm];
     }
@@ -276,7 +276,7 @@ pub const Evaluator = struct {
                 return switch (x) {
                     .bottom => .bottom,
                     .agg => |xs| xs[node.payload],
-                    .int, .float, .bool_, .str, .tag, .list => unreachable,
+                    .int, .float, .bool_, .str, .tag, .list => unreachable, // field and index read an aggregate by the typing of the body
                 };
             },
             .payload => {
@@ -286,7 +286,7 @@ pub const Evaluator = struct {
                     // Reading a payload of another tag is a compiler bug in a
                     // well-formed body, and ⊥ in a candidate the derivation built.
                     .tag => |t| if (t.name.index() == node.payload) t.payload[self.store.wordSlice(node.aux)[0]] else self.crash(),
-                    .int, .float, .bool_, .str, .agg, .list => unreachable,
+                    .int, .float, .bool_, .str, .agg, .list => unreachable, // payload reads a tag by the typing of the body
                 };
             },
             .call => {
@@ -298,7 +298,7 @@ pub const Evaluator = struct {
                     .value => |vs| vs[0],
                     .ret => |v| v,
                     .bottom => .bottom,
-                    .jump, .cont, .brk => unreachable,
+                    .jump, .cont, .brk => unreachable, // a called row body ends in a value, ret or bottom
                 };
             },
             .prim => {
@@ -308,7 +308,7 @@ pub const Evaluator = struct {
                 const p = prims.lookup(ir.PrimId.of(node.payload)) orelse return .bottom;
                 return self.evalPrim(p, args);
             },
-            .switch_, .for_range, .for_list, .loop, .and_, .or_ => unreachable,
+            .switch_, .for_range, .for_list, .loop, .and_, .or_ => unreachable, // control-flow ops are evaluated by evalNode's own prongs, not here
         }
     }
 
@@ -319,7 +319,7 @@ pub const Evaluator = struct {
             return switch (try self.evalRegion(frame, self.armFor(frame, node, scrutinee))) {
                 .value => |vs| vs,
                 .bottom => try self.bottoms(outputs),
-                .jump, .ret, .cont, .brk => unreachable,
+                .jump, .ret, .cont, .brk => unreachable, // a switch arm ends in a value or bottom
             };
         }
         // ⊥ scrutinee: each output that every arm gives as one value, none ⊥, has it.
@@ -329,7 +329,7 @@ pub const Evaluator = struct {
             res.* = switch (try self.evalRegion(frame, arm)) {
                 .value => |vs| vs,
                 .bottom => try self.bottoms(outputs),
-                .jump, .ret, .cont, .brk => unreachable,
+                .jump, .ret, .cont, .brk => unreachable, // a switch arm ends in a value or bottom
             };
         }
         const out = try self.arena.alloc(Value, outputs);
@@ -355,13 +355,13 @@ pub const Evaluator = struct {
         switch (first) {
             .bool_ => |b| if (b == decisive) return first,
             .bottom => saw_bottom = true,
-            .int, .float, .str, .agg, .tag, .list => unreachable,
+            .int, .float, .str, .agg, .tag, .list => unreachable, // And and Or operands are Bool or bottom by the typing of the body
         }
         for (self.store.regionSlice(node.regions)) |r| {
             const v: Value = switch (try self.evalRegion(frame, r)) {
                 .value => |vs| vs[0],
                 .bottom => .bottom,
-                .jump, .ret, .cont, .brk => unreachable,
+                .jump, .ret, .cont, .brk => unreachable, // And and Or operand regions end in a value or bottom
             };
             switch (v) {
                 .bool_ => |b| if (b == decisive) return v,
@@ -370,7 +370,7 @@ pub const Evaluator = struct {
                     // looking for an operand that decides the result.
                     saw_bottom = true;
                 },
-                .int, .float, .str, .agg, .tag, .list => unreachable,
+                .int, .float, .str, .agg, .tag, .list => unreachable, // And and Or operands are Bool or bottom by the typing of the body
             }
         }
         if (saw_bottom) return .bottom;
@@ -384,7 +384,7 @@ pub const Evaluator = struct {
         var slots: []const Value = switch (node.op) {
             .for_range, .for_list => args[@as(usize, 1) + @intFromBool(node.op == .for_range) ..],
             .loop => args,
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .unwrap, .closure, .field, .index, .payload, .elem, .opt_field, .prim, .call, .lambda, .apply, .and_, .or_, .switch_ => unreachable,
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .unwrap, .closure, .field, .index, .payload, .elem, .opt_field, .prim, .call, .lambda, .apply, .and_, .or_, .switch_ => unreachable, // evalLoop is only called for loop ops
         };
         var turn: i256 = 0;
         while (true) {
@@ -401,7 +401,7 @@ pub const Evaluator = struct {
                     try params.appendSlice(self.arena, &.{ .{ .int = turn }, xs[@intCast(turn)] });
                 },
                 .loop => {},
-                .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .unwrap, .closure, .field, .index, .payload, .elem, .opt_field, .prim, .call, .lambda, .apply, .and_, .or_, .switch_ => unreachable,
+                .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .unwrap, .closure, .field, .index, .payload, .elem, .opt_field, .prim, .call, .lambda, .apply, .and_, .or_, .switch_ => unreachable, // evalLoop is only called for loop ops
             }
             try params.appendSlice(self.arena, slots);
             self.forget(frame, body);
@@ -410,7 +410,7 @@ pub const Evaluator = struct {
                 .cont => |next| slots = next,
                 .brk => |vs| return vs,
                 .bottom => return self.bottoms(node.tys.len),
-                .value, .jump, .ret => unreachable,
+                .value, .jump, .ret => unreachable, // a loop body ends in cont, brk or bottom
             }
             turn += 1;
         }
@@ -434,7 +434,7 @@ pub const Evaluator = struct {
                     for (args) |a| try out.appendSlice(self.arena, a.list);
                     break :blk .{ .list = out.items };
                 },
-                .bottom, .int, .float, .bool_, .agg, .tag => unreachable,
+                .bottom, .int, .float, .bool_, .agg, .tag => unreachable, // concat's operands are strs or lists by the typing of the body
             },
             .len => .{ .int = args[0].list.len },
             .get, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => error.Unsupported,
@@ -477,7 +477,7 @@ fn floatResult(comptime F: type, method: prims.Method, a: F, b: F) Error!Value {
         .plus => .{ .float = @as(Bits, @bitCast(a + b)) },
         .minus => .{ .float = @as(Bits, @bitCast(a - b)) },
         .times => .{ .float = @as(Bits, @bitCast(a * b)) },
-        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable,
+        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable, // float prims admit no other methods (prims.admits)
     };
 }
 

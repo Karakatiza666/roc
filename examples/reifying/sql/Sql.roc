@@ -46,7 +46,7 @@ Sql :: {}.{
 		## One `INSERT` per row, with the values the compiler's derived encoder
 		## writes. An optional field that is absent is a column left out, which
 		## the database fills with `NULL`.
-		insert : Table(row), List(row) -> Try(Str, Error) where [row.encoder_for : Sql.Encoding -> (row, List(Sql.Token) -> Try(List(Sql.Token), []))]
+		insert : Table(row), List(row) -> Try(Str, Error) where [row.encoder_for : Sql.RowEncoding -> (row, List(Sql.Token) -> Try(List(Sql.Token), []))]
 		insert = |Table.(t), rows| {
 			statements = rows.map_try(
 				|row| {
@@ -204,7 +204,7 @@ Sql :: {}.{
 		## come from the compiler's derived encoder for `p`, which is the same
 		## record type the filter reads, so a parameter the filter reads is a
 		## parameter the record has.
-		bind : Selected(p, out), p -> Try(Statement, Error) where [p.encoder_for : Sql.Encoding -> (p, List(Sql.Token) -> Try(List(Sql.Token), []))]
+		bind : Selected(p, out), p -> Try(Statement, Error) where [p.encoder_for : Sql.RowEncoding -> (p, List(Sql.Token) -> Try(List(Sql.Token), []))]
 		bind = |selected, params| {
 			values = Sql.values_of(params)?
 			sql = Selected.render(selected, Sql.placeholder)?
@@ -936,8 +936,8 @@ Sql :: {}.{
 	# --------------------------------------------------------------- encoding
 
 	## The requirement that a record can become SQL values: the compiler
-	## derives its encoder against [Sql.Encoding].
-	a.Bindable :  where [a.encoder_for : Sql.Encoding -> (a, List(Sql.Token) -> Try(List(Sql.Token), []))]
+	## derives its encoder against [Sql.RowEncoding].
+	a.Bindable :  where [a.encoder_for : Sql.RowEncoding -> (a, List(Sql.Token) -> Try(List(Sql.Token), []))]
 
 	## What the derived encoder writes: a column's name, then its value.
 	Token := [Name(Str), Val(Value)]
@@ -945,8 +945,8 @@ Sql :: {}.{
 	## The format the compiler derives a record's encoder against. A column
 	## holds one scalar, so these are the scalars and the one record around
 	## them.
-	Encoding := [Row].{
-		rename_field : Encoding, Str -> Str
+	RowEncoding := [Row].{
+		rename_field : RowEncoding, Str -> Str
 		rename_field = |_, name| name
 
 		encode_record : List(Token), U64, (List(Token), (List(Token), Str, (List(Token) -> Try(List(Token), [])) -> Try(List(Token), [])) -> Try(List(Token), [])) -> Try(List(Token), [])
@@ -968,7 +968,7 @@ Sql :: {}.{
 	values_of : a -> Try(List({ name : Str, value : Value }), Error) where [a.Bindable]
 	values_of = |record| {
 		Shape : a
-		encode = Shape.encoder_for(Encoding.Row)
+		encode = Shape.encoder_for(RowEncoding.Row)
 		Ok(tokens) = encode(record, [])
 		Sql.pair_up(tokens, [])
 	}

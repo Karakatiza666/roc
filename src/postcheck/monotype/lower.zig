@@ -34914,10 +34914,9 @@ const BodyContext = struct {
             // `Code(f)` here, and `f` may still hold a row the seal has yet to
             // close to its default.
             .code_from_lambda => |maybe_node| {
-                // No node means the walk refused this site and reported it, so
-                // the site is a checked error and adds no second report.
-                const node = maybe_node orelse
-                    return loweredExprStep(try self.addExprWithTypeCell(cell, .{ .checked_error = try self.addStringLiteral("runtime error") }));
+                // Publication wrote every site: a refused walk became a
+                // checked error, so a site that reaches here holds a node.
+                const node = maybe_node orelse unreachable; // publication wrote every staged site
                 return loweredExprStep(try self.restoreConstNodeAtNode(self.view, self.view, node, expected_node));
             },
             .call => return requestLowerTask(self, .{ .call_expr_at_node = .{ .expr = checked_expr, .expected_node = expected_node } }),
@@ -35419,8 +35418,7 @@ const BodyContext = struct {
             // publication, so its site is a checked error and adds no second
             // report.
             .code_from_lambda => |maybe_node| {
-                const node = maybe_node orelse
-                    return self.withTypeDone(task, try self.addExpr(.{ .ty = ty, .data = .{ .checked_error = try self.addStringLiteral("runtime error") } }));
+                const node = maybe_node orelse unreachable; // publication wrote every staged site
                 return self.withTypeDone(task, try self.restoreConstNodeAtNode(self.view, self.view, node, try self.graph.importMono(ty)));
             },
             .str_segment => |str| .{ .str_lit = try self.lowerStringLiteral(str) },

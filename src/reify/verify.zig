@@ -256,13 +256,13 @@ const Verifier = struct {
                     .for_range => 2,
                     .for_list => 1,
                     .loop => 0,
-                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable,
+                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // this branch is reached for loop ops only
                 };
                 const header: usize = switch (nd.op) {
                     .for_range => 1,
                     .for_list => 2,
                     .loop => 0,
-                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable,
+                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // this branch is reached for loop ops only
                 };
                 if (args.len < lead or params.len != header + (args.len - lead) or tys.len != args.len - lead) break :blk true;
                 for (tys, 0..) |t, k| if (t != params[header + k] or !try self.argFits(nd, lead + k, t)) break :blk true;
@@ -309,7 +309,7 @@ const Verifier = struct {
             .bool_ => try self.types.boolTy(),
             .str => try self.types.strTy(),
             .list => null,
-            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => unreachable,
+            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => unreachable, // int and float owners are handled by the branches above
         };
         if (operand) |o| for (0..self.store.refSlice(nd.args).len) |k| if (self.argTy(nd, k) != o) return false;
         const bool_ty = try self.types.boolTy();
@@ -353,7 +353,7 @@ const Verifier = struct {
         for (self.store.refSlice(reg.end.refs)) |ref| try self.checkRef(r, null, ref, "region", r.index());
         const loop = self.innermostLoopBody(r);
         switch (reg.end.kind) {
-            .open => unreachable,
+            .open => unreachable, // open ends are reported just above
             .value => {
                 if (reg.kind == .loop_body) try self.report.add("region {d}: a loop body ends in Value", .{r.index()});
                 // A row body delivers the row's result.

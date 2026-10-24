@@ -10715,6 +10715,13 @@ pub const CheckedBody = struct {
 pub const CheckedPatternBinder = struct {
     id: PatternBinderId,
     pattern: CheckedPatternId,
+    /// The name the binding's source wrote, interned in the owning module's
+    /// ident store: the identifier the canonicalizer recorded on the binding
+    /// pattern (`assign`, `var_assign`, `as`), or, for an associated item,
+    /// the method identifier its owner registered it under. Null for a binder
+    /// publication introduces with no source name: a literal pattern's
+    /// matched-value binder.
+    name: ?Ident.Idx,
     reassignable: bool,
     /// A generalized callable lookup binding. Its uses instantiate the
     /// referenced callable; the binding does not own a runtime value cell.
@@ -11107,8 +11114,9 @@ pub const CheckedExprData = union(enum) {
     str_from_quote: CheckedQuoteData,
     /// A function named where a `Code(f)` was expected. Publication walks the
     /// function's body into this module's const store and records the root of
-    /// that description here; null means the walk refused the body and said so
-    /// as a `staged_code` problem.
+    /// that description here. Null is only the state copying leaves the site
+    /// in until publication fills it: a refused walk, and the name a template
+    /// call calls, become `runtime_error`, so no published body holds a null.
     code_from_lambda: ?ConstNodeId,
     str_segment: CheckedStringLiteralId,
     str: []const CheckedExprId,
@@ -12776,6 +12784,15 @@ pub const CheckedBodyStore = struct {
             if (std.meta.activeTag(module.expr(decl.expr).data) != .e_runtime_error) continue;
             try rejected_method_decls.put(allocator, method_statement, {});
         }
+        // An associated item's pattern binds its qualified name (`Lib.scale`);
+        // the name its declaration wrote is the method identifier its owner
+        // registered it under.
+        var associated_binder_names = collections.DenseMapUnmanaged(CIR.Pattern.Idx, Ident.Idx).empty;
+        defer associated_binder_names.deinit(allocator);
+        for (module.methodDefEntries()) |entry| {
+            const binding_pattern = module.moduleEnvConst().store.getDef(entry.value.def_idx).pattern;
+            try associated_binder_names.put(allocator, binding_pattern, entry.key.methodIdent());
+        }
         var exprs = std.ArrayList(CheckedExpr).empty;
         errdefer exprs.deinit(allocator);
         errdefer deinitCheckedExprList(allocator, exprs.items);
@@ -12897,6 +12914,7 @@ pub const CheckedBodyStore = struct {
             .promoted_patterns = &promoted_patterns,
             .recursively_referenced_patterns = &recursively_referenced_patterns,
             .rejected_method_decls = &rejected_method_decls,
+            .associated_binder_names = &associated_binder_names,
         };
 
         node_idx = 0;
@@ -13503,7 +13521,18 @@ pub const CheckedBodyStore = struct {
     /// A site that named a function holds the empty description body copying
     /// left on it. A lambda written in place holds itself, because the walk
     /// had to read it to build the description now taking its place.
-    pub fn attachCodeReification(self: *CheckedBodyStore, expr_id: CheckedExprId, node: ?ConstNodeId) void {
+    pub fn attachCodeReification(self: *CheckedBodyStore, expr_id: CheckedExprId, node: ConstNodeId) void {
+        self.stagedSiteData(expr_id).* = .{ .code_from_lambda = node };
+    }
+
+    /// Record that the walk refused a staged site. The refusal is reported
+    /// separately; the site is a checked error exactly like one checking
+    /// poisoned, so no later stage has a refused description to special-case.
+    pub fn refuseCodeReification(self: *CheckedBodyStore, expr_id: CheckedExprId) void {
+        self.stagedSiteData(expr_id).* = .{ .runtime_error = .{} };
+    }
+
+    fn stagedSiteData(self: *CheckedBodyStore, expr_id: CheckedExprId) *StoredCheckedExprData {
         const data = &self.stored_exprs.items[@backingInt(expr_id)].data;
         switch (data.*) {
             .code_from_lambda, .lambda, .closure => {},
@@ -13557,7 +13586,7 @@ pub const CheckedBodyStore = struct {
                 .{@backingInt(expr_id)},
             ),
         }
-        data.* = .{ .code_from_lambda = node };
+        return data;
     }
 
     /// Whether checking replaced a staged site with a runtime error. Its own
@@ -15318,6 +15347,9 @@ const CheckedBodyPayloadCopier = struct {
     /// it to a checked error and checking retired every lookup of its name,
     /// so its declaration evaluates nothing and its block omits it.
     rejected_method_decls: *const collections.DenseMapUnmanaged(CIR.Statement.Idx, void),
+    /// The declared name of each associated item's binding pattern, from the
+    /// method table the canonicalizer registered it in.
+    associated_binder_names: *const collections.DenseMapUnmanaged(CIR.Pattern.Idx, Ident.Idx),
 
     /// Whether the declaration is a recursive value, marking each of its
     /// binders `recursive_value` when it is.
@@ -15694,7 +15726,7 @@ const CheckedBodyPayloadCopier = struct {
         const pattern_id = self.checkedPattern(pattern_idx);
         const binder: PatternBinderId = @fromBackingInt(@intCast(@as(u32, @intCast(self.pattern_binders.items.len))));
         std.debug.assert(self.pattern_binder_by_pattern[@backingInt(pattern_id)] == .none);
-        try self.pattern_binders.append(self.allocator, .{ .id = binder, .pattern = pattern_id, .reassignable = false });
+        try self.pattern_binders.append(self.allocator, .{ .id = binder, .pattern = pattern_id, .name = null, .reassignable = false });
         self.pattern_binder_by_pattern[@backingInt(pattern_id)] = .some(binder);
         const context = plan.patternContext(&self.module.moduleEnvConst().store) orelse unreachable; // recordLiteralDispatchPlan allocates a pattern context for every pattern node's plan
         std.debug.assert(context.equality_fn_var_plus_one != 0);
@@ -16318,10 +16350,40 @@ const CheckedBodyPayloadCopier = struct {
         try self.pattern_binders.append(self.allocator, .{
             .id = id,
             .pattern = checked_pattern,
+            .name = self.sourcePatternBinderName(pattern),
             .reassignable = self.sourcePatternBinderIsReassignable(pattern),
         });
         self.pattern_binder_by_pattern[raw] = .some(id);
         return id;
+    }
+
+    /// The name a binding pattern's source wrote: an associated item's
+    /// declared method name, and otherwise the identifier on the pattern.
+    fn sourcePatternBinderName(self: *const @This(), pattern: CIR.Pattern.Idx) Ident.Idx {
+        if (self.associated_binder_names.get(pattern)) |declared| return declared;
+        return switch (self.module.pattern(pattern).data) {
+            .assign => |assign| assign.ident,
+            .var_assign => |assign| assign.ident,
+            .as => |as_pattern| as_pattern.ident,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .num_from_numeral_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => checkedArtifactInvariant("checked artifact invariant violated: non-binder pattern requested a pattern binder", .{}),
+            .deferred_import_ref => checkedArtifactInvariant("deferred import reference pattern reached checked artifact publication", .{}),
+        };
     }
 
     fn sourcePatternBinderIsReassignable(self: *const @This(), pattern: CIR.Pattern.Idx) bool {
@@ -38291,12 +38353,23 @@ fn reifyStagedCode(
     }, module, module_env, foreign.lookup());
     defer sites.deinit(allocator);
 
+    // The name a template call calls is never read: the call stands for a
+    // description built elsewhere, so nothing is walked for it.
+    for (module_env.store.codeReificationSites()) |site| {
+        if (site.kind != .template_callee) continue;
+        const expr = checked_bodies.exprIdAtRawNode(site.node_idx) orelse continue;
+        if (checked_bodies.codeSiteWasPoisoned(expr)) continue;
+        checked_bodies.refuseCodeReification(expr);
+    }
+
     for (sites.outcomes) |site| {
         if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
         switch (site.outcome) {
             .reified => |node| checked_bodies.attachCodeReification(site.expr, node),
             .rejected => |rejection| {
-                checked_bodies.attachCodeReification(site.expr, null);
+                checked_bodies.refuseCodeReification(site.expr);
+                // The site is a runtime error either way. Only the report
+                // depends on the caller asking for compile-time problems.
                 const problems = problem_store orelse continue;
                 const detail = if (rejection.open) |open|
                     try openVariableDetail(allocator, problems, open)
@@ -40771,6 +40844,7 @@ test "loop mutation and state merge plans preserve expect mode, dispatch operand
     for ([_]PatternBinderId{ b0, b1, b2 }) |binder| try store.pattern_binders.append(gpa, .{
         .id = binder,
         .pattern = p0,
+        .name = null,
         .reassignable = true,
     });
     try store.commitExprs(gpa, &.{
@@ -41431,6 +41505,25 @@ test "checked diagnostic-error fact propagates through body dependencies and typ
     try std.testing.expectEqualSlices(bool, &.{ true, true, true, true, false, true, true }, &contains_diagnostic_error);
 }
 
+test "a refused staged site publishes as a runtime error, never a null description" {
+    const gpa = std.testing.allocator;
+    var store = CheckedBodyStore{};
+    defer store.deinit(gpa);
+    const e0 = testIndexId(CheckedExprId, 0);
+    const exprs = [_]CheckedExpr{.{
+        .id = e0,
+        .ty = testIndexId(CheckedTypeId, 0),
+        .source_region = base.Region.zero(),
+        .data = .{ .code_from_lambda = null },
+    }};
+    try store.commitExprs(gpa, &exprs);
+
+    try std.testing.expect(!store.codeSiteWasPoisoned(e0));
+    store.refuseCodeReification(e0);
+    try std.testing.expect(store.codeSiteWasPoisoned(e0));
+    try std.testing.expect(store.expr(e0).data == .runtime_error);
+}
+
 test "checked inspect evaluation elision is producer-recorded for exact callable value forms" {
     const field_name: canonical.RecordFieldLabelId = @fromBackingInt(@intCast(1));
     const record_fields = [_]CheckedRecordExprField{.{ .label = field_name, .value = testIndexId(CheckedExprId, 0) }};
@@ -41488,8 +41581,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0xF1, 0xE1, 0xF8, 0x05, 0xC1, 0xAE, 0x03, 0xC2, 0xD2, 0xE3, 0xA9, 0xFD, 0xB2, 0x34, 0x75, 0x22,
-        0xE3, 0x18, 0x16, 0x98, 0x94, 0x55, 0x93, 0x6D, 0x8D, 0x3F, 0x64, 0x3F, 0x0A, 0xBE, 0xB8, 0x9B,
+        0x02, 0xBE, 0xA3, 0x5E, 0x0F, 0xB6, 0xDE, 0x00, 0x1D, 0x4C, 0x43, 0x43, 0x31, 0x31, 0xA6, 0x63,
+        0x3D, 0xC4, 0xC6, 0x19, 0x21, 0x5F, 0xA6, 0x37, 0x0C, 0x33, 0x49, 0xF4, 0x62, 0x3A, 0x54, 0x6A,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

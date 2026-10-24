@@ -203,7 +203,7 @@ const DemandWalk = struct {
                 try self.demandJumps(at, ty);
             },
             .node => try self.demandNode(at, ty),
-            .row_param => unreachable,
+            .row_param => unreachable, // demands are made on nodes and region parameters, never row parameters
         }
     }
 
@@ -245,7 +245,7 @@ const DemandWalk = struct {
                 for (arms) |arm| try self.demandEnd(arm, at.output, ty);
             },
             .crash, .call => {},
-            .lit, .derived, .record, .tuple, .list, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .lit, .derived, .record, .tuple, .list, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // only ops that carry demands are demanded here (switch_, crash, call)
         }
     }
 
@@ -356,7 +356,7 @@ const Rebuild = struct {
         const refs = try self.mapRefs(picked);
         defer self.gpa.free(refs);
         const spec: EndSpec = switch (end.kind) {
-            .open => unreachable,
+            .open => unreachable, // ends of the old rows are closed
             .value => .{ .value = refs },
             .jump => .{ .jump = .{ .join = self.regions.get(RegionId.of(end.target)).?, .args = refs } },
             .return_ => .{ .return_ = refs[0] },

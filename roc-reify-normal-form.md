@@ -1466,7 +1466,7 @@ step = |x| x * 3
 
 The translated code reached it through these calls:
 
-    step(x) (line 28, column 14)
+    step(x) (test/cli/StagedRefusal.roc:28:14)
 
 The translator gave this reason:
 

@@ -6252,7 +6252,7 @@ pub const ReportBuilder = struct {
         var report = try Report.init(self.gpa, "Translation Refused", "A translator refused code that this expression built.", .runtime_error);
         errdefer report.deinit();
         const owned_message = try report.addOwnedString(self.problems.getExtraString(data.message));
-        const path = self.problems.getExtraString(data.path);
+        const path = self.problems.getRefusalCalls(data.path);
 
         const region_info = self.module_env.calcRegionInfo(data.region);
         try report.document.addSourceRegion(
@@ -6282,7 +6282,7 @@ pub const ReportBuilder = struct {
             try D.renderSlice(&.{D.bytes("The translated code reached it through these calls:")}, self, &report);
             try report.document.addLineBreak();
             try report.document.addLineBreak();
-            try report.document.addCodeBlock(try report.addOwnedString(path));
+            try self.addRefusalCalls(&report, path);
             try report.document.addLineBreak();
             try report.document.addLineBreak();
         }
@@ -6291,6 +6291,35 @@ pub const ReportBuilder = struct {
         try report.document.addLineBreak();
         try report.document.addCodeBlock(owned_message);
         return report;
+    }
+
+    /// The calls a refused source was reached through, one per line as a code
+    /// block. A call in this module is placed like any other region of it, so
+    /// its line counts from the file the author wrote.
+    fn addRefusalCalls(self: *Self, report: *Report, calls: []const problem_mod.RefusalCall) Allocator.Error!void {
+        const document = &report.document;
+        try document.startAnnotation(.code_block);
+        for (calls, 0..) |call, index| {
+            if (index != 0) try document.addLineBreak();
+            try document.addCodeLines(self.problems.getExtraString(call.text));
+            switch (call.place) {
+                .local => |region| {
+                    try document.addText(" (");
+                    try document.addSourceLocation(self.module_env.calcRegionInfo(region), self.filename);
+                    try document.addText(")");
+                },
+                .foreign => |origin| {
+                    const position = try std.fmt.allocPrint(self.gpa, " (in {s}, line {d}, column {d})", .{
+                        self.problems.getExtraString(origin.module_name),
+                        origin.line,
+                        origin.column,
+                    });
+                    defer self.gpa.free(position);
+                    try document.addText(position);
+                },
+            }
+        }
+        try document.endAnnotation();
     }
 
     /// Build a report for compile-time evaluation error

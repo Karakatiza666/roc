@@ -16,6 +16,8 @@ const CheckedExhaustivenessSiteId = checked_ids.CheckedExhaustivenessSiteId;
 const Problem = types.Problem;
 const ExtraStringIdx = types.ExtraStringIdx;
 const MissingPatternsRange = types.MissingPatternsRange;
+const RefusalCall = types.RefusalCall;
+const RefusalCallsRange = types.RefusalCallsRange;
 
 const ByteList = std.array_list.Managed(u8);
 
@@ -65,6 +67,8 @@ pub const Store = struct {
     extra_strings_backing: ByteList,
     /// Backing storage for missing patterns index arrays
     missing_patterns_backing: std.array_list.Managed(ExtraStringIdx),
+    /// Backing storage for the calls a translation refusal was reached through
+    refusal_calls_backing: std.ArrayList(RefusalCall) = .empty,
 
     /// Allocation-free empty store, including after ownership transfer.
     pub fn initEmpty(gpa: Allocator) Self {
@@ -98,6 +102,7 @@ pub const Store = struct {
     pub fn deinit(self: *Self) void {
         self.extra_strings_backing.deinit();
         self.missing_patterns_backing.deinit();
+        self.refusal_calls_backing.deinit(self.gpa);
         self.pending_static_exhaustiveness.deinit(self.gpa);
         self.problems.deinit(self.gpa);
     }
@@ -118,6 +123,19 @@ pub const Store = struct {
     /// Get the slice of missing pattern indices by range
     pub fn getMissingPatterns(self: *const Self, range: MissingPatternsRange) []const ExtraStringIdx {
         return self.missing_patterns_backing.items[range.start..][0..range.count];
+    }
+
+    /// Put the calls a translation refusal was reached through in the backing
+    /// store, returning their range.
+    pub fn putRefusalCalls(self: *Self, calls: []const RefusalCall) std.mem.Allocator.Error!RefusalCallsRange {
+        const start = self.refusal_calls_backing.items.len;
+        try self.refusal_calls_backing.appendSlice(self.gpa, calls);
+        return .{ .start = start, .count = calls.len };
+    }
+
+    /// Get the calls a translation refusal was reached through by their range
+    pub fn getRefusalCalls(self: *const Self, range: RefusalCallsRange) []const RefusalCall {
+        return self.refusal_calls_backing.items[range.start..][0..range.count];
     }
 
     /// Create a deep snapshot from a Var, storing it in this SnapshotStore

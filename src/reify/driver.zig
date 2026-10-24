@@ -482,7 +482,7 @@ test "components run callee first and recursion is recorded" {
     const pos = struct {
         fn of(cs: []const []RowId, r: RowId) usize {
             for (cs, 0..) |comp, i| if (comp[0] == r) return i;
-            unreachable;
+            unreachable; // the component list covers every row
         }
     };
     try testing.expect(pos.of(comps, leaf) < pos.of(comps, root));

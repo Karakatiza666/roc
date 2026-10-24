@@ -98,7 +98,7 @@ expect Sql.schema_gaps(migrations.take_first(2)) == ["customers.email is never c
 ```
 
 Parameter and row values cross into SQL through the compiler's derived
-`encoder_for`, pointed at `Sql.Encoding` (`Sql.roc:948`). `bind` requires `p`
+`encoder_for`, pointed at `Sql.RowEncoding` (`Sql.roc:948`). `bind` requires `p`
 to have that encoder, so the parameter values are typed by the same record the
 filter reads.
 
@@ -143,11 +143,11 @@ receiver first, which is why the builder once spelled a join
 `.join(orders).on(..)`. The same early close made a second `filter_by` fail:
 the first lambda closed the parameter record to the fields it read.
 
-A site now queues its rows, and `groundPendingStagedRows`
-(`src/check/Check.zig`) closes them just before the binding that holds them
-generalizes: only the extensions that boundary owns, so a row an outer scope
-still has to fix stays open for that scope. A site no binding generalizes,
-such as one in an `expect`, closes at the end of the module.
+Checking now closes no row at a site. The reifier reads each open row tail
+at the default that checking recorded for it and seals it there, the way
+Monotype seals a row when it compiles a function
+(`variableSealsToRowDefault`). A row that a later clause widens is still open
+when that clause is checked, so the chain types as it does in ordinary Roc.
 `test/cli/StagedSiblingRows.roc` pins a table before the lambda, two tables,
 a lambda alone, and a chain whose second clause adds a field to the first
 one's parameter record.

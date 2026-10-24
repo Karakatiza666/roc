@@ -1472,6 +1472,10 @@ fn setLiteralDispatchPlanPlusOne(store: *NodeStore, node_idx: Node.Idx, plan_plu
 }
 
 /// Record that this expression is reified into a `Code` at `fn_var`.
+///
+/// The list is kept sorted by node index, so a lookup is a binary search and
+/// every consumer meets sites in one deterministic order whatever order the
+/// checker recorded them in.
 pub fn recordCodeReificationSite(
     store: *NodeStore,
     node_idx: Node.Idx,
@@ -1480,22 +1484,36 @@ pub fn recordCodeReificationSite(
     view: CodeReificationSite.View,
 ) Allocator.Error!void {
     const raw = @backingInt(node_idx);
-    for (store.code_reification_sites.items.items) |*existing| {
-        if (existing.node_idx != raw) continue;
-        existing.fn_var = @backingInt(fn_var);
-        existing.kind = kind;
-        existing.view = view;
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    if (at < items.len and items[at].node_idx == raw) {
+        items[at].fn_var = @backingInt(fn_var);
+        items[at].kind = kind;
+        items[at].view = view;
         return;
     }
-    _ = try store.code_reification_sites.append(store.gpa, .{
+    const site: CodeReificationSite = .{
         .node_idx = raw,
         .fn_var = @backingInt(fn_var),
         .kind = kind,
         .view = view,
-    });
+    };
+    const list = &store.code_reification_sites.items;
+    try list.insert(store.gpa, at, site);
 }
 
-/// Every expression this module reifies into a `Code`.
+/// Index of the first site whose node index is not below `raw`.
+fn codeReificationSiteLowerBound(items: []const CodeReificationSite, raw: u32) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (items[mid].node_idx < raw) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// Every expression this module reifies into a `Code`, in node order.
 pub fn codeReificationSites(store: *const NodeStore) []const CodeReificationSite {
     return store.code_reification_sites.items.items;
 }
@@ -1503,9 +1521,9 @@ pub fn codeReificationSites(store: *const NodeStore) []const CodeReificationSite
 /// The reification recorded for this expression, if it has one.
 pub fn codeReificationSiteForNode(store: *const NodeStore, node_idx: Node.Idx) ?CodeReificationSite {
     const raw = @backingInt(node_idx);
-    for (store.code_reification_sites.items.items) |site| {
-        if (site.node_idx == raw) return site;
-    }
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    if (at < items.len and items[at].node_idx == raw) return items[at];
     return null;
 }
 
@@ -5969,6 +5987,41 @@ test "literal dispatch plans are retired with their owning nodes" {
 
     try store.replaceExprWithRuntimeError(numeral_expr, runtime_error_diagnostic);
     try testing.expectEqual(@as(usize, 0), store.literalDispatchPlans().len);
+}
+
+test "code reification sites are found by node and kept in node order" {
+    const testing = std.testing;
+    var store = try NodeStore.init(testing.allocator);
+    defer store.deinit();
+
+    const node = struct {
+        fn at(raw: u32) Node.Idx {
+            return @fromBackingInt(raw);
+        }
+    }.at;
+    const var_ = struct {
+        fn at(raw: u32) types.Var {
+            return @fromBackingInt(raw);
+        }
+    }.at;
+
+    try testing.expect(store.codeReificationSiteForNode(node(7)) == null);
+    try store.recordCodeReificationSite(node(9), var_(1), .named_function, .graph);
+    try store.recordCodeReificationSite(node(3), var_(2), .inline_lambda, .graph);
+    try store.recordCodeReificationSite(node(6), var_(3), .template, .inline_);
+    try store.recordCodeReificationSite(node(3), var_(4), .template_call, .inline_);
+
+    const sites = store.codeReificationSites();
+    try testing.expectEqual(@as(usize, 3), sites.len);
+    try testing.expectEqualSlices(u32, &.{ 3, 6, 9 }, &.{ sites[0].node_idx, sites[1].node_idx, sites[2].node_idx });
+
+    const updated = store.codeReificationSiteForNode(node(3)).?;
+    try testing.expectEqual(@as(u32, 4), updated.fn_var);
+    try testing.expectEqual(CodeReificationSite.Kind.template_call, updated.kind);
+    try testing.expectEqual(CodeReificationSite.View.inline_, updated.view);
+    try testing.expectEqual(@as(u32, 1), store.codeReificationSiteForNode(node(9)).?.fn_var);
+    try testing.expect(store.codeReificationSiteForNode(node(4)) == null);
+    try testing.expect(store.codeReificationSiteForNode(node(10)) == null);
 }
 
 test "NodeStore multiple nodes CompactWriter roundtrip" {

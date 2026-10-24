@@ -124,7 +124,7 @@ fn condsHold(m: *const Match, conds: []const generalize.Cond) bool {
                 .is_lit => isLit(t),
                 .nonzero_lit => isLit(t) and (t.app.sym.int orelse 0) != 0,
                 .speculatable => speculatable(t),
-                .int_owner => unreachable,
+                .int_owner => unreachable, // the outer prong selects only these three conditions
             } else false,
         };
         if (!holds) return false;
@@ -150,7 +150,7 @@ fn speculatable(t: Term) bool {
     if (x.sym.op == .prim) {
         const owner = switch (x.sym.owner.?) {
             .fixed => |o| o,
-            .bind => unreachable,
+            .bind => unreachable, // signature prims carry a fixed owner, never a bound owner variable
         };
         if (!reify.prims.get(reify.prims.find(owner, x.sym.method.?).?).speculatable) return false;
     }

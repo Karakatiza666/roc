@@ -77,7 +77,7 @@ fn ctors(arena: Allocator, sig: sig_mod.Signature) Allocator.Error![]Ctor {
         },
         .wrap => try out.append(arena, .{ .sym = .{ .op = .wrap }, .args = &.{.i64}, .result = .nominal_i64 }),
         .unwrap => try out.append(arena, .{ .sym = .{ .op = .unwrap }, .args = &.{.nominal_i64}, .result = .i64 }),
-        .concat, .len, .get => unreachable,
+        .concat, .len, .get => unreachable, // enumerated methods exclude concat, len and get
     };
     return out.toOwnedSlice(arena);
 }
@@ -158,7 +158,7 @@ fn membersOf(vars: sig_mod.Vars, t: Term, facts: []const Fact) u8 {
             }
             break :blk out;
         },
-        .lit, .crash, .derived, .record, .tuple, .list, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+        .lit, .crash, .derived, .record, .tuple, .list, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols
     };
 }
 

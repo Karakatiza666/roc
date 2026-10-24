@@ -299,7 +299,7 @@ pub const Prover = struct {
                 if (b.get(p[1], true)) Value{ .int = b.int(p[2]) } else .bottom,
                 if (b.get(p[3], true)) Value{ .bool_ = b.get(p[4], false) } else .bottom,
             }) },
-            .f64, .str, .union_abc, .list_i64 => unreachable,
+            .f64, .str, .union_abc, .list_i64 => unreachable, // the encoder rejects f64, str, union_abc and list_i64 signatures
         };
     }
 
@@ -353,7 +353,7 @@ fn intAtoms(arena: Allocator, vars: sig_mod.Vars, l: Term, r: Term) Allocator.Er
     for (try smt.varsOf(arena, vars, l, r)) |v| n += switch (vars.of(v)) {
         .bool => 0,
         .i64, .union_ab, .record_xy, .tuple_ib, .nominal_i64 => 1,
-        .f64, .str, .union_abc, .list_i64 => unreachable,
+        .f64, .str, .union_abc, .list_i64 => unreachable, // the encoder rejects f64, str, union_abc and list_i64 signatures
     };
     return n;
 }
@@ -393,7 +393,7 @@ fn domain(arena: Allocator, sort: sig_mod.Sort) Allocator.Error![]const Value {
         .record_xy, .tuple_ib => for (try domain(arena, .i64)) |x| for (try domain(arena, .bool)) |y| {
             try out.append(arena, .{ .agg = try arena.dupe(Value, &.{ x, y }) });
         },
-        .f64, .str, .union_abc, .list_i64 => unreachable,
+        .f64, .str, .union_abc, .list_i64 => unreachable, // the encoder rejects f64, str, union_abc and list_i64 signatures
     }
     return out.toOwnedSlice(arena);
 }

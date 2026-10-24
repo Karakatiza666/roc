@@ -135,7 +135,7 @@ fn checkConds(arena: Allocator, s: term.Subst, rule: table.Rule, rt: term.RuleTe
         },
         .is_lit, .speculatable, .nonzero_lit, .movable, .movable_rest, .speculatable_rest, .same_ty, .lit_bool_switch, .not_lit => {},
         // Only an evaluation row folds, and `all` pairs first-order rows.
-        .folds => unreachable,
+        .folds => unreachable, // only an evaluation row folds, and `all` pairs first-order rows
     };
     return true;
 }
@@ -149,7 +149,7 @@ fn literalVars(arena: Allocator, s: term.Subst, rule: table.Rule, var_offset: te
             .app => {},
         },
         .int_owner, .not_float_owner, .speculatable, .speculatable_rest, .same_ty, .movable, .movable_rest, .polarity_flips, .lit_bool_switch, .not_lit => {},
-        .folds => unreachable,
+        .folds => unreachable, // only an evaluation row folds, and `all` pairs first-order rows
     };
 }
 
@@ -280,7 +280,7 @@ fn joins(arena: Allocator, gpa: Allocator, s: term.Subst, peak: Term, left: Term
 
 /// The normal form of a term over the table's patterns, as step 1 builds it.
 pub fn normalize(arena: Allocator, gpa: Allocator, t: Term, knocked_out: []const bool) Allocator.Error!Term {
-    return (try normalizeTyped(arena, gpa, t, knocked_out)) orelse unreachable;
+    return (try normalizeTyped(arena, gpa, t, knocked_out)) orelse unreachable; // the terms normalized here come from the enumerated well-typed symbols, so normalizeTyped finds them well-typed
 }
 
 /// The normal form of `t` as `normalize` builds it, or null when `t` has no
@@ -371,7 +371,7 @@ const Materializer = struct {
             .bool_ => self.types.boolTy(),
             .str => self.types.strTy(),
             .list => self.types.listTy(try self.types.intTy(.i64)),
-            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => unreachable,
+            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => unreachable, // int and float owners are handled by the branches above
         };
     }
 
@@ -447,7 +447,7 @@ const Materializer = struct {
                             .record => .field,
                             .tuple => .index,
                             .tag => .payload,
-                            .lit, .crash, .derived, .list, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+                            .lit, .crash, .derived, .list, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // the prong above admits only record, tuple and tag
                         };
                         const e = expected orelse return self.aggregateOf(projection, try self.infer(x.args[0], null));
                         const component = self.componentOf(e, x.sym.op) orelse {
@@ -473,7 +473,7 @@ const Materializer = struct {
                         _ = try self.infer(x.args[0], backing);
                         return e;
                     },
-                    .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+                    .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
                 }
             },
         }
@@ -491,7 +491,7 @@ const Materializer = struct {
             .field => self.types.recordTy(&.{.{ .name = "f", .ty = component }}),
             .index => self.types.tupleTy(&.{component}),
             .payload => self.types.tagUnionTy(&.{.{ .name = "T", .payload = &.{component} }}),
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // callers pass field, index or payload only
         };
     }
 
@@ -620,8 +620,8 @@ const Materializer = struct {
                     .tag => b.tag(try self.types.tagUnionTy(&.{.{ .name = "T", .payload = &.{self.refTy(a[0])} }}), try self.types.name("T"), a),
                     .wrap => b.wrap(try self.types.nominalTy("N", self.refTy(a[0])), a[0]),
                     .unwrap => b.unwrap(a[0]),
-                    .switch_, .and_, .or_ => unreachable,
-                    .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+                    .switch_, .and_, .or_ => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
+                    .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
                 };
             },
         }
@@ -671,7 +671,7 @@ fn rowIndex(step: []const u8, method: prims.Method) usize {
         if (!std.mem.eql(u8, r.step, step)) continue;
         if (r.args.len == 1 and r.args[0] == .prim and r.args[0].prim.method == method) return i;
     }
-    unreachable;
+    unreachable; // the test names a table row that exists
 }
 
 test "knocking out the is_lte half of N13q leaves the pair with N13h unjoined" {

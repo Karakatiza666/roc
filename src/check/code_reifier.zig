@@ -1592,33 +1592,14 @@ pub const Reifier = struct {
         return self.lookupBinding(binder);
     }
 
-    /// An `assign` pattern's region is exactly its identifier, and an `as`
-    /// pattern's region ends at the identifier it binds, so both name a binder
-    /// through the source. Regions survive serialization where the source-node
-    /// map does not, which is why the name comes from here.
-    ///
-    /// One `assign` reads wider than its identifier: a string pattern's
-    /// capture carries the interpolation that wrote it, braces and all.
+    /// The name the canonicalizer recorded on the pattern that binds `binder`,
+    /// read from the ident store of the module that owns it.
     fn binderName(self: *Reifier, binder: PatternBinderId) []const u8 {
-        const record = self.bodies.patternBinder(binder);
-        const pattern = self.bodies.pattern(record.pattern);
-        const text = self.env.getSource(pattern.source_region);
-        return switch (pattern.data) {
-            .as => trailingIdentifier(text),
-            .assign => interpolatedIdentifier(text),
-            .pending,
-            .applied_tag,
-            .nominal,
-            .record_destructure,
-            .list,
-            .tuple,
-            .numeral_literal,
-            .str_literal,
-            .str_interpolation,
-            .underscore,
-            .runtime_error,
-            => text,
-        };
+        // A source binding pattern always records its identifier; only a
+        // literal pattern's matched-value binder has none, and no capture,
+        // parameter or exported function names one.
+        const name = self.bodies.patternBinder(binder).name orelse unreachable; // a source binding pattern always records its identifier (see above)
+        return self.env.getIdentText(name);
     }
 
     // Values //
@@ -3688,7 +3669,7 @@ pub const Reifier = struct {
                 const slots = try self.slotValues(loop, rest, region);
                 defer self.gpa.free(slots);
                 try b.close(.{ .continue_ = slots });
-            } else unreachable;
+            } else unreachable; // a step union has exactly the done, one and skip variants (checked above)
             self.scope.shrinkRetainingCapacity(scope_base);
         }
         const sw = try b.exitingSwitch(step, &arms, &.{}, &.{});
@@ -4611,7 +4592,7 @@ pub const Reifier = struct {
             return switch (self) {
                 .here => |local| local.template,
                 .away => |definition| definition.template,
-                .provided => unreachable,
+                .provided => unreachable, // methodDefinition's .provided is returned before the template is read
             };
         }
 
@@ -4619,7 +4600,7 @@ pub const Reifier = struct {
             return switch (self) {
                 .here => |local| local.body,
                 .away => |definition| definition.body,
-                .provided => unreachable,
+                .provided => unreachable, // methodDefinition's .provided is returned before the body is read
             };
         }
     };
@@ -5571,9 +5552,14 @@ pub const Reifier = struct {
                     link_fields = &.{};
                     link_ext = alias.backing;
                 },
-                .flex, .rigid => {
-                    const bound = reader.fixedType(next) orelse
+                .flex, .rigid => |variable| {
+                    const bound = reader.fixedType(next) orelse {
+                        // A row variable nothing fixes is the row default
+                        // lowering seals it to, as `buildTy` reads one.
+                        const payload = reader.types.payload(next);
+                        if (payload == .flex and payload.variableSealsToRowDefault() and variable.row_default.? == .empty_record) break;
                         return self.rejectError(.unresolved_type, region, "an open record");
+                    };
                     // The fields from here on are what one site fixed, so the
                     // frame that asked declines to cache this type.
                     self.substitution_uses += 1;
@@ -6767,49 +6753,13 @@ fn exprFormName(data: checked.CheckedExprData) []const u8 {
     };
 }
 
-/// Whether a binder's name is the one its author wrote.
-///
-/// A binder's name is read back from its region, which holds for a binding
-/// written in the source and not for one the compiler introduced while
-/// desugaring: the `Ok` binder `x ?? default` produces carries the whole
-/// expression's region. A translator emits these names into its own target,
-/// so a name that is not one is refused rather than carried.
-/// The identifier an `as` pattern's region ends with.
-///
-/// The region covers the pattern being renamed as well, and only the name is
-/// wanted. Scanning back over the characters a name may hold finds it without
-/// the walk having to know what the pattern before it was written as.
-/// The name inside a string pattern's `${name}`, or the text as it stands.
-///
-/// A capture's region is the whole interpolation, and `${x}` is no name a
-/// target accepts, so the walk would invent one where the author wrote `x`.
-fn interpolatedIdentifier(text: []const u8) []const u8 {
-    if (text.len < 3) return text;
-    if (text[0] != '$' or text[1] != '{' or text[text.len - 1] != '}') return text;
-    return text[2 .. text.len - 1];
-}
-
-fn trailingIdentifier(text: []const u8) []const u8 {
-    var start = text.len;
-    while (start > 0 and isNameChar(text[start - 1])) start -= 1;
-    return text[start..];
-}
-
-fn isNameChar(char: u8) bool {
-    // `$` starts a `var`'s name, which Roc requires and which the
-    // description carries the way it carries every other source spelling.
-    return std.ascii.isAlphanumeric(char) or char == '_' or char == '!' or char == '$';
-}
-
 fn patternFormName(data: checked.CheckedPatternData) []const u8 {
     return switch (data) {
         .list => "a list pattern",
         .str_interpolation => "a string interpolation pattern",
         .runtime_error => "a pattern that failed to compile",
-        // The checked artifact keeps an `as` binder without the identifier it
-        // was written with, so there is no name for a translator to emit.
-        .as => "an `as` pattern",
         .pending,
+        .as,
         .assign,
         .applied_tag,
         .nominal,
@@ -7446,7 +7396,7 @@ pub fn reifyModuleSites(
                 &call_args,
                 &call_values,
             ),
-            .template, .template_callee => unreachable,
+            .template, .template_callee => unreachable, // template and template_callee sites were skipped by the continue above
         };
         try results.append(gpa, .{ .expr = site_expr, .outcome = outcome });
     }

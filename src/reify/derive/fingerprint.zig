@@ -48,7 +48,7 @@ fn special(arena: Allocator, sort: Sort, i: usize) Allocator.Error!Value {
         // A tuple's values are a record's, and a nominal's its backing type's.
         .tuple_ib => special(arena, .record_xy, i),
         .nominal_i64 => special(arena, .i64, i),
-        .f64, .str, .union_abc, .list_i64 => unreachable,
+        .f64, .str, .union_abc, .list_i64 => unreachable, // fingerprints cover only the sorts the signatures use
     };
 }
 
@@ -71,7 +71,7 @@ fn random(arena: Allocator, rng: std.Random, sort: Sort) Allocator.Error!Value {
         .union_ab => if (rng.uintLessThan(u8, 4) == 0) tagB() else tagA(arena, .{ .int = randomInt(rng) }),
         .record_xy, .tuple_ib => record(arena, .{ .int = randomInt(rng) }, .{ .bool_ = rng.boolean() }),
         .nominal_i64 => .{ .int = randomInt(rng) },
-        .f64, .str, .union_abc, .list_i64 => unreachable,
+        .f64, .str, .union_abc, .list_i64 => unreachable, // fingerprints cover only the sorts the signatures use
     };
 }
 
@@ -159,7 +159,7 @@ pub fn writeValue(w: *std.Io.Writer, sort: Sort, v: Value) std.Io.Writer.Error!v
             try writeValue(w, .bool, xs[1]);
             try w.writeAll(if (sort == .tuple_ib) ")" else "}");
         },
-        .float, .str, .list => unreachable,
+        .float, .str, .list => unreachable, // signature values are int, bool, tag, aggregate or bottom
     }
 }
 

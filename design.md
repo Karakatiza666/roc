@@ -6346,10 +6346,10 @@ A condition that reads a code reification site draws no compile-time condition
 warning. A described function exists only while the compiler runs, so the
 result of a translator is known at compile time by design, and a `match` over
 it is how a program reads it. The author cannot act on the warning. The
-checker records the fact as explicit data: a hoist frame carries
+checker records this as explicit data: a hoist frame carries
 `reads_code_site`, set where a site is recorded and passed to every parent
 frame, and a binder whose right-hand side reads a site is kept in
-`code_site_bindings`, so a later lookup of that binder carries the fact. Only
+`code_site_bindings`, so a later lookup of that binder carries the flag. Only
 a binder named by a plain pattern is kept. Accepted: `match Stage.describe(f)`,
 a match over a top-level or local value bound to that call. Rejected: an `if`
 on a plain constant still warns. Both sides are pinned by
@@ -13078,6 +13078,13 @@ Other solved-graph mutations:
   for immediate rejection while the expression frame owns the result;
   deferred rejection follows the expression replacement described under Module
   Completion Boundary and never poisons either shared solved class.
+- `poisonUndescribableStagedCode` (`markErroneous` and
+  `erroneous_value_exprs`)—mechanism: diagnostic recovery after an
+  already-reported error. It probes only whether a description site's function
+  type holds an error, which an error-free program never does, and then retires
+  the definition holding the site the same way an erroneous value is retired,
+  so that compile-time evaluation does not instantiate an erroneous function.
+  No error-free program's typechecking or checked-module output changes.
 - `retireCallLikeExprWithErroneousOperands` / statement-owned iterator plan
   recovery (`markErroneous`, `markStaticDispatchFnRejected`, and the explicit
   `call_operand_type_error_exprs` table)—mechanism: Erroneous Call Operand Retirement
@@ -23533,10 +23540,10 @@ rules are in `roc-reify-proposal.md`, `roc-reify-normal-form.md` and
 
 | Stage | What it does with a description | Where |
 |---|---|---|
-| Checking | Types a function at a `Code` position as usual, records a `CodeReificationSite` and a `code_from_lambda` expression, and rejects a `Code` anywhere except a function parameter or the result of a template | `src/check/Check.zig` (`stagedCode`, `checkStagedCodePositions`) |
-| Publication | Walks each site's checked bodies, solved types and dispatch plans, builds the normal form with `src/reify`, and writes the `Code` value into the module's `ConstStore`. A refusal is one `staged_code` problem, and its site holds no node | `src/check/code_reifier.zig`, `reifyStagedCode` in `src/check/checked_artifact.zig` |
-| Lowering | Restores the stored node as a constant. It walks no function and adds no report for a site that holds no node | `.code_from_lambda` in `src/postcheck/monotype/lower.zig`, `pushCodeConversion` in `src/postcheck/boxy/plan.zig` |
-| Evaluation | Runs a translator as any other Roc. `Code.refuse_at` lowers to a crash statement that carries a `Refusal`, and compile-time evaluation reports it at the source regions of the node | `src/lir/LIR.zig` (`Refusal`), `CodeProvenanceTable` in `src/check/checked_artifact.zig` |
+| Checking | Types a function at a `Code` position as usual, records a `CodeReificationSite` and a `code_from_lambda` expression, and rejects a `Code` anywhere except a parameter of the annotation's outermost function or what that function returns (see the position rules below) | `src/check/Check.zig` (`stagedCode`, `checkStagedCodePositions`) |
+| Description | Walks each site's checked bodies, solved types and dispatch plans, builds the normal form with `src/reify`, and writes the `Code` value into the module's `ConstStore`. A refusal is one `staged_code` problem (when the caller asks for compile-time problems), and its site becomes a `runtime_error` exactly like one checking poisoned | `src/check/code_reifier.zig`, `reifyStagedCode` |
+| Lowering | Restores the stored node as a constant. It walks no function, and a refused site has already become a checked error, so lowering has no refused case | `.code_from_lambda` in `src/postcheck/monotype/lower.zig`, `pushCodeConversion` in `src/postcheck/boxy/plan.zig` |
+| Evaluation | Runs a translator as any other Roc. `Code.refuse_at` lowers to a crash statement that carries a `Refusal`, and compile-time evaluation reports it at the source regions of the node | `src/lir/LIR.zig` (`Refusal`), `CodeProvenanceTable` in the checked module data |
 
 Invariants:
 
@@ -23547,23 +23554,56 @@ Invariants:
 - A description is a specialization read without lowering, so the walk reads
   types by Monotype's rules and checking commits nothing for it. A variable a
   substitution fixes is read through it. A dispatch edge whose target
-  publication selected (`derived_from_callable`) relates a monomorphic
+  the checker selected (`derived_from_callable`) relates a monomorphic
   target's type to the edge's callable, which fixes the callable's other
   variables (`y` in `|x, y| x + y`). A variable still open after that seals
-  to its published `numeric_default_phase` by
+  to its recorded `numeric_default_phase` by
   `literal_defaulting.defaultTargetForPhase` (`x` in `|x| x * 2` is `Dec`). A
   variable with no default (`same = |x| x`), or a dispatcher whose selected
   target does not fit its callable (`x` in `|x| x * 2.U8`), is refused. See
   `relateSelectedTargets` and `defaultedVariable` in
-  `src/check/code_reifier.zig`.
+  `src/check/code_reifier.zig`. A record or tag row tail still open seals to
+  its recorded row default by `CheckedTypePayload.variableSealsToRowDefault`,
+  as Monotype seals it (`r` in `|r| r.id > 0` is `{ id : Dec }`), so checking
+  closes no row at a `Code` site.
+- A binder's name in a description is the identifier the canonicalizer
+  recorded on its pattern, written to `CheckedPatternBinder.name`, never
+  text read back through the pattern's region.
 - A lambda written at a `Code` position is described rather than lowered, so
   no template body holds it. The template ref seal collects its parameters
   and body on their own (`collectStagedLambda`, the `staged_*` spans of
-  `TemplateIteratorRefs`), and the evidence pass publishes the use-site
+  `TemplateIteratorRefs`), and the evidence pass writes the use-site
   evidence and substitution of every call inside it with no enclosing
   template params, as it does for a named function's body. The walk reads
   what each call fixed an unannotated callee to from that entry
   (`siteSubstitution`, `siteEvidence`), never from the lambda's types.
+- A call to an unannotated generic helper from another unannotated helper
+  reads the callee's evidence through the caller's own: an evidence entry that
+  forwards to the caller's evidence is resolved against the evidence the walk
+  holds, as Monotype does through its evidence chain (`supply` in
+  `src/check/code_reifier.zig`).
+- A `Code` position is read off the annotation the user wrote, not off the
+  solved type. A `Code` is allowed as a parameter of the annotation's outermost
+  function, and as what that function returns. A transparent alias of a
+  `Code` is a `Code` position (`stagedCode`), and an alias used in any other
+  place is rejected. A callback's parameters and a record field of function
+  type are rejected (`rejectMisplacedStagedCode`). A call is a template call
+  only when the callee's own return type is a `Code`
+  (`claimOrRejectCodeCall`), so a generic function that hands a `Code` back is
+  an ordinary call. Each site records the definition or top-level `expect`
+  that owns it, and `poisonUndescribableStagedCode` retires that owner when
+  the site's function type holds an error.
+- A row that holds a `Return` in a loop or in a switch arm is not inlined, in
+  the `graph` view and in the `inline` view, because inlining it would make
+  the caller return the value of the callee. A `Return` in a lambda body ends
+  the lambda and does not count (`Returns.holds` in `src/reify/live.zig`,
+  used by `src/reify/views.zig`).
+- A refusal by `Code.refuse_at` carries the calls the refused node was inlined
+  through as structured frames (`RefusalCall`, `src/check/problem/types.zig`).
+  A frame in the reporting module keeps its region, so the report places it
+  through the same mapping as every other region of that module, including the
+  mapping of a synthetic root. A frame in another module names the module, the
+  line and the column. No second line-shift mechanism exists.
 - The normal-form version, `normal_form_version` in `src/reify/mod.zig`,
   changes exactly when the rules, the builtin table or the speculatable lists
   change. A fingerprint test pins it. `Code.version` carries it, so a

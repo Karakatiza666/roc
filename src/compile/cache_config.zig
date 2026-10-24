@@ -358,12 +358,10 @@ pub const Constants = struct {
     ///      their bodies demand.
     /// 161: generated codec derivations record the renaming their snapshot
     ///      applied to every type that holds a variable.
-    /// 162: A module remembers how many lines of its source the compiler
-    ///      prepended, so a region it reports names the line the author wrote.
-    /// 163: A stored `Code` value holds the normal-form IR, not `Code.Ir`:
+    /// 162: A stored `Code` value holds the normal-form IR, not `Code.Ir`:
     ///      placement and numbering are canonical, rows are digests, and the
     ///      `graph` view inlines rows called once.
-    pub const CACHE_VERSION = 163;
+    pub const CACHE_VERSION = 162;
 };
 
 /// Configuration for the Roc cache system.

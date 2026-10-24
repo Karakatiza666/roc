@@ -23773,7 +23773,7 @@ Builtin :: [].{
 				ListOf(item) => "List(${item.name()})"
 				Record(fields) => {
 					rendered = fields.map(|field| "${field.name} : ${field.ty.name()}")
-					if rendered.is_empty() "{}" else "{ ${Str.join_with(rendered, ", ")} }"
+					if (rendered.is_empty()) "{}" else "{ ${Str.join_with(rendered, ", ")} }"
 				}
 				Tuple(parts) => "(${Str.join_with(parts.map(|part| part.name()), ", ")})"
 				Fn(params, result) => {
@@ -24303,7 +24303,7 @@ code_depths_in = |row, region, depth, start| {
 			node = row.node(n)
 			placed = { ..info, def_depth: code_put_index(info.def_depth, n.to_u64(), depth) }
 			read = node.args.fold(placed, |acc, arg| code_read_depth(acc, arg, depth))
-			inner = if node.op.repeats() depth + 1 else depth
+			inner = if (node.op.repeats()) depth + 1 else depth
 			node.op.regions().fold(read, |acc, sub| code_depths_in(row, sub, inner, acc))
 		},
 	)
@@ -24335,7 +24335,7 @@ code_val_tree = |row, info, val| match val {
 	Param(k) => Param(k)
 	Arg(arg) => Arg(arg)
 	Out(out) => Out(out)
-	Node(n) => if code_kept(row, info, n) Def(n) else code_node_tree(row, info, n)
+	Node(n) => if (code_kept(row, info, n)) Def(n) else code_node_tree(row, info, n)
 }
 
 code_node_tree : Code.Row, CodeTreeInfo, U32 -> Code.Tree

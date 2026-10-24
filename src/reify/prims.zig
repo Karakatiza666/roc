@@ -357,7 +357,7 @@ pub fn foldInt(int: types.IntTy, method: Method, a: i256, b: i256) ?Folded {
         .bitwise_and => .{ .int = wrapTo(int, a & b) },
         .bitwise_or => .{ .int = wrapTo(int, a | b) },
         .bitwise_xor => .{ .int = wrapTo(int, a ^ b) },
-        .not, .concat, .len, .get => unreachable,
+        .not, .concat, .len, .get => unreachable, // float prims admit no other methods (prims.admits)
     };
 }
 

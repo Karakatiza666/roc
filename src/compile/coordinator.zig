@@ -1413,12 +1413,6 @@ test "dependency post-order of a deep dependency chain runs on a small stack" {
     for (order, 0..) |node, position| try std.testing.expectEqual(depth - 1 - position, node);
 }
 
-/// A module whose file the compiler wrote the first lines of, and how many.
-pub const PrependedSource = struct {
-    path: []const u8,
-    line_count: u32,
-};
-
 /// Coordinator manages all compilation state and coordinates workers
 pub const Coordinator = struct {
     gpa: Allocator,
@@ -1566,11 +1560,6 @@ pub const Coordinator = struct {
     /// checking, so platform existence comes from explicit registration data
     /// rather than probing names or canonicalization progress.
     platform_root_package_name: ?[]const u8 = null,
-    /// The module compiled from a source the compiler prepended lines to, and
-    /// how many. `roc file.roc` writes a headerless file out with app wiring on
-    /// top, and anything that hands one of that module's lines to its author
-    /// counts from the file the author wrote instead. Borrowed from the caller.
-    prepended_source: ?PrependedSource = null,
 
     /// Timing accumulators
     total_parse_ns: u64,
@@ -1812,19 +1801,6 @@ pub const Coordinator = struct {
 
     pub fn setReleaseCheckedSolverTypes(self: *Coordinator, enabled: bool) void {
         self.release_checked_solver_types = enabled;
-    }
-
-    /// Declare that one module's file carries compiler-written lines on top.
-    /// `path` is borrowed and must outlive the coordinator.
-    pub fn setPrependedSource(self: *Coordinator, path: []const u8, line_count: u32) void {
-        self.prepended_source = .{ .path = path, .line_count = line_count };
-    }
-
-    fn applyPrependedSource(self: *const Coordinator, env: *ModuleEnv, path: []const u8) void {
-        env.common.prepended_line_count = if (self.prepended_source) |prepended|
-            if (std.mem.eql(u8, prepended.path, path)) prepended.line_count else 0
-        else
-            0;
     }
 
     /// Record which registered package is the app's platform. App-root type
@@ -6223,8 +6199,6 @@ pub const Coordinator = struct {
             module_alloc.destroy(env);
         };
         std.debug.assert(env.module_role == task.module_role);
-        // The cache key names the source, not how much of it the compiler wrote.
-        self.applyPrependedSource(env, task.path);
 
         const worker_alloc = task_allocs.result;
 
@@ -6407,7 +6381,6 @@ pub const Coordinator = struct {
         const parse_ast = parsed.ast;
         errdefer destroyModuleEnvAndSource(env);
         errdefer parse_ast.deinit();
-        self.applyPrependedSource(env, task.path);
 
         // The result payloads outlive this task, so they use the result
         // allocator. Only import-discovery intermediates use task scratch below.

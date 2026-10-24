@@ -1,11 +1,12 @@
-# A lambda written at a `Code` position keeps its rows open until the binding
-# around it generalizes.
+# A lambda written at a `Code` position is described with the rows checking
+# left it, which checking does not close early.
 #
 # A call relates its arguments only after it has checked every one, so the
 # table before the lambda fixes the row the lambda reads after the lambda was
 # checked. The second clause of a chain reads the parameter record the first
-# one opened and adds a field to it. A row nothing else fixes still closes on
-# exactly the fields the lambda reads.
+# one opened and adds a field to it. A row nothing else fixes seals to its
+# row default, as lowering seals it, so it holds exactly the fields the lambda
+# reads.
 Tag(p, row) :: { name : Str }.{
 	make : Str -> Tag(p, row)
 	make = |name| Tag.({ name: name })

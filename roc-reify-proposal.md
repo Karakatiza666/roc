@@ -61,7 +61,9 @@ Three translators ship as examples. Each one has an `expected_output` file and a
 |---|---|---|---|
 | `examples/reifying/glsl/` | a GLSL 330 fragment shader | 8 in `main.roc`, 1 in `refactored.roc` | both |
 | `examples/reifying/sql/` | a SQLite script for a schema, migrations, seed rows and queries | 12 in `main.roc`, 11 in `refactored.roc` | `refactored.roc` |
-| `examples/reifying/dbsp/` | a Rust program for the `dbsp` crate, which is not compiled here | 14 in `main.roc`, 1 in `refactored.roc` | neither |
+| `examples/reifying/dbsp/` | a Rust program for the `dbsp` crate, which is not compiled here | 19 in `main.roc`, 1 in `refactored.roc` | both |
+
+`examples/reifying/hello/` is a fourth, smaller translator of 63 lines. It turns an arithmetic function into an expression, and it shows both ways to refuse (`Err` and `Code.refuse_at`). The CLI suite runs it.
 
 `examples/reifying/shaders-without-reifying/` is the control experiment: the
 shader of the GLSL example written as a library DSL.
@@ -85,8 +87,8 @@ The tests, in layers. The counts were taken at the time of writing.
 |---|---|---|
 | Normal-form unit tests | `src/reify/` (118 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
 | Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (81 tests) | a walk that describes a body wrongly |
-| Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (82 cases) | the same, for calls into other modules and builtins |
-| CLI fixtures | `test/cli/Staged*.roc` (34 files), run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
+| Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (86 cases) | the same, for calls into other modules and builtins |
+| CLI fixtures | `test/cli/Staged*.roc` (45 files), run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
 | Fuzzers | `src/reify/fuzz_gen.zig`, `src/compile/reify_fuzz.zig`, `test/fuzzing/fuzz-reify.zig` | two spellings of one term that differ, or a normal form that computes what Roc does not |
 | Examples | the three above | translator output that changed under a refactor |
 | Rule derivation, offline | `zig build reify-rules`, `src/reify/derive/` (48 `test` blocks) | a normalization rule that is missing |
@@ -164,8 +166,8 @@ role would imply a new kind of module, and a translator is an ordinary package.
    thunk, and cannot be called. Section 12 covers what that costs.
 6. **Structural.** `Code` has `is_eq` and `to_hash` over a normal form, which
    gives translators common-subexpression detection and a stable cache key for
-   compiled artifacts for free. The prototype has both (`src/build/roc/Builtin.roc:24174`,
-   `:24178`). A normal form has no names: parameters and nodes are numbered, so
+   compiled artifacts for free. The prototype has both (`src/build/roc/Builtin.roc:24196`,
+   `:24200`). A normal form has no names: parameters and nodes are numbered, so
    two sites that differ only in the names of locals, parameters or helpers,
    or in the order of independent bindings, are equal and hash alike
    (`test/cli/StagedSites.roc`). Equality ignores the key of the site that
@@ -1101,7 +1103,7 @@ exclusions.
 | Excluded | Why |
 |---|---|
 | A function value nothing fixes: read from a list, or from a parameter of the described function | the compiler cannot say which function it is, so there is no body to describe. Defunctionalizing it would emit a dispatch table, and GLSL and SQL have no dispatch table. A function chosen by an `if` between known functions, or read from a record literal, is fixed: each branch is described, and the call becomes a `Switch` |
-| An undetermined type: a type variable, a `where` variable or an open row that nothing fixes | the body reads differently at each instantiation, so there is no one body to describe |
+| An undetermined type: a type variable or a `where` variable that nothing fixes, and no numeric or row default settles | the body reads differently at each instantiation, so there is no one body to describe |
 | A `Code` not fixed at build time: a template argument computed at run time, or a `Code` passed to a template | rule 7 of section 3. This one is a choice rather than an absence, and lifting it raises the cross-stage persistence question section 12 defers |
 
 A reified function's types are worked out the way any other Roc function's are.
@@ -1116,6 +1118,13 @@ the same story one level down: it is described at the types that call gives it.
 
 None of that is special to `Code`. The only types left out are the ones the
 program never settles on, which is the second exclusion above.
+
+The defaults are the ordinary ones. In `|x| x * 2` at a `Code` position, `x`
+takes `Dec`, as it would in a compiled function, and an open record or tag row
+takes its row default. A default that does not fit its use, as in
+`|x| x * 2.U8`, is refused with that reason. The checker commits none of this.
+The walk seals each variable the way Monotype does (`defaultedVariable` in
+`src/check/code_reifier.zig`).
 
 Everything else in pure Roc describes: calls into other modules of the package
 (a function of another package is a named primitive), recursive
@@ -1273,7 +1282,7 @@ neither crash nor diverge. It is exact: a builtin the normal form does not list
 is not speculatable, and neither is a node over one. Float arithmetic, `_wrap`
 arithmetic, comparisons, and reads of a record or tuple are. Checked integer
 `+`, `-` and `*`, `//`, `%` and `crash` are not
-(`src/build/roc/Builtin.roc:23997`, `roc-reify-normal-form.md` section 1.1). A
+(`src/build/roc/Builtin.roc:24014`, `roc-reify-normal-form.md` section 1.1). A
 translator for a target without short-circuit evaluation, such as SQL's `AND`,
 reads the flag on each operand to decide whether it may evaluate them eagerly.
 The normal form itself never evaluates a node that is not speculatable where the
@@ -1344,7 +1353,7 @@ library a translator owns, `Glsl.Vec3.scale` mapped to `*`, and does not fit a
 dependency whose body the translator should read. The design lets a translator
 declare which functions are its primitives and reads every other body
 (`roc-reify-normal-form.md` section 3.8, the item `code_primitives`). The
-prototype has not built that: `src/check/code_reifier.zig:16` is the rule today,
+prototype has not built that: `src/check/code_reifier.zig:17` is the rule today,
 and milestone M13 of `roc-reify-normalization-plan.md` is the work. Until then
 every function of another package is a primitive.
 
@@ -1364,7 +1373,7 @@ What stays open:
 
 | Gap | Detail |
 |---|---|
-| No example uses it | Each of the three translators returns an `Err`, because `refuse_at` stops the compile and an `Err` can be tested. Their messages name the construct and, in the DBSP example, the stage, and do not name a line |
+| Only the hello example uses it | `examples/reifying/hello/refused.roc` calls `refuse_at` and `roc check` reports the line. Each of the three larger translators returns an `Err`, because `refuse_at` stops the compile and an `Err` can be tested. Their messages name the construct and, in the DBSP example, the stage, and do not name a line |
 | The value carries no region | The regions are in a table only `refuse_at` reads, so a translator cannot put a line in a message of its own. |
 | Where it is reported | The report comes from the dev backend's evaluation. The interpreter's evaluation runs only where no problem store exists, so it never reports one (`roc-reify-normalization-plan.md`, the gaps M8a leaves) |
 

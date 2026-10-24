@@ -490,7 +490,7 @@ pub const Builder = struct {
         const key: u32 = switch (op) {
             .and_ => 1,
             .or_ => 0,
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // openOperand is only called for the operands of an And or Or node
         };
         for (earlier) |e| try self.facts.append(self.gpa, .{ .ref = e, .key = key });
         return r;
@@ -509,7 +509,7 @@ pub const Builder = struct {
 
     fn endOf(self: *Builder, end: EndSpec) Allocator.Error!ir.End {
         return switch (end) {
-            .open => unreachable,
+            .open => unreachable, // callers pass the end of a region being closed, never an open one
             .value => |refs| .{ .kind = .value, .target = 0, .refs = try self.store.addRefs(refs) },
             .jump => |j| .{ .kind = .jump, .target = j.join.index(), .refs = try self.store.addRefs(j.args) },
             .return_ => |r| .{ .kind = .return_, .target = 0, .refs = try self.store.addRefs(&.{r}) },
@@ -735,7 +735,7 @@ pub const Builder = struct {
             switch (r.kind) {
                 .arm => try self.pushArmFact(r.owner, path.items[i]),
                 .join => {},
-                .row_body, .operand, .loop_body, .lambda_body => unreachable,
+                .row_body, .operand, .loop_body, .lambda_body => unreachable, // the path runs along arms and joins only, as enter's contract states
             }
         }
         try self.pushOpen(x, mark);
@@ -771,7 +771,7 @@ pub const Builder = struct {
         defer self.gpa.free(refs);
         for (old_refs, refs) |a, *o| o.* = try self.available(a);
         return switch (end.kind) {
-            .open => unreachable,
+            .open => unreachable, // copyEnd copies closed regions, whose end is never open
             .branch => .{ .kind = .branch, .target = (try self.available(Ref.of(NodeId.of(end.target)))).nodeId().index(), .refs = .empty },
             .jump => .{ .kind = .jump, .target = self.joinCopy(RegionId.of(end.target)).index(), .refs = try self.store.addRefs(refs) },
             .value, .return_, .continue_, .break_ => .{ .kind = end.kind, .target = 0, .refs = try self.store.addRefs(refs) },
@@ -1397,7 +1397,7 @@ pub const Builder = struct {
             return switch (a.value) {
                 .int => litIntValue(self.b.types, a).? < litIntValue(self.b.types, c).?,
                 .str => |sa| std.mem.order(u8, self.b.store.byteSlice(sa), self.b.store.byteSlice(c.value.str)) == .lt,
-                .bool_, .float, .dec, .bytes => unreachable,
+                .bool_, .float, .dec, .bytes => unreachable, // literal switch keys are ints or strings
             };
         }
     };
@@ -1615,7 +1615,7 @@ pub const Builder = struct {
             .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not => self.types.boolTy(),
             .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat => self.store.refTy(self.row, args[0]),
             .len => self.types.intTy(.u64),
-            .get => unreachable,
+            .get => unreachable, // `get` has no result type derivable from its arguments and is never built through `prim`
         };
     }
 
@@ -1718,7 +1718,7 @@ pub const Builder = struct {
                 .same_arms => |sa| self.matchSameArms(sa, spec, b),
                 .tag_arm => |k| self.matchTagArm(k, spec, b),
                 .lit_switch => |ls| self.matchLitSwitch(ls, spec, spec, b),
-                .any, .lit_bool, .lit_int, .prim, .op, .component, .connective, .rest, .identity, .absorbing => unreachable,
+                .any, .lit_bool, .lit_int, .prim, .op, .component, .connective, .rest, .identity, .absorbing => unreachable, // the table check keeps only switch-shaped argument patterns at a switch_ root
             };
         }
         if (rule.root == .and_ or rule.root == .or_) {
@@ -1779,7 +1779,7 @@ pub const Builder = struct {
         // Every key pattern of the table is a variable (`table.zig`, the mirror of a `Bool` switch).
         const key = switch (ls.key.*) {
             .any => |k| k,
-            .lit_bool, .lit_int, .prim, .op, .component, .bool_switch, .connective, .same_arms, .tag_arm, .rest, .identity, .absorbing, .lit_switch => unreachable,
+            .lit_bool, .lit_int, .prim, .op, .component, .bool_switch, .connective, .same_arms, .tag_arm, .rest, .identity, .absorbing, .lit_switch => unreachable, // every key pattern of a literal-switch rule is a variable (table check)
         };
         if (!self.bindLit(key, LitId.of(spec.aux[0]), b)) return false;
         // As in `matchSwitch`, this switch's arms bind their region variables first.
@@ -1954,7 +1954,7 @@ pub const Builder = struct {
                 return self.bindVar(k, ref, b);
             },
             // `matchArgs` binds a run.
-            .rest => unreachable,
+            .rest => unreachable, // matchArgs binds a run, so a rest pattern never reaches matchPat
             .op => |op| {
                 const n = self.nodeOf(ref) orelse return false;
                 if (n.op != op.op) return false;
@@ -2002,7 +2002,7 @@ pub const Builder = struct {
                 }, root, b);
             },
             // The table's check keeps these at a `switch_` root.
-            .same_arms, .tag_arm => unreachable,
+            .same_arms, .tag_arm => unreachable, // the table check keeps same_arms and tag_arm at a switch_ root
         }
     }
 
@@ -2042,7 +2042,7 @@ pub const Builder = struct {
                 .nonzero_lit => litNonzero(self.store.lit(l).value),
                 .same_ty => self.store.lit(l).ty == b.root.tys[0],
                 .polarity_flips, .lit_bool_switch, .not_lit => false,
-                .int_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds => unreachable,
+                .int_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds => unreachable, // these conditions are not literal-indexed, so the outer prong never selects them
             },
             .int_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds => {},
         }
@@ -2096,10 +2096,10 @@ pub const Builder = struct {
             .bool_ => switch (p.method) {
                 .not => .{ .bool_ = !vals[0].value.bool_ },
                 .is_eq => .{ .bool_ = vals[0].value.bool_ == vals[1].value.bool_ },
-                .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable,
+                .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable, // bool owners only have the not and is_eq folds
             },
             .str, .list, .f32, .f64 => null,
-            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => unreachable,
+            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => unreachable, // integer owners fold through foldIntAll above
         };
     }
 
@@ -2152,7 +2152,7 @@ pub const Builder = struct {
                 if (args.items.len == 1 and prims.associativeOf(pp.method)) return args.items[0];
                 return self.call(owner, pp.method, args.items);
             },
-            .rest => unreachable,
+            .rest => unreachable, // rest is expanded among a chain's arguments above
             .bool_switch => |bs| {
                 const bool_ty = try self.types.boolTy();
                 const scrutinee = try self.instantiate(bs.scrutinee.*, b, &.{bool_ty});
@@ -2323,7 +2323,7 @@ pub const Builder = struct {
     pub fn available(self: *Builder, ref: Ref) Allocator.Error!Ref {
         if (self.visible(ref)) return ref;
         switch (ref.kind) {
-            .row_param => unreachable,
+            .row_param => unreachable, // a row parameter is visible in every region of its own row
             .region_param => {
                 if (self.param_subst.get(ref.regionId())) |values| return values[ref.output];
                 const c = self.region_copy.items[ref.target];
@@ -2397,7 +2397,7 @@ pub const Builder = struct {
                     .arm => try self.openArmAt(args[0], aux, @intCast(i)),
                     .operand => try self.openOperand(args[0..1], nd.op),
                     .join, .loop_body, .lambda_body => try self.openRegion(kind, params),
-                    .row_body => unreachable,
+                    .row_body => unreachable, // row_body regions are never owned by a node
                 };
                 self.region_copy.items[old.index()] = regions[i];
                 try self.fillFrom(old);
@@ -2418,7 +2418,7 @@ pub const Builder = struct {
         defer self.gpa.free(refs);
         for (old_refs, refs) |a, *o| o.* = try self.available(a);
         const spec: EndSpec = switch (end.kind) {
-            .open => unreachable,
+            .open => unreachable, // copyEnd copies closed regions, whose end is never open
             .value => .{ .value = refs },
             .jump => .{ .jump = .{ .join = self.joinCopy(RegionId.of(end.target)), .args = refs } },
             .return_ => .{ .return_ = refs[0] },
@@ -2533,7 +2533,7 @@ fn ruleIndex(step: []const u8, root: Op) usize {
     for (table.rules, 0..) |r, i| {
         if (std.mem.eql(u8, r.step, step) and r.root == root) return i;
     }
-    unreachable;
+    unreachable; // every caller names a step and root present in the table
 }
 
 test "an if written twice is one node, and one with another arm is not" {
@@ -2777,7 +2777,7 @@ fn switchRuleIndex(step: []const u8, first_arm: table.Arm) usize {
         const arm = r.args[0].bool_switch.arms[0];
         if (std.meta.eql(arm, first_arm)) return i;
     }
-    unreachable;
+    unreachable; // every caller names a switch rule present in the table
 }
 
 test "N13i: a switch on a negation swaps its arms, and knocking out N13i and N13s, which covers it, stops it" {
@@ -2931,7 +2931,7 @@ fn ruleIndexResult(step: []const u8, result: std.meta.Tag(table.Tmpl)) usize {
     for (table.rules, 0..) |r, i| {
         if (std.mem.eql(u8, r.step, step) and r.result == result) return i;
     }
-    unreachable;
+    unreachable; // every caller names a result kind present in the table
 }
 
 // `if a { if b { x + 1 } else { y * 2 } } else { y * 2 }`, each arm computing
@@ -3086,7 +3086,7 @@ fn ruleIndexArgs(step: []const u8, root: Op, nth: usize) usize {
         if (seen == nth) return i;
         seen += 1;
     }
-    unreachable;
+    unreachable; // every caller names a step, root and nth that exist in the table
 }
 
 fn nestedAnd(f: *Fixture) Allocator.Error!Ref {
@@ -3577,7 +3577,7 @@ fn n15aIndex(method: prims.Method, kind: std.meta.Tag(table.Pat)) usize {
         if (!std.mem.eql(u8, r.step, "N15a") or r.root_prim.?.method != method) continue;
         if (r.args[1] == kind) return i;
     }
-    unreachable;
+    unreachable; // the table holds an N15a row for every method and kind asked
 }
 
 test "N15a: a chain is one Prim over its operands in order, whatever its grouping, and the knockout stops it" {
@@ -3696,7 +3696,7 @@ fn litSwitchOf(b: *Builder, x: Ref, keys: []const i128, values: []const ?Ref, in
 
 const NoInner = struct {
     fn build(_: NoInner, _: *Builder, _: usize) HelperError!Ref {
-        unreachable;
+        unreachable; // NoInner is only used where no inner builder is ever invoked
     }
 };
 

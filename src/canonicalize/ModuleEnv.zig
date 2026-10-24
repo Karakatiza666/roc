@@ -3927,11 +3927,6 @@ pub fn calcRegionInfo(self: *const Self, region: Region) RegionInfo {
     return self.common.calcRegionInfo(region);
 }
 
-/// The lines and columns of a region, counted in the file the author wrote.
-/// See `CommonEnv.prepended_line_count`.
-pub fn calcAuthoredRegionInfo(self: *const Self, region: Region) RegionInfo {
-    return self.common.calcAuthoredRegionInfo(region);
-}
 /// Get the source line for a given region
 pub fn getSourceLine(self: *const Self, region: Region) error{ BeginTooLarge, EndTooLarge, InvalidPosition, NoLineStarts, OutOfOrder }![]const u8 {
     return self.common.getSourceLine(region);

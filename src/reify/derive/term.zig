@@ -170,7 +170,7 @@ pub fn instances(arena: Allocator, rule: table.Rule) Allocator.Error![]const Rul
         .polarity_flips => |k| polar = k,
         .lit_bool_switch => |k| lit_bool = k,
         .int_owner, .not_float_owner, .is_lit, .speculatable, .nonzero_lit, .movable, .movable_rest, .speculatable_rest, .same_ty, .not_lit => {},
-        .folds => unreachable,
+        .folds => unreachable, // only an evaluation row folds
     };
     const shapes: []const ?Term = if (polar != null) try polarityShapes(arena) else &.{null};
     // A literal switch with `Bool` arms reads as one over one key, the literal 0.
@@ -370,7 +370,7 @@ fn ofPat(arena: Allocator, p: table.Pat, ctx: *Ctx) Allocator.Error!Term {
             break :blk .{ .app = .{ .sym = sym, .args = try ofArgs(arena, pp.args, ctx, sym) } };
         },
         // `ofArgs` reads these among a chain's arguments.
-        .rest, .identity, .absorbing => unreachable,
+        .rest, .identity, .absorbing => unreachable, // ofArgs reads these among a chain's arguments
         .op => |op| blk: {
             const args = try arena.alloc(Term, op.args.len);
             for (op.args, args) |sub, *a| a.* = try ofPat(arena, sub, ctx);
@@ -449,7 +449,7 @@ fn ofTmpl(arena: Allocator, t: table.Tmpl, ctx: *Ctx) Allocator.Error!Term {
             if (args.items.len == 1 and prims.associativeOf(pp.method)) break :blk args.items[0];
             break :blk .{ .app = .{ .sym = .{ .op = .prim, .method = pp.method, .owner = pp.owner }, .args = args.items } };
         },
-        .rest => unreachable,
+        .rest => unreachable, // rest is expanded among a chain's arguments above
         .bool_switch => |bs| blk: {
             const args = try arena.alloc(Term, 3);
             args[0] = try ofTmpl(arena, bs.scrutinee.*, ctx);
@@ -487,7 +487,7 @@ fn ofTmpl(arena: Allocator, t: table.Tmpl, ctx: *Ctx) Allocator.Error!Term {
             };
             break :blk .{ .app = .{ .sym = .{ .op = .switch_, .index = 1 }, .args = args } };
         },
-        .folded => unreachable,
+        .folded => unreachable, // folded templates occur only in results of evaluation rows, not in term patterns
     };
 }
 

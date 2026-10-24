@@ -76,7 +76,7 @@ const Encoder = struct {
             .i64, .nominal_i64 => self.bv(),
             .union_ab => if (i == 2) self.bv() else "Bool",
             .record_xy, .tuple_ib => if (i == 1) self.bv() else "Bool",
-            .f64, .str, .union_abc, .list_i64 => unreachable,
+            .f64, .str, .union_abc, .list_i64 => unreachable, // only the sorts the encoder supports reach it (no f64, str, union_abc or list_i64)
         };
     }
 
@@ -85,7 +85,7 @@ const Encoder = struct {
             .bool, .i64, .nominal_i64 => 1,
             .union_ab => 3,
             .record_xy, .tuple_ib => 4,
-            .f64, .str, .union_abc, .list_i64 => unreachable,
+            .f64, .str, .union_abc, .list_i64 => unreachable, // only the sorts the encoder supports reach it (no f64, str, union_abc or list_i64)
         };
     }
 
@@ -116,7 +116,7 @@ const Encoder = struct {
             .bool, .i64, .nominal_i64 => v.d,
             .union_ab => self.print("(and {s} (=> {s} {s}))", .{ v.d, v.parts[0], v.parts[1] }),
             .record_xy, .tuple_ib => self.print("(and {s} {s} {s})", .{ v.d, v.parts[0], v.parts[2] }),
-            .f64, .str, .union_abc, .list_i64 => unreachable,
+            .f64, .str, .union_abc, .list_i64 => unreachable, // only the sorts the encoder supports reach it (no f64, str, union_abc or list_i64)
         };
     }
 
@@ -126,7 +126,7 @@ const Encoder = struct {
             .bool, .i64, .nominal_i64 => try self.print("(= {s} {s})", .{ a.parts[0], b.parts[0] }),
             .union_ab => try self.print("(and (= {s} {s}) (=> {s} (and (= {s} {s}) (=> {s} (= {s} {s})))))", .{ a.parts[0], b.parts[0], a.parts[0], a.parts[1], b.parts[1], a.parts[1], a.parts[2], b.parts[2] }),
             .record_xy, .tuple_ib => try self.print("(and (= {s} {s}) (=> {s} (= {s} {s})) (= {s} {s}) (=> {s} (= {s} {s})))", .{ a.parts[0], b.parts[0], a.parts[0], a.parts[1], b.parts[1], a.parts[2], b.parts[2], a.parts[2], a.parts[3], b.parts[3] }),
-            .f64, .str, .union_abc, .list_i64 => unreachable,
+            .f64, .str, .union_abc, .list_i64 => unreachable, // only the sorts the encoder supports reach it (no f64, str, union_abc or list_i64)
         };
         return self.print("(and (= {s} {s}) (=> {s} {s}))", .{ a.d, b.d, a.d, inner });
     }
@@ -189,7 +189,7 @@ const Encoder = struct {
                     .bitwise_or => "bvor",
                     .bitwise_xor => "bvxor",
                     .plus, .minus, .times, .div_trunc => null,
-                    .not, .concat, .len, .get => unreachable,
+                    .not, .concat, .len, .get => unreachable, // these methods are not total bit-vector ops and are handled by earlier prongs
                 };
                 if (total) |op| return self.val(sort, d, &.{try self.print("({s} {s})", .{ op, parts.items })}, sd);
                 std.debug.assert(x.args.len == 2);
@@ -198,7 +198,7 @@ const Encoder = struct {
                     .minus => "bvsub",
                     .times => "bvmul",
                     .div_trunc => if (s) "bvsdiv" else "bvudiv",
-                    .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable,
+                    .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable, // the total ops were handled above, leaving only these four
                 };
                 const value = try self.print("({s} {s} {s})", .{ op, a.parts[0], b.parts[0] });
                 // Checked arithmetic fails where the result leaves the type, which
@@ -211,7 +211,7 @@ const Encoder = struct {
                     .times => try self.print("(bv{s}mulo {s} {s})", .{ sign, a.parts[0], b.parts[0] }),
                     // An unsigned quotient never leaves its type.
                     .div_trunc => if (s) try self.print("(bvsdivo {s} {s})", .{ a.parts[0], b.parts[0] }) else "false",
-                    .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable,
+                    .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable, // the overflow check applies only to plus, minus, times and div_trunc
                 };
                 const in_range = try self.print("(not {s})", .{overflows});
                 const ok = try self.define("Bool", if (m == .div_trunc) try self.print("(and (not (= {s} {s})) {s})", .{ b.parts[0], try self.lit(0), in_range }) else in_range);
@@ -244,7 +244,7 @@ const Encoder = struct {
                 const second = switch (sig_mod.sortOf(self.vars, x.args[0])) {
                     .bool => c.parts[0],
                     .union_ab => try self.print("(not {s})", .{c.parts[0]}),
-                    .i64, .record_xy, .f64, .str, .union_abc, .list_i64, .tuple_ib, .nominal_i64 => unreachable,
+                    .i64, .record_xy, .f64, .str, .union_abc, .list_i64, .tuple_ib, .nominal_i64 => unreachable, // a switch scrutinee is a Bool or a two-tag union in signatures
                 };
                 const d = try self.print("(ite {s} (ite {s} {s} {s}) (and {s} {s}))", .{ c.d, second, tr.d, f.d, f.d, try self.same(sort, f, tr) });
                 var parts: [4][]const u8 = undefined;
@@ -274,7 +274,7 @@ const Encoder = struct {
             },
             // A nominal's parts are its backing value's.
             .wrap, .unwrap => return self.encode(x.args[0]),
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         }
     }
 

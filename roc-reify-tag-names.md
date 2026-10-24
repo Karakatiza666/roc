@@ -188,8 +188,8 @@ Tests:
 | `src/reify/rebuild.zig:654` | inlining a call over a narrower argument drops the arms of the tags the argument cannot hold | switch pruning (2.2) |
 | `src/reify/verify.zig:522`, `:559`, `:578` | conformance of a narrower tag, a wider value where a narrower one is expected, and the call type | 2.1 and the call type |
 | `src/reify/rows.zig:1140` | the walked digest reads a tag by its name, not by the order a store interned it in | digest by text |
-| `src/compile/test/code_reifier_test.zig:1384` | a helper that closes a row, read at a wider union, describes as the same code written inline | the refactor promise |
-| `src/compile/test/code_reifier_test.zig:1334`, `:1421`, `:1463` | a `?` body reaches a wider match with no node between; a match keeps the arm of a tag only it lists; a match lists a tag the helper cannot build | conformance and arms through the walk |
+| `src/compile/test/code_reifier_test.zig:1440` | a helper that closes a row, read at a wider union, describes as the same code written inline | the refactor promise |
+| `src/compile/test/code_reifier_test.zig:1390`, `:1477`, `:1519` | a `?` body reaches a wider match with no node between; a match keeps the arm of a tag only it lists; a match lists a tag the helper cannot build | conformance and arms through the walk |
 | `src/eval/test/eval_staging_tests.zig:1573` | a call result of the union its callee's body closed reaches a wider match by name | staged output without `Widen` |
 
 ## 3 Tag ids across module and site boundaries
@@ -235,7 +235,7 @@ Each gap is resolved. The last column says where.
 | Gap | Effect if left | Needed | Resolved at |
 |---|---|---|---|
 | digest hashed tag payload words raw | interning order depends on walk order, so two equal sites digest differently | hash tag and payload names by text (section 2) | `src/reify/digest.zig:348-349`. Test: `src/reify/rows.zig:1140`. |
-| the demanded-type rule (2.3) is new | without it, an extracted helper changes node types, a smaller version of the `Widen` problem | the inline view rebuilds the ends at the demanded type, with a test that compares inline code and an inlined helper | `src/reify/rebuild.zig:116-265` and `:522`. Test: `src/compile/test/code_reifier_test.zig:1384`. Limits: 2.3. |
+| the demanded-type rule (2.3) is new | without it, an extracted helper changes node types, a smaller version of the `Widen` problem | the inline view rebuilds the ends at the demanded type, with a test that compares inline code and an inlined helper | `src/reify/rebuild.zig:116-265` and `:522`. Test: `src/compile/test/code_reifier_test.zig:1440`. Limits: 2.3. |
 | switch pruning (2.2) is new | a switch with arms for tags its scrutinee cannot hold fails `verify` after inlining | the switch constructor maps arms by name | `src/reify/builder.zig:1061-1095`. Test: `src/reify/rebuild.zig:654`. |
 | typed translators | a C or GLSL translator with one struct per union sees a child whose type is narrower than its slot, and must convert there | document conformance in `Code` | the paragraph in `src/build/roc/Builtin.roc:23930-23936`. `Code.Ty.widens` was not added: the paragraph is enough for the translators that exist, and the helper can follow when one needs it. |
 | the derivation tool | `src/reify/derive/cp.zig` and `sig.zig` read tag positions through `armCount` | update them | `src/reify/derive/sig.zig:22-37` (the tool interns `A` and `B` first, so a tag name is its index), `:330-331`, `src/reify/derive/term.zig:667-702` (`readBack` turns a name into a term position), `src/reify/derive/cp.zig:278`, `:309`, `:586`, `:617-620`. The rule table and the builtin table did not change, so the fingerprint did not change either. The version stays 3. |
