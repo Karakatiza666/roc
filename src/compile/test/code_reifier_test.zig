@@ -4619,3 +4619,173 @@ test "L4 and L5 M7: scalar replacement keeps every seed's two prints one normal 
     }
     try std.testing.expect(verdicts.get(.agree) > 0);
 }
+
+// M8, V5a: `inline_digest`. A node's digest is its content in the `inline`
+// view, so spellings that meet give each node one digest, and a change to
+// what a node computes changes it and the digests of the nodes that read it.
+
+/// Every node digest of the `inline` view of `wobble`, row by row.
+fn inlineDigests(gpa: Allocator, source: []const u8) (StagedError || error{ TestUnexpectedResult, TestExpectedEqual })![]u128 {
+    const staged = try Staged.createInlined(gpa, source);
+    defer staged.destroy();
+    if (staged.outcome != .reified) {
+        try staged.expectDump("");
+        return error.TestUnexpectedResult;
+    }
+    // `Inlined := { digests, graph, site, version }`, in label order.
+    const rows = staged.store.get(staged.store.get(staged.outcome.reified).record[0]).list.nodes;
+    var out: std.ArrayList(u128) = .empty;
+    errdefer out.deinit(gpa);
+    for (rows) |row| for (staged.store.get(row).list.nodes) |digest| {
+        try out.append(gpa, staged.store.get(digest).scalar.u128);
+    };
+    return out.toOwnedSlice(gpa);
+}
+
+fn expectSameDigests(left: []const u8, right: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const a = try inlineDigests(gpa, left);
+    defer gpa.free(a);
+    const b = try inlineDigests(gpa, right);
+    defer gpa.free(b);
+    try std.testing.expect(a.len > 0);
+    try std.testing.expectEqualSlices(u128, a, b);
+}
+
+/// The digests differ, as lists, and their last entry, which is the node
+/// the function returns, differs too. `shared` is how many entries from the
+/// start stay equal.
+fn expectOtherDigests(left: []const u8, right: []const u8, shared: usize) !void {
+    const gpa = std.testing.allocator;
+    const a = try inlineDigests(gpa, left);
+    defer gpa.free(a);
+    const b = try inlineDigests(gpa, right);
+    defer gpa.free(b);
+    try std.testing.expect(a.len > 0 and b.len > 0);
+    try std.testing.expect(a[a.len - 1] != b[b.len - 1]);
+    try std.testing.expectEqualSlices(u128, a[0..shared], b[0..shared]);
+    // Every digest of the unchanged part of one side is on the other side
+    // only if the node it names is, so no digest of a changed node repeats.
+    for (a[shared..]) |d| if (std.mem.findScalar(u128, b[shared..], d) != null) {
+        // A node the change did not reach can still repeat; the last never does.
+        try std.testing.expect(d != a[a.len - 1]);
+    };
+}
+
+const m8_helper =
+    \\step : U64 -> U64
+    \\step = |x| x * 3 + 1
+    \\
+;
+
+test "L3 M8: a helper called twice and its body written out have one inline_digest per node" {
+    try expectSameDigests(
+        m8_helper ++
+            \\wobble : U64 -> U64
+            \\wobble = |input| step(input) + step(input + 7)
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| (input * 3 + 1) + ((input + 7) * 3 + 1)
+    );
+}
+
+test "L3 M8: extracting a helper, in any parameter order, keeps every inline_digest" {
+    try expectSameDigests(
+        \\wobble : U64 -> U64
+        \\wobble = |input| (input * 3 + 1) + ((input + 7) * 3 + 1)
+    ,
+        \\scale : U64, U64 -> U64
+        \\scale = |k, x| x * k + 1
+        \\
+        \\wobble : U64 -> U64
+        \\wobble = |input| scale(3, input) + scale(3, input + 7)
+    );
+    try expectSameDigests(
+        \\wobble : U64 -> U64
+        \\wobble = |input| (input * 3 + 1) + ((input + 7) * 3 + 1)
+    ,
+        \\once : U64 -> U64
+        \\once = |x| x * 3 + 1
+        \\
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    base = once(input)
+        \\    shifted = once(input + 7)
+        \\    base + shifted
+        \\}
+    );
+}
+
+test "L3 M8: renamed bindings, a reorder and an if against a match keep every inline_digest" {
+    try expectSameDigests(
+        \\wobble : U64 -> U64
+        \\wobble = |input| (input * 3 + 1) + ((input + 7) * 3 + 1)
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    shifted = input + 7
+        \\    first = input * 3 + 1
+        \\    second = shifted * 3 + 1
+        \\    first + second
+        \\}
+    );
+    try expectSameDigests(
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 10 input * 2 else input + 5
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| match input < 10 {
+        \\    Bool.True => input * 2
+        \\    Bool.False => input + 5
+        \\}
+    );
+}
+
+test "L3 M8: a change to what a node computes changes the digests of the node and its readers" {
+    // The constant changes the second `step`'s argument, so the first
+    // half of the nodes stay and the sum changes.
+    try expectOtherDigests(
+        m8_helper ++
+            \\wobble : U64 -> U64
+            \\wobble = |input| step(input) + step(input + 7)
+    ,
+        m8_helper ++
+            \\wobble : U64 -> U64
+            \\wobble = |input| step(input) + step(input + 8)
+    , 1);
+    // A different operation in the helper changes every node that reads it.
+    try expectOtherDigests(
+        m8_helper ++
+            \\wobble : U64 -> U64
+            \\wobble = |input| step(input) + step(input + 7)
+    ,
+        \\step : U64 -> U64
+        \\step = |x| x * 3 - 1
+        \\
+        \\wobble : U64 -> U64
+        \\wobble = |input| step(input) + step(input + 7)
+    , 0);
+}
+
+test "L3 M8: a recursive helper's call is named by its body" {
+    const body =
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    go = |n, acc| if n == 0 acc else go(n - 1, acc + CHANGE)
+        \\    go(input, 0)
+        \\}
+    ;
+    const gpa = std.testing.allocator;
+    const one = try std.mem.replaceOwned(u8, gpa, body, "CHANGE", "2");
+    defer gpa.free(one);
+    const same = try std.mem.replaceOwned(u8, gpa, body, "CHANGE", "2");
+    defer gpa.free(same);
+    const other = try std.mem.replaceOwned(u8, gpa, body, "CHANGE", "3");
+    defer gpa.free(other);
+    try expectSameDigests(one, same);
+    const a = try inlineDigests(gpa, one);
+    defer gpa.free(a);
+    const b = try inlineDigests(gpa, other);
+    defer gpa.free(b);
+    try std.testing.expect(!std.mem.eql(u128, a, b));
+}

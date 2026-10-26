@@ -7938,6 +7938,8 @@ pub const Walk = struct {
     /// slots its root reads, in slot order.
     const Normalized = struct {
         graph: ConstNodeId,
+        /// The digests of the nodes of an `inline` view (V5a); null for `graph`.
+        digests: ?ConstNodeId,
         origins: reify.provenance.Emitted,
         slot_order: []ir.SlotId,
     };
@@ -8113,6 +8115,7 @@ pub const Walk = struct {
             try self.publish(site_key, &memo.origins);
             var emitter = try code_emit.Emitter.init(self.gpa, self.store, &site.store, &site.types);
             defer emitter.deinit();
+            if (memo.digests) |digests| return emitter.inlinedOf(memo.graph, digests, site_key);
             return emitter.siteOf(memo.graph, site_key);
         }
         try self.normalize(root, region);
@@ -8122,13 +8125,18 @@ pub const Walk = struct {
         defer emitter.deinit();
         self.root = root;
         const graph = try emitter.graph(root);
+        const digests: ?ConstNodeId = switch (self.view) {
+            .graph => null,
+            .inline_ => try emitter.digests(root),
+        };
         try self.bindSlots(emitter.slot_order, region);
         var origins = try reify.provenance.emitted(self.gpa, &site.store, root);
         errdefer origins.deinit(self.gpa);
         const slot_order = try self.gpa.dupe(ir.SlotId, emitter.slot_order);
         errdefer self.gpa.free(slot_order);
         try self.publish(site_key, &origins);
-        try self.normalized.put(self.gpa, memo_key, .{ .graph = graph, .origins = origins, .slot_order = slot_order });
+        try self.normalized.put(self.gpa, memo_key, .{ .graph = graph, .digests = digests, .origins = origins, .slot_order = slot_order });
+        if (digests) |d| return emitter.inlinedOf(graph, d, site_key);
         return emitter.siteOf(graph, site_key);
     }
 

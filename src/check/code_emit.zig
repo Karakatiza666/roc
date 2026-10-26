@@ -90,6 +90,30 @@ pub const Emitter = struct {
         return self.record(&.{ graph_node, try self.scalar(.{ .u64 = site_key }), try self.u32Node(version) });
     }
 
+    /// The `Code.Inlined` backing over a graph already written and its
+    /// digests (`digests`): `{ digests, graph, site, version }`, in label
+    /// order.
+    pub fn inlinedOf(self: *Emitter, graph_node: ConstNodeId, digests_node: ConstNodeId, site_key: u64) Allocator.Error!ConstNodeId {
+        return self.record(&.{ digests_node, graph_node, try self.scalar(.{ .u64 = site_key }), try self.u32Node(version) });
+    }
+
+    /// The content digest of every node of the rows the site of `root`
+    /// reaches (V5a): a list per row, root first, with one `U128` per node,
+    /// in the numbering of `graph`.
+    pub fn digests(self: *Emitter, root: RowId) Allocator.Error!ConstNodeId {
+        const all = try reify.rows.siteDigests(self.gpa, self.store, self.types, root);
+        defer reify.digest.freeSite(self.gpa, all);
+        const per_row = try self.gpa.alloc(ConstNodeId, all.len);
+        defer self.gpa.free(per_row);
+        for (all, per_row) |row_digests, *out| {
+            const items = try self.gpa.alloc(ConstNodeId, row_digests.len);
+            defer self.gpa.free(items);
+            for (row_digests, items) |d, *o| o.* = try self.scalar(.{ .u128 = d });
+            out.* = try self.listOf(items);
+        }
+        return self.listOf(per_row);
+    }
+
     /// The `Graph` of the site whose root is `root`: the rows it reaches.
     pub fn graph(self: *Emitter, root: RowId) Allocator.Error!ConstNodeId {
         self.row_index.clearRetainingCapacity();

@@ -607,6 +607,25 @@ pub fn walkedDigest(gpa: Allocator, store: *const ir.Store, types: *const types_
     return std.mem.readInt(u128, out[0..16], .little);
 }
 
+/// The content digest of every node of the rows the site of `root` reaches
+/// (V5a): one slice per row, root first, in the order the emitter writes the
+/// rows, with one digest per node in the order it numbers them. Free it with
+/// `digest_mod.freeSite`.
+pub fn siteDigests(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, root: RowId) Allocator.Error![]const []const Digest {
+    var returns = try live_mod.Returns.init(gpa, store);
+    defer returns.deinit(gpa);
+    var reached: ir.RowTable(number.Numbering) = .empty;
+    defer {
+        for (reached.values()) |*n| n.deinit(gpa);
+        reached.deinit(gpa);
+    }
+    try number.siteRows(gpa, store, &returns, root, &reached);
+    const orders = try gpa.alloc([]const ir.NodeId, reached.count());
+    defer gpa.free(orders);
+    for (reached.values(), orders) |*numbering, *o| o.* = numbering.order.items;
+    return digest_mod.ofSite(gpa, store, types, reached.keys(), orders);
+}
+
 /// Whether a row the site of `root` reaches holds an `Apply` (N8j): a call
 /// through a function value that no rule resolved, which refuses the site.
 pub fn reachesApply(gpa: Allocator, store: *const ir.Store, root: RowId) Allocator.Error!bool {

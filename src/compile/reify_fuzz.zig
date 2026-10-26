@@ -247,11 +247,17 @@ const Site = struct {
 
     /// Walk the site in place, since the walk keeps a pointer to the store.
     fn describe(self: *Site, gpa: Allocator, lookup: *const Lookup, env: *const ModuleEnv, param: []const u8) Error!void {
+        return self.describeIn(gpa, lookup, env, param, .graph);
+    }
+
+    /// `describe`, for a site whose declared type selects `view`.
+    fn describeIn(self: *Site, gpa: Allocator, lookup: *const Lookup, env: *const ModuleEnv, param: []const u8, view: @TypeOf(@as(CodeReifier.Walk, undefined).view)) Error!void {
         const artifact = lookup.artifact;
         self.gpa = gpa;
         self.dump = .empty;
         self.store = ConstStore.init(gpa);
         self.walk = CodeReifier.Walk.init(gpa, &self.store, lookup.lookup());
+        self.walk.view = view;
         const lambda = lambdaByParam(artifact, env, param) orelse return error.SiteNotFound;
         const reifier = try self.walk.reader(.{ .sources = CodeReifier.Reifier.artifactSources(artifact), .env = env });
         self.outcome = try reifier.reifyLambda(lambda, .{
@@ -377,6 +383,40 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
                 return error.NormalFormsDiffer;
             },
         },
+    }
+
+    // L4 for V5a: in the `inline` view, the prints meet and every node of
+    // them has one digest.
+    {
+        var left_inline: Site = undefined;
+        try left_inline.describeIn(gpa, &lookup, env, case.left_param, .inline_);
+        defer left_inline.deinit();
+        var right_inline: Site = undefined;
+        try right_inline.describeIn(gpa, &lookup, env, case.right_param, .inline_);
+        defer right_inline.deinit();
+        if (left_inline.outcome == .reified and right_inline.outcome == .reified) {
+            if (!std.mem.eql(u8, left_inline.dump.items, right_inline.dump.items)) {
+                std.debug.print("the prints describe as two normal forms in the inline view:\n{s}\n{s}\n", .{ left_inline.dump.items, right_inline.dump.items });
+                return error.NormalFormsDiffer;
+            }
+            const ls = left_inline.walk.site.?;
+            const rs = right_inline.walk.site.?;
+            const ld = try reify.rows.siteDigests(gpa, &ls.store, &ls.types, left_inline.walk.root.?);
+            defer reify.digest.freeSite(gpa, ld);
+            const rd = try reify.rows.siteDigests(gpa, &rs.store, &rs.types, right_inline.walk.root.?);
+            defer reify.digest.freeSite(gpa, rd);
+            var equal_digests = ld.len == rd.len;
+            if (equal_digests) for (ld, rd) |a, b| {
+                if (!std.mem.eql(reify.digest.Digest, a, b)) equal_digests = false;
+            };
+            if (!equal_digests) {
+                std.debug.print("the prints meet in the inline view and their nodes have different digests:\n{s}\n", .{left_inline.dump.items});
+                return error.NormalFormsDiffer;
+            }
+        } else if ((left_inline.outcome == .reified) != (right_inline.outcome == .reified)) {
+            // One print is refused in this view and the other is not.
+            return error.RefusalsDiffer;
+        }
     }
 
     // L5: the normal form's value is the one Roc computed at compile time.

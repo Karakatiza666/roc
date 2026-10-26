@@ -384,7 +384,9 @@ pub const Constants = struct {
     ///      component (N14).
     /// 170: Normal form 10: the speculatable conditions of the rules read the
     ///      operand cone, so `x - x` keeps a loop that can crash.
-    pub const CACHE_VERSION = 170;
+    /// 171: `Code.Inlined` values hold `inline_digest`'s digests (V5a), and
+    ///      `Code.Digest` is a builtin type.
+    pub const CACHE_VERSION = 171;
 };
 
 /// Configuration for the Roc cache system.

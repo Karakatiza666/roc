@@ -24205,13 +24205,28 @@ Builtin :: [].{
 			),
 		]
 
+		## A node's content digest in the `inline` view (see
+		## [Code.Inlined] `inline_digest`). Two digests are equal when the
+		## contents are.
+		Digest :: { bits : U128 }.{
+			## The digest as a number, for a translator that persists it.
+			to_u128 : Digest -> U128
+			to_u128 = |Digest.(inner)| inner.bits
+
+			is_eq : Digest, Digest -> Bool
+			is_eq = |Digest.(a), Digest.(b)| a.bits == b.bits
+
+			to_hash : Digest, Hasher -> Hasher
+			to_hash = |Digest.(inner), hasher| Hasher.write_u128(hasher, inner.bits)
+		}
+
 		## A description whose site is declared `Code.Inlined(f)`: the `inline`
 		## view of the normal form. Every call of a function that does not reach
 		## itself is inlined, however many calls it has, and a function value of
 		## one is a `Lambda` region where it is built. Only recursive functions
 		## stay rows. A translator with no function form, such as one that emits
 		## one expression, reads this view.
-		Inlined(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+		Inlined(_fn) :: { digests : List(List(U128)), graph : Graph, site : U64, version : U32 }.{
 
 			## The rows the description reaches: the root, and the recursive
 			## rows it calls.
@@ -24235,6 +24250,31 @@ Builtin :: [].{
 			## [Code.refuse_at] refuses one of the `graph` view.
 			refuse_at : Inlined(_fn), { row : U32, node : U32 }, Str -> _a
 			refuse_at = |Inlined.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
+
+			## The content digest of node `at.node` of row `at.row` of the
+			## `inline` view, which names the node under the refactors the
+			## normal form absorbs. Two nodes that compute one thing, in this
+			## value or in another, have one digest: it reads the node's
+			## operation, its types and the digests of what it reads, and not
+			## the node's index, its row's index, or where the node sits. So a
+			## translator can key a persisted operator or a checkpoint by it,
+			## and extracting or inlining a helper, or any other refactor of
+			## the normal form's rules, keeps it. A change to what the node
+			## computes, or to anything it reads, changes it. A `Call` that
+			## `inline` leaves, to a recursive function, is named by that
+			## function's place in `rows` and the content of its body.
+			##
+			## It is defined only in this view: in `graph` a node of a shared
+			## row has one inlined content per caller, so it has no one digest.
+			## A node that does not exist crashes, as [Code.Row] `node` does.
+			inline_digest : Inlined(_fn), { row : U32, node : U32 } -> Digest
+			inline_digest = |Inlined.(inner), at| match inner.digests.get(at.row.to_u64()) {
+				Ok(row_digests) => match row_digests.get(at.node.to_u64()) {
+					Ok(bits) => Digest.({ bits: bits })
+					Err(_) => crash "Code.Inlined.inline_digest: no node at this index"
+				}
+				Err(_) => crash "Code.Inlined.inline_digest: no row with this id"
+			}
 
 			## A translator's result, as [Code.bound] makes one for the `graph`
 			## view.

@@ -126,6 +126,74 @@ pub fn ofRowContent(gpa: Allocator, store: *const ir.Store, row: ir.RowId, names
     return rowDigest(store, &memo, row);
 }
 
+/// The digest of every node of the rows a site reaches (V5a), for the
+/// `inline` view: `rows` in the order the emitter numbers them, and for
+/// each, its nodes in numbering order (`orders`). The result holds one
+/// slice per row, with one digest per node.
+///
+/// A node's digest is its content digest: its op, immediates and types
+/// hashed by content, so two sites with one normal form give each node one
+/// digest, whatever their type ids and row ids were. A `Call` or `Closure`
+/// that `inline` leaves names its row by the row's place in `rows` and the
+/// content of the row's own body, so a change inside a recursive helper
+/// changes its callers' digests.
+pub fn ofSite(
+    gpa: Allocator,
+    store: *const ir.Store,
+    types: *const types_mod.Types,
+    rows: []const ir.RowId,
+    orders: []const []const NodeId,
+) Allocator.Error![]const []const Digest {
+    std.debug.assert(rows.len == orders.len);
+    const place = try gpa.alloc(Digest, store.rows.items.len);
+    defer gpa.free(place);
+    @memset(place, 0);
+    for (rows, 0..) |r, i| place[r.index()] = @as(Digest, i) | (@as(Digest, 1) << 64);
+    const ByPlace = struct {
+        fn name(ctx: *const anyopaque, row: ir.RowId) Digest {
+            const table: *const []Digest = @ptrCast(@alignCast(ctx));
+            return table.*[row.index()];
+        }
+    };
+    const place_slice: []Digest = place;
+    var content: Content = .{ .gpa = gpa, .types = types };
+    defer content.deinit();
+    const shallow: RowNamer = .{ .ctx = @ptrCast(&place_slice), .name = ByPlace.name };
+    const names = try gpa.alloc(Digest, store.rows.items.len);
+    defer gpa.free(names);
+    @memset(names, 0);
+    for (rows) |r| {
+        var h: Hasher = .{};
+        h.digest(place[r.index()]);
+        h.digest(try ofRowContent(gpa, store, r, shallow, &content));
+        names[r.index()] = h.final();
+    }
+    const names_slice: []Digest = names;
+    const named: RowNamer = .{ .ctx = @ptrCast(&names_slice), .name = ByPlace.name };
+    var memo: Memo = .{ .gpa = gpa, .store = store, .names = named, .content = &content };
+    defer memo.deinit();
+    const out = try gpa.alloc([]const Digest, rows.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |each| gpa.free(each);
+        gpa.free(out);
+    }
+    for (orders, out) |order, *slot| {
+        const row_digests = try gpa.alloc(Digest, order.len);
+        errdefer gpa.free(row_digests);
+        for (order, row_digests) |n, *d| d.* = try memo.nodeD(n);
+        slot.* = row_digests;
+        made += 1;
+    }
+    return out;
+}
+
+/// Free what `ofSite` returned.
+pub fn freeSite(gpa: Allocator, digests: []const []const Digest) void {
+    for (digests) |each| gpa.free(each);
+    gpa.free(digests);
+}
+
 fn rowDigest(store: *const ir.Store, memo: *Memo, row: ir.RowId) Allocator.Error!Digest {
     const info = store.row(row);
     var h: Hasher = .{};

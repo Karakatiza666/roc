@@ -52,6 +52,7 @@ Section 4 defines it; section 11 covers where its output executes.
 |---|---|
 | What it describes | Pure Roc as section 10 states it: literals, operators, calls (helpers, generic and recursive functions, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods. A construct it does not describe stops with a report that names the construct |
 | What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 10 (`src/reify/mod.zig:36`) |
+| How a translator names a node | `Code.Inlined.inline_digest` gives a node of the `inline` view a content digest that survives the refactors above and helper extraction (`roc-reify-normalization-plan.md`, M8) |
 | How a translator refuses | It returns an `Err`, or calls `Code.refuse_at`, which the compiler reports at the source of the node (section 13) |
 
 Three translators ship as examples. Each one has an `expected_output` file and a
