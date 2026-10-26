@@ -2603,7 +2603,7 @@ pub const Builder = struct {
             .key_owner => |k| b.owners[k].?.int() != null or b.owners[k].? == .str,
             .not_float_owner => |k| b.owners[k].?.float() == null,
             .is_lit => |k| if (self.nodeOf(b.vars[k].?)) |n| n.op == .lit else false,
-            .speculatable => |k| if (self.nodeOf(b.vars[k].?)) |n| n.flags.speculatable else true,
+            .speculatable => |k| try self.coneSpeculatable(b.vars[k].?),
             .nonzero_lit => |k| if (self.nodeOf(b.vars[k].?)) |n| n.op == .lit and litNonzero(self.store.lit(LitId.of(n.payload)).value) else false,
             .movable => |k| try self.movable(b.regions[k].?),
             .movable_rest => |k| blk: {
@@ -2617,8 +2617,7 @@ pub const Builder = struct {
             .speculatable_rest => |k| blk: {
                 const seq = b.arg_seqs[k].?;
                 for (self.argsOf(seq.src, b)[seq.lo..seq.hi]) |a| {
-                    const n = self.nodeOf(a) orelse continue;
-                    if (!n.flags.speculatable) break :blk false;
+                    if (!try self.coneSpeculatable(a)) break :blk false;
                 }
                 break :blk true;
             },
@@ -3071,6 +3070,31 @@ pub const Builder = struct {
                 return a.target < b.target or (a.target == b.target and a.output < b.output);
             }
         }.lt);
+    }
+
+    /// Whether dropping or repeating `ref` drops or repeats no failure: the
+    /// node and every live node it reads, through its operands and through
+    /// the ends of the regions it owns, are speculatable (normal-form 1.1).
+    /// A node's own flag covers only the node, so `Field` of a loop output is
+    /// flagged speculatable although the loop it reads is not.
+    fn coneSpeculatable(self: *Builder, ref: Ref) Allocator.Error!bool {
+        var seen: collections.DenseMapUnmanaged(NodeId, void) = .empty;
+        defer seen.deinit(self.gpa);
+        var stack: std.ArrayList(Ref) = .empty;
+        defer stack.deinit(self.gpa);
+        try stack.append(self.gpa, ref);
+        while (stack.pop()) |r| switch (r.kind) {
+            .row_param, .region_param, .input => {},
+            .node => {
+                const n = r.nodeId();
+                if ((try seen.getOrPut(self.gpa, n)).found_existing) continue;
+                const nd = self.store.node(n);
+                if (!nd.flags.speculatable) return false;
+                try stack.appendSlice(self.gpa, self.store.refSlice(nd.args));
+                for (self.store.regionSlice(nd.regions)) |sub| try self.pushEnd(&stack, sub);
+            },
+        };
+        return true;
     }
 
     fn pushEnd(self: *Builder, stack: *std.ArrayList(Ref), r: RegionId) Allocator.Error!void {
@@ -4462,6 +4486,38 @@ test "N15c: a literal operand of integer is_eq, plus and times goes last, and tw
     const off = f.store.node((try f.b.call(.i64, .plus, &.{ three, p(0) })).nodeId());
     try testing.expectEqualSlices(Ref, &.{ three, p(0) }, f.store.refSlice(off.args));
     try f.b.endRow(.{ .value = &.{p(0)} });
+}
+
+test "T1.11 and the other speculatable conditions read the operand cone: a field of a loop output keeps x - x and x * 0" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const i64_ty = try f.types.intTy(.i64);
+    const rec_ty = try f.types.recordTy(&.{ .{ .name = "spare", .ty = i64_ty }, .{ .name = "total", .ty = i64_ty } });
+    _ = try f.b.beginRow(&.{i64_ty}, i64_ty);
+    const zero = try f.b.litInt(i64_ty, 0);
+    const lb = try f.b.openRegion(.loop_body, &.{ i64_ty, rec_ty });
+    const acc = Ref.regionParam(lb, 1);
+    const next = try f.b.record(rec_ty, &.{
+        try f.b.field(acc, 0),
+        try f.b.call(.i64, .plus, &.{ try f.b.field(acc, 1), Ref.regionParam(lb, 0) }),
+    });
+    try f.b.close(.{ .continue_ = &.{next} });
+    const init = try f.b.record(rec_ty, &.{ zero, zero });
+    const loop = try f.b.loopOf(.for_range, &.{ zero, Ref.rowParam(0), init }, lb, &.{rec_ty});
+    // The Field node is flagged speculatable, the loop it reads is not.
+    const total = try f.b.field(loop, 1);
+    try testing.expect(f.store.node(total.nodeId()).flags.speculatable);
+    try testing.expect(!f.store.node(loop.nodeId()).flags.speculatable);
+    const minus = try f.b.call(.i64, .minus, &.{ total, total });
+    try testing.expectEqual(Op.prim, f.store.node(minus.nodeId()).op);
+    const times = try f.b.call(.i64, .times, &.{ total, zero });
+    try testing.expectEqual(Op.prim, f.store.node(times.nodeId()).op);
+    // The same rules still fire over an operand whose cone is speculatable.
+    try testing.expectEqual(zero, try f.b.call(.i64, .minus, &.{ Ref.rowParam(0), Ref.rowParam(0) }));
+    try testing.expectEqual(zero, try f.b.call(.i64, .times, &.{ Ref.rowParam(0), zero }));
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .plus, &.{ minus, times })} });
+    try verifyOk(&f);
 }
 
 test "N13j over floats: a fold is the IEEE result of the type, with Roc's one NaN and the bits of a negative zero" {

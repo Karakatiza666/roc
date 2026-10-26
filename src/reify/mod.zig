@@ -33,7 +33,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 9;
+pub const normal_form_version: u32 = 10;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -50,6 +50,8 @@ pub fn fingerprint() u64 {
     for (std.enums.values(ir.RecordForm)) |form| h.update(@tagName(form));
     for (loops.steps) |step| h.update(step);
     for (scalar.steps) |step| h.update(step);
+    // The conditions `speculatable` and `speculatable_rest` read the cone.
+    h.update("speculatable reads the operand cone");
     return h.final();
 }
 
@@ -94,6 +96,10 @@ const recorded = [_]Recorded{
     // body only reads that way and every `Continue` gives as a construction
     // is one slot per component (N14a, N14b).
     .{ .version = 9, .fingerprint = 0x2255e015149a57ec },
+    // Fix of T1.11: the speculatable conditions of the rules hold only when
+    // the operand and every node it reads are speculatable, so `x - x` over
+    // a field of a loop output keeps the loop.
+    .{ .version = 10, .fingerprint = 0xb436a740a244c612 },
 };
 
 const std = @import("std");

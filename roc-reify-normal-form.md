@@ -103,6 +103,14 @@ it can neither crash nor diverge on any input:
 | a `Call` of a non-recursive row whose body is speculatable | a call to a recursive row; a primitive from another package (3.8) |
 | a `ForRange` or `ForList` (3.11) whose body is speculatable: it runs a bounded number of turns and none of them can fail | a general `Loop` |
 
+A rule that drops or repeats an operand under a speculatable condition reads
+the whole cone of the operand: the node, every node it reads, and every node
+the regions it owns read. The flag of one node covers only that node, and
+`Field` of a loop output is flagged speculatable although the loop it reads is
+not (`src/reify/builder.zig:3080`, `coneSpeculatable`). Rule T1.11 (`x - x`
+is `0`), `x * 0`, and the rules over `speculatable_rest` use it, so a loop
+that can crash on checked-integer overflow is never lost (C2).
+
 A checked integer `plus`, `minus` or `times` whose operands' intervals (N13u)
 prove that the result fits its type cannot crash in the regions those facts
 hold in, so it is speculatable there, and N5b hoists it no further out than

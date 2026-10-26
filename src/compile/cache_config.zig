@@ -382,7 +382,9 @@ pub const Constants = struct {
     /// 169: Normal form 9: a record or tuple that a non-root row or a loop
     ///      only reads by field or index is one parameter or slot per
     ///      component (N14).
-    pub const CACHE_VERSION = 169;
+    /// 170: Normal form 10: the speculatable conditions of the rules read the
+    ///      operand cone, so `x - x` keeps a loop that can crash.
+    pub const CACHE_VERSION = 170;
 };
 
 /// Configuration for the Roc cache system.

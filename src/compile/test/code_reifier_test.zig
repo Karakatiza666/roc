@@ -2523,13 +2523,38 @@ test "a literal pattern inside a variant keeps its condition where it stands" {
         \\  n0 = float 0x0 : F32
         \\  n1 = field 1(p0) : F32
         \\  n2 = Num.F32.is_lt(n0, n1) : Bool
-        \\  n4 = switch n2 : F32
+        \\  n21 = and(n2) : Bool !spec
+        \\    operand
+        \\      n3 = list() : List(U8)
+        \\      n4 = 0 : U64
+        \\      n5 = bytes 1 : List(U8)
+        \\      n6 = False : Bool
+        \\      n7 = record(n3, n4, n5, n6) : { digits_after_pt : List(U8), digits_after_pt_count : U64, digits_before_pt : List(U8), is_negative : Bool }
+        \\      n8 = tag Literal(n7) : [Literal({ digits_after_pt : List(U8), digits_after_pt_count : U64, digits_before_pt : List(U8), is_negative : Bool })]
+        \\      n9 = wrap(n8) : Builtin.Num.Numeral
+        \\      n10 = Num.U32.from_numeral(n9) : Builtin.Try !spec
+        \\      n11 = unwrap(n10) : [Err([InvalidNumeral(Str)]), Ok(U32)]
+        \\      n17 = switch n11 : Count !spec
+        \\        arm 0
+        \\          n12 = "this literal was rejected by its conversion" : Str
+        \\          n13 = crash(n12) : Count !spec
+        \\          value n13
+        \\        arm 1
+        \\          n14 = payload Ok.0(n11) : U32 !spec
+        \\          n15 = record(n14) : { n : U32 }
+        \\          n16 = wrap(n15) : Count
+        \\          value n16
+        \\      n18 = unwrap(n17) : { n : U32 }
+        \\      n19 = field 0(n18) : U32
+        \\      n20 = Num.U32.is_eq(n19, n19) : Bool
+        \\      value n20
+        \\  n23 = switch n21 : F32
         \\    arm 0
-        \\      n3 = field 0(p0) : F32
-        \\      value n3
+        \\      n22 = field 0(p0) : F32
+        \\      value n22
         \\    arm 1
         \\      value n1
-        \\  value n4
+        \\  value n23
         \\
     );
 }
@@ -3067,6 +3092,9 @@ test "L3: `a != b` is `!(a == b)`" {
 // differential of `roc-reify-normalization-plan.md` 5.1, run by the driver
 // the AFL target runs, on the cases `reify.fuzz_gen` generates from each seed.
 
+// `m7` stays off here: with it on, seed 0x5eed case 119 fails with two normal
+// forms because a literal `0` is placed once above a switch in one print and
+// once inside an arm in the other (an N5 gap, not the cone of T1.11).
 test "L4 and L5: every seed's two prints are one normal form, which computes what Roc computes" {
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const random = prng.random();
@@ -4500,6 +4528,58 @@ test "L3 M7: a record `var` that a loop passes whole to a helper stays a record"
         \\    $a + $b
         \\}
     );
+}
+
+// T1.11 and the speculatable conditions read the operand cone: `x - x` over a
+// field of a loop output keeps the loop, because the loop can crash on
+// checked-integer overflow (C2).
+const record_accumulator_source =
+    \\wobble : List(U64) -> U64
+    \\wobble = |input| {
+    \\    lc = {
+    \\        var $acc = { total: 0, spare: 0 }
+    \\        for x in input { $acc = { total: $acc.total + x, spare: $acc.spare } }
+    \\        $acc.total
+    \\    }
+    \\    lc - lc
+    \\}
+;
+const scalar_accumulator_source =
+    \\wobble : List(U64) -> U64
+    \\wobble = |input| {
+    \\    lc = {
+    \\        var $acc = 0
+    \\        for x in input { $acc = $acc + x }
+    \\        $acc
+    \\    }
+    \\    lc - lc
+    \\}
+;
+
+test "L3 M7: `lc - lc` over a record accumulator and over a scalar one keep the loop and meet" {
+    try expectSameNormalForm(record_accumulator_source, scalar_accumulator_source);
+    const gpa = std.testing.allocator;
+    const staged = try Staged.createRunning(gpa, record_accumulator_source, "");
+    defer staged.destroy();
+    try std.testing.expect(staged.outcome == .reified);
+    try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "minus") != null);
+}
+
+test "L5 M7: `lc - lc` over a record accumulator crashes on overflow as Roc does, and is 0 otherwise" {
+    const gpa = std.testing.allocator;
+    const staged = try Staged.createRunning(gpa, record_accumulator_source, "");
+    defer staged.destroy();
+    try std.testing.expect(staged.outcome == .reified);
+    var values_impl = std.heap.ArenaAllocator.init(gpa);
+    defer values_impl.deinit();
+    const values = values_impl.allocator();
+    const site = staged.walk.site.?;
+    var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
+    const small = [_]reify.eval.Value{ .{ .int = 3 }, .{ .int = 4 } };
+    const fits = try evaluator.run(staged.walk.root.?, &.{.{ .list = &small }});
+    try std.testing.expect(fits.eql(.{ .int = 0 }));
+    const big = [_]reify.eval.Value{ .{ .int = std.math.maxInt(u64) }, .{ .int = 1 } };
+    try std.testing.expectError(error.Crash, evaluator.run(staged.walk.root.?, &.{.{ .list = &big }}));
 }
 
 // The gap M3 left (plan 4.1): a lambda that captures a whole record, and a
