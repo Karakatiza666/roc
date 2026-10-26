@@ -51,7 +51,7 @@ Section 4 defines it; section 11 covers where its output executes.
 | Part | State |
 |---|---|
 | What it describes | Pure Roc as section 10 states it: literals, operators, calls (helpers, generic and recursive functions, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods. A construct it does not describe stops with a report that names the construct |
-| What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 3 (`src/reify/mod.zig:33`) |
+| What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 9 (`src/reify/mod.zig:36`) |
 | How a translator refuses | It returns an `Err`, or calls `Code.refuse_at`, which the compiler reports at the source of the node (section 13) |
 
 Three translators ship as examples. Each one has an `expected_output` file and a
@@ -75,7 +75,7 @@ unticked boxes cost"):
 |---|---|
 | A function value nothing fixes: read from a list, or from a parameter of the described function | there is no definition to describe. A function chosen by an `if`, or read from a record literal, between known functions describes |
 | A name that exists only at run time: a function parameter, a branch or loop binder, a `var`, read by a lambda from outside itself | timing: the description is built before the value exists |
-| A top-level value that computes a function | no definition names the function it holds |
+| A site that names a top-level value computing a function | the site's root needs a lambda whose parameters it can list. A use of such a value inside a described body describes (section 13, "Naming a constant") |
 | A computed top-level value of another package | its body belongs to that package, and the description does not read it |
 | A tag union whose row nothing closed | it stands for many unions, and a description is monomorphic |
 | A custom `from_interpolation` literal | it needs an assembler function the compiler computes |
@@ -85,10 +85,10 @@ The tests, in layers. The counts were taken at the time of writing.
 
 | Layer | Where | What it catches |
 |---|---|---|
-| Normal-form unit tests | `src/reify/` (118 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
-| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (81 tests) | a walk that describes a body wrongly |
-| Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (86 cases) | the same, for calls into other modules and builtins |
-| CLI fixtures | `test/cli/Staged*.roc` (45 files), run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
+| Normal-form unit tests | `src/reify/` (160 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
+| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (162 tests) | a walk that describes a body wrongly |
+| Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (116 cases) | the same, for calls into other modules and builtins |
+| CLI fixtures | `test/cli/Staged*.roc` (48 files), run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
 | Fuzzers | `src/reify/fuzz_gen.zig`, `src/compile/reify_fuzz.zig`, `test/fuzzing/fuzz-reify.zig` | two spellings of one term that differ, or a normal form that computes what Roc does not |
 | Examples | the three above | translator output that changed under a refactor |
 | Rule derivation, offline | `zig build reify-rules`, `src/reify/derive/` (48 `test` blocks) | a normalization rule that is missing |
@@ -148,11 +148,15 @@ role would imply a new kind of module, and a translator is an ordinary package.
    function parameter, a branch or loop binder, a `var`. That is timing rather
    than purity: the description is built before any such value exists, so a
    captured one could only arrive as an opaque pointer, which is what this
-   feature exists to avoid. A top-level value that computes a function,
-   `doubler = make(2.0)`, is refused too, because no definition names the
-   function it holds, and so is a computed value of another package, whose
-   body the description does not read. Each refusal names the value.
-   Section 13 carries what is left of this.
+   feature exists to avoid. A translator that returns a `Code.Bound` opts in
+   to such values as typed input slots of the description, and receives no
+   value: the program receives the values next to the translator's result
+   (section 10.1). A top-level value that computes a function,
+   `doubler = make(2.0)`, describes as the definition it was written as, so
+   the lambda of `make` is a row and its capture is the literal `2.0`. A
+   computed value of another package is refused, because its body the
+   description does not read. Each refusal names the value. Section 13
+   carries what is left of this.
 
    A template goes further: a function returning `Code` whose arguments are
    fixed at the call and written into the body it returns. An argument can be
@@ -175,7 +179,9 @@ role would imply a new kind of module, and a translator is an ordinary package.
    another version of the rules is not equal to one built under this version.
    The hash is the one a translator puts in the key of a cache.
 7. **Compile-time constructible only.** No runtime constructor. With rule 3,
-   every `Code` value in a program is fully determined at build time.
+   the description in every `Code` value is fully determined at build time.
+   A captured run-time value is a typed slot of the description, and its
+   value never reaches the translator (section 10.1).
 8. **Roc reifies; the translator validates.** The compiler never asks whether an
    expression is lowerable. It guarantees only that it is well-typed, pure,
    closed and monomorphic, in a stable representation. Whether a GPU can run
@@ -1150,8 +1156,19 @@ further down the pipeline.
 
 | Kind | What is left |
 |---|---|
-| Mechanical | a tag union whose row the checker left open; a record update over a record with an optional field; a `.?` path; a record pattern whose rest binds a name |
-| Needs a decision | a top-level value that computes a function, which no definition names; a computed value of another package, whose body the description does not read |
+| Needs a decision | a computed value of another package, whose body the description does not read; a custom `from_interpolation`, whose value is a function the conversion computes and no node applies. Derived `is_eq` on a function stays refused, because Roc has no equality on functions |
+
+The mechanical kind is empty. A tag union whose row the checker left open
+seals to the variants the definition names. An unset or omitted optional
+field, a record update over a record with an optional field, a `.?` before
+the last segment of a path, and a record pattern whose rest binds a name
+describe with the nodes that already exist: a `Record` that lists the fields it
+sets, `OptField`, and a `Switch` on the `Try` that `OptField` gives. A string
+interpolation pattern describes as `Str.starts_with`, `Str.drop_prefix` and
+`Str.split_first` with their tests. A literal of your own type whose
+`from_numeral` or `from_quote` is a Roc function describes as a `Call` of that
+row. Derived `is_eq` on an empty tag union, and through an opaque nominal that
+derives it, describes as `Derived`.
 
 `roc-reify-design.md` lists every construct, ticked or not, with the reason
 line the compiler prints for each refusal.
@@ -1175,6 +1192,125 @@ row from any region. The end carries the value the author wrote rather than a
 emits them where they stand and a target that folds lowers them itself. The
 split falls along target capability: a target with no loops at all, SQL or a
 query plan, still takes `return` and `x?` and never meets a loop.
+
+### 10.1 Captured run-time inputs
+
+A lambda at a `Code` position can read a value that exists only when the
+program runs: a parameter of the function around it, a branch or loop binder.
+The description cannot hold that value, because the description is built
+while the compiler runs. A translator can opt in to receive such a value as an
+input slot. The description stays fixed at build time, and the translator
+still runs once, at build time. The program receives the values at run time,
+next to the translator's result, as a SQL driver receives the values of its
+bind parameters.
+
+```roc
+Stage := {}.{
+	## The result is a `Code.Bound`, so the lambda may read run-time values.
+	render : Code(U16 -> U16) -> Code.Bound(Str)
+	render = |code| {
+		graph = code.graph()
+		code.bound("${Stage.text(graph)} with ${graph.slots().len().to_str()} slots")
+	}
+}
+
+scaled : U16 -> Str
+scaled = |n| {
+	k = n * 2
+	bound = Stage.render(|x| x + k)   # the translator ran while the compiler ran
+	match bound.inputs() {            # the values arrive when the program runs
+		[Int(value)] => "${bound.value()}: n is ${value.to_str()}"
+		_ => bound.value()
+	}
+}
+```
+
+The description of the lambda is `plus(p0, times(Input(0), 2))`, with
+`Graph.slots` equal to `[U16]`. Slot 0 is `n`. The walk replays `k = n * 2` as
+it replays every binding of the block around the site, so `k` is not a slot.
+
+#### The rules
+
+| Item | Rule |
+| --- | --- |
+| Opt-in | The translator's declared return type is exactly `Code.Bound(a)`. A translator that can fail returns `Code.Bound(Try(s, e))`. A translator with any other return type keeps the refusal, and the refusal names the opt-in. |
+| What a slot is | A name that the walk cannot replay and that the compiler does not fix (a parameter, a branch binder, a loop binder), followed by the longest chain of `Field`, `Index` and `Unwrap` reads of it. `order.price` is one slot. `order` is a slot only where the body reads it whole. |
+| In the description | `Code.Val.Input(k)` reads slot `k`, as `Param(k)` reads a parameter. `Code.Tree.Input(k)` is the same in a tree. Only the root row reads a slot. A lifted row receives a slot value as a `Closure` argument. |
+| Slot types | `Graph.slots : Graph -> List(Ty)`, in slot order. |
+| Slot order | The order in which the final root first reads each slot: its nodes in index order, each node's arguments and then the ends of the regions it holds, and the body's end last. A slot that normalization removes is not a slot. |
+| Equality and hash | `slots` is part of the description, so `==`, `to_hash` and the cache key read it. The values never enter them. |
+| The translator | Builds its result with `Code.bound : Code(f), a -> Code.Bound(a)` (or `Code.Inlined.bound`). The result holds no inputs while the compiler runs, because the values do not exist then. The translator emits one placeholder for each slot it reads, for example `?` in SQL. |
+| The site | The call of the translator is a compile-time root. The lambda is a description, so the root does not depend on what the lambda reads at run time. The program reads that root's value, and the site sets `inputs` to one `Code.Value` for each slot, in slot order. |
+| The program | Reads `bound.value()` and `bound.inputs()`. A SQL binder maps each `Code.Value` to a driver value with one `match`. |
+
+#### `Code.Bound` and `Code.Value`
+
+```roc
+Code.Bound(a) :: { value : a, inputs : List(Code.Value) }
+
+Code.Value := [
+	Int(I128),                 # an integer of any type but U128
+	U128(U128),
+	Frac(F64),                 # an F32 or an F64
+	Dec(Dec),
+	Bool(Bool),
+	Str(Str),
+	Record(List(Code.Value)),  # one value per field, in the field order of the slot's Ty
+	Tuple(List(Code.Value)),
+	List(List(Code.Value)),
+	Tag(Str, List(Code.Value)),
+	Wrap(Code.Value),          # a nominal value: the value of its backing
+]
+```
+
+A `Code.Value` follows the slot's `Code.Ty`:
+
+| `Code.Ty` of the slot | `Code.Value` |
+| --- | --- |
+| an integer type other than `U128` | `Int(value)` |
+| `U128` | `U128(value)` |
+| `F32`, `F64` | `Frac(value)` |
+| `Dec` | `Dec(value)` |
+| `Bool` | `Bool(value)` |
+| `Str` | `Str(value)` |
+| `ListOf(t)` | `List(values)`, one per item |
+| `Record(fields)` | `Record(values)`, one per field, in the order of `fields` |
+| `Tuple(items)` | `Tuple(values)` |
+| `TagUnion(variants)` | `Tag(name, payloads)` |
+| `Named(name, backing)` | `Wrap(value of the backing)` |
+| `Recursive(name)` | the value of the enclosing `Named` of that name |
+
+A slot type that holds a shape no `Code.Value` expresses is refused at the
+site, by name:
+
+| Shape | Reason line |
+| --- | --- |
+| `Fn` | "a captured function value" |
+| `Opaque` | "a captured value of an opaque type" |
+| a record field marked `Optional` | "a captured record with an optional field" |
+
+In debug builds, the site asserts that each `Code.Value` it builds matches its
+slot type. In release builds a mismatch is unreachable.
+
+#### What stays refused
+
+| Case | Reason line |
+| --- | --- |
+| A translator that does not return `Code.Bound` | the capture refusal, with the line "A translator whose result is a `Code.Bound` receives such a value as an input slot." |
+| A `var` | "a `var`, whose value at the call is not always the value the description reads" |
+| A function value with no definition | as before: "a function value that names no definition" |
+| A call whose other arguments are not fixed at build time | "a translator that receives captured inputs runs while the compiler runs, so the other arguments of its call must be fixed then" |
+| A call that holds two sites with captured inputs | "a call that binds the inputs of two sites" |
+| A call whose result type it does not fix | "a translator result whose type the call does not fix" |
+| A translator result that holds a function, such as a query builder that keeps its clauses as closures | The call cannot be a compile-time root of its own, because a stored value holds no function, so the reason line is the one for a call whose arguments are not fixed. Return data, such as the rendered text, from a translator that receives captured inputs. |
+
+#### Why these choices
+
+| Choice | Reason |
+| --- | --- |
+| The opt-in is the return type | The program must receive the values from the call, and the call keeps the type that its signature declares. So the declared return type must hold a place for the values. A parameter type gives no such place. |
+| A slot is a leaf with its projections, not the value the lambda captures | R (`roc-reify-normal-form.md:1509` and `:1514`) promises that binding a value once and writing the expression in place give one description, and that destructuring and reading fields give one description. A slot that is the captured name would break both. The projection chain keeps a slot a scalar where the body reads only a field of a record. |
+| `List(Code.Value)` and not a typed tuple | The slots are a product of the walk, which runs after the solver. A typed tuple needs the solver to know the slots, which needs a new typing rule. `Code.Value` is an ordinary type. |
 
 ---
 
@@ -1243,9 +1379,11 @@ splice would make Roc a two-level language, with hygiene and cross-stage
 persistence attached. Worth wanting and worth deferring, so long as the cost is
 stated: some translators are out of reach until it exists.
 
-**A runtime constructor for `Code`.** Every `Code` value is determined at build
-time, which is what makes rule 7 of section 3 hold and what keeps a translator
-from needing a runtime.
+**A runtime constructor for `Code`.** The description of every `Code` is
+determined at build time, which is what makes rule 7 of section 3 hold and what
+keeps a translator from needing a runtime. A value that exists only at run time
+reaches the program next to the translator's result, through `Code.Bound`, and
+never reaches the translator (section 10.1).
 
 **Automatic lifting.** Not `f(xs)` where `f : a -> b` and `xs : Rel(a)`.
 Type-directed lifting reads as magic exactly when a reader most needs to know
@@ -1312,9 +1450,25 @@ literal or an aggregate of literals folds to that data, and a computed value,
 the order of compile-time evaluation does not change, and nothing is needed for
 an opaque value. A template argument named by a value written as data folds the
 same way; a value the block around a lambda binds is repeated at the head of
-its body. What is still refused is a top-level value that computes a function,
-because no definition names what it holds, and a computed value of another
-package, because its body belongs to that package. Folded constants are
+its body. What is still refused is a computed value of another package,
+because its body belongs to that package, and a site that itself names a
+top-level value computing a function, because the site's root needs a lambda.
+
+A top-level value that computes a function, `doubler = make(2.0)`, was listed
+here as needing a decision. The decision is that it folds by definition, the
+same as a computed constant. The compiler evaluates the value after the
+description is built, so an evaluated closure is not available to the walk, and
+none is needed: the definition names the lambda and every capture. The checker
+records the checked expression the binding was written as
+(`CallableEvalTemplate.body`, `src/check/checked_artifact.zig:16986`), and the
+walk builds it where the name stands (`src/check/code_reifier.zig`
+(`computedFunction`)). A call on the name is one `Call` of the lambda's row
+over the capture and then the argument, the name used as a value is a `Closure`
+of the row, and a function the definition captures is a row of its own. No
+node, no rule and no language surface changes, so `normal_form_version` stays
+as it is.
+
+Folded constants are
 load-bearing in the alpha-equivalent normal form of rule 6, so two
 instantiations of one template at different constants must not compare equal
 or hash alike. Two constants written alike describe alike, which is the

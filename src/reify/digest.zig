@@ -283,6 +283,7 @@ fn refDigest(store: *const ir.Store, ctx: anytype, ref: ir.Ref) Allocator.Error!
             h.word(ref.output);
         },
         .row_param => h.words(&.{ 1, ref.output }),
+        .input => h.words(&.{ 3, ref.target }),
         .region_param => {
             h.words(&.{ 2, ref.output });
             h.digest(try binderDigest(store, ctx, ref.regionId()));
@@ -345,6 +346,7 @@ fn immediates(store: *const ir.Store, ctx: anytype, h: *Hasher, nd: ir.Node) All
             const name = store.primName(ir.PrimId.of(nd.payload));
             h.text(name.owner);
             h.text(name.method);
+            if (name.role != .none) h.word(@backingInt(name.role));
         },
         // A tag is its name, and one store interns names in its own order.
         .derived, .tag, .payload => content.name(h, types_mod.NameId.of(nd.payload)),

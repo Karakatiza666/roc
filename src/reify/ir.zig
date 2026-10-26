@@ -195,7 +195,8 @@ pub const Span = struct {
     pub const empty: Span = .{ .start = 0, .len = 0 };
 };
 
-/// A value reference: a row parameter, a region parameter, or one output of a node.
+/// A value reference: a row parameter, a region parameter, one output of a
+/// node, or an input slot of the root (N18).
 ///
 /// Region parameters are loop slots, a `ForRange` index, a `ForList` element,
 /// and join parameters. A reference names what it reads positionally; no
@@ -206,7 +207,7 @@ pub const Ref = packed struct(u64) {
     target: u32,
 
     /// What a reference reads.
-    pub const Kind = enum(u2) { node, row_param, region_param };
+    pub const Kind = enum(u2) { node, row_param, region_param, input };
 
     /// Output `output` of node `n`.
     pub fn node(n: NodeId, output: u30) Ref {
@@ -228,11 +229,16 @@ pub const Ref = packed struct(u64) {
         return .{ .kind = .region_param, .output = k, .target = r.index() };
     }
 
-    /// The node this reference reads, or `none` for a parameter.
+    /// Input slot `s` of the store's slot table (N18).
+    pub fn input(s: SlotId) Ref {
+        return .{ .kind = .input, .output = 0, .target = s.index() };
+    }
+
+    /// The node this reference reads, or `none` for a parameter or a slot.
     pub fn nodeId(self: Ref) NodeId {
         return switch (self.kind) {
             .node => NodeId.of(self.target),
-            .row_param, .region_param => NodeId.none,
+            .row_param, .region_param, .input => NodeId.none,
         };
     }
 
@@ -240,9 +246,48 @@ pub const Ref = packed struct(u64) {
     pub fn regionId(self: Ref) RegionId {
         return switch (self.kind) {
             .region_param => RegionId.of(self.target),
-            .node, .row_param => RegionId.none,
+            .node, .row_param, .input => RegionId.none,
         };
     }
+
+    /// The slot this reference reads.
+    pub fn slotId(self: Ref) SlotId {
+        std.debug.assert(self.kind == .input);
+        return SlotId.of(self.target);
+    }
+};
+
+/// An input slot of the root (N18): a value the program supplies at run time.
+pub const SlotId = enum(u32) {
+    _,
+
+    /// The slot with this index.
+    pub fn of(i: u32) SlotId {
+        return @fromBackingInt(@intCast(i));
+    }
+
+    /// This slot's index.
+    pub fn index(self: SlotId) u32 {
+        return @backingInt(self);
+    }
+};
+
+/// One input slot: a run-time name the walk cannot replay, or a projection of
+/// another slot (N18b). `leaf` names the run-time name for the walk, which
+/// keeps what each leaf stands for; the normal form reads only `ty`.
+pub const Slot = struct {
+    ty: TyId,
+    source: Source,
+
+    pub const Source = union(enum) {
+        /// The run-time name the walk numbered `leaf`.
+        leaf: u32,
+        /// A read of slot `of`: field `k` in the record type's order, element
+        /// `k` of a tuple, or the backing of a nominal.
+        field: struct { of: SlotId, k: u32 },
+        index: struct { of: SlotId, k: u32 },
+        unwrap: SlotId,
+    };
 };
 
 /// The operation of a node. The declaration order is the op precedence the
@@ -292,6 +337,16 @@ pub const Op = enum(u8) {
             .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => false,
         };
     }
+};
+
+/// How a `record` node says which members of its type it sets. A node that
+/// sets every member holds one argument per member, in the type's order. A
+/// node that leaves an optional member unset holds one argument per member it
+/// sets, and `aux` lists those members' positions in the type's order. A value
+/// has one form, so a node never lists the members when it sets all of them.
+pub const RecordForm = enum {
+    every_member,
+    listed_members,
 };
 
 /// Why a region exists; the verifier and the evaluator read it.
@@ -358,8 +413,10 @@ pub const Node = struct {
     /// captured values as its arguments, and an `apply` the function value
     /// and then the call's arguments.
     ///
-    /// Loops read their arguments and give their body parameters this way; a
-    /// loop has one output per slot:
+    /// Loops read their arguments and give their body parameters this way. A
+    /// `for_range` or `for_list` has one output per slot; a `loop` has the
+    /// outputs its `Break`s carry, which are its `tys` and need not be its
+    /// slots:
     ///
     /// | op | args | body params |
     /// |---|---|---|
@@ -423,6 +480,22 @@ pub const LitValue = union(enum) {
     bytes: Span,
 };
 
+/// The role the checker gave a builtin iterator procedure (N11k), which the
+/// walk records on the primitive it names. A rule that reads an iterator
+/// loop reads this role and never the name of the type, so a function of
+/// another package with the same names has no role.
+pub const IteratorRole = enum(u8) {
+    /// Any other primitive.
+    none,
+    /// `Iter.iter`: an iterator is its own iterator.
+    identity,
+    /// `Iter.next`: the iterator protocol's step.
+    next,
+    /// `List.iter`: an iterator that yields every element of a list in index
+    /// order, one per step, and never skips.
+    list_iter,
+};
+
 /// A primitive the builtin table does not hold, by the names its owner gives
 /// it: a builtin such as `Num.F32` and `sin`, or a function of another
 /// package that does not expose its body (N8h), such as `Glsl.Vec3` and
@@ -430,12 +503,15 @@ pub const LitValue = union(enum) {
 pub const NamedPrim = struct {
     owner: Span,
     method: Span,
+    role: IteratorRole = .none,
 };
 
-/// A primitive's owner and method names.
+/// A primitive's owner and method names, and the role of an iterator
+/// procedure.
 pub const PrimName = struct {
     owner: []const u8,
     method: []const u8,
+    role: IteratorRole = .none,
 };
 
 /// One literal's entry: its type and value.
@@ -457,6 +533,8 @@ pub const Store = struct {
     words: std.ArrayList(u32) = .empty,
     bytes: std.ArrayList(u8) = .empty,
     named_prims: std.ArrayList(NamedPrim) = .empty,
+    /// The input slots the walk made (N18), in the order it made them.
+    slots: std.ArrayList(Slot) = .empty,
     /// Per node, where it came from (N10). Nothing in the normal form reads it.
     provenance: provenance.Provenance = .{},
 
@@ -475,6 +553,7 @@ pub const Store = struct {
         self.words.deinit(self.gpa);
         self.bytes.deinit(self.gpa);
         self.named_prims.deinit(self.gpa);
+        self.slots.deinit(self.gpa);
         self.provenance.deinit(self.gpa);
     }
 
@@ -557,7 +636,7 @@ pub const Store = struct {
     pub fn primName(self: *const Store, id: PrimId) PrimName {
         if (prims.lookup(id)) |p| return .{ .owner = p.owner.text(), .method = prims.methodName(p.method) };
         const named = self.named_prims.items[id.index() - prims.table.len];
-        return .{ .owner = self.byteSlice(named.owner), .method = self.byteSlice(named.method) };
+        return .{ .owner = self.byteSlice(named.owner), .method = self.byteSlice(named.method), .role = named.role };
     }
 
     /// The literal with id `l`.
@@ -636,7 +715,22 @@ pub const Store = struct {
             .node => self.tySlice(self.nodes.items(.tys)[ref.target])[ref.output],
             .row_param => self.tySlice(self.row(row_id).params)[ref.output],
             .region_param => self.tySlice(self.regions.items(.params)[ref.target])[ref.output],
+            .input => self.slots.items[ref.target].ty,
         };
+    }
+
+    /// The slot `source` names, made the first time it is asked for, so one
+    /// leaf or one projection of a slot is one slot.
+    pub fn slot(self: *Store, ty: TyId, source: Slot.Source) Allocator.Error!SlotId {
+        for (self.slots.items, 0..) |existing, i| {
+            if (std.meta.eql(existing.source, source)) {
+                std.debug.assert(existing.ty == ty);
+                return SlotId.of(@intCast(i));
+            }
+        }
+        const id = SlotId.of(@intCast(self.slots.items.len));
+        try self.slots.append(self.gpa, .{ .ty = ty, .source = source });
+        return id;
     }
 };
 

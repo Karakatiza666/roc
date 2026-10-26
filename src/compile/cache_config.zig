@@ -361,7 +361,28 @@ pub const Constants = struct {
     /// 162: A stored `Code` value holds the normal-form IR, not `Code.Ir`:
     ///      placement and numbering are canonical, rows are digests, and the
     ///      `graph` view inlines rows called once.
-    pub const CACHE_VERSION = 162;
+    /// 163: Normal form 4: a `Code` value's graph holds the types of its
+    ///      input slots, and a checked body store records the calls that
+    ///      bind them.
+    /// 164: Normal form 5: a `Record` node may leave an optional member
+    ///      unset and lists the members it sets, and the walk describes the
+    ///      constructs it refused before.
+    /// 165: A checked callable-eval template records the expression its
+    ///      binding was written as, and a top-level value that computes a
+    ///      function describes as that expression.
+    /// 166: Normal form 6: a `match` on string literals is a literal switch
+    ///      keyed by the strings, its arms in byte order (N13n over `Str`,
+    ///      N7a).
+    /// 167: Normal form 7: literals, chains, `and`/`or`, nested `if`, bounded
+    ///      `List.get` and case-of-case.
+    /// 168: Normal form 8: three canonical loop forms. A tail-recursive row is
+    ///      a `Loop`, a general `Loop` has outputs of its own (`Op.Loop` is a
+    ///      record of its body and outputs), and `Code.Row.iteration` says what
+    ///      a loop iterates over.
+    /// 169: Normal form 9: a record or tuple that a non-root row or a loop
+    ///      only reads by field or index is one parameter or slot per
+    ///      component (N14).
+    pub const CACHE_VERSION = 169;
 };
 
 /// Configuration for the Roc cache system.

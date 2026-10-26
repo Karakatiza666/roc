@@ -19,7 +19,7 @@ and the inputs of its tests.
 roc examples/reifying/sql/main.roc          # the SQLite script
 roc test examples/reifying/sql/main.roc     # 12 expects
 roc test examples/reifying/sql/refactored.roc  # 11 expects: ten of those, and the script is expected_output.sql
-python3 examples/reifying/sql/check.py      # run it on SQLite, compare with Roc
+python3 examples/reifying/sql/check.py      # run it on SQLite, bind the `?` values, compare with Roc
 ```
 
 ## What it covers
@@ -28,6 +28,7 @@ python3 examples/reifying/sql/check.py      # run it on SQLite, compare with Roc
 | --- | --- | --- | --- |
 | Binary operators | `p.price >= 20 and p.title != "Gift card"` | `(products.price >= 20.0) AND (products.title <> 'Gift card')` | `main.roc:123` |
 | `NUMERIC` arithmetic | `p.price * 1.2` over a `Dec` | `products.price * 1.2` | `main.roc:123` |
+| A captured run-time value | `\|o\| o.quantity >= min_quantity` inside `orders_of_at_least` | `?1 <= orders.quantity`, which `check.py` binds to the value | `main.roc:205` |
 | `NUMERIC(p, s)` columns | `.numeric(\|p\| p.price, 10, 2)` | `price NUMERIC(10, 2) NOT NULL` | `main.roc:61` |
 | `CHECK` | `.check(\|o\| o.quantity > 0 and o.discount < 1)` | `CHECK ((quantity > 0) AND ...)` | `main.roc:78` |
 | Keys | `.primary_key(\|c\| c.id)`, `.references(\|o\| o.customer_id, customers)` | `PRIMARY KEY (id)`, `FOREIGN KEY (customer_id) REFERENCES customers` | `main.roc:74` |
@@ -226,7 +227,7 @@ In a package this panic also hid three ordinary type errors in `Sql.roc`.
 | --- | --- |
 | A migration's lambdas name the current row type | Adding a field is fine: `schema_gaps` catches a missing migration. Dropping or renaming one makes old migrations stop compiling, because they read a field the record no longer has. A historical migration needs frozen types or string column names |
 | A foreign key's target type is not checked | `Table(row)` carries no key type, so `references(\|o\| o.customer_id, customers)` checks the column exists, not that its type matches `customers.id` |
-| Captures are refused | A runtime value reaches a query only as a field of the parameter record. That makes parameters typed, which is the point; top-level constants still fold into literals |
+| A captured value needs `select_where` | A clause that reads a value from around itself is refused unless its translator returns a `Code.Bound`. `Sql.select_where` does, so its filter can read a parameter of the function around it, and the value is a numbered `?`. The other clauses keep the parameter record, which types the parameters by name. Top-level constants still fold into literals |
 | No result decoding | The Echo platform has no database driver. `Selected(p, out)` keeps `out`, so a driver can decode rows with `out.parser_for` |
 | `NULL` reaches Roc only through optional fields | Non-optional fields are `NOT NULL` columns, and Roc forces `??`, `match` or `is_ok` on the optional ones, so SQL's three-valued logic never decides a predicate. An outer join would reintroduce it |
 | `SELECT` columns come in field-name order, not in the order the query wrote them | A Roc record has no field order, so a record the clause builds reaches the translator sorted by name. `{ title: .., price: .. }` selects `price` first. A reader of the result should match columns by name |

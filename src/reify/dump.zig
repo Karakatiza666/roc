@@ -184,7 +184,19 @@ const View = struct {
                 try w.writeAll("switch ");
                 try v.refs(w, args, "");
             },
-            .crash, .derived, .record, .tuple, .list, .wrap, .unwrap, .elem, .opt_field, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => {
+            .record => {
+                // A node that leaves a member unset names the members it sets.
+                const members = types.memberSlice(types.get(store.tySlice(nd.tys)[0]).record);
+                try w.writeAll("record");
+                if (args.len != members.len) {
+                    try w.writeAll(" set");
+                    for (store.wordSlice(nd.aux)) |k| try w.print(" {s}", .{types.nameText(members[k].name)});
+                }
+                try w.writeAll("(");
+                try v.refs(w, args, "");
+                try w.writeAll(")");
+            },
+            .crash, .derived, .tuple, .list, .wrap, .unwrap, .elem, .opt_field, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => {
                 try w.print("{s}(", .{opName(nd.op)});
                 try v.refs(w, args, "");
                 try w.writeAll(")");
@@ -239,6 +251,7 @@ const View = struct {
             try w.writeAll(if (i == 0) lead else ", ");
             switch (r.kind) {
                 .row_param => try w.print("p{d}", .{r.output}),
+                .input => try w.print("in{d}", .{r.target}),
                 .region_param => {
                     try v.regionName(w, r.regionId());
                     try w.print(".{d}", .{r.output});

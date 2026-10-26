@@ -165,9 +165,10 @@ expect {
 }
 
 ## GLSL 330 has no recursion, so a helper that reaches itself stays a call and
-## is refused for that reason.
+## is refused for that reason. (A helper whose self call is a tail call is a
+## loop in the normal form, so this one calls itself in the middle of a sum.)
 fade : F32, U8 -> F32
-fade = |x, n| if n == 0 x else fade(x * 0.5, n - 1)
+fade = |x, n| if n == 0 x else 0.5 * fade(x, n - 1)
 
 faded : Varyings, Uniforms -> Glsl.Vec4
 faded = |_frag, settings| {

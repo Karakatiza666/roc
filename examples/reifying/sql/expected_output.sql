@@ -90,3 +90,10 @@ JOIN products ON orders.product_id = products.id
 GROUP BY customers.country
 ORDER BY revenue DESC;
 -- roc: [{"country":"GB","orders":2,"revenue":448.8},{"country":"US","orders":3,"revenue":461.875},{"country":"NL","orders":1,"revenue":100.0}]
+
+-- query: orders_of_at_least
+-- params: [10]
+SELECT *
+FROM orders
+WHERE ?1 <= orders.quantity;
+-- roc: [{"customer_id":1,"discount":0.1,"id":2,"product_id":2,"quantity":12},{"customer_id":2,"discount":0.25,"id":4,"product_id":3,"quantity":10},{"customer_id":4,"discount":0.15,"id":6,"product_id":2,"quantity":20}]

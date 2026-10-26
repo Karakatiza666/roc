@@ -37,6 +37,9 @@ const digest = @import("digest.zig");
 const builder_mod = @import("builder.zig");
 const rows = @import("rows.zig");
 const views = @import("views.zig");
+const match = @import("match.zig");
+const loops = @import("loops.zig");
+const scalar = @import("scalar.zig");
 
 const Allocator = std.mem.Allocator;
 const RowId = ir.RowId;
@@ -106,10 +109,12 @@ pub fn runTo(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass, vie
     defer rows.freeComponents(gpa, comps);
     var fin: rows.Finalizer = .{ .gpa = gpa, .root = root, .ties = ties(b), .max_turns = max_rounds };
     defer fin.deinit();
-    var special: Specialize = .{ .gpa = gpa, .passes = passes, .fin = &fin, .stats = &stats };
+    var special: Specialize = .{ .gpa = gpa, .passes = passes, .fin = &fin, .stats = &stats, .arena = std.heap.ArenaAllocator.init(gpa) };
     defer special.deinit();
     b.specializer = .{ .ctx = &special, .run = Specialize.run };
     defer b.specializer = null;
+    b.scalarizer = .{ .ctx = &special, .run = Specialize.scalarize };
+    defer b.scalarizer = null;
     for (comps) |comp| {
         try component(gpa, b, passes, &fin, comp, &stats);
         if (special.failed) |err| return err;
@@ -126,7 +131,8 @@ pub fn runTo(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass, vie
     if (special.failed) |err| return err;
     try numberStage(gpa, b);
     if (checks) {
-        try checkInvariants(gpa, store, b.types);
+        try checkInvariants(gpa, store, b.types, root);
+        try checkFlatTrees(gpa, store, b.types);
         if (try rows.check(gpa, store, root)) |_| return error.InvariantBroken;
     }
     return stats;
@@ -220,12 +226,135 @@ const Specialize = struct {
     fin: *rows.Finalizer,
     stats: *Stats,
     made: std.AutoHashMapUnmanaged(u128, RowId) = .empty,
+    /// Per finalized row's digest: how N14a splits its parameters, or null
+    /// where it splits none. The arena owns the shapes.
+    shapes: std.AutoHashMapUnmanaged(u128, ?[]const scalar.Shape) = .empty,
+    arena: std.heap.ArenaAllocator,
     /// The first error a specialization stopped with, which ends the run
     /// once the caller's round is over.
     failed: ?Error = null,
 
     fn deinit(self: *Specialize) void {
         self.made.deinit(self.gpa);
+        self.shapes.deinit(self.gpa);
+        self.arena.deinit();
+    }
+
+    // N14a: the row a call of `row` is made to, when a parameter of `row`
+    // splits. It is built from the finalized row with each such parameter
+    // replaced by one parameter per component, which the body reads as the
+    // aggregate they make, so a read by field or index is the component
+    // (N13). It is simplified and finalized on the spot, before the call is
+    // built, and keyed by the row's digest and the shapes, so two calls that
+    // split one row alike share a row, and so do rows that differ only in
+    // whether they take `f(a, b)`, `f({ a, b })` or `f((a, b))` (N8g).
+    fn scalarize(ctx: *anyopaque, b: *Builder, row: RowId) builder_mod.SpecializeError!?builder_mod.Scalarized {
+        const self: *Specialize = @ptrCast(@alignCast(ctx));
+        const store = b.store;
+        if (!scalar.rowEligible(store, row)) return null;
+        const digest_of = store.row(row).digest.?;
+        const known = try self.shapes.getOrPut(self.gpa, digest_of);
+        if (!known.found_existing) known.value_ptr.* = try scalar.analyzeRow(self.arena.allocator(), self.gpa, store, b.types, row);
+        const shapes = known.value_ptr.* orelse return null;
+
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("scalar");
+        h.update(std.mem.asBytes(&digest_of));
+        for (shapes) |shape| hashShape(&h, shape);
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        const key = std.mem.readInt(u128, out[0..16], .little);
+        if (self.made.get(key)) |made| return self.scalarized(store, made, shapes);
+
+        const held = b.suspendRow();
+        defer b.resumeRow(held);
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const leaves = try scalar.leavesOf(scratch.allocator(), shapes);
+        const old = try self.gpa.dupe(ir.TyId, store.tySlice(store.row(row).params));
+        defer self.gpa.free(old);
+        const params = try self.gpa.alloc(ir.TyId, leaves.len);
+        defer self.gpa.free(params);
+        for (leaves, params) |leaf, *t| t.* = scalar.tyAt(b.types, old[leaf.index], leaf.path);
+        var returns = try live.Returns.init(self.gpa, store);
+        defer returns.deinit(self.gpa);
+        var p = try place.planWith(self.gpa, store, &returns, row, .simplify, ties(b));
+        defer p.deinit();
+        const Values = struct {
+            gpa: Allocator,
+            old: []const ir.TyId,
+            shapes: []const scalar.Shape,
+            first: []const u32,
+
+            // Each old parameter as the aggregate its new parameters make.
+            fn of(v: @This(), bb: *Builder) Allocator.Error![]const ir.Ref {
+                const refs = try v.gpa.alloc(ir.Ref, v.old.len);
+                errdefer v.gpa.free(refs);
+                for (refs, v.old, v.shapes, v.first) |*r, ty, shape, first| {
+                    var next = first;
+                    r.* = try aggregate(bb, ty, shape, &next);
+                }
+                return refs;
+            }
+
+            fn aggregate(bb: *Builder, ty: ir.TyId, shape: scalar.Shape, next: *u32) Allocator.Error!ir.Ref {
+                switch (shape) {
+                    .whole => {
+                        defer next.* += 1;
+                        return ir.Ref.rowParam(@intCast(next.*));
+                    },
+                    .split => |children| {
+                        const parts = try bb.gpa.alloc(ir.Ref, children.len);
+                        defer bb.gpa.free(parts);
+                        for (children, parts, 0..) |child, *part, i| {
+                            part.* = try aggregate(bb, bb.types.componentTy(ty, @intCast(i)), child, next);
+                        }
+                        return switch (bb.types.get(ty)) {
+                            .record => try bb.record(ty, parts),
+                            .tuple => try bb.tuple(ty, parts),
+                            .bool_, .str, .int, .float, .dec, .tag_union, .list, .nominal, .func, .opaque_, .recursive => unreachable, // a shape splits records and tuples only
+                        };
+                    },
+                }
+            }
+        };
+        const first = try self.gpa.alloc(u32, old.len);
+        defer self.gpa.free(first);
+        var at: u32 = 0;
+        for (first, shapes) |*f, shape| {
+            f.* = at;
+            at += shape.leafCount();
+        }
+        const values: Values = .{ .gpa = self.gpa, .old = old, .shapes = shapes, .first = first };
+        const made = try rebuild.into(self.gpa, b, &p, params, values, Values.of);
+        try self.made.put(self.gpa, key, made);
+        const comp = [_]RowId{made};
+        component(self.gpa, b, self.passes, self.fin, &comp, self.stats) catch |err| {
+            if (self.failed == null) self.failed = err;
+            return switch (err) {
+                error.OutOfMemory => |e| e,
+                error.MeasureDidNotFall => error.MeasureDidNotFall,
+                error.RoundBoundExceeded => error.RoundBoundExceeded,
+                error.InvariantBroken, error.UnresolvedApply => error.InvariantBroken,
+            };
+        };
+        return self.scalarized(store, made, shapes);
+    }
+
+    fn scalarized(self: *const Specialize, store: *const ir.Store, made: RowId, shapes: []const scalar.Shape) builder_mod.Scalarized {
+        const at = self.specialized(store, made);
+        return .{ .row = at.row, .order = at.order, .shapes = shapes };
+    }
+
+    fn hashShape(h: *std.crypto.hash.sha2.Sha256, shape: scalar.Shape) void {
+        switch (shape) {
+            .whole => h.update("w"),
+            .split => |children| {
+                h.update("(");
+                for (children) |c| hashShape(h, c);
+                h.update(")");
+            },
+        }
     }
 
     fn run(ctx: *anyopaque, b: *Builder, row: RowId, param: u32, closure: RowId, captures: []const ir.TyId) builder_mod.SpecializeError!?builder_mod.Specialized {
@@ -322,6 +451,28 @@ fn component(gpa: Allocator, b: *Builder, passes: []const Pass, fin: *rows.Final
     }
     try fin.finalize(b, comp);
     if (checks and !try allSettled(gpa, b.store, comp)) return error.InvariantBroken;
+    // Finalizing merged rows that call each other alike into one row that
+    // calls itself. When that call is a tail call the row is a loop (N12),
+    // so the row it became is simplified again, then finalized again.
+    var again: std.ArrayList(RowId) = .empty;
+    defer again.deinit(gpa);
+    {
+        var reached = try live.ofStore(gpa, b.store);
+        defer reached.deinit(gpa);
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        for (comp) |r| {
+            const at = canonical(b.store, r);
+            if (at != r or std.mem.indexOfScalar(RowId, again.items, at) != null) continue;
+            if (try loops.tailSites(scratch.allocator(), b.store, reached, at) != null) try again.append(gpa, at);
+        }
+    }
+    if (again.items.len == 0) return;
+    const more = try simplify(gpa, b, passes, again.items);
+    stats.rounds += more;
+    stats.max_component_rounds = @max(stats.max_component_rounds, more);
+    try fin.finalize(b, again.items);
+    if (checks and !try allSettled(gpa, b.store, again.items)) return error.InvariantBroken;
 }
 
 /// What a round compares: per row, its fingerprint and its flag, and the
@@ -347,12 +498,14 @@ fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types
     const flags = try gpa.alloc(bool, comp.len);
     errdefer gpa.free(flags);
     var total: measure.Measure = .{};
+    var calls = scalar.Cache.init(gpa, store, types, reached);
+    defer calls.deinit();
     for (comp, prints, flags) |r, *p, *f| {
         var numbering = try number.ofRow(gpa, store, &returns, r);
         defer numbering.deinit(gpa);
         p.* = number.fingerprint(store, &returns, &numbering, r);
         f.* = store.row(r).speculatable;
-        const m = try measure.ofRow(gpa, store, types, reached.nodes, r);
+        const m = try measure.ofRow(gpa, store, types, reached, &calls, r);
         for (&total.counts, m.counts) |*t, c| t.* +|= c;
     }
     return .{ .prints = prints, .flags = flags, .measure = total };
@@ -367,11 +520,18 @@ fn simplify(gpa: Allocator, b: *Builder, passes: []const Pass, comp: []const Row
         {
             var returns = try live.Returns.init(gpa, store);
             defer returns.deinit(gpa);
+            var reached = try live.ofStore(gpa, store);
+            defer reached.deinit(gpa);
+            var tails = std.heap.ArenaAllocator.init(gpa);
+            defer tails.deinit();
             for (comp) |r| {
                 var p = try place.planWith(gpa, store, &returns, r, .simplify, ties(b));
                 defer p.deinit();
                 if (checks and !place.noSpeculation(&p)) return error.InvariantBroken;
-                try rebuild.run(gpa, b, &p, .{});
+                // N12: a row whose every call to itself is a tail call is a loop.
+                if (try loops.tailSites(tails.allocator(), store, reached, r)) |tail| {
+                    try rebuild.runTail(gpa, b, &p, &tail);
+                } else try rebuild.run(gpa, b, &p, .{});
             }
         }
         var passed = false;
@@ -447,10 +607,43 @@ fn ties(b: *const Builder) place.Ties {
     return .lowest;
 }
 
-fn checkInvariants(gpa: Allocator, store: *const ir.Store, types: *types_mod.Types) Error!void {
+// N7a: every flat decision tree is canonical, and none is larger than the
+// multiplier bound (`match.zig`).
+fn checkFlatTrees(gpa: Allocator, store: *const ir.Store, types: *types_mod.Types) Error!void {
+    var report = try match.check(gpa, store, types);
+    defer report.deinit();
+    if (!report.ok()) return error.InvariantBroken;
+}
+
+fn checkInvariants(gpa: Allocator, store: *const ir.Store, types: *types_mod.Types, root: RowId) Error!void {
     var report = try verify.verifyAll(gpa, store, types);
     defer report.deinit();
     if (!report.ok()) return error.InvariantBroken;
+    // L2: no call of a row the site reaches is one N14a splits.
+    {
+        var returns = try live.Returns.init(gpa, store);
+        defer returns.deinit(gpa);
+        var reached: ir.RowTable(number.Numbering) = .empty;
+        defer {
+            for (reached.values()) |*n| n.deinit(gpa);
+            reached.deinit(gpa);
+        }
+        try number.siteRows(gpa, store, &returns, root, &reached);
+        var nodes: std.ArrayList(ir.NodeId) = .empty;
+        defer nodes.deinit(gpa);
+        for (reached.values()) |numbering| try nodes.appendSlice(gpa, numbering.order.items);
+        if (!try scalar.noneRewritable(gpa, store, types, nodes.items)) return error.InvariantBroken;
+    }
+    // L2: no loop of a finished row matches a loop rule.
+    var returns = try live.Returns.init(gpa, store);
+    defer returns.deinit(gpa);
+    for (0..store.rows.items.len) |i| {
+        const r = RowId.of(@intCast(i));
+        if (store.row(r).merged_into != null) continue;
+        var p = try place.plan(gpa, store, &returns, r, .simplify);
+        defer p.deinit();
+        if (!try loops.noneRewritable(gpa, store, types, &p)) return error.InvariantBroken;
+    }
 }
 
 const testing = std.testing;
@@ -471,7 +664,8 @@ test "components run callee first and recursion is recorded" {
     try b.endRow(.{ .value = &.{c} });
     const rec = try b.beginRow(&.{i64_ty}, i64_ty);
     const again = try b.callRow(rec, &.{ir.Ref.rowParam(0)});
-    try b.endRow(.{ .value = &.{again} });
+    // Not a tail call, so the row stays recursive (a tail call becomes a loop, N12).
+    try b.endRow(.{ .value = &.{try b.call(.i64, .plus_wrap, &.{ again, ir.Ref.rowParam(0) })} });
 
     const comps = try components(testing.allocator, &store);
     defer {

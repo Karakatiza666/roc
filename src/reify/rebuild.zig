@@ -18,6 +18,8 @@ const ir = @import("ir.zig");
 const builder_mod = @import("builder.zig");
 const place = @import("place.zig");
 const provenance = @import("provenance.zig");
+const loops = @import("loops.zig");
+const scalar = @import("scalar.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -61,9 +63,9 @@ pub const Options = struct {
 
 /// Rebuild the row of `p` through `b`, which builds no other row now.
 pub fn run(gpa: Allocator, b: *Builder, p: *const place.Plan, opts: Options) Allocator.Error!void {
-    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = p, .opts = opts };
-    defer r.deinit();
     const old_body = b.store.row(p.row).body;
+    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = p, .opts = opts, .row_body = old_body };
+    defer r.deinit();
     try b.rebuildRow(p.row);
     try r.regions.put(gpa, old_body, b.store.row(p.row).body);
     try r.fill(old_body);
@@ -85,12 +87,48 @@ pub fn into(
     const row = try b.beginRow(params, b.store.row(p.row).result);
     const refs = try values(ctx, b);
     defer gpa.free(refs);
-    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = p, .opts = .{ .param_values = refs } };
+    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = p, .opts = .{ .param_values = refs }, .row_body = old_body };
     defer r.deinit();
     try r.regions.put(gpa, old_body, b.store.row(row).body);
     try r.fill(old_body);
     try r.finish(old_body, .row, null);
     return row;
+}
+
+/// N12: rebuild the row of `p`, whose every call to itself is one of `tail`'s,
+/// as a row whose body is one `Loop`. The parameters become the loop's slots,
+/// a tail call is `Continue` with its arguments, and every other path of the
+/// row ends in `Break` with the row's value, so the loop's one output is the
+/// row's result. The row keeps its id and its parameters. `b` builds no other
+/// row now.
+pub fn runTail(gpa: Allocator, b: *Builder, p: *const place.Plan, tail: *const loops.Tail) Allocator.Error!void {
+    const old_body = b.store.row(p.row).body;
+    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = p, .opts = .{}, .row_body = old_body, .tail = tail };
+    defer r.deinit();
+    var calls = tail.calls.keyIterator();
+    while (calls.next()) |n| try r.skipped.put(gpa, n.*, {});
+    var switches = tail.switches.keyIterator();
+    while (switches.next()) |n| try r.skipped.put(gpa, n.*, {});
+    const row = p.row;
+    const params = try gpa.dupe(TyId, b.store.tySlice(b.store.row(row).params));
+    defer gpa.free(params);
+    const result = b.store.row(row).result;
+    try b.rebuildRow(row);
+    const body = try b.openRegion(.loop_body, params);
+    const slots = try gpa.alloc(Ref, params.len);
+    defer gpa.free(slots);
+    const init = try gpa.alloc(Ref, params.len);
+    defer gpa.free(init);
+    for (slots, init, 0..) |*slot, *start, k| {
+        slot.* = Ref.regionParam(body, @intCast(k));
+        start.* = Ref.rowParam(@intCast(k));
+    }
+    r.opts.param_values = slots;
+    try r.regions.put(gpa, old_body, body);
+    try r.fill(old_body);
+    try r.finish(old_body, .region, null);
+    const loop = try b.loopOf(.loop, init, body, &.{result});
+    try b.endRow(.{ .value = &.{loop} });
 }
 
 /// How a copied region closes: as a region, as the row's body (`endRow`),
@@ -173,7 +211,7 @@ const DemandWalk = struct {
     }
 
     fn countRead(self: *DemandWalk, ref: Ref) Allocator.Error!void {
-        if (ref.kind == .row_param) return;
+        if (ref.kind == .row_param or ref.kind == .input) return;
         const gop = try self.reads.getOrPut(self.gpa, Demand.key(self.canonical(ref)));
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
@@ -188,7 +226,7 @@ const DemandWalk = struct {
         const have = self.store.refTy(self.p.row, ref);
         if (have == ty) return;
         if (!try self.types.widens(have, ty)) @import("base").invariant("reify rebuild: an inlined end of type {d} is demanded at type {d}, which it does not widen to", .{ have.index(), ty.index() });
-        if (ref.kind == .row_param) return;
+        if (ref.kind == .row_param or ref.kind == .input) return;
         const at = self.canonical(ref);
         const gop = try self.arrivals.getOrPut(self.gpa, Demand.key(at));
         if (!gop.found_existing) gop.value_ptr.* = .{ .count = 0, .ty = ty, .conflict = false };
@@ -203,7 +241,7 @@ const DemandWalk = struct {
                 try self.demandJumps(at, ty);
             },
             .node => try self.demandNode(at, ty),
-            .row_param => unreachable, // demands are made on nodes and region parameters, never row parameters
+            .row_param, .input => unreachable, // demands are made on nodes and region parameters, never row parameters or slots
         }
     }
 
@@ -269,10 +307,25 @@ const DemandWalk = struct {
 /// whose outputs were dropped or reordered, where each old output went.
 const Built = struct {
     ref: Ref,
-    /// Per old output: its new index. Empty when outputs keep their places.
+    /// Per old output: its new index, or `no_output` for one the new node does
+    /// not give. Empty when outputs keep their places.
     outs: []const u32 = &.{},
+    /// Per old output that the new node does not give: the value that stands
+    /// for it. Empty for a node whose dropped outputs nothing reads.
+    repl: []const Ref = &.{},
     /// The number of outputs the new node has.
     width: u32,
+
+    const no_output = std.math.maxInt(u32);
+};
+
+/// The loop being copied under a rewrite (`loops.zig`): the rewrite, the body
+/// of the loop it builds, and the new values its slots start from.
+const Active = struct {
+    rw: *const loops.Rewrite,
+    body: RegionId,
+    /// Per old slot, its initial value in the new row.
+    init: []const Ref,
 };
 
 const Rebuild = struct {
@@ -293,15 +346,52 @@ const Rebuild = struct {
     aliases: ?collections.DenseMapUnmanaged(NodeId, std.ArrayList(NodeId)) = null,
     nodes: collections.DenseMapUnmanaged(NodeId, Built) = .empty,
     regions: collections.DenseMapUnmanaged(RegionId, RegionId) = .empty,
+    /// The body of the row `p` places, as it stood before the rebuild.
+    row_body: RegionId = RegionId.none,
+    /// Whether this copy builds a body into another one: an inlined call or a
+    /// lambda. A rule that reads the row's result does not apply there.
+    inside: bool = false,
+    /// Nodes the copy does not build: what a loop rule or N12 replaced.
+    skipped: std.AutoHashMapUnmanaged(NodeId, void) = .empty,
+    /// Per old loop body being copied under a rewrite: that rewrite.
+    rewrites: collections.DenseMapUnmanaged(RegionId, *const Active) = .empty,
+    /// The loops being copied, innermost last: null for one copied as it is,
+    /// and for a lambda, whose paths are not the loop's.
+    frames: std.ArrayList(?*const Active) = .empty,
+    /// Where set, the row is rebuilt as a loop (N12).
+    tail: ?*const loops.Tail = null,
+    arena_impl: ?std.heap.ArenaAllocator = null,
+    /// How the row of `p` uses its values, read by the loop rules; made when
+    /// the first loop asks.
+    usage_impl: ?scalar.Usage = null,
+
+    // What the rules of the loop being copied allocate.
+    fn arena(self: *Rebuild) Allocator {
+        if (self.arena_impl == null) self.arena_impl = std.heap.ArenaAllocator.init(self.gpa);
+        return self.arena_impl.?.allocator();
+    }
+
+    // How the row of `p` uses its values.
+    fn usage(self: *Rebuild) Allocator.Error!*const scalar.Usage {
+        if (self.usage_impl == null) self.usage_impl = try scalar.Usage.ofPlan(self.arena(), self.p);
+        return &self.usage_impl.?;
+    }
 
     fn deinit(self: *Rebuild) void {
+        self.skipped.deinit(self.gpa);
+        self.rewrites.deinit(self.gpa);
+        self.frames.deinit(self.gpa);
+        if (self.arena_impl) |*impl| impl.deinit();
         if (self.aliases) |*map| {
             var lists = map.valueIterator();
             while (lists.next()) |l| l.deinit(self.gpa);
             map.deinit(self.gpa);
         }
         var it = self.nodes.valueIterator();
-        while (it.next()) |v| self.gpa.free(v.outs);
+        while (it.next()) |v| {
+            self.gpa.free(v.outs);
+            self.gpa.free(v.repl);
+        }
         self.nodes.deinit(self.gpa);
         self.regions.deinit(self.gpa);
     }
@@ -318,14 +408,44 @@ const Rebuild = struct {
                 Ref.rowParam(@intCast(map[ref.output].?))
             else
                 ref,
-            .region_param => Ref.regionParam(self.regions.get(ref.regionId()).?, ref.output),
+            .region_param => blk: {
+                if (self.rewrites.get(ref.regionId())) |act| break :blk self.paramRef(act, ref.output);
+                break :blk Ref.regionParam(self.regions.get(ref.regionId()).?, ref.output);
+            },
+            .input => ref,
             .node => blk: {
                 const built = self.nodes.get(self.p.aliasOf(ref.nodeId())) orelse
                     @import("base").invariant("reify rebuild: node {d} is read before it is built", .{ref.target});
                 const k: u32 = if (built.outs.len == 0) ref.output else built.outs[ref.output];
+                if (k == Built.no_output) {
+                    if (built.repl.len == 0) @import("base").invariant("reify rebuild: an output a rewrite dropped is read", .{});
+                    break :blk built.repl[ref.output];
+                }
                 break :blk if (built.width > 1) Ref.node(built.ref.nodeId(), @intCast(k)) else built.ref;
             },
         };
+    }
+
+    // What parameter `k` of the old loop body a rewrite replaces is in the new one.
+    fn paramRef(self: *const Rebuild, act: *const Active, k: u32) Ref {
+        return switch (act.rw.params[k]) {
+            .param => |i| Ref.regionParam(act.body, @intCast(i)),
+            .init => |slot| act.init[slot],
+            .same_as => |j| self.paramRef(act, j),
+            // A slot the rule removed because nothing that stays reads it. Values
+            // computed only for its next value are still built in this round,
+            // over its initial value; nothing reads them, so the next round
+            // does not copy them.
+            .gone => act.init[k - (act.rw.params.len - act.init.len)],
+            // A split slot is read through the nodes that stand for its components.
+            .split => @import("base").invariant("reify rebuild: a split loop slot is read whole", .{}),
+        };
+    }
+
+    // The loop whose paths the region being copied is on, when a rewrite copies it.
+    fn active(self: *const Rebuild) ?*const Active {
+        if (self.frames.items.len == 0) return null;
+        return self.frames.items[self.frames.items.len - 1];
     }
 
     fn mapRefs(self: *const Rebuild, refs: []const Ref) Allocator.Error![]Ref {
@@ -335,7 +455,11 @@ const Rebuild = struct {
     }
 
     fn fill(self: *Rebuild, r: RegionId) Allocator.Error!void {
-        for (self.p.membersOf(r)) |m| try self.node(m);
+        for (self.p.membersOf(r)) |m| {
+            // A node a rule stands in for, or built ahead of its region, is not built again.
+            if (self.skipped.contains(m) or self.nodes.contains(m)) continue;
+            try self.node(m);
+        }
     }
 
     // Close the region being built, a copy of old region `r`, with `r`'s end,
@@ -343,10 +467,33 @@ const Rebuild = struct {
     // join goes on in the join's copy, which the end of that join closes.
     // `select` gives the outputs an arm of a value switch keeps, by old
     // index, in new order.
-    fn finish(self: *Rebuild, r: RegionId, as: EndAs, select: ?[]const u32) Allocator.Error!void {
+    fn finish(self: *Rebuild, r: RegionId, as: EndAs, select_in: ?[]const u32) Allocator.Error!void {
         const end = self.store().region(r).end;
         const old_refs = try self.gpa.dupe(Ref, self.store().refSlice(end.refs));
         defer self.gpa.free(old_refs);
+        // N12: the paths of a row built as a loop end in its terminators.
+        if (self.tail) |t| if (t.spine.contains(r)) switch (end.kind) {
+            .value, .return_ => return self.tailValue(t, old_refs[0], as),
+            .jump, .branch, .open, .continue_, .break_ => {},
+        };
+        // N14b: a loop that splits slots gives each part its component.
+        if (self.active()) |act| if (act.rw.split) |sp| {
+            const bounded = act.rw.op != .loop;
+            if (end.kind == .continue_ or (end.kind == .break_ and bounded)) {
+                const refs = try self.partRefs(act, sp, old_refs);
+                defer self.gpa.free(refs);
+                return self.close(if (end.kind == .continue_) .{ .continue_ = refs } else .{ .break_ = refs }, as);
+            }
+        };
+        // A loop under a rewrite keeps the values of the slots and outputs it keeps.
+        var select = select_in;
+        var returns_break = false;
+        if (self.active()) |act| switch (end.kind) {
+            .continue_ => select = act.rw.slots,
+            .break_ => select = act.rw.break_keep,
+            .return_ => returns_break = act.rw.returns_break,
+            .value, .jump, .branch, .open => {},
+        };
         const picked = if (select) |sel| blk: {
             const out = try self.gpa.alloc(Ref, sel.len);
             for (sel, out) |k, *o| o.* = old_refs[k];
@@ -359,7 +506,7 @@ const Rebuild = struct {
             .open => unreachable, // ends of the old rows are closed
             .value => .{ .value = refs },
             .jump => .{ .jump = .{ .join = self.regions.get(RegionId.of(end.target)).?, .args = refs } },
-            .return_ => .{ .return_ = refs[0] },
+            .return_ => if (returns_break) .{ .break_ = refs[0..1] } else .{ .return_ = refs[0] },
             .continue_ => .{ .continue_ = refs },
             .break_ => .{ .break_ = refs },
             .branch => {
@@ -381,6 +528,108 @@ const Rebuild = struct {
             },
         };
         try self.close(spec, as);
+    }
+
+    // N14b: per part of the loop `act` builds, the value the old values of
+    // the slots give it, for the `Continue` or `Break` that ends with `old_refs`.
+    fn partRefs(self: *Rebuild, act: *const Active, sp: *const loops.Split, old_refs: []const Ref) Allocator.Error![]Ref {
+        const header: u32 = @intCast(act.rw.params.len - sp.shapes.len);
+        const out = try self.gpa.alloc(Ref, sp.parts.len);
+        errdefer self.gpa.free(out);
+        for (sp.parts, out, 0..) |leaf, *o, j| {
+            const old_param = Ref.regionParam(act.rw.body, @intCast(header + leaf.index));
+            o.* = try self.partValue(act, old_param, Ref.regionParam(act.body, @intCast(header + j)), old_refs[leaf.index], leaf.path);
+        }
+        return out;
+    }
+
+    // The component at `path` of the old value `v` of a slot: a component of
+    // the construction `v` is, the new parameter when `v` is the slot itself,
+    // and otherwise a read of the value.
+    fn partValue(self: *Rebuild, act: *const Active, old_param: Ref, new_param: Ref, v: Ref, path: []const u32) Allocator.Error!Ref {
+        var cur = v;
+        var rest = path;
+        while (rest.len > 0) {
+            if (cur == old_param) return new_param;
+            if (cur.kind != .node or cur.output != 0) break;
+            const nd = self.store().node(cur.nodeId());
+            if ((nd.op != .record and nd.op != .tuple) or nd.aux.len != 0) break;
+            cur = self.store().refSlice(nd.args)[rest[0]];
+            rest = rest[1..];
+        }
+        _ = act;
+        self.mark();
+        return self.components(self.mapRef(cur), rest);
+    }
+
+    // The component of `value` at `path`.
+    fn components(self: *Rebuild, value: Ref, path: []const u32) Allocator.Error!Ref {
+        var ref = value;
+        for (path) |i| {
+            const ty = self.store().refTy(self.b.row, ref);
+            ref = switch (self.b.types.get(ty)) {
+                .record => try self.b.field(ref, i),
+                .tuple => try self.b.index(ref, i),
+                .bool_, .str, .int, .float, .dec, .tag_union, .list, .nominal, .func, .opaque_, .recursive => unreachable, // a shape splits records and tuples only
+            };
+        }
+        return ref;
+    }
+
+    // The aggregate of type `ty` that the outputs of `loop` from `next` make,
+    // as `shape` splits it.
+    fn aggregateFrom(self: *Rebuild, loop: NodeId, ty: TyId, shape: scalar.Shape, next: *u32) Allocator.Error!Ref {
+        switch (shape) {
+            .whole => {
+                defer next.* += 1;
+                return Ref.node(loop, @intCast(next.*));
+            },
+            .split => |children| {
+                const parts = try self.gpa.alloc(Ref, children.len);
+                defer self.gpa.free(parts);
+                for (children, parts, 0..) |child, *part, i| {
+                    part.* = try self.aggregateFrom(loop, self.b.types.componentTy(ty, @intCast(i)), child, next);
+                }
+                self.mark();
+                return switch (self.b.types.get(ty)) {
+                    .record => try self.b.record(ty, parts),
+                    .tuple => try self.b.tuple(ty, parts),
+                    .bool_, .str, .int, .float, .dec, .tag_union, .list, .nominal, .func, .opaque_, .recursive => unreachable, // a shape splits records and tuples only
+                };
+            },
+        }
+    }
+
+    // N12: the value a path of the row ends in. A tail call is the next turn,
+    // a value switch is an exiting switch whose arms end the same way, and any
+    // other value is where the loop ends.
+    fn tailValue(self: *Rebuild, t: *const loops.Tail, ref: Ref, as: EndAs) Allocator.Error!void {
+        if (ref.kind == .node) {
+            const n = ref.nodeId();
+            const nd = self.store().node(n);
+            if (t.calls.contains(n)) {
+                const old_args = try self.gpa.dupe(Ref, self.store().refSlice(nd.args));
+                defer self.gpa.free(old_args);
+                const args = try self.mapRefs(old_args);
+                defer self.gpa.free(args);
+                return self.close(.{ .continue_ = args }, as);
+            }
+            if (t.switches.contains(n)) {
+                const old_regions = try self.gpa.dupe(RegionId, self.store().regionSlice(nd.regions));
+                defer self.gpa.free(old_regions);
+                const aux = try self.gpa.dupe(u32, self.store().wordSlice(nd.aux));
+                defer self.gpa.free(aux);
+                const old_args = try self.gpa.dupe(Ref, self.store().refSlice(nd.args));
+                defer self.gpa.free(old_args);
+                const args = try self.mapRefs(old_args);
+                defer self.gpa.free(args);
+                // No outputs: the switch is the exiting one, and its arms end the loop's turn.
+                try self.switchNode(n, nd, args, &.{}, aux, old_regions);
+                return self.close(.{ .branch = self.nodes.get(n).?.ref.nodeId() }, as);
+            }
+        }
+        const value = [1]Ref{self.mapRef(ref)};
+        try self.close(.{ .break_ = &value }, as);
     }
 
     fn close(self: *Rebuild, spec: EndSpec, as: EndAs) Allocator.Error!void {
@@ -483,12 +732,24 @@ const Rebuild = struct {
                 break :blk .{ .ref = try self.make(.{ .op = nd.op, .payload = nd.payload, .args = args, .tys = tys, .regions = regions, .aux = aux }), .width = 1 };
             },
             .for_range, .for_list, .loop, .lambda => blk: {
+                // The loop rules (`loops.zig`): the loop is copied as a rewrite says.
+                if (nd.op != .lambda and !self.opts.raw) {
+                    const where: loops.Where = .{ .row_body = if (self.inside) null else self.row_body, .usage = try self.usage() };
+                    if (try loops.analyze(self.arena(), self.p, self.b.types, n, where)) |found| {
+                        const rw = found;
+                        break :blk try self.rewrittenLoop(nd, &rw, args);
+                    }
+                }
+                // A loop copied as it is, and a lambda, are paths of their own.
+                try self.frames.append(self.gpa, null);
+                defer _ = self.frames.pop();
                 const regions = try self.gpa.alloc(RegionId, old_regions.len);
                 defer self.gpa.free(regions);
                 for (old_regions, regions) |old, *new| {
                     const params = try self.gpa.dupe(TyId, s.tySlice(s.region(old).params));
                     defer self.gpa.free(params);
                     new.* = try self.b.openRegion(s.region(old).kind, params);
+                    if (nd.op == .for_list) try self.b.noteListLoop(new.*, args[0]);
                     try self.regions.put(self.gpa, old, new.*);
                     try self.fill(old);
                     try self.finish(old, if (nd.op == .lambda) .{ .lambda = new.* } else .region, null);
@@ -515,6 +776,88 @@ const Rebuild = struct {
         try self.nodes.put(self.gpa, n, built);
     }
 
+    // N11: the loop `nd` copied as the rewrite `rw` says. What the header
+    // reads from the old body is built first, where the loop stands. The new
+    // body is built from the old body's nodes without those the rule replaced,
+    // then, when the rule moves the body into one of its arms, from that
+    // arm's nodes and end. The rewrite says which slots and outputs the new
+    // loop keeps and what the others are.
+    fn rewrittenLoop(self: *Rebuild, nd: ir.Node, rw: *const loops.Rewrite, args: []const Ref) Allocator.Error!Built {
+        const lead: usize = switch (nd.op) {
+            .for_range => 2,
+            .for_list => 1,
+            .loop => 0,
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // only a loop is rewritten
+        };
+        for (rw.hoist) |m| try self.node(m);
+        const slot_count = if (rw.split) |sp| sp.parts.len else rw.slots.len;
+        const new_args = try self.gpa.alloc(Ref, rw.header.len + slot_count);
+        defer self.gpa.free(new_args);
+        for (rw.header, new_args[0..rw.header.len]) |h, *o| o.* = self.mapRef(h);
+        if (rw.split) |sp| {
+            // N14b: each part starts as the component of its slot's initial value.
+            for (sp.parts, new_args[rw.header.len..]) |leaf, *o| {
+                self.mark();
+                o.* = try self.components(args[lead + leaf.index], leaf.path);
+            }
+        } else for (rw.slots, new_args[rw.header.len..]) |k, *o| o.* = args[lead + k];
+        const body = try self.b.openRegion(.loop_body, rw.param_tys);
+        if (rw.op == .for_list) try self.b.noteListLoop(body, new_args[0]);
+        var act: Active = .{ .rw = rw, .body = body, .init = args[lead..] };
+        try self.regions.put(self.gpa, rw.body, body);
+        if (rw.continue_in) |r| try self.regions.put(self.gpa, r, body);
+        try self.rewrites.put(self.gpa, rw.body, &act);
+        defer _ = self.rewrites.remove(rw.body);
+        for (rw.skip) |m| try self.skipped.put(self.gpa, m, {});
+        for (rw.stands) |st| try self.nodes.put(self.gpa, st.node, .{ .ref = Ref.regionParam(body, @intCast(st.param)), .width = 1 });
+        try self.frames.append(self.gpa, &act);
+        defer _ = self.frames.pop();
+        try self.fill(rw.body);
+        if (rw.continue_in) |r| {
+            try self.fill(r);
+            try self.finish(r, .region, null);
+        } else try self.finish(rw.body, .region, null);
+        const ref = try self.make(.{ .op = rw.op, .payload = rw.payload, .args = new_args, .tys = rw.out_tys, .regions = &.{body} });
+        const outs = try self.gpa.alloc(u32, rw.outputs.len);
+        errdefer self.gpa.free(outs);
+        const repl = try self.gpa.alloc(Ref, rw.outputs.len);
+        errdefer self.gpa.free(repl);
+        for (rw.outputs, outs, repl, 0..) |to, *out, *value, o| {
+            var at = to;
+            while (std.meta.activeTag(at) == .same_as) at = rw.outputs[at.same_as];
+            switch (at) {
+                .output => |k| {
+                    out.* = k;
+                    value.* = ref;
+                },
+                .init => |slot| {
+                    out.* = Built.no_output;
+                    value.* = args[lead + slot];
+                },
+                // Every `Break` gave this value, which stands outside the loop.
+                .value => |v| {
+                    out.* = Built.no_output;
+                    value.* = self.mapRef(v);
+                },
+                // Nothing reads an output the rule dropped.
+                .gone => {
+                    out.* = Built.no_output;
+                    value.* = ref;
+                },
+                // N14b: the aggregate the outputs of the parts make.
+                .rebuilt => |slot| {
+                    const sp = rw.split.?;
+                    out.* = Built.no_output;
+                    var next = sp.first[slot];
+                    value.* = try self.aggregateFrom(ref.nodeId(), sp.slot_tys[slot], sp.shapes[slot], &next);
+                },
+                .same_as => unreachable, // resolved by the loop above
+            }
+            _ = o;
+        }
+        return .{ .ref = ref, .outs = outs, .repl = repl, .width = @intCast(rw.out_tys.len) };
+    }
+
     // The body of the row `callee` places, built in the current region over
     // `args` for its parameters: its value, at the type `ty` of the call. A
     // call at a type wider than the row's result has the ends of the body
@@ -523,7 +866,7 @@ const Rebuild = struct {
     fn inlined(self: *Rebuild, callee: *const place.Plan, args: []const Ref, ty: TyId) Allocator.Error!Ref {
         var wanted: ?Demand = if (ty == self.store().row(callee.row).result) null else try DemandWalk.run(self.gpa, self.store(), self.b.types, callee, ty);
         defer if (wanted) |*w| w.deinit();
-        var r: Rebuild = .{ .gpa = self.gpa, .b = self.b, .p = callee, .opts = .{ .param_values = args, .inline_rows = self.opts.inline_rows, .lambda_rows = self.opts.lambda_rows }, .via = self.here, .demand = if (wanted) |*w| w else null };
+        var r: Rebuild = .{ .gpa = self.gpa, .b = self.b, .p = callee, .opts = .{ .param_values = args, .inline_rows = self.opts.inline_rows, .lambda_rows = self.opts.lambda_rows }, .via = self.here, .demand = if (wanted) |*w| w else null, .inside = true };
         defer r.deinit();
         const body = self.store().row(callee.row).body;
         try r.regions.put(self.gpa, body, self.b.current());
@@ -550,13 +893,40 @@ const Rebuild = struct {
         defer self.gpa.free(values);
         @memcpy(values[0..captures.len], captures);
         for (values[captures.len..], 0..) |*v, k| v.* = Ref.regionParam(region, @intCast(k));
-        var r: Rebuild = .{ .gpa = self.gpa, .b = self.b, .p = callee, .opts = .{ .param_values = values, .inline_rows = self.opts.inline_rows, .lambda_rows = self.opts.lambda_rows }, .via = self.here };
+        var r: Rebuild = .{ .gpa = self.gpa, .b = self.b, .p = callee, .opts = .{ .param_values = values, .inline_rows = self.opts.inline_rows, .lambda_rows = self.opts.lambda_rows }, .via = self.here, .inside = true };
         defer r.deinit();
         const body = s.row(callee.row).body;
         try r.regions.put(self.gpa, body, region);
         try r.fill(body);
         try r.finish(body, .{ .lambda = region }, null);
         return self.make(.{ .op = .lambda, .tys = &.{ty}, .regions = &.{region} });
+    }
+
+    // Whether the switch `n` and its arms are the only readers of its
+    // scrutinee, a node of the old row, and of the `Unwrap`s of nominals that
+    // lead to the node it reads, each of which only the `Unwrap` after it reads.
+    fn soleReader(self: *const Rebuild, n: NodeId, nd: ir.Node) bool {
+        const s = self.store();
+        var t = s.refSlice(nd.args)[0];
+        var reader = n;
+        const arms = s.regionSlice(nd.regions);
+        while (true) {
+            if (t.kind != .node) return false;
+            const sites = (self.p.uses.get(t.nodeId()) orelse return false).items;
+            for (sites) |site| {
+                const at: RegionId = switch (site) {
+                    .node => |r| if (r == reader or (reader != n and r == n)) continue else s.node(r).region,
+                    .region => |r| r,
+                };
+                for (arms) |arm| {
+                    if (s.encloses(arm, at)) break;
+                } else return false;
+            }
+            const read = s.node(t.nodeId());
+            if (read.op != .unwrap) return true;
+            reader = t.nodeId();
+            t = s.refSlice(read.args)[0];
+        }
     }
 
     fn switchNode(self: *Rebuild, n: NodeId, nd: ir.Node, args: []const Ref, tys: []const TyId, aux: []const u32, old_regions: []const RegionId) Allocator.Error!void {
@@ -636,6 +1006,10 @@ const Rebuild = struct {
         @memcpy(regions[new_arms.len..], joins);
         const spec: builder_mod.NodeSpec = .{ .op = .switch_, .payload = @intCast(new_arms.len), .args = args, .tys = new_tys, .regions = regions, .aux = aux };
         self.mark();
+        // N13r moves this switch into the arms of the value switch it tests an
+        // output of only when it is the one reader of that output.
+        self.b.sole_reader = if (self.soleReader(n, nd)) args[0] else null;
+        defer self.b.sole_reader = null;
         const ref = if (self.opts.raw)
             try self.b.makeRaw(spec)
         else if (value)

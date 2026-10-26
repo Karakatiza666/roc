@@ -477,7 +477,7 @@ pub const ModuleType = enum {
             // The normal form of a reified function (roc-reify-normal-form.md).
             .reify => .{
                 .root = "src/reify/mod.zig",
-                .deps = &.{ .base, .collections },
+                .deps = &.{ .base, .collections, .builtins },
                 .tests = .{ .unit = .{ .aggregators = &.{"reify tests"} } },
                 .available = .dependents_only,
             },

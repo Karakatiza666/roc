@@ -277,7 +277,7 @@ Dbsp :: {}.{
 			}
 			block.defs.join_map(|def| Dbsp.calls_in(def.value)).concat(ends.join_map(Dbsp.calls_in))
 		}
-		Param(_) | Arg(_) | Out(_) | Def(_) => []
+		Param(_) | Input(_) | Arg(_) | Out(_) | Def(_) => []
 	}
 
 	## Every row that `pending` calls, directly or through other rows, once each,
@@ -385,7 +385,7 @@ Dbsp :: {}.{
 			}
 			block.defs.any(|def| Dbsp.reads(def.value, k)) or ends.any(|end| Dbsp.reads(end, k))
 		}
-		Arg(_) | Out(_) | Def(_) => Bool.False
+		Input(_) | Arg(_) | Out(_) | Def(_) => Bool.False
 	}
 
 	## One more stage: the call it writes, and the row type it leaves.
@@ -591,6 +591,9 @@ Dbsp :: {}.{
 		_ => Ok({ lets: [], value: Dbsp.owned(tree, scope)?.text })
 	}
 
+	no_input : Error
+	no_input = Unsupported("a value the step reads from around itself has no closure form here; read it from a column")
+
 	no_loop : Error
 	no_loop = Unsupported("a loop has no closure form; `dbsp`'s operators are the loops, so write the step as a `filter`, a `map` or a `count`")
 
@@ -602,7 +605,7 @@ Dbsp :: {}.{
 			(Field(_), [inner]) | (Index(_), [inner]) | (Unwrap, [inner]) => Dbsp.is_read(inner)
 			_ => Bool.False
 		}
-		Arg(_) | Out(_) | Block(_) => Bool.False
+		Input(_) | Arg(_) | Out(_) | Block(_) => Bool.False
 	}
 
 	## Whether a tree reads a name, whose value a Rust expression would borrow
@@ -614,7 +617,7 @@ Dbsp :: {}.{
 			Field(_) | Index(_) | Unwrap => Bool.True
 			_ => Bool.False
 		}
-		Arg(_) | Out(_) | Block(_) => Bool.False
+		Input(_) | Arg(_) | Out(_) | Block(_) => Bool.False
 	}
 
 	tree_ty : Code.Tree, Scope -> Try(Code.Ty, Error)
@@ -626,6 +629,7 @@ Dbsp :: {}.{
 		}
 		Def(n) => Ok(scope.row.node(n).ty)
 		Arg(_) | Out(_) | Block(_) => Err(Dbsp.no_loop)
+		Input(_) => Err(Dbsp.no_input)
 	}
 
 	## An expression that owns its value.
@@ -655,6 +659,7 @@ Dbsp :: {}.{
 			Err(_) => Err(BadCircuit("a value read before its block computes it"))
 		}
 		Arg(_) | Out(_) => Err(Dbsp.no_loop)
+		Input(_) => Err(Dbsp.no_input)
 		Block(_) => {
 			inner = Dbsp.render_block(tree, scope)?
 			if inner.lets.is_empty() {

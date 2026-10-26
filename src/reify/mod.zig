@@ -22,19 +22,22 @@ pub const views = @import("views.zig");
 pub const provenance = @import("provenance.zig");
 pub const live = @import("live.zig");
 pub const place = @import("place.zig");
+pub const match = @import("match.zig");
 pub const rebuild = @import("rebuild.zig");
 pub const number = @import("number.zig");
+pub const loops = @import("loops.zig");
+pub const scalar = @import("scalar.zig");
 pub const fuzz_gen = @import("fuzz_gen.zig");
 
 /// The normal-form version (I11). The rules, the speculatable lists and the
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 3;
+pub const normal_form_version: u32 = 9;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
-/// the builtin table with its speculatable list, and the speculatable list
-/// of the ops.
+/// the builtin table with its speculatable list, the speculatable list of
+/// the ops, and the kinds of value a node reads.
 pub fn fingerprint() u64 {
     var h = std.hash.Wyhash.init(0);
     h.update(std.mem.asBytes(&rules.fingerprint()));
@@ -43,6 +46,10 @@ pub fn fingerprint() u64 {
         h.update(@tagName(op));
         h.update(@tagName(builder.opSpeculatable(op)));
     }
+    for (std.enums.values(ir.Ref.Kind)) |kind| h.update(@tagName(kind));
+    for (std.enums.values(ir.RecordForm)) |form| h.update(@tagName(form));
+    for (loops.steps) |step| h.update(step);
+    for (scalar.steps) |step| h.update(step);
     return h.final();
 }
 
@@ -60,6 +67,33 @@ const recorded = [_]Recorded{
     // M3: `Apply`, rows finalized before their callers with digests and
     // first-read parameters, and the `graph` view.
     .{ .version = 3, .fingerprint = 0x8b7cdb45472514a6 },
+    // M4: input slots, the captured run-time values a root reads (N18), and
+    // the kinds of value a node reads in the fingerprint.
+    .{ .version = 4, .fingerprint = 0xc85b7416400dd35c },
+    // M5: a `Record` node may leave an optional member unset, and says which
+    // members it sets (`ir.RecordForm`).
+    .{ .version = 5, .fingerprint = 0x087a981c03021a8a },
+    // M4: a switch on `Str` equality against a literal is a literal switch
+    // keyed by the string (N13n over `Str`), so the arms of a `match` on
+    // string literals meet in any order (N7a, `match.zig`).
+    .{ .version = 6, .fingerprint = 0x4664538352b123b1 },
+    // M5 of the plan: literals of floats, `Str` and chains fold (N13j, N13k),
+    // chains of `Str.concat` and `List.concat` flatten (N15a), a `Str`
+    // literal goes last in an equality (N15c), and the hand-written
+    // algorithms N7b, N13m, N13r and N13d over `Bool.not` run.
+    .{ .version = 7, .fingerprint = 0x27ea5d8c8ceef391 },
+    // M6 of the plan: three canonical loop forms. A row whose every call to
+    // itself is a tail call is a `Loop` (N12); a loop's invariant, dead and
+    // equal slots and unread outputs go (N11g to N11j); a loop over
+    // `List.iter(xs)` is `ForList(xs)` (N11k); a counter `Loop` is a
+    // `ForRange` and `ForRange(0, List.len(xs))` is `ForList(xs)` (N11l). A
+    // general `Loop` has outputs of its own, apart from its slots.
+    .{ .version = 8, .fingerprint = 0x97ad1e35a8feb8fb },
+    // M7 of the plan: a record or tuple that a non-root row only reads by
+    // field or index is one parameter per component, and a loop slot the
+    // body only reads that way and every `Continue` gives as a construction
+    // is one slot per component (N14a, N14b).
+    .{ .version = 9, .fingerprint = 0x2255e015149a57ec },
 };
 
 const std = @import("std");
@@ -94,7 +128,10 @@ test "reify tests" {
     std.testing.refAllDecls(@import("provenance.zig"));
     std.testing.refAllDecls(@import("live.zig"));
     std.testing.refAllDecls(@import("place.zig"));
+    std.testing.refAllDecls(@import("match.zig"));
     std.testing.refAllDecls(@import("rebuild.zig"));
     std.testing.refAllDecls(@import("number.zig"));
+    std.testing.refAllDecls(@import("loops.zig"));
+    std.testing.refAllDecls(@import("scalar.zig"));
     std.testing.refAllDecls(@import("fuzz_gen.zig"));
 }

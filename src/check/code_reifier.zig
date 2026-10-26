@@ -89,6 +89,9 @@ pub const Rejection = struct {
         /// (`detail` names the bound), so the site is refused rather than
         /// normalized without end.
         bound_exceeded,
+        /// A value the lambda reads at run time that its translator's
+        /// `Code.Bound` cannot receive as an input slot (`detail` says why).
+        input_not_bound,
     };
 };
 
@@ -467,7 +470,7 @@ pub const Reifier = struct {
     const Callee = union(enum) {
         definition: CalleeTarget,
         /// A builtin, by its export name.
-        provided: []const u8,
+        provided: Provided,
         foreign: ForeignName,
         /// A function value the walk does not know, such as a parameter or
         /// one an `if` chooses: the call is an `Apply` (N8i), which
@@ -1226,6 +1229,9 @@ pub const Reifier = struct {
             .in_scope => for (captured) |capture| {
                 if (self.capturedInScope(capture.pattern)) continue;
                 if (self.replayStatement(capture.pattern) != null) continue;
+                // A translator that returns a `Code.Bound` receives what the
+                // body reads of it as an input slot (`inputSlot`).
+                if (self.walk.inputs != null) continue;
                 return self.rejectError(.capture, region, self.capturedName(capture.pattern));
             },
         }
@@ -2116,6 +2122,13 @@ pub const Reifier = struct {
 
     /// A record literal, in the type's field order, and a record update as
     /// the full record it builds (N1g).
+    ///
+    /// A field the literal unsets (`b: _`), or leaves out where the type marks
+    /// it optional, is a member the `Record` node does not set
+    /// (`ir.RecordForm`). An update carries a field it did not write from its
+    /// subject, and a subject's optional field may be absent, so the update
+    /// is a switch on whether the subject holds it: the arm where it does
+    /// sets it, and the arm where it does not leaves it unset.
     fn recordExpr(
         self: *Reifier,
         fields: []const checked.CheckedRecordExprField,
@@ -2132,8 +2145,6 @@ pub const Reifier = struct {
             .record => target,
             .bool_, .str, .int, .float, .dec, .tuple, .tag_union, .list, .func, .opaque_, .recursive => return self.rejectError(.unsupported_type, region, "a record of this type"),
         };
-        if (unsets.len != 0) return self.rejectError(.unsupported_expression, region, "a record literal that unsets an optional field");
-        const b = self.bld();
         // The subject of an update is written first, then the fields, and
         // they are built in that order.
         const subject = if (ext) |subject_id| try self.readable(try self.exprRef(subject_id)) else null;
@@ -2141,36 +2152,154 @@ pub const Reifier = struct {
         const values = try self.gpa.alloc(?Ref, members_len);
         defer self.gpa.free(values);
         @memset(values, null);
+        const unset = try self.gpa.alloc(bool, members_len);
+        defer self.gpa.free(unset);
+        @memset(unset, false);
         for (fields) |field| {
             const value = try self.exprRef(field.value);
             const index = self.memberIndex(shape, self.names.recordFieldLabelText(field.label)) orelse
                 return self.rejectError(.unsupported_type, region, "a field the record's type does not have");
             values[index] = value;
         }
-        const refs = try self.gpa.alloc(Ref, members_len);
-        defer self.gpa.free(refs);
-        for (values, refs, 0..) |value, *ref, index| {
-            if (value) |v| {
-                ref.* = v;
-                continue;
-            }
-            const member = types.memberSlice(types.get(shape).record)[index];
-            const from = subject orelse
-                return self.rejectError(.unsupported_expression, region, "a record literal that leaves out a field");
-            // A field the update did not write carries whatever the subject
-            // had, and a `Field` read of one that may be absent is not that.
-            if (member.optional) return self.rejectError(.unsupported_expression, region, "a record update over a record with an optional field");
-            ref.* = try b.field(from, try self.fieldIndex(from, types.nameText(member.name), region));
+        for (unsets) |label| {
+            const index = self.memberIndex(shape, self.names.recordFieldLabelText(label)) orelse
+                return self.rejectError(.unsupported_type, region, "a field the record's type does not have");
+            std.debug.assert(types.memberSlice(types.get(shape).record)[index].optional);
+            unset[index] = true;
         }
-        const record = try b.record(shape, refs);
-        return if (shape == target) record else b.wrap(target, record);
+        var carried = std.ArrayList(Carry).empty;
+        defer carried.deinit(self.gpa);
+        if (subject) |from| {
+            try self.carryMembers(from, shape, values, unset, &carried, region);
+        } else for (values, unset, 0..) |value, is_unset, index| {
+            if (value != null or is_unset) continue;
+            // No subject: the checker accepts a literal that leaves out only
+            // an optional field, which is then unset.
+            if (!types.memberSlice(types.get(shape).record)[index].optional) {
+                return self.rejectError(.unsupported_expression, region, "a record literal that leaves out a field");
+            }
+        }
+        return self.recordSetting(target, shape, values, carried.items, subject, region);
     }
+
+    /// Take each member of `shape` that `values` leaves null, and `unset` does
+    /// not unset, from the record `from`. A field `from` always holds is a
+    /// read. An optional one is a read where `from` holds it and is left
+    /// unset where it does not, which only `from`'s value says, so it goes
+    /// into `carried`.
+    fn carryMembers(
+        self: *Reifier,
+        from: Ref,
+        shape: TyId,
+        values: []?Ref,
+        unset: []const bool,
+        carried: *std.ArrayList(Carry),
+        region: base.Region,
+    ) Error!void {
+        const b = self.bld();
+        const types = self.rt();
+        for (values, unset, 0..) |*value, is_unset, index| {
+            if (value.* != null or is_unset) continue;
+            const member = types.memberSlice(types.get(shape).record)[index];
+            const at = try self.fieldIndex(from, types.nameText(member.name), region);
+            const held = types.memberSlice(types.get(self.irs().refTy(b.row, from)).record)[at];
+            if (member.optional and held.optional) {
+                try carried.append(self.gpa, .{ .member = @intCast(index), .at = at });
+            } else value.* = try b.field(from, at);
+        }
+    }
+
+    /// A member an update takes from its subject if the subject holds it.
+    const Carry = struct {
+        /// The member's position in the record type.
+        member: u32,
+        /// Its position in the subject's record type.
+        at: u32,
+    };
+
+    /// The record `shape` setting the members `values` holds, in `target`,
+    /// and, for each member of `carried`, the member too in the arm where
+    /// the subject holds it. The members `values` leaves null and `carried`
+    /// does not name are unset.
+    fn recordSetting(
+        self: *Reifier,
+        target: TyId,
+        shape: TyId,
+        values: []const ?Ref,
+        carried: []const Carry,
+        subject: ?Ref,
+        region: base.Region,
+    ) Error!Ref {
+        const b = self.bld();
+        const types = self.rt();
+        if (carried.len == 0) {
+            const set = try self.gpa.alloc(u32, values.len);
+            defer self.gpa.free(set);
+            const refs = try self.gpa.alloc(Ref, values.len);
+            defer self.gpa.free(refs);
+            var count: usize = 0;
+            for (values, 0..) |value, index| {
+                const v = value orelse continue;
+                set[count] = @intCast(index);
+                refs[count] = v;
+                count += 1;
+            }
+            const record = try b.recordSetting(shape, set[0..count], refs[0..count]);
+            return if (shape == target) record else b.wrap(target, record);
+        }
+        const from = subject.?;
+        const first = carried[0];
+        const ok_ty = types.tySlice(types.memberSlice(types.get(self.irs().refTy(b.row, from)).record)[first.at].tys)[0];
+        const found = try self.readable(try b.optField(from, first.at, try self.missingFieldTry(ok_ty)));
+        const union_ty = self.irs().refTy(b.row, found);
+        const ok = try types.name("Ok");
+        const names = try self.memberNames(union_ty, region);
+        defer self.gpa.free(names);
+        const arms = try self.gpa.alloc(RegionId, names.len);
+        defer self.gpa.free(arms);
+        const own = try self.gpa.dupe(?Ref, values);
+        defer self.gpa.free(own);
+        for (arms, names) |*arm, name| {
+            arm.* = try b.openTagArm(found, name);
+            own[first.member] = if (name == ok) try b.payload(found, ok, 0) else null;
+            const built = try self.recordSetting(target, shape, own, carried[1..], subject, region);
+            try b.close(.{ .value = &.{built} });
+        }
+        return b.switchOn(found, arms, &.{}, &.{target}, &.{});
+    }
+
+    /// `Try(ok, [MissingField])`, the type the checker gives a `.?` read
+    /// (`mkTryContent` over `makeFieldMissingTag`, `src/check/Check.zig`).
+    fn missingFieldTry(self: *Reifier, ok_ty: TyId) Error!TyId {
+        return self.tryOver(ok_ty, "MissingField");
+    }
+
+    /// `Try(ok, [err])`, for the one payload-free tag `err`.
+    fn tryOver(self: *Reifier, ok_ty: TyId, err: []const u8) Error!TyId {
+        const types = self.rt();
+        const err_ty = try types.tagUnionTy(&.{.{ .name = err, .payload = &.{} }});
+        const backing = try types.tagUnionTy(&.{
+            .{ .name = "Err", .payload = &.{err_ty} },
+            .{ .name = "Ok", .payload = &.{ok_ty} },
+        });
+        return types.nominalTy(try_type_name, backing);
+    }
+
+    /// The name the type table gives the builtin `Try`: the registry entry
+    /// the canonicalizer interns the builtin's qualified name from, so it is
+    /// the text `typeNameText` answers for the checker's own `Try`
+    /// (`src/canonicalize/CIR.zig` (`builtin_type_specs`)). The `.?` assert
+    /// in `optionalPath` holds the two together: the type built here must be
+    /// the type the checker gave the path.
+    const try_type_name = CIR.builtinTypeSpec("try_type").qualified_name;
 
     /// A field access path, one read per segment. A segment written `.?`
     /// reads a field the type marks optional and hands back the
-    /// `Try(a, [MissingField])` the value sits in; the checker gives the whole
-    /// path one flat `Try`, which nested reads cannot say, so an optional
-    /// segment is built only where it is the path's last.
+    /// `Try(a, [MissingField])` the value sits in. The checker gives the
+    /// whole path one flat `Try` of the last field's type, and the first
+    /// optional segment found missing is the `Err` of all of it, so an
+    /// optional segment before the last is a switch on its own `Try`: the
+    /// `Err` arm is the path's `Err`, and the `Ok` arm reads the rest.
     fn fieldAccessExpr(
         self: *Reifier,
         receiver_id: CheckedExprId,
@@ -2179,20 +2308,70 @@ pub const Reifier = struct {
         region: base.Region,
     ) Error!Ref {
         const b = self.bld();
-        var value = try self.exprRef(receiver_id);
+        const receiver = try self.exprRef(receiver_id);
+        const optional = for (segments) |segment| {
+            if (segment.mode == .optional) break true;
+        } else false;
+        if (!optional) {
+            var value = receiver;
+            for (segments) |segment| {
+                const record = try self.readable(value);
+                value = try b.field(record, try self.fieldIndex(record, self.names.recordFieldLabelText(segment.field_name), segment.source_region));
+            }
+            return value;
+        }
+        return self.optionalPath(receiver, segments, try self.tyOf(path_ty, region), region);
+    }
+
+    /// The rest of a path that holds an optional segment, read from `value`,
+    /// as the `Try` of type `path`.
+    fn optionalPath(self: *Reifier, value: Ref, segments: []const checked.CheckedFieldAccessSegment, path: TyId, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const types = self.rt();
+        var current = value;
         for (segments, 1..) |segment, walked| {
-            const record = try self.readable(value);
+            const record = try self.readable(current);
             const index = try self.fieldIndex(record, self.names.recordFieldLabelText(segment.field_name), segment.source_region);
-            if (segment.mode == .optional) {
-                if (walked != segments.len) {
-                    return self.rejectError(.unsupported_expression, region, "a field read through an optional field");
-                }
-                value = try b.optField(record, index, try self.tyOf(path_ty, region));
+            if (segment.mode == .required) {
+                current = try b.field(record, index);
                 continue;
             }
-            value = try b.field(record, index);
+            const field_ty = types.tySlice(types.memberSlice(types.get(self.irs().refTy(b.row, record)).record)[index].tys)[0];
+            const found = try b.optField(record, index, try self.missingFieldTry(field_ty));
+            if (walked == segments.len) {
+                // The last segment's `Try` is the path's own.
+                std.debug.assert(self.irs().refTy(b.row, found) == path);
+                return found;
+            }
+            const union_value = try self.readable(found);
+            const ok = try types.name("Ok");
+            const names = try self.memberNames(self.irs().refTy(b.row, union_value), region);
+            defer self.gpa.free(names);
+            const arms = try self.gpa.alloc(RegionId, names.len);
+            defer self.gpa.free(arms);
+            for (arms, names) |*arm, name| {
+                arm.* = try b.openTagArm(union_value, name);
+                const delivered = if (name == ok)
+                    try self.optionalPath(try b.payload(union_value, ok, 0), segments[walked..], path, region)
+                else
+                    try self.pathTry(path, "Err", null, region);
+                try b.close(.{ .value = &.{delivered} });
+            }
+            return b.switchOn(union_value, arms, &.{}, &.{path}, &.{});
         }
-        return value;
+        return self.pathTry(path, "Ok", current, region);
+    }
+
+    /// The path's `Try` holding the `Ok` value, or the `Err(MissingField)`.
+    fn pathTry(self: *Reifier, path: TyId, tag_text: []const u8, ok_value: ?Ref, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const types = self.rt();
+        const unfolded = try types.unfold(path);
+        const name = try self.tagName(unfolded, tag_text, region);
+        if (ok_value) |value| return b.wrap(path, try b.tag(unfolded, name, &.{value}));
+        const missing_ty = types.tySlice(types.memberSlice(types.get(unfolded).tag_union)[types.memberIndex(unfolded, name).?].tys)[0];
+        const missing = try b.tag(missing_ty, try self.tagName(missing_ty, "MissingField", region), &.{});
+        return b.wrap(path, try b.tag(unfolded, name, &.{missing}));
     }
 
     /// A nominal's value: its backing, built at the unfolded backing type,
@@ -2285,7 +2464,31 @@ pub const Reifier = struct {
         if (resolved) |id| {
             if (self.functionOf(use_ty) != null) return self.functionValue(id, binder, use_ty, region);
         }
+        if (self.walk.inputs) |*inputs| {
+            if (inputs.reader == self) return self.inputSlot(inputs, binder, region);
+        }
         return self.rejectError(.capture, region, self.binderName(binder));
+    }
+
+    /// The input slot of a run-time name the walk cannot replay (N18a), at a
+    /// site whose translator returns a `Code.Bound`
+    /// (`roc-reify-proposal.md` section 10.1). The program supplies the
+    /// value at the call, so the name has to be the value the description
+    /// reads there: a `var` can be written again before the call, and a row
+    /// other than the root has no call of its own to supply it at.
+    fn inputSlot(self: *Reifier, inputs: *Walk.Inputs, binder: PatternBinderId, region: base.Region) Error!Ref {
+        const record = self.bodies.patternBinder(binder);
+        if (record.reassignable) return self.rejectError(.input_not_bound, region, "a `var`, whose value at the call is not always the value the description reads");
+        if (self.walk.rows.items.len != 1) return self.rejectError(.input_not_bound, region, "a value that a function inside the description reads from around the lambda");
+        const pattern = self.bodies.pattern(record.pattern);
+        const ty = try self.tyOf(pattern.ty, pattern.source_region);
+        const leaf: u32 = for (inputs.leaves.items, 0..) |known, i| {
+            if (known == binder) break @intCast(i);
+        } else blk: {
+            try inputs.leaves.append(self.gpa, binder);
+            break :blk @intCast(inputs.leaves.items.len - 1);
+        };
+        return self.bld().input(ty, leaf);
     }
 
     fn bindingValue(self: *Reifier, binding: Binding, use_ty: CheckedTypeId, use_expr: ?CheckedExprId, region: base.Region) Error!Ref {
@@ -2313,6 +2516,13 @@ pub const Reifier = struct {
         use_ty: CheckedTypeId,
         region: base.Region,
     ) Error!Ref {
+        // A top-level value that computes a function is the definition it was
+        // written as, built where the name stands, as a constant is.
+        if (try self.computedFunction(resolved, region)) |computed| switch (computed) {
+            .written => |written| return try self.foldedBody(written.reader, written.body, null) orelse
+                self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function and reads itself"),
+            .foreign => return self.rejectError(.unsupported_expression, region, "a function of the compiler or of another package used as a value"),
+        };
         return switch (try self.resolvedTarget(resolved, written_binder, region)) {
             .definition => |target| self.closureOf(target, try self.tyOf(use_ty, region)),
             .provided, .foreign => self.rejectError(.unsupported_expression, region, "a function of the compiler or of another package used as a value"),
@@ -2380,17 +2590,87 @@ pub const Reifier = struct {
     ) Error!?Ref {
         const definition = try self.constantDefinition(resolved) orelse return null;
         const reader = definition.reader;
-        // A constant that reads itself is refused on the repeat.
-        if (reader.folding.contains(definition.body)) return null;
         // A computation of another package is a body of that package, which
         // the walk does not read, as it does not read that package's
         // functions (N8h).
-        if (!samePackage(self.env, reader.env) and !try self.nameHoldsConstant(resolved)) {
+        if (!reader.folding.contains(definition.body) and !samePackage(self.env, reader.env) and !try self.nameHoldsConstant(resolved)) {
             return self.rejectError(.unsupported_expression, region, "a computed constant of another package");
         }
-        try reader.folding.put(reader.gpa, definition.body, {});
-        defer _ = reader.folding.remove(definition.body);
-        return if (at) |ty| try reader.exprAt(definition.body, ty) else try reader.exprRef(definition.body);
+        return self.foldedBody(reader, definition.body, at);
+    }
+
+    /// The definition `body` of `reader`'s module, built where a name stands.
+    /// Null for a definition that reads itself, which is refused on the repeat
+    /// rather than followed forever.
+    fn foldedBody(self: *Reifier, reader: *Reifier, body: CheckedExprId, at: ?TyId) Error!?Ref {
+        _ = self;
+        if (reader.folding.contains(body)) return null;
+        try reader.folding.put(reader.gpa, body, {});
+        defer _ = reader.folding.remove(body);
+        return if (at) |ty| try reader.exprAt(body, ty) else try reader.exprRef(body);
+    }
+
+    /// A top-level value that computes a function, `doubler = make(2.0)`.
+    ///
+    /// The compiler evaluates such a value after the description is built, so
+    /// the closure it holds is not known to the walk. What the walk knows is
+    /// the definition, and it reads that where the name stands, the way it
+    /// reads a computed constant. The definition names the lambda's row and
+    /// every capture, so no value the compiler evaluates is needed.
+    const ComputedFunction = union(enum) {
+        /// The definition, and the reader of the module that wrote it.
+        written: struct { reader: *Reifier, body: CheckedExprId },
+        /// A value of another package: its definition is a body of that
+        /// package, which the walk does not read (N8h), so a call on it is a
+        /// `Prim` named by the module and the value.
+        foreign: ForeignName,
+    };
+
+    /// Where a name that is a top-level value computing a function leads, or
+    /// null for any other name, an exact alias of a function included: its
+    /// lookup names the procedure it forwards to.
+    fn computedFunction(self: *Reifier, resolved: checked.ResolvedValueRefId, region: base.Region) Error!?ComputedFunction {
+        const use = switch (self.value_refs.callableTarget(resolved).ref) {
+            .top_level_proc, .imported_proc, .promoted_top_level_proc => |use| use,
+            .local_proc,
+            .local_param,
+            .local_value,
+            .local_mutable_version,
+            .pattern_binder,
+            .selected_hoisted_const,
+            .top_level_const,
+            .imported_const,
+            .hosted_proc,
+            .platform_required_declaration,
+            .platform_required_checked_error,
+            .platform_required_const,
+            .platform_required_proc,
+            => return null,
+        };
+        switch (use.binding) {
+            .top_level => |top_level| {
+                if (!std.meta.eql(top_level.artifact.bytes, self.artifact.bytes)) return null;
+                const template_id = switch (self.procedure_bindings.get(top_level.binding).body) {
+                    .callable_eval_template => |id| id,
+                    .direct_template, .checked_error => return null,
+                };
+                const template = self.callable_eval_templates.templates[@backingInt(template_id)];
+                if (template.forwarded_lookup != null) return null;
+                return .{ .written = .{ .reader = self, .body = template.body } };
+            },
+            .imported => |imported| {
+                const away = self.walk.foreign.findExportedComputed(imported.artifact, imported.def) orelse return null;
+                const reader = try self.walk.reader(away.module);
+                if (samePackage(self.env, reader.env)) return .{ .written = .{ .reader = reader, .body = away.body } };
+                if (reader.env.module_role == .builtin) {
+                    return self.rejectError(.unsupported_expression, region, "a call to a function the compiler provides");
+                }
+                const binder = reader.bodies.patternBinderForCheckedPattern(imported.pattern) orelse
+                    return reader.rejectError(.unresolved_reference, region, "this call");
+                return .{ .foreign = .{ .owner = reader.env.module_name, .method = reader.binderName(binder) } };
+            },
+            .hosted, .platform_required => return null,
+        }
     }
 
     // Control //
@@ -3000,6 +3280,7 @@ pub const Reifier = struct {
         queue: []const Test,
         value: CheckedExprId,
         list: ListReads,
+        str: StrReads,
     };
 
     /// A `Bool` switch on `flag`: the arm where it is `holds` goes on to
@@ -3029,6 +3310,7 @@ pub const Reifier = struct {
             .queue => |queue| self.testQueue(br, subject, at, queue, top, region),
             .value => |value| self.armBody(br, value, top),
             .list => |reads| self.listReads(br, subject, at, reads, top),
+            .str => |reads| self.strReads(br, subject, at, reads, top),
         };
     }
 
@@ -3081,7 +3363,12 @@ pub const Reifier = struct {
                         .required, .sub_pattern => |inner| inner,
                         .rest => |inner| {
                             if (self.bodies.pattern(inner).data == .underscore) continue;
-                            return self.rejectError(.unsupported_expression, pattern.source_region, "a record pattern whose `..` binds a name");
+                            // The name binds a record of the fields the pattern
+                            // does not name, which is the record those reads
+                            // build.
+                            const rest_ty = try self.tyOf(self.bodies.pattern(inner).ty, pattern.source_region);
+                            try parts.append(self.gpa, .{ .pattern = inner, .value = try self.restRecord(record, rest_ty, pattern.source_region) });
+                            continue;
                         },
                     };
                     const index = try self.fieldIndex(record, self.names.recordFieldLabelText(destruct.label), pattern.source_region);
@@ -3103,8 +3390,29 @@ pub const Reifier = struct {
                 return self.boolTest(br, subject, at, eq, true, .{ .queue = queue[1..] }, top, region);
             },
             .list => |list| return self.listTest(br, subject, at, queue, list.patterns, list.rest, top, region),
-            .str_interpolation, .pending, .runtime_error => return self.rejectError(.unsupported_expression, pattern.source_region, patternFormName(pattern.data)),
+            .str_interpolation => |str| return self.strTest(br, subject, at, queue, str.prefix, str.steps, str.end, top, region),
+            .pending, .runtime_error => return self.rejectError(.unsupported_expression, pattern.source_region, patternFormName(pattern.data)),
         }
+    }
+
+    /// The record of type `rest_ty` that `..rest` binds: each of its fields
+    /// read from `record`.
+    fn restRecord(self: *Reifier, record: Ref, rest_ty: TyId, region: base.Region) Error!Ref {
+        const types = self.rt();
+        const members_len = switch (types.get(rest_ty)) {
+            .record => |span| span.len,
+            .bool_, .str, .int, .float, .dec, .tuple, .tag_union, .list, .nominal, .func, .opaque_, .recursive => return self.rejectError(.unsupported_type, region, "a record pattern rest of this type"),
+        };
+        const values = try self.gpa.alloc(?Ref, members_len);
+        defer self.gpa.free(values);
+        @memset(values, null);
+        const unset = try self.gpa.alloc(bool, members_len);
+        defer self.gpa.free(unset);
+        @memset(unset, false);
+        var carried = std.ArrayList(Carry).empty;
+        defer carried.deinit(self.gpa);
+        try self.carryMembers(record, rest_ty, values, unset, &carried, region);
+        return self.recordSetting(rest_ty, rest_ty, values, carried.items, record, region);
     }
 
     /// A literal pattern of the author's own type: the checker wrote the
@@ -3309,6 +3617,120 @@ pub const Reifier = struct {
             parts[items.len] = .{ .pattern = rest_pattern, .value = middle };
         }
         const tail = try self.expanded(reads.queue, parts);
+        defer self.gpa.free(tail);
+        return self.testQueue(br, subject, at, tail, top, reads.region);
+    }
+
+    /// A string interpolation pattern, as the decisions and reads Roc makes
+    /// for it (`LIR.strMatchStep`): the text starts with the prefix; each
+    /// step but a final tail capture splits the text left at the first place
+    /// its delimiter appears, capturing what comes before it; an exact end
+    /// leaves no text. A test that fails goes on to the next alternative.
+    fn strTest(
+        self: *Reifier,
+        br: *Branching,
+        subject: Ref,
+        at: MatchAt,
+        queue: []const Test,
+        prefix_id: checked.CheckedStringLiteralId,
+        steps: []const checked.CheckedStrPatternStep,
+        end: checked.CheckedStrPatternEnd,
+        top: bool,
+        region: base.Region,
+    ) Error!?Ref {
+        const b = self.bld();
+        const text = try self.readable(queue[0].value);
+        const prefix = self.bodies.stringLiteral(prefix_id);
+        var captures = std.ArrayList(Test).empty;
+        defer captures.deinit(self.gpa);
+        const reads: StrReads = .{ .text = text, .prefix = prefix, .steps = steps, .end = end, .queue = queue, .captures = &captures, .region = region };
+        if (prefix.len == 0) return self.strReads(br, subject, at, reads, top);
+        const starts = try b.primOf(try b.namedPrim("Str", "starts_with"), &.{ text, try b.litStr(prefix) }, try self.rt().boolTy());
+        return self.boolTest(br, subject, at, starts, true, .{ .str = reads }, top, region);
+    }
+
+    /// What a string pattern reads once its prefix matched.
+    const StrReads = struct {
+        text: Ref,
+        prefix: []const u8,
+        steps: []const checked.CheckedStrPatternStep,
+        end: checked.CheckedStrPatternEnd,
+        /// The queue whose first test is this string pattern.
+        queue: []const Test,
+        /// The captures read so far, as the tests of their patterns.
+        captures: *std.ArrayList(Test),
+        region: base.Region,
+    };
+
+    /// Drop the prefix, and go on to the steps.
+    fn strReads(self: *Reifier, br: *Branching, subject: Ref, at: MatchAt, reads: StrReads, top: bool) Error!?Ref {
+        const b = self.bld();
+        const str_ty = try self.rt().strTy();
+        const rest = if (reads.prefix.len == 0)
+            reads.text
+        else
+            try b.primOf(try b.namedPrim("Str", "drop_prefix"), &.{ reads.text, try b.litStr(reads.prefix) }, str_ty);
+        return self.strSteps(br, subject, at, reads, rest, reads.steps, top);
+    }
+
+    /// The steps of a string pattern from the text `rest` that is left.
+    fn strSteps(self: *Reifier, br: *Branching, subject: Ref, at: MatchAt, reads: StrReads, rest: Ref, steps: []const checked.CheckedStrPatternStep, top: bool) Error!?Ref {
+        const b = self.bld();
+        const region = reads.region;
+        const captured = reads.captures.items.len;
+        defer reads.captures.shrinkRetainingCapacity(captured);
+        const step = steps[0];
+        const last = steps.len == 1;
+        if (last and reads.end == .tail) {
+            if (step.capture) |capture| try reads.captures.append(self.gpa, .{ .pattern = capture, .value = rest });
+            return self.strDone(br, subject, at, reads, top);
+        }
+        const str_ty = try self.rt().strTy();
+        const pair_ty = try self.rt().recordTy(&.{ .{ .name = "after", .ty = str_ty }, .{ .name = "before", .ty = str_ty } });
+        const split_ty = try self.tryOver(pair_ty, "NotFound");
+        const split = try b.primOf(try b.namedPrim("Str", "split_first"), &.{ rest, try b.litStr(self.bodies.stringLiteral(step.delimiter)) }, split_ty);
+        const found = try self.readable(split);
+        const ok = try self.rt().name("Ok");
+        const names = try self.memberNames(self.irs().refTy(b.row, found), region);
+        defer self.gpa.free(names);
+        const arms = try self.gpa.alloc(RegionId, names.len);
+        defer self.gpa.free(arms);
+        const scope_base = self.scope.items.len;
+        for (arms, names) |*arm, name| {
+            arm.* = try br.openTagArm(found, name);
+            if (name == ok) {
+                const pair = try self.readable(try b.payload(found, ok, 0));
+                if (step.capture) |capture| {
+                    const before = try b.field(pair, try self.fieldIndex(pair, "before", region));
+                    try reads.captures.append(self.gpa, .{ .pattern = capture, .value = before });
+                }
+                const after = try b.field(pair, try self.fieldIndex(pair, "after", region));
+                if (last) {
+                    // An exact end leaves no text after the last delimiter.
+                    const empty = try b.primOf(try b.namedPrim("Str", "is_empty"), &.{after}, try self.rt().boolTy());
+                    try closedArm(self.strEnd(br, subject, at, reads, empty, false));
+                } else try closedArm(self.strSteps(br, subject, at, reads, after, steps[1..], false));
+                reads.captures.shrinkRetainingCapacity(captured);
+            } else try closedArm(self.failed(br, subject, at, false, region));
+            self.scope.shrinkRetainingCapacity(scope_base);
+        }
+        if (top) return br.finish(found, arms, &.{});
+        try br.inner(found, arms, &.{});
+        return null;
+    }
+
+    /// The pattern ended where `empty` says no text is left: the tests of
+    /// the captures and then of the queue run where it holds.
+    fn strEnd(self: *Reifier, br: *Branching, subject: Ref, at: MatchAt, reads: StrReads, empty: Ref, top: bool) Error!?Ref {
+        const tail = try self.expanded(reads.queue, reads.captures.items);
+        defer self.gpa.free(tail);
+        return self.boolTest(br, subject, at, empty, true, .{ .queue = tail }, top, reads.region);
+    }
+
+    /// The pattern matched whatever text is left: the tests of the captures
+    /// and then of the queue.
+    fn strDone(self: *Reifier, br: *Branching, subject: Ref, at: MatchAt, reads: StrReads, top: bool) Error!?Ref {
+        const tail = try self.expanded(reads.queue, reads.captures.items);
         defer self.gpa.free(tail);
         return self.testQueue(br, subject, at, tail, top, reads.region);
     }
@@ -3518,6 +3940,10 @@ pub const Reifier = struct {
         try params.appendSlice(self.gpa, slot_tys);
 
         const body = try b.openRegion(.loop_body, params.items);
+        switch (counted) {
+            .range => {},
+            .list => |list| try b.noteListLoop(body, list),
+        }
         try self.loopBody(.{ .body = body, .slot_base = slot_base, .iterator = false, .carried = carried.binders.items }, carried, body_id, switch (counted) {
             .range => .{ .item = .{ .pattern = pattern_id, .value = Ref.regionParam(body, 0) } },
             .list => .{ .item = .{ .pattern = pattern_id, .value = Ref.regionParam(body, 1) } },
@@ -3769,10 +4195,10 @@ pub const Reifier = struct {
         if (try self.curriedCall(func, operands, at, region)) |flattened| return flattened;
         var callee = try self.calleeTarget(func, region);
         switch (callee) {
-            .provided => |export_name| {
+            .provided => |provided| {
                 const args = try self.exprRefs(operands);
                 defer self.gpa.free(args);
-                return self.providedPrim(export_name, args, result_ty, region);
+                return self.providedPrim(provided, args, result_ty, region);
             },
             .foreign => |name| {
                 const args = try self.exprRefs(operands);
@@ -3800,7 +4226,7 @@ pub const Reifier = struct {
         try self.bindCallees(&callee.definition, operands, region);
         const kept = try self.keptOperands(operands, callee.definition.bound);
         defer self.gpa.free(kept);
-        return self.callOf(callee.definition, &.{kept}, at);
+        return self.callOf(callee.definition, &.{.{ .reader = self, .exprs = kept }}, at);
     }
 
     /// `Call` of a definition's row over what it captured, read here, then
@@ -3808,44 +4234,143 @@ pub const Reifier = struct {
     /// and bound callees. The call has the type `at` the site reads its result
     /// at, which is wider than the row's result where the site reads a
     /// narrower union at a wider one (design.md "Row Coercion Primitive").
-    fn callOf(self: *Reifier, target: CalleeTarget, groups: []const []const CheckedExprId, at: TyId) Error!Ref {
+    fn callOf(self: *Reifier, target: CalleeTarget, groups: []const ArgumentGroup, at: TyId) Error!Ref {
         var args = std.ArrayList(Ref).empty;
         defer args.deinit(self.gpa);
+        // The callee was resolved where the first group is written, so that
+        // is where what it captured is read.
+        const owner = groups[0].reader;
         for (target.captures) |capture| {
             if (capturedCallee(target.bound, capture.pattern) != null) continue;
-            const pattern = self.bodies.pattern(capture.pattern);
-            try args.append(self.gpa, try self.lookupRef(capture.pattern, null, pattern.ty, null, null, pattern.source_region));
+            const pattern = owner.bodies.pattern(capture.pattern);
+            try args.append(self.gpa, try owner.lookupRef(capture.pattern, null, pattern.ty, null, null, pattern.source_region));
         }
-        for (groups) |group| for (group) |child| {
-            try args.append(self.gpa, try self.exprRef(child));
+        for (groups) |group| for (group.exprs) |child| {
+            try args.append(self.gpa, try group.reader.exprRef(child));
         };
         const row = try self.calledRow(target);
         return self.bld().callRowAt(row, args.items, at);
     }
 
+    /// The arguments of one group of a call, with the reader of the module
+    /// that wrote them. A curried call's two groups can be written in two
+    /// modules: a top-level value that computes a function is written in the
+    /// module that defines it, and the call that runs it in the module that
+    /// uses it.
+    const ArgumentGroup = struct {
+        reader: *Reifier,
+        exprs: []const CheckedExprId,
+    };
+
     /// A builtin by its export name, `Builtin.Num.I64.plus`: the `Prim` of
     /// its owner and method (N1a).
-    fn providedPrim(self: *Reifier, export_name: []const u8, args: []const Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
-        const name = prims.namedOfExport(export_name) orelse
+    fn providedPrim(self: *Reifier, provided: Provided, args: []const Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        const name = prims.namedOfExport(provided.name) orelse
             return self.rejectError(.unresolved_reference, region, "a builtin with no owner in its name");
         const b = self.bld();
-        return b.primOf(try b.namedPrim(name.owner, name.method), args, try self.tyOf(result_ty, region));
+        return b.primOf(try b.namedPrimWithRole(name.owner, name.method, provided.role), args, try self.tyOf(result_ty, region));
     }
 
+    /// The expression that constructed a function, and the reader of the
+    /// module that wrote it.
+    const Constructor = struct {
+        reader: *Reifier,
+        expr: CheckedExprId,
+    };
+
     /// The call one expression constructed a function with: the call itself,
-    /// or the one a held binding remembers.
-    fn constructorCall(self: *Reifier, func: CheckedExprId) ?CheckedExprId {
+    /// the one a held binding remembers, or the definition of a top-level
+    /// value that computes the function.
+    fn constructorCall(self: *Reifier, func: CheckedExprId, region: base.Region) Error!?Constructor {
         const callee = self.bodies.expr(func);
-        if (callee.data != .lookup_local) {
-            return if (self.constructsFunction(func)) func else null;
+        switch (callee.data) {
+            .lookup_local => |local| {
+                const binder = self.bodies.patternBinderForCheckedPattern(local.pattern) orelse
+                    return null;
+                const binding = self.lookupBinding(binder) orelse return self.computedConstructor(local.resolved, region);
+                return switch (binding.kind) {
+                    .function => |bound| if (self.lambdaOf(bound) == null) .{ .reader = self, .expr = bound } else null,
+                    .value, .constant, .callee => null,
+                };
+            },
+            .lookup_external, .lookup_required => |reference| return self.computedConstructor(reference, region),
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .row_coerce,
+            .bytes_literal,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => return if (self.constructsFunction(func)) .{ .reader = self, .expr = func } else null,
         }
-        const binder = self.bodies.patternBinderForCheckedPattern(callee.data.lookup_local.pattern) orelse
-            return null;
-        const binding = self.lookupBinding(binder) orelse return null;
-        return switch (binding.kind) {
-            .function => |bound| if (self.lambdaOf(bound) == null) bound else null,
-            .value, .constant, .callee => null,
+    }
+
+    /// What a top-level value that computes a function was written as, where
+    /// the name is such a value of a module the walk reads.
+    fn computedConstructor(self: *Reifier, resolved: ?checked.ResolvedValueRefId, region: base.Region) Error!?Constructor {
+        const id = resolved orelse return null;
+        const computed = try self.computedFunction(id, region) orelse return null;
+        const written = switch (computed) {
+            .written => |written| written,
+            // A function of another package has no body here to flatten.
+            .foreign => return null,
         };
+        // A value written as another such value, `renamed = doubler`, is the
+        // one it names. The definition is marked while the walk follows it, so
+        // a value that reaches itself ends at its own definition.
+        const data = written.reader.bodies.expr(written.body).data;
+        const named: ?checked.ResolvedValueRefId = if (data == .lookup_local)
+            data.lookup_local.resolved
+        else if (data == .lookup_external)
+            data.lookup_external
+        else if (data == .lookup_required)
+            data.lookup_required
+        else
+            null;
+        if (named != null and !written.reader.folding.contains(written.body)) {
+            try written.reader.folding.put(written.reader.gpa, written.body, {});
+            defer _ = written.reader.folding.remove(written.body);
+            if (try written.reader.computedConstructor(named, region)) |inner| return inner;
+        }
+        return .{ .reader = written.reader, .expr = written.body };
     }
 
     /// One `Call` for a definition that hands back a function and a use that
@@ -3855,43 +4380,47 @@ pub const Reifier = struct {
     /// Null when the callee is not a curried definition, which is every other
     /// call.
     fn curriedCall(self: *Reifier, func: CheckedExprId, operands: []const CheckedExprId, at: TyId, region: base.Region) Error!?Ref {
-        const constructor = self.constructorCall(func) orelse return null;
-        const built = self.bodies.expr(constructor).data;
+        const constructor = try self.constructorCall(func, region) orelse return null;
+        // The constructor is read where it was written. For a name bound in
+        // the row that is this reader, and for a top-level value it is the
+        // reader of the module that defines the value.
+        const writer = constructor.reader;
+        const built = writer.bodies.expr(constructor.expr).data;
         if (built == .call) {
             const call = built.call;
-            const resolved = try self.calleeTarget(call.func, region);
+            const resolved = try writer.calleeTarget(call.func, region);
             if (resolved != .definition) return null;
             var callee = resolved.definition;
-            if (self.plans.siteEvidence(call.func)) |supplied| {
-                callee.evidence = try self.supply(supplied, self.evidence);
+            if (writer.plans.siteEvidence(call.func)) |supplied| {
+                callee.evidence = try writer.supply(supplied, writer.evidence);
             }
-            return self.flattenedCall(callee, call.args, operands, at);
+            return self.flattenedCall(callee, .{ .reader = writer, .exprs = call.args }, operands, at);
         }
         if (built != .dispatch_call and built != .type_dispatch_call) return null;
         const id = (if (built == .dispatch_call) built.dispatch_call else built.type_dispatch_call) orelse return null;
-        const plan = self.plans.plans[@backingInt(id)];
-        const found = try self.dispatchTarget(DispatchSpec.ofPlan(plan), region);
+        const plan = writer.plans.plans[@backingInt(id)];
+        const found = try writer.dispatchTarget(DispatchSpec.ofPlan(plan), region);
         const callee = switch (found) {
             .definition => |target| target,
             // A builtin or a function of another package carries no body to
             // flatten a curried call through.
             .provided, .foreign, .none => return null,
         };
-        const constructed = try self.dispatchExprs(plan, region);
+        const constructed = try writer.dispatchExprs(plan, region);
         defer self.gpa.free(constructed);
-        return self.flattenedCall(callee, constructed, operands, at);
+        return self.flattenedCall(callee, .{ .reader = writer, .exprs = constructed }, operands, at);
     }
 
     /// One `Call` over both argument groups, against the row that gathers
     /// both lambdas' parameters. Takes the callee's instantiation either way.
-    fn flattenedCall(self: *Reifier, callee: CalleeTarget, constructed: []const CheckedExprId, operands: []const CheckedExprId, at: TyId) Error!?Ref {
+    fn flattenedCall(self: *Reifier, callee: CalleeTarget, constructed: ArgumentGroup, operands: []const CheckedExprId, at: TyId) Error!?Ref {
         var target = callee;
         if (!target.reader.isCurried(target.key.body)) {
             if (target.instantiation) |*fixed| fixed.substitution.deinit(self.gpa);
             return null;
         }
         target.key.curried = true;
-        return try self.callOf(target, &.{ constructed, operands }, at);
+        return try self.callOf(target, &.{ constructed, .{ .reader = self, .exprs = operands } }, at);
     }
 
     /// One dispatch's operands as checked expressions. The caller owns the
@@ -4144,6 +4673,15 @@ pub const Reifier = struct {
     /// `written_binder` is what the call site's own name binds, which names a
     /// definition of this module.
     fn resolvedTarget(self: *Reifier, resolved: checked.ResolvedValueRefId, written_binder: ?PatternBinderId, region: base.Region) Error!Callee {
+        // A top-level value that computes a function is no definition. A call
+        // on it is the call of the definition it is written as when that is a
+        // curried call (`curriedCall`), and otherwise an `Apply` of the value
+        // it is written as, which the builder resolves once the value is a
+        // known closure.
+        if (try self.computedFunction(resolved, region)) |computed| return switch (computed) {
+            .written => .value,
+            .foreign => |name| .{ .foreign = name },
+        };
         const use = switch (self.value_refs.callableTarget(resolved).ref) {
             // A promoted local function is a procedure of the module with a
             // binding of its own, which captures nothing: the checker proved
@@ -4173,7 +4711,7 @@ pub const Reifier = struct {
             if (reader.env.module_role == .builtin) {
                 const export_name = providedName(reader.names, reached.template) orelse
                     return self.rejectError(.unsupported_expression, region, "a call to a function the compiler provides");
-                return .{ .provided = export_name.text };
+                return .{ .provided = .{ .name = export_name.text, .role = roleOf(use.iterator_procedure) } };
             }
             if (!samePackage(self.env, reader.env)) {
                 const binder = reached.binder orelse return reader.rejectError(.unresolved_reference, region, "this call");
@@ -4245,12 +4783,14 @@ pub const Reifier = struct {
             // A top-level value whose definition computes a function. The
             // checker records the lookup an exact alias of a function,
             // `same = add_one`, forwards to, and that lookup names the
-            // procedure. Any other such value is the function the compiler
-            // evaluates, so no definition names it and there is no row for a
-            // call on it to name.
+            // procedure. Any other such value reaches here only as the
+            // function a site itself names: a use inside a description is
+            // read as the definition (`computedFunction`), but a site's root
+            // needs a lambda whose parameters it can list, and a value that
+            // computes a function has none.
             .callable_eval_template => |id| {
                 const lookup = self.callable_eval_templates.templates[@backingInt(id)].forwarded_lookup orelse
-                    return self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function");
+                    return self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function, named as the function to describe");
                 return self.forwardedProcedure(lookup, region);
             },
             .checked_error => return self.rejectError(.unresolved_reference, region, "this call"),
@@ -4319,6 +4859,25 @@ pub const Reifier = struct {
         return reached;
     }
 
+    /// A builtin the walk names instead of walking: its export name, and the
+    /// role the checker gave it when it is a procedure of the iterator
+    /// protocol (N11k).
+    const Provided = struct {
+        name: []const u8,
+        role: ir.IteratorRole = .none,
+    };
+
+    /// The role of the iterator procedure the checker recorded, when the walk
+    /// has a rule for it.
+    fn roleOf(procedure: ?checked.IteratorProcedureId) ir.IteratorRole {
+        return switch (procedure orelse return .none) {
+            .identity => .identity,
+            .next => .next,
+            .list_iter => .list_iter,
+            .custom, .single, .list_iter_rev, .str_iter_utf8, .map, .keep_if, .drop_if, .take_first, .drop_first, .concat, .append, .with_index, .step_by, .from_iter, .range_iter, .numeric_range_iter, .numeric_to, .numeric_until, .from_step, .range_done => .none,
+        };
+    }
+
     /// The name a function the compiler provides answers to.
     const ProvidedName = struct {
         id: canonical.ExportNameId,
@@ -4380,20 +4939,85 @@ pub const Reifier = struct {
         const operands = plan.argsSlice(self.plans);
         const args = try self.gpa.alloc(Ref, operands.len);
         defer self.gpa.free(args);
-        var generated = false;
+        var generated: Generated = .none;
         for (operands, args) |operand, *arg| arg.* = switch (operand) {
             .checked_expr => |child| try self.exprRef(child),
             .generated_numeral => |numeral_operand| blk: {
-                generated = true;
+                generated = .{ .numeral = numeral_operand };
                 break :blk try self.generatedNumeral(numeral_operand, region);
             },
             .generated_quote => |literal| blk: {
-                generated = true;
+                generated = .quote;
                 break :blk try self.bld().litStr(self.bodies.stringLiteral(literal));
             },
             .generated_interpolation_segments => return self.rejectError(.unsupported_expression, region, "a custom string interpolation"),
         };
         return self.dispatchWithArgs(DispatchSpec.ofPlan(plan), args, generated, result_ty, region);
+    }
+
+    /// The `Num.Numeral` a row that converts a literal takes, of the nominal
+    /// type `param` its parameter names: the `Literal` the compiler makes
+    /// from the digits the literal spells, field by field as Monotype makes it
+    /// (`lowerNumeralValue`).
+    fn numeralArgument(self: *Reifier, literal: ModuleEnv.NumeralLiteral, param: TyId) Error!Ref {
+        const b = self.bld();
+        const types = self.rt();
+        const unfolded = switch (types.get(param)) {
+            .nominal => try types.unfold(param),
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .func, .opaque_, .recursive => invariant("a from_numeral parameter is not the Numeral nominal"),
+        };
+        const literal_tag = types.findName("Literal") orelse invariant("the Numeral type has no Literal tag");
+        const at = types.memberIndex(unfolded, literal_tag) orelse invariant("the Numeral type has no Literal tag");
+        const record_ty = types.tySlice(types.memberSlice(types.get(unfolded).tag_union)[at].tys)[0];
+        const fields = try self.gpa.dupe(reify.types.Member, types.memberSlice(types.get(record_ty).record));
+        defer self.gpa.free(fields);
+        const values = try self.gpa.alloc(Ref, fields.len);
+        defer self.gpa.free(values);
+        for (fields, values) |field, *value| {
+            const label = types.nameText(field.name);
+            const field_ty = types.tySlice(field.tys)[0];
+            value.* = if (std.mem.eql(u8, label, "is_negative"))
+                try b.litBool(literal.isNegative())
+            else if (std.mem.eql(u8, label, "digits_before_pt"))
+                try self.u8List(self.env.numeralDigitsBefore(literal), field_ty)
+            else if (std.mem.eql(u8, label, "digits_after_pt"))
+                try self.u8List(self.env.numeralDigitsAfter(literal), field_ty)
+            else if (std.mem.eql(u8, label, "digits_after_pt_count"))
+                try b.litInt(field_ty, literal.after_decimal_digit_count)
+            else
+                invariant("the Numeral record has a field the compiler does not fill");
+        }
+        const record = try b.record(record_ty, values);
+        return b.wrap(param, try b.tag(unfolded, literal_tag, &.{record}));
+    }
+
+    /// A `List(U8)` of the bytes: the empty list, or one literal holding them.
+    fn u8List(self: *Reifier, bytes: []const u8, ty: TyId) Error!Ref {
+        if (bytes.len == 0) return self.bld().listOf(ty, &.{});
+        return self.bld().litBytes(ty, bytes);
+    }
+
+    /// The value a conversion's `Try` holds: its `Ok` payload, or, where the
+    /// conversion rejected the literal, the crash that rejection is when the
+    /// program runs.
+    fn convertedLiteral(self: *Reifier, converted: Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const ty = try self.tyOf(result_ty, region);
+        const found = try self.readable(converted);
+        const ok = try self.rt().name("Ok");
+        const names = try self.memberNames(self.irs().refTy(b.row, found), region);
+        defer self.gpa.free(names);
+        const arms = try self.gpa.alloc(RegionId, names.len);
+        defer self.gpa.free(arms);
+        for (arms, names) |*arm, name| {
+            arm.* = try b.openTagArm(found, name);
+            const delivered = if (name == ok)
+                try b.payload(found, ok, 0)
+            else
+                try b.crash(ty, try b.litStr("this literal was rejected by its conversion"));
+            try b.close(.{ .value = &.{delivered} });
+        }
+        return b.switchOn(found, arms, &.{}, &.{ty}, &.{});
     }
 
     /// The literal the compiler hands to a `from_numeral` conversion, in the
@@ -4409,26 +5033,43 @@ pub const Reifier = struct {
 
     /// A dispatch over operands already built.
     fn dispatchWith(self: *Reifier, spec: DispatchSpec, args: []const Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
-        return self.dispatchWithArgs(spec, args, false, result_ty, region);
+        return self.dispatchWithArgs(spec, args, .none, result_ty, region);
     }
 
-    /// `generated` says an operand is one the compiler wrote, which only a
-    /// `Prim` takes: a row's parameter has the type the method declares.
-    fn dispatchWithArgs(self: *Reifier, spec: DispatchSpec, args: []const Ref, generated: bool, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
+    /// The operand of a literal's conversion that the compiler wrote, which
+    /// makes the dispatch a conversion of a literal.
+    const Generated = union(enum) {
+        none,
+        /// The number the literal spells.
+        numeral: ModuleEnv.NumeralLiteral,
+        /// The text between the quotes, a `Str`.
+        quote,
+    };
+
+    /// `generated` says an operand is one the compiler wrote. A `Prim` takes
+    /// it as the number or text it is. A row's parameter has the type the
+    /// method declares, so a `Num.Numeral` is built for it
+    /// (`numeralArgument`), and the row's `Try` is read as the checker reads
+    /// a conversion: the `Ok` payload is the literal's value, and an `Err`
+    /// is a literal the conversion rejected.
+    fn dispatchWithArgs(self: *Reifier, spec: DispatchSpec, args: []const Ref, generated: Generated, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
         const b = self.bld();
         switch (try self.dispatchTarget(spec, region)) {
             .definition => |target| {
-                if (generated) {
-                    var refused = target;
-                    if (refused.instantiation) |*fixed| fixed.substitution.deinit(self.gpa);
-                    return self.rejectError(.unsupported_expression, region, "a conversion whose argument the compiler generates");
-                }
                 // A method takes no captures, so its row's parameters are the
                 // dispatch's operands.
                 const row = try self.calledRow(target);
-                return b.callRow(row, args);
+                switch (generated) {
+                    .none => return b.callRow(row, args),
+                    .quote => return self.convertedLiteral(try b.callRow(row, args), result_ty, region),
+                    .numeral => |literal| {
+                        const param = self.irs().tySlice(self.irs().row(row).params)[0];
+                        const converted = try b.callRow(row, &.{try self.numeralArgument(literal, param)});
+                        return self.convertedLiteral(converted, result_ty, region);
+                    },
+                }
             },
-            .provided => |export_name| return self.providedPrim(export_name, args, result_ty, region),
+            .provided => |provided| return self.providedPrim(provided, args, result_ty, region),
             .foreign => |name| return b.primOf(try b.namedPrim(name.owner, name.method), args, try self.tyOf(result_ty, region)),
             .none => return self.rejectError(.unresolved_reference, region, "a method this call names no target for"),
         }
@@ -4478,7 +5119,7 @@ pub const Reifier = struct {
         /// A body the walk builds a row for.
         definition: CalleeTarget,
         /// A builtin, by its export name.
-        provided: []const u8,
+        provided: Provided,
         /// A method of another package (N8h), or of an opaque nominal.
         foreign: ForeignName,
         /// Nothing the walk reaches.
@@ -4540,7 +5181,7 @@ pub const Reifier = struct {
         }
         const found = owner.methodDefinition(procedure.template, target.def_idx) orelse return .none;
         const reader = switch (found) {
-            .provided => |name| return .{ .provided = name },
+            .provided => |name| return .{ .provided = .{ .name = name, .role = roleOf(procedure.runtime_target.iteratorProcedure()) } },
             .here => owner,
             .away => |definition| blk: {
                 if (!samePackage(self.env, definition.module.env)) {
@@ -4832,10 +5473,13 @@ pub const Reifier = struct {
                 });
                 break :blk try self.conjunction(parts.items, region);
             },
-            .tag_union => |tag_union| self.tagUnionEq(lhs, rhs, tag_union, region),
+            .tag_union => |tag_union| self.tagUnionEq(lhs, rhs, tag_union, resolved.id, region),
             // One inhabitant, so both operands hold it.
             .empty_record => b.litBool(true),
-            .empty_tag_union => self.rejectError(.unsupported_type, region, "derived equality on an empty tag union"),
+            // No inhabitant, so no pair of values reaches the comparison: the
+            // compiler derives it over no variants, and it is left to the
+            // stage, as every derivation the walk does not expand is.
+            .empty_tag_union => self.derivedEq(lhs, rhs, resolved.id, region),
             .flex, .rigid => |variable| blk: {
                 const sealed = try self.sealedVariable(resolved.id, variable, region) orelse break :blk self.rejectOpen(type_id, region);
                 break :blk b.primOf(try b.namedPrim(primitiveOwnerText(defaultBuiltin(sealed)).?, "is_eq"), &.{ lhs, rhs }, try self.rt().boolTy());
@@ -4874,11 +5518,11 @@ pub const Reifier = struct {
     /// A derived `==` over a tag union: a switch on the left operand, and in
     /// each arm a switch on the right one whose matching arm compares the
     /// payloads and whose other arms are `False`.
-    fn tagUnionEq(self: *Reifier, lhs: Ref, rhs: Ref, tag_union: checked.CheckedTagUnionType, region: base.Region) Error!Ref {
+    fn tagUnionEq(self: *Reifier, lhs: Ref, rhs: Ref, tag_union: checked.CheckedTagUnionType, subject_id: CheckedTypeId, region: base.Region) Error!Ref {
         var variants = std.ArrayList(checked.CheckedTag).empty;
         defer variants.deinit(self.gpa);
         try self.collectVariants(&variants, tag_union.tags, tag_union.ext, region);
-        if (variants.items.len == 0) return self.rejectError(.unsupported_type, region, "derived equality on an empty tag union");
+        if (variants.items.len == 0) return self.derivedEq(lhs, rhs, subject_id, region);
         // Each variant's name as the type table interns it, so a tag of an
         // operand finds its variant by name.
         const variant_names = try self.gpa.alloc(NameId, variants.items.len);
@@ -4968,12 +5612,23 @@ pub const Reifier = struct {
             .undeclared => return self.rejectError(.unsupported_type, region, self.names.typeNameText(nominal.name)),
         }
         if (nominal.builtin != null) return self.rejectError(.unsupported_type, region, "derived equality on this builtin type");
-        if (nominal.is_opaque) return self.rejectError(.unsupported_type, region, self.names.typeNameText(nominal.name));
+        // An opaque type's `Ty` names it without its backing, and the
+        // derivation is that backing's comparison, so expanding it here would
+        // describe a representation the description hides everywhere else.
+        // The stage gets the derivation, as `to_hash` through one does.
+        if (nominal.is_opaque) return self.derivedEq(lhs, rhs, type_id, region);
         const backing = self.types.nominalBackingTemplateForPayload(nominal) orelse
             return self.rejectError(.unsupported_type, region, self.names.typeNameText(nominal.name));
         var bound_args = try self.bindNominalArgs(nominal);
         defer self.releaseNominalArgs(&bound_args);
         return self.eqOver(try self.unwrapOnce(lhs), try self.unwrapOnce(rhs), backing, region);
+    }
+
+    /// A derived `is_eq` left for the stage to expand: `Derived` over the
+    /// two operands, of the type they share.
+    fn derivedEq(self: *Reifier, lhs: Ref, rhs: Ref, subject_id: CheckedTypeId, region: base.Region) Error!Ref {
+        const subject = try self.tyOf(subject_id, region);
+        return self.bld().derived("is_eq", subject, &.{ lhs, rhs }, try self.rt().boolTy());
     }
 
     /// What a nominal's declaration says about one method.
@@ -5029,10 +5684,10 @@ pub const Reifier = struct {
                 const row = try self.calledRow(found);
                 break :blk try b.callRow(row, args);
             },
-            .provided => |export_name| blk: {
-                const name = prims.namedOfExport(export_name) orelse
+            .provided => |provided| blk: {
+                const name = prims.namedOfExport(provided.name) orelse
                     break :blk self.rejectError(.unresolved_reference, region, "a builtin with no owner in its name");
-                break :blk try b.primOf(try b.namedPrim(name.owner, name.method), args, result);
+                break :blk try b.primOf(try b.namedPrimWithRole(name.owner, name.method, provided.role), args, result);
             },
             .foreign => |name| try b.primOf(try b.namedPrim(name.owner, name.method), args, result),
             .none => self.rejectError(.unresolved_reference, region, "a method its nominal names no target for"),
@@ -5316,11 +5971,12 @@ pub const Reifier = struct {
 
     /// Every variant of a tag union, following its extension.
     ///
-    /// An extension the checker closed ends it. Closing a row leaves a variable
-    /// behind rather than an `empty_tag_union`, marked with the default that
-    /// says what it closed to, so `checkedRowVariableClosesTagRow` is the one
-    /// reading of a variable found here. A variable without that mark names a
-    /// row still open, and a normal form is monomorphic.
+    /// An extension that is a variable ends it, sealed to the empty union the
+    /// way Monotype seals a row (`lowerCheckedTypeVariable`): a variable the
+    /// checker closed carries the default that says so, and one nothing closed
+    /// stands for the variants the definition names and no others. A
+    /// description is monomorphic, so the variants it names are the variants
+    /// it has.
     fn collectVariants(
         self: *Reifier,
         collected: *std.ArrayList(checked.CheckedTag),
@@ -5343,12 +5999,7 @@ pub const Reifier = struct {
                     link_tags = &.{};
                     link_ext = alias.backing;
                 },
-                .flex, .rigid => |variable| {
-                    if (!checked.checkedRowVariableClosesTagRow(variable)) {
-                        return self.rejectError(.unresolved_type, region, "an open tag union");
-                    }
-                    break;
-                },
+                .flex, .rigid => break,
                 .pending, .err => return self.rejectError(.unresolved_type, region, "an unresolved type"),
                 .record,
                 .empty_record,
@@ -5954,20 +6605,30 @@ pub const Reifier = struct {
                     try self.matchType(substitution, scheme_vars, element, use.reader.resolvedType(fixed));
                 }
             },
-            .record => |scheme_record| try self.matchRecord(
-                substitution,
-                scheme_vars,
-                scheme_record.fields,
-                scheme_record.ext,
-                use,
-            ),
-            .tag_union => |scheme_union| try self.matchTagUnion(
-                substitution,
-                scheme_vars,
-                scheme_union.tags,
-                scheme_union.ext,
-                use,
-            ),
+            // The checker lifts a structural record or tag union into a
+            // nominal it meets (unify.zig `mergeToNominal`), so where the use
+            // holds a nominal the scheme's structure stands for that nominal
+            // at this use. The structure is no variable, so the lift is an
+            // entry of its own, and the key names it (`instantiationKey`).
+            .record, .tag_union => if (use.reader.nominalOf(use.id) != null) {
+                if (!substitution.contains(scheme_id)) try substitution.put(self.gpa, scheme_id, use);
+            } else switch (self.types.payload(scheme_id)) {
+                .record => |scheme_record| try self.matchRecord(
+                    substitution,
+                    scheme_vars,
+                    scheme_record.fields,
+                    scheme_record.ext,
+                    use,
+                ),
+                .tag_union => |scheme_union| try self.matchTagUnion(
+                    substitution,
+                    scheme_vars,
+                    scheme_union.tags,
+                    scheme_union.ext,
+                    use,
+                ),
+                .alias, .function, .nominal, .tuple, .empty_record, .empty_tag_union, .flex, .rigid, .pending, .err => unreachable, // the outer switch reached this for a record or a tag union only
+            },
             // A row variable is left unbound on purpose: `Ty` has no form for
             // a row, so a description of one would be a description of
             // something else.
@@ -6225,6 +6886,18 @@ pub const Reifier = struct {
                 continue;
             };
             hasher.update(&bound.reader.types.rootKey(bound.id).bytes);
+        }
+        // A structure the use lifted into a nominal (`matchType`) is keyed
+        // too, by the nominal it stands for: a use that lifts it and one that
+        // does not are two types the definition is called at. The structure's
+        // id is canonical in the defining module, which every use shares, and
+        // the entries are in the order the match met them, which the scheme
+        // fixes.
+        var entries = substitution.constIterator();
+        while (entries.next()) |entry| {
+            if (std.mem.indexOfScalar(CheckedTypeId, scheme_vars, entry.key_ptr.*) != null) continue;
+            hasher.update(std.mem.asBytes(&@backingInt(entry.key_ptr.*)));
+            hasher.update(&entry.value_ptr.reader.types.rootKey(entry.value_ptr.id).bytes);
         }
         var key: [32]u8 = undefined;
         hasher.final(&key);
@@ -6826,7 +7499,120 @@ pub const SiteProvenance = struct {
 pub const SiteOutcome = struct {
     expr: CheckedExprId,
     outcome: Outcome,
+    /// The site's input slots, in slot order. Empty unless the site's
+    /// translator returns a `Code.Bound` and the description reads a value
+    /// that exists only at run time.
+    slots: []SlotSource = &.{},
+    /// The call that binds the site's input slots, as the checker recorded
+    /// it, or null.
+    bound_call: ?u32 = null,
 };
+
+/// What the program supplies for one input slot: a run-time name, read
+/// through these projections at the call (N18b).
+pub const SlotSource = struct {
+    leaf: PatternBinderId,
+    steps: []const SlotStep,
+    /// The slot type's shape (`slotShape`), which the site lowering checks
+    /// the value it builds against in debug builds.
+    shape: []const u32,
+};
+
+/// One projection of a slot source.
+pub const SlotStep = union(enum) {
+    field: canonical.RecordFieldLabelId,
+    index: u32,
+    unwrap,
+};
+
+/// The words that say the shape of a slot of type `ty`, in pre-order, which
+/// the site lowering compares with the type it builds a `Code.Value` at in
+/// debug builds (`CodeValueShape` in `checked_artifact.zig` names the
+/// words). Returns why the type holds a shape no `Code.Value` expresses, or
+/// null.
+fn slotShape(
+    gpa: Allocator,
+    types: *const Types,
+    names: *const canonical.CanonicalNameStore,
+    ty: TyId,
+    out: *std.ArrayList(u32),
+) Allocator.Error!?[]const u8 {
+    const S = checked.CodeValueShape;
+    const Item = union(enum) { ty: TyId, word: u32 };
+    var pending = std.ArrayList(Item).empty;
+    defer pending.deinit(gpa);
+    try pending.append(gpa, .{ .ty = ty });
+    while (pending.pop()) |item| {
+        const current = switch (item) {
+            .word => |word| {
+                try out.append(gpa, word);
+                continue;
+            },
+            .ty => |current| current,
+        };
+        switch (types.get(current)) {
+            .func => return "a captured function value",
+            .opaque_ => return "a captured value of an opaque type",
+            .int => |int| try out.appendSlice(gpa, &.{ @intFromEnum(S.int), @intFromEnum(int) }),
+            .float => |float| try out.appendSlice(gpa, &.{ @intFromEnum(S.frac), @intFromBool(float == .f64) }),
+            .dec => try out.append(gpa, @intFromEnum(S.dec)),
+            .bool_ => try out.append(gpa, @intFromEnum(S.bool_)),
+            .str => try out.append(gpa, @intFromEnum(S.str)),
+            .recursive => try out.append(gpa, @intFromEnum(S.recursive)),
+            .list => |elem| {
+                try out.append(gpa, @intFromEnum(S.list));
+                try pending.append(gpa, .{ .ty = elem });
+            },
+            .nominal => |n| {
+                try out.append(gpa, @intFromEnum(S.wrap));
+                try pending.append(gpa, .{ .ty = n.backing });
+            },
+            .tuple => |span| {
+                const items = types.tySlice(span);
+                try out.appendSlice(gpa, &.{ @intFromEnum(S.tuple), @intCast(items.len) });
+                var i = items.len;
+                while (i > 0) {
+                    i -= 1;
+                    try pending.append(gpa, .{ .ty = items[i] });
+                }
+            },
+            .record => |span| {
+                const fields = types.memberSlice(span);
+                try out.appendSlice(gpa, &.{ @intFromEnum(S.record), @intCast(fields.len) });
+                var i = fields.len;
+                while (i > 0) {
+                    i -= 1;
+                    const field = fields[i];
+                    if (field.optional) return "a captured record with an optional field";
+                    const label = names.lookupRecordFieldLabel(types.nameText(field.name)) orelse
+                        invariant("a field of a slot type has no label in the site's module");
+                    try pending.append(gpa, .{ .ty = types.tySlice(field.tys)[0] });
+                    try pending.append(gpa, .{ .word = @backingInt(label) });
+                }
+            },
+            .tag_union => |span| {
+                const tags = types.memberSlice(span);
+                try out.appendSlice(gpa, &.{ @intFromEnum(S.tag_union), @intCast(tags.len) });
+                var i = tags.len;
+                while (i > 0) {
+                    i -= 1;
+                    const tag = tags[i];
+                    const label = names.lookupTagLabel(types.nameText(tag.name)) orelse
+                        invariant("a tag of a slot type has no label in the site's module");
+                    const payloads = types.tySlice(tag.tys);
+                    var p = payloads.len;
+                    while (p > 0) {
+                        p -= 1;
+                        try pending.append(gpa, .{ .ty = payloads[p] });
+                    }
+                    try pending.append(gpa, .{ .word = @intCast(payloads.len) });
+                    try pending.append(gpa, .{ .word = @backingInt(label) });
+                }
+            },
+        }
+    }
+    return null;
+}
 
 /// The checked body a constant template holds, or null when the compiler did
 /// not fix a value for it.
@@ -6864,6 +7650,13 @@ pub const ForeignModule = struct {
 pub const ForeignAlias = struct {
     module: ForeignModule,
     lookup: CheckedExprId,
+};
+
+/// A top-level value another module exports that computes a function: the
+/// module that holds it, and the checked expression it was written as.
+pub const ForeignComputed = struct {
+    module: ForeignModule,
+    body: CheckedExprId,
 };
 
 /// A definition another module exports, resolved to what the walk reads.
@@ -6932,6 +7725,14 @@ pub const ForeignLookup = struct {
         artifact: canonical.ArtifactRef,
         def: CIR.Def.Idx,
     ) ?ForeignAlias,
+    /// A top-level value of a named artifact that computes a function,
+    /// `doubler = make(2.0)`: the module that holds it, and the checked
+    /// expression it was written as.
+    resolve_exported_computed: *const fn (
+        context: *const anyopaque,
+        artifact: canonical.ArtifactRef,
+        def: CIR.Def.Idx,
+    ) ?ForeignComputed,
     /// A constant another module fixed, named by the ref the checker resolved
     /// the use to. A constant is reached by ref rather than by import index
     /// because the name that reads it may be written in a third module.
@@ -6971,6 +7772,7 @@ pub const ForeignLookup = struct {
         .resolve_alias = resolveNothingImportedAlias,
         .resolve_exported = resolveNothingExported,
         .resolve_exported_alias = resolveNothingAlias,
+        .resolve_exported_computed = resolveNothingComputed,
         .resolve_constant = resolveNothingConstant,
         .resolve_method = resolveNothingMethod,
         .resolve_inspect_override = resolveNothingInspectOverride,
@@ -6989,6 +7791,10 @@ pub const ForeignLookup = struct {
     }
 
     fn resolveNothingAlias(_: *const anyopaque, _: canonical.ArtifactRef, _: CIR.Def.Idx) ?ForeignAlias {
+        return null;
+    }
+
+    fn resolveNothingComputed(_: *const anyopaque, _: canonical.ArtifactRef, _: CIR.Def.Idx) ?ForeignComputed {
         return null;
     }
 
@@ -7053,6 +7859,14 @@ pub const ForeignLookup = struct {
     ) ?ForeignAlias {
         return self.resolve_exported_alias(self.context, artifact, def);
     }
+
+    fn findExportedComputed(
+        self: ForeignLookup,
+        artifact: canonical.ArtifactRef,
+        def: CIR.Def.Idx,
+    ) ?ForeignComputed {
+        return self.resolve_exported_computed(self.context, artifact, def);
+    }
 };
 
 /// One site's walk, across every module it reaches.
@@ -7104,11 +7918,28 @@ pub const Walk = struct {
 
     /// How many sites were normalized, which P1's counter reads.
     normalizations: u32 = 0,
+    /// Where set, the site's translator returns a `Code.Bound`, so a run-time
+    /// name the root reads is an input slot rather than a refusal.
+    inputs: ?Inputs = null,
+    /// The input slots of the site last finished, in slot order: what the
+    /// program supplies for each. Owned; `takeSlots` hands it over.
+    slots: []SlotSource = &.{},
 
-    /// A normal form P1 keeps: its `Graph`, and its nodes' origins.
+    /// The run-time names a site that binds inputs reads.
+    pub const Inputs = struct {
+        /// The reader of the site's own module, the only module whose
+        /// run-time names the call can supply.
+        reader: *Reifier,
+        /// Each leaf the walk numbered, by its number (`ir.Slot.Source.leaf`).
+        leaves: std.ArrayList(PatternBinderId) = .empty,
+    };
+
+    /// A normal form P1 keeps: its `Graph`, its nodes' origins, and the
+    /// slots its root reads, in slot order.
     const Normalized = struct {
         graph: ConstNodeId,
         origins: reify.provenance.Emitted,
+        slot_order: []ir.SlotId,
     };
 
     /// What one site is built into.
@@ -7135,8 +7966,13 @@ pub const Walk = struct {
         self.definitions.deinit(self.gpa);
         self.rows.deinit(self.gpa);
         var memo = self.normalized.valueIterator();
-        while (memo.next()) |m| m.origins.deinit(self.gpa);
+        while (memo.next()) |m| {
+            m.origins.deinit(self.gpa);
+            self.gpa.free(m.slot_order);
+        }
         self.normalized.deinit(self.gpa);
+        self.endInputs();
+        self.freeSlots();
         self.sources.deinit(self.gpa);
         self.source_ids.deinit(self.gpa);
         for (self.published.items) |*p| p.deinit(self.gpa);
@@ -7172,9 +8008,36 @@ pub const Walk = struct {
 
     /// Start a site whose declared type selects `view`, so a site refused for
     /// one reason does not report the reason an earlier site was refused for.
-    pub fn beginSite(self: *Walk, view: View) void {
+    /// `binds_inputs` says whether its translator returns a `Code.Bound`, so
+    /// that a run-time name the root reads is an input slot, and
+    /// `site_reader` is the site module's reader.
+    pub fn beginSite(self: *Walk, view: View, binds_inputs: bool, site_reader: *Reifier) void {
         self.view = view;
         self.rejection = null;
+        self.endInputs();
+        self.freeSlots();
+        if (binds_inputs) self.inputs = .{ .reader = site_reader };
+    }
+
+    fn endInputs(self: *Walk) void {
+        if (self.inputs) |*inputs| inputs.leaves.deinit(self.gpa);
+        self.inputs = null;
+    }
+
+    fn freeSlots(self: *Walk) void {
+        for (self.slots) |slot| {
+            self.gpa.free(slot.steps);
+            self.gpa.free(slot.shape);
+        }
+        self.gpa.free(self.slots);
+        self.slots = &.{};
+    }
+
+    /// The input slots of the site last finished, which the caller now owns.
+    pub fn takeSlots(self: *Walk) []SlotSource {
+        const out = self.slots;
+        self.slots = &.{};
+        return out;
     }
 
     /// Give the site about to be walked a store, a type table and a builder
@@ -7244,8 +8107,9 @@ pub const Walk = struct {
     pub fn finish(self: *Walk, root: RowId, site_key: u64, region: base.Region) error{ Rejected, OutOfMemory }!ConstNodeId {
         const site = self.site.?;
         const walked = try reify.rows.walkedDigest(self.gpa, &site.store, &site.types, root);
-        const memo_key = .{ self.view, walked, reify.provenance.digest(&site.store) };
+        const memo_key = .{ self.view, walked ^ slotsDigest(&site.store), reify.provenance.digest(&site.store) };
         if (self.normalized.get(memo_key)) |memo| {
+            try self.bindSlots(memo.slot_order, region);
             try self.publish(site_key, &memo.origins);
             var emitter = try code_emit.Emitter.init(self.gpa, self.store, &site.store, &site.types);
             defer emitter.deinit();
@@ -7258,11 +8122,97 @@ pub const Walk = struct {
         defer emitter.deinit();
         self.root = root;
         const graph = try emitter.graph(root);
+        try self.bindSlots(emitter.slot_order, region);
         var origins = try reify.provenance.emitted(self.gpa, &site.store, root);
         errdefer origins.deinit(self.gpa);
+        const slot_order = try self.gpa.dupe(ir.SlotId, emitter.slot_order);
+        errdefer self.gpa.free(slot_order);
         try self.publish(site_key, &origins);
-        try self.normalized.put(self.gpa, memo_key, .{ .graph = graph, .origins = origins });
+        try self.normalized.put(self.gpa, memo_key, .{ .graph = graph, .origins = origins, .slot_order = slot_order });
         return emitter.siteOf(graph, site_key);
+    }
+
+    /// A digest of the slots the walk made, which the walked rows read only
+    /// by number: two sites whose rows match and whose slots differ are not
+    /// one normal form.
+    fn slotsDigest(store: *const ir.Store) u128 {
+        var hasher = std.hash.Wyhash.init(0x5107);
+        for (store.slots.items) |slot| {
+            hasher.update(std.mem.asBytes(&slot.ty));
+            switch (slot.source) {
+                .leaf => |leaf| hasher.update(&.{ 0, @truncate(leaf), @truncate(leaf >> 8), @truncate(leaf >> 16), @truncate(leaf >> 24) }),
+                .field => |f| hasher.update(std.mem.asBytes(&[_]u32{ 1, f.of.index(), f.k })),
+                .index => |f| hasher.update(std.mem.asBytes(&[_]u32{ 2, f.of.index(), f.k })),
+                .unwrap => |of| hasher.update(std.mem.asBytes(&[_]u32{ 3, of.index() })),
+            }
+        }
+        const h = hasher.final();
+        return @as(u128, h) << 64 | h;
+    }
+
+    /// Record, for each slot the root reads in slot order, the run-time name
+    /// and the projections the program supplies it from, and refuse a slot
+    /// whose type holds a shape no `Code.Value` expresses.
+    fn bindSlots(self: *Walk, order: []const ir.SlotId, region: base.Region) error{ Rejected, OutOfMemory }!void {
+        self.freeSlots();
+        if (order.len == 0) return;
+        const site = self.site.?;
+        const inputs = self.inputs orelse invariant("a site whose translator binds no inputs reads an input slot");
+        const out = try self.gpa.alloc(SlotSource, order.len);
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |made_slot| {
+                self.gpa.free(made_slot.steps);
+                self.gpa.free(made_slot.shape);
+            }
+            self.gpa.free(out);
+        }
+        var steps = std.ArrayList(SlotStep).empty;
+        defer steps.deinit(self.gpa);
+        var shape = std.ArrayList(u32).empty;
+        defer shape.deinit(self.gpa);
+        for (order, out) |slot, *dest| {
+            shape.clearRetainingCapacity();
+            if (try slotShape(self.gpa, &site.types, inputs.reader.names, site.store.slots.items[slot.index()].ty, &shape)) |why| {
+                self.rejection = .{ .kind = .input_not_bound, .region = region, .detail = why };
+                return error.Rejected;
+            }
+            steps.clearRetainingCapacity();
+            var current = slot;
+            const leaf: u32 = while (true) {
+                const entry = site.store.slots.items[current.index()];
+                switch (entry.source) {
+                    .leaf => |leaf| break leaf,
+                    .field => |f| {
+                        const parent_ty = site.store.slots.items[f.of.index()].ty;
+                        const members = site.types.memberSlice(site.types.get(parent_ty).record);
+                        const text = site.types.nameText(members[f.k].name);
+                        const label = inputs.reader.names.lookupRecordFieldLabel(text) orelse
+                            invariant("a field a slot reads has no label in the site's module");
+                        try steps.append(self.gpa, .{ .field = label });
+                        current = f.of;
+                    },
+                    .index => |f| {
+                        try steps.append(self.gpa, .{ .index = f.k });
+                        current = f.of;
+                    },
+                    .unwrap => |of| {
+                        try steps.append(self.gpa, .unwrap);
+                        current = of;
+                    },
+                }
+            };
+            std.mem.reverse(SlotStep, steps.items);
+            const owned_steps = try self.gpa.dupe(SlotStep, steps.items);
+            errdefer self.gpa.free(owned_steps);
+            dest.* = .{
+                .leaf = inputs.leaves.items[leaf],
+                .steps = owned_steps,
+                .shape = try self.gpa.dupe(u32, shape.items),
+            };
+            made += 1;
+        }
+        self.slots = out;
     }
 
     // Record the provenance of the site keyed `key`: its sources, and the
@@ -7369,7 +8319,8 @@ pub fn reifyModuleSites(
         }
         const site_expr = local.bodies.exprIdAtRawNode(site.node_idx) orelse continue;
         const region = env.store.getRegionAt(@fromBackingInt(@intCast(site.node_idx)));
-        walk.beginSite(site.view);
+        const bound_call: ?u32 = if (site.bound_call == @import("can").NodeStore.CodeReificationSite.no_bound_call) null else site.bound_call;
+        walk.beginSite(site.view, bound_call != null, reifier);
         const outcome: Outcome = switch (site.kind) {
             .named_function => try reifyNamedSite(&walk, reifier, module, local, site.node_idx, site.fn_var, region),
             // The lambda is the root, and the site is where it is written, so
@@ -7398,12 +8349,22 @@ pub fn reifyModuleSites(
             ),
             .template, .template_callee => unreachable, // template and template_callee sites were skipped by the continue above
         };
-        try results.append(gpa, .{ .expr = site_expr, .outcome = outcome });
+        const slots = walk.takeSlots();
+        errdefer freeSlotSources(gpa, slots);
+        try results.append(gpa, .{ .expr = site_expr, .outcome = outcome, .slots = slots, .bound_call = bound_call });
     }
 
     const outcomes = try results.toOwnedSlice(gpa);
     errdefer gpa.free(outcomes);
     return .{ .outcomes = outcomes, .provenance = try walk.published.toOwnedSlice(gpa) };
+}
+
+fn freeSlotSources(gpa: Allocator, slots: []SlotSource) void {
+    for (slots) |slot| {
+        gpa.free(slot.steps);
+        gpa.free(slot.shape);
+    }
+    gpa.free(slots);
 }
 
 /// What a module's sites came to: each site's outcome, and the provenance of
@@ -7413,6 +8374,7 @@ pub const ModuleSites = struct {
     provenance: []SiteProvenance = &.{},
 
     pub fn deinit(self: *ModuleSites, gpa: Allocator) void {
+        for (self.outcomes) |outcome| freeSlotSources(gpa, outcome.slots);
         gpa.free(self.outcomes);
         for (self.provenance) |*p| p.deinit(gpa);
         gpa.free(self.provenance);

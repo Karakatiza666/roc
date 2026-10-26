@@ -9,6 +9,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const types = @import("types.zig");
+const float_bits = @import("builtins").float_bits;
 
 const PrimId = ir.PrimId;
 
@@ -298,8 +299,9 @@ pub fn ownerOfTypeName(type_name: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, type_name, builtin_prefix)) type_name[builtin_prefix.len..] else type_name;
 }
 
-/// A builtin's value over literal operands (N13j, N13k).
-pub const Folded = union(enum) { bool_: bool, int: i256 };
+/// A builtin's value over literal operands (N13j, N13k). A `str` is owned by
+/// the caller of the fold that made it.
+pub const Folded = union(enum) { bool_: bool, int: i256, float: u64, str: []u8 };
 
 /// The identity of associative integer builtin `method` at `int`, the
 /// operand N15a drops from a chain; null for a builtin without one. The
@@ -358,6 +360,40 @@ pub fn foldInt(int: types.IntTy, method: Method, a: i256, b: i256) ?Folded {
         .bitwise_or => .{ .int = wrapTo(int, a | b) },
         .bitwise_xor => .{ .int = wrapTo(int, a ^ b) },
         .not, .concat, .len, .get => unreachable, // float prims admit no other methods (prims.admits)
+    };
+}
+
+/// The value of float builtin `method` at `float` over the bits of its
+/// operands. The operations are the IEEE-754 ones of the type, in strict
+/// float mode, and a `NaN` result is Roc's canonical `NaN`, the bits Roc gives
+/// a `NaN` it observes (`float_bits`). No host math library is called, so the
+/// bits are the same on every host (plan 1.9). Null where the table has no
+/// float builtin by that method.
+pub fn foldFloat(float: types.FloatTy, method: Method, a_bits: u64, b_bits: u64) ?Folded {
+    return switch (float) {
+        .f64 => floatFold(f64, method, @bitCast(a_bits), @bitCast(b_bits)),
+        .f32 => floatFold(f32, method, @bitCast(@as(u32, @truncate(a_bits))), @bitCast(@as(u32, @truncate(b_bits)))),
+    };
+}
+
+fn floatFold(comptime F: type, method: Method, a: F, b: F) ?Folded {
+    const Bits = @Int(.unsigned, @bitSizeOf(F));
+    const arith = struct {
+        fn bits(v: F) Folded {
+            const raw: Bits = @bitCast(v);
+            return .{ .float = if (F == f32) float_bits.normalizeF32NanBits(raw) else float_bits.normalizeF64NanBits(raw) };
+        }
+    };
+    return switch (method) {
+        .is_eq => .{ .bool_ = a == b },
+        .is_lt => .{ .bool_ = a < b },
+        .is_lte => .{ .bool_ = a <= b },
+        .is_gt => .{ .bool_ = a > b },
+        .is_gte => .{ .bool_ = a >= b },
+        .plus => arith.bits(a + b),
+        .minus => arith.bits(a - b),
+        .times => arith.bits(a * b),
+        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => null,
     };
 }
 

@@ -23843,11 +23843,13 @@ Builtin :: [].{
 		## `Switch`. In a `ForRange` body, parameter 0 is the index; in a
 		## `ForList` body, parameter 0 is the index and parameter 1 the item;
 		## the slots follow.
+		## `Input` is input slot `k` of the root (see [Code.Bound]).
 		Val := [
 			Param(U32),
 			Node(U32),
 			Out({ node : U32, k : U32 }),
 			Arg({ owner : U32, k : U32 }),
+			Input(U32),
 		].{
 			is_eq : _
 			to_hash : _
@@ -23909,7 +23911,7 @@ Builtin :: [].{
 		## | `Prim` | the builtin's arguments, in its parameter order; a chain of an associative builtin has all its operands (see below) |
 		## | `Call` | the row's parameters |
 		## | `Closure` | the captured values; the row takes them first |
-		## | `Record`, `Tuple`, `List`, `Tag` | the components; a `Record`'s in its field order |
+		## | `Record`, `Tuple`, `List`, `Tag` | the components; a `Record`'s in its field order, one for each name it lists. The names are every field of the type, unless the type marks a field `Optional` and the record leaves it unset |
 		## | `Wrap`, `Unwrap` | the value; `Wrap` into the named nominal |
 		## | `Field`, `Index`, `Payload`, `OptField` | the value read |
 		## | `Item` | the list, then the index |
@@ -23917,7 +23919,7 @@ Builtin :: [].{
 		## | `And`, `Or` | the first operand; each region after it is one more |
 		## | `ForRange` | the start, the end, then the slots' initial values |
 		## | `ForList` | the list, then the slots' initial values |
-		## | `Loop` | the slots' initial values |
+		## | `Loop` | the slots' initial values; the body's `Break` delivers the node's `outputs`, which need not be the slots |
 		## | `Crash` | the message |
 		## | `Derived` | the derived method's arguments |
 		##
@@ -23977,7 +23979,7 @@ Builtin :: [].{
 			Or(List(Region)),
 			ForRange({ inclusive : Bool, body : Region }),
 			ForList(Region),
-			Loop(Region),
+			Loop({ body : Region, outputs : List(Ty) }),
 			Lambda(Region),
 			Crash,
 			Derived(Str, Ty),
@@ -23992,7 +23994,8 @@ Builtin :: [].{
 				Switch(sw) => List.concat(sw.arms.map(|arm| arm.region), sw.joins)
 				And(rest) | Or(rest) => rest
 				ForRange(loop) => [loop.body]
-				ForList(body) | Loop(body) | Lambda(body) => [body]
+				Loop(loop) => [loop.body]
+				ForList(body) | Lambda(body) => [body]
 				Lit(_) | Prim(_) | Call(_) | Closure(_) | Record(_) | Tuple | List | Tag(_) | Wrap(_) | Unwrap => []
 				Field(_) | Index(_) | Payload(_, _) | Item | OptField(_) | Crash | Derived(_, _) => []
 			}
@@ -24027,16 +24030,35 @@ Builtin :: [].{
 			children = |node| { vals: node.args, regions: node.op.regions() }
 
 			## How many values this node delivers: one, or a `Switch`'s outputs,
-			## or a loop's slots.
+			## or a bounded loop's slots, or a `Loop`'s `outputs`.
 			outputs : Node -> U64
 			outputs = |node| match node.op {
 				Switch(sw) => sw.outputs.len()
 				ForRange(_) => node.args.len() - 2
 				ForList(_) => node.args.len() - 1
-				Loop(_) => node.args.len()
+				Loop(loop) => loop.outputs.len()
 				Lit(_) | Prim(_) | Call(_) | Closure(_) | Record(_) | Tuple | List | Tag(_) | Wrap(_) | Unwrap => 1
 				Field(_) | Index(_) | Payload(_, _) | Item | OptField(_) | And(_) | Or(_) | Lambda(_) | Crash | Derived(_, _) => 1
 			}
+		}
+
+		## What a loop goes over (see [Code.Row] `iteration`).
+		##
+		## `OverList` is a `ForList`: `list` is the list it reads, `item` and
+		## `index` are the body parameters that hold the element and its
+		## position, each `Read` with the [Code.Val] to read it by only when the
+		## body reads it. `OverRange` is a `ForRange` from `start` up to, and
+		## not including, `end`, or including it when `inclusive` is `True`;
+		## `index` is the counter. `exits_early` is `True` when the body can
+		## leave the loop before the last turn, by a `Break` or a `Return`.
+		## `General` is a `Loop`, whose body decides for itself when to stop.
+		Iteration := [
+			OverList({ list : Val, item : [Read(Val), Unread], index : [Read(Val), Unread], exits_early : Bool }),
+			OverRange({ start : Val, end : Val, inclusive : Bool, index : [Read(Val), Unread], exits_early : Bool }),
+			General,
+		].{
+			is_eq : _
+			to_hash : _
 		}
 
 		## One row: a function of its parameters. `nodes` holds every node of the
@@ -24063,6 +24085,33 @@ Builtin :: [].{
 				Err(_) => crash "Code.Row.node: no node at this index"
 			}
 
+			## What the loop at node index `n` goes over: the list of a
+			## `ForList`, the bounds of a `ForRange`, or `General` for a
+			## `Loop`. The normal form meets a `for` over a list, a `for` over
+			## `xs.iter()` and an index `while` in one `ForList`, and a `for`
+			## over a range, a counter `while` and a tail-recursive helper in
+			## one `ForRange`, so a translator that reads this sees one shape.
+			## A node that is not a loop is a compiler bug in the translator and
+			## crashes.
+			iteration : Row, U32 -> Iteration
+			iteration = |row, n| {
+				loop_node = row.node(n)
+				escapes = |body| code_escapes(row, body, 0)
+				read_of = |k| if (code_reads_arg(row, n, k)) Read(Arg({ owner: n, k })) else Unread
+				match loop_node.op {
+					ForList(body) => match loop_node.args {
+						[list, ..] => OverList({ list, item: read_of(1), index: read_of(0), exits_early: escapes(body) })
+						[] => crash "Code.Row.iteration: a ForList without a list"
+					}
+					ForRange(loop) => match loop_node.args {
+						[start, end, ..] => OverRange({ start, end, inclusive: loop.inclusive, index: read_of(0), exits_early: escapes(loop.body) })
+						_ => crash "Code.Row.iteration: a ForRange without bounds"
+					}
+					Loop(_) => General
+					_ => crash "Code.Row.iteration: this node is not a loop"
+				}
+			}
+
 			## Who reads each node, by node index: the nodes whose arguments
 			## read it, each once per read, and how many reads there are in all.
 			## The count includes the reads of the regions' ends, which no node
@@ -24074,8 +24123,9 @@ Builtin :: [].{
 			}
 		}
 
-		## The rows a site's description reaches, root first.
-		Graph := { root : U32, rows : List(Row) }.{
+		## The rows a site's description reaches, root first, and the types of
+		## the root's input slots.
+		Graph := { root : U32, rows : List(Row), slots : List(Ty) }.{
 			is_eq : _
 			to_hash : _
 
@@ -24093,6 +24143,12 @@ Builtin :: [].{
 			## The root row, which is the function the site described.
 			root_row : Graph -> Row
 			root_row = |graph| graph.row(graph.root)
+
+			## The type of each input slot, in the order the root first reads
+			## them: item `k` is the type of `Input(k)`. Empty unless the
+			## translator returns a [Code.Bound].
+			slots : Graph -> List(Ty)
+			slots = |graph| graph.slots
 
 			## The fields of the root's parameter, by name, for a translator
 			## that binds each field to an input of its host. Empty where the
@@ -24137,6 +24193,7 @@ Builtin :: [].{
 		Tree := [
 			Op({ op : Op, args : List(Tree), ty : Ty }),
 			Param(U32),
+			Input(U32),
 			Arg({ owner : U32, k : U32 }),
 			Out({ node : U32, k : U32 }),
 			Def(U32),
@@ -24178,6 +24235,49 @@ Builtin :: [].{
 			## [Code.refuse_at] refuses one of the `graph` view.
 			refuse_at : Inlined(_fn), { row : U32, node : U32 }, Str -> _a
 			refuse_at = |Inlined.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
+
+			## A translator's result, as [Code.bound] makes one for the `graph`
+			## view.
+			bound : Inlined(_fn), a -> Bound(a)
+			bound = |_, value| Bound.({ value, inputs: [] })
+		}
+
+		## The run-time value of one input slot, which follows the slot's
+		## [Code.Ty]: an integer that is not a `U128` is an `Int`, a record has
+		## one value per field in the order of its `Ty`, and a nominal value is a
+		## `Wrap` of its backing's value.
+		Value := [
+			Int(I128),
+			U128(U128),
+			Frac(F64),
+			Dec(Dec),
+			Bool(Bool),
+			Str(Str),
+			Record(List(Value)),
+			Tuple(List(Value)),
+			List(List(Value)),
+			Tag(Str, List(Value)),
+			Wrap(Value),
+		].{
+			is_eq : _
+			to_hash : _
+		}
+
+		## A translator's result with the run-time values of the site's input
+		## slots. A translator that returns a `Bound` accepts a lambda that
+		## reads a value from around itself which exists only when the program
+		## runs, such as `order.price`. The translator runs while the compiler
+		## runs and emits a placeholder per slot, such as a `?` in SQL; the
+		## program receives one [Code.Value] per slot in `inputs`.
+		Bound(result) :: { value : result, inputs : List(Value) }.{
+
+			## What the translator returned.
+			value : Bound(result) -> result
+			value = |Bound.(inner)| inner.value
+
+			## The run-time value of each input slot, in slot order.
+			inputs : Bound(_result) -> List(Value)
+			inputs = |Bound.(inner)| inner.inputs
 		}
 
 		## The rows the site's description reaches.
@@ -24199,6 +24299,11 @@ Builtin :: [].{
 		## Hashes the normal form, and not the site key, to agree with `is_eq`.
 		to_hash : Code(_fn), Hasher -> Hasher
 		to_hash = |Code.(inner), hasher| inner.graph.to_hash(Hasher.write_u32(hasher, inner.version))
+
+		## A translator's result, which the site completes with the values of
+		## its input slots (see [Code.Bound]).
+		bound : Code(_fn), a -> Bound(a)
+		bound = |_, value| Bound.({ value, inputs: [] })
 
 		## Refuse node `at.node` of row `at.row` of the description: `at.row` is
 		## a row's `id`, and `at.node` the node's index in that row's `nodes`.
@@ -24245,7 +24350,7 @@ code_read_in = |table, val, user| match val {
 			Err(_) => crash "Code.Row.uses: a read of a node past the row"
 		}
 	}
-	Param(_) | Arg(_) => table
+	Param(_) | Arg(_) | Input(_) => table
 }
 
 code_uses_in : Code.Row, Code.Region, List({ users : List(U32), count : U64 }) -> List({ users : List(U32), count : U64 })
@@ -24259,6 +24364,46 @@ code_uses_in = |row, region, start| {
 		},
 	)
 	code_end_vals(region.end).fold(after_nodes, |acc, val| code_read_in(acc, val, End))
+}
+
+# Whether parameter `k` of the body of loop node `owner` is read anywhere in the row.
+code_reads_arg : Code.Row, U32, U32 -> Bool
+code_reads_arg = |row, owner, k| {
+	is_it = |val| match val {
+		Arg(arg) => arg.owner == owner and arg.k == k
+		Param(_) | Node(_) | Out(_) | Input(_) => Bool.False
+	}
+	row.nodes.any(|node| node.args.any(is_it)) or code_region_ends_any(row, row.body, is_it)
+}
+
+# Whether the end of any region under `region` reads a value `is_it` accepts.
+code_region_ends_any : Code.Row, Code.Region, (Code.Val -> Bool) -> Bool
+code_region_ends_any = |row, region, is_it| {
+	region.nodes.any(|n| row.node(n).op.regions().any(|sub| code_region_ends_any(row, sub, is_it))) or code_end_vals(region.end).any(is_it)
+}
+
+# Whether a region can leave the loop it is the body of before its last turn:
+# a `Break` of that loop, or a `Return`. `depth` counts the loops inside it.
+code_escapes : Code.Row, Code.Region, U64 -> Bool
+code_escapes = |row, region, depth| {
+	here = match region.end {
+		Break(_) => depth == 0
+		Return(_) => Bool.True
+		Value(_) | Continue(_) | Jump(_) | Branch(_) => Bool.False
+	}
+	here or region.nodes.any(
+		|n| {
+			node = row.node(n)
+			inner = match node.op {
+				ForRange(_) | ForList(_) | Loop(_) => depth + 1
+				_ => depth
+			}
+			match node.op {
+				Lambda(_) => Bool.False
+				_ => node.op.regions().any(|sub| code_escapes(row, sub, inner))
+			}
+		},
+	)
 }
 
 # The values a region's end reads.
@@ -24292,7 +24437,7 @@ code_read_depth = |info, val, depth| match val {
 		at = n.to_u64()
 		{ ..info, uses: code_put_index(info.uses, at, code_at_index(info.uses, at) + 1), use_depth: code_put_index(info.use_depth, at, depth) }
 	}
-	Param(_) | Arg(_) => info
+	Param(_) | Arg(_) | Input(_) => info
 }
 
 code_depths_in : Code.Row, Code.Region, U64, CodeTreeInfo -> CodeTreeInfo
@@ -24333,6 +24478,7 @@ code_kept = |row, info, n| {
 code_val_tree : Code.Row, CodeTreeInfo, Code.Val -> Code.Tree
 code_val_tree = |row, info, val| match val {
 	Param(k) => Param(k)
+	Input(k) => Input(k)
 	Arg(arg) => Arg(arg)
 	Out(out) => Out(out)
 	Node(n) => if (code_kept(row, info, n)) Def(n) else code_node_tree(row, info, n)

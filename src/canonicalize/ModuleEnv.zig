@@ -160,6 +160,7 @@ pub const CommonIdents = extern struct {
     builtin_numeral: Ident.Idx,
     builtin_code: Ident.Idx,
     builtin_code_inlined: Ident.Idx,
+    builtin_code_bound: Ident.Idx,
     builtin_str: Ident.Idx,
     builtin_list: Ident.Idx,
     builtin_box: Ident.Idx,
@@ -322,6 +323,7 @@ pub const CommonIdents = extern struct {
             .builtin_numeral = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("numeral_type").qualified_name)),
             .builtin_code = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_type").qualified_name)),
             .builtin_code_inlined = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_inlined_type").qualified_name)),
+            .builtin_code_bound = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_bound_type").qualified_name)),
             .builtin_str = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("str_type").qualified_name)),
             .builtin_list = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("list_type").qualified_name)),
             .builtin_box = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("box_type").qualified_name)),
@@ -4741,6 +4743,18 @@ pub fn recordCodeReificationSite(
     view: NodeStore.CodeReificationSite.View,
 ) std.mem.Allocator.Error!void {
     try self.store.recordCodeReificationSite(node_idx, fn_var, kind, view);
+}
+
+/// Record that the call at `call_idx` binds the run-time reads of the lambda
+/// site at `node_idx` as input slots.
+pub fn markCodeSiteBound(self: *Self, node_idx: Node.Idx, call_idx: Node.Idx) void {
+    self.store.markCodeSiteBound(node_idx, call_idx);
+}
+
+/// Whether the call at `call_idx` binds the run-time reads of a lambda site
+/// as input slots.
+pub fn codeSiteBindsCall(self: *const Self, call_idx: Node.Idx) bool {
+    return self.store.codeSiteBindsCall(call_idx);
 }
 
 /// The reification recorded for this expression, if it has one.

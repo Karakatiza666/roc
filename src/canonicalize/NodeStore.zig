@@ -920,6 +920,13 @@ pub const CodeReificationSite = extern struct {
     /// Written so the record's tail bytes are the same on every build: this
     /// list is serialized into the module cache.
     kind_padding: [2]u8 = .{ 0, 0 },
+    /// The node of the call that binds what this lambda reads at run time as
+    /// input slots (the call's result is a `Code.Bound`), or `no_bound_call`.
+    /// The checker sets it when the call finishes checking.
+    bound_call: u32 = no_bound_call,
+
+    /// `bound_call` of a site no call binds inputs for.
+    pub const no_bound_call: u32 = std.math.maxInt(u32);
 
     /// The view a site's declared type selects (plan 1.5): `Code(f)` holds
     /// the `graph` view and `Code.Inlined(f)` the `inline` view.
@@ -1490,6 +1497,7 @@ pub fn recordCodeReificationSite(
         items[at].fn_var = @backingInt(fn_var);
         items[at].kind = kind;
         items[at].view = view;
+        items[at].bound_call = CodeReificationSite.no_bound_call;
         return;
     }
     const site: CodeReificationSite = .{
@@ -1500,6 +1508,28 @@ pub fn recordCodeReificationSite(
     };
     const list = &store.code_reification_sites.items;
     try list.insert(store.gpa, at, site);
+}
+
+/// Record that the call at `call_idx` binds what the lambda site at
+/// `node_idx` reads at run time as input slots.
+pub fn markCodeSiteBound(store: *NodeStore, node_idx: Node.Idx, call_idx: Node.Idx) void {
+    const raw = @backingInt(node_idx);
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    // The checker records a site when it opens the site's frame, before the
+    // call that holds it finishes.
+    std.debug.assert(at < items.len and items[at].node_idx == raw);
+    items[at].bound_call = @backingInt(call_idx);
+}
+
+/// Whether the call at `call_idx` binds the run-time reads of a lambda site
+/// as input slots.
+pub fn codeSiteBindsCall(store: *const NodeStore, call_idx: Node.Idx) bool {
+    const raw = @backingInt(call_idx);
+    for (store.code_reification_sites.items.items) |site| {
+        if (site.bound_call == raw) return true;
+    }
+    return false;
 }
 
 /// Index of the first site whose node index is not below `raw`.

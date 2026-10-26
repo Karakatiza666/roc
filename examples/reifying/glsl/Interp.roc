@@ -66,6 +66,7 @@ Interp :: {}.{
 			Err(_) => Err(Unbound("node ${n.to_str()}"))
 		}
 		Arg(_) | Out(_) => Err(UnknownCall("a loop's or a branch's state, which this interpreter evaluates no loop for"))
+		Input(k) => Err(Unbound("input slot ${k.to_str()}"))
 		Block(block) => {
 			inner = block.defs.fold_try(
 				scope,

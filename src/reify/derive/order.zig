@@ -38,7 +38,7 @@ pub fn ruleLits(arena: std.mem.Allocator, rule: reify.rules.Rule) std.mem.Alloca
     for (rule.conds) |c| switch (c) {
         .is_lit, .nonzero_lit => |k| try lit.append(arena, k),
         .not_lit => |k| try not_lit.append(arena, k),
-        .int_owner, .not_float_owner, .speculatable, .movable, .movable_rest, .speculatable_rest, .polarity_flips, .folds, .same_ty, .lit_bool_switch => {},
+        .int_owner, .key_owner, .not_float_owner, .speculatable, .movable, .movable_rest, .speculatable_rest, .polarity_flips, .folds, .folds_pair, .same_ty, .lit_bool_switch => {},
     };
     return .{ .lit = lit.items, .not_lit = not_lit.items };
 }
@@ -113,7 +113,7 @@ pub fn count(t: Term, c: Component, ctx: Context, kinds: Kinds) u64 {
     if (ctx == .scrutinee) switch (c) {
         .is_lte_scrutinees => n += lteLeaves(t),
         .flipping_scrutinees => n += @intFromBool(term.polarityFlips(t)),
-        .loops, .general_loops, .aggregate_slots, .applies, .switches, .negated_connectives, .forwarding_calls, .nodes, .flipped_comparisons, .unordered_leaves, .terminators, .joins, .arms_and_operands, .graph_nodes => {},
+        .self_tail_calls, .loops, .general_loops, .aggregate_slots, .split_calls, .loop_slots, .loop_returns, .applies, .switches, .negated_connectives, .forwarding_calls, .nodes, .flipped_comparisons, .unordered_leaves, .terminators, .joins, .arms_and_operands, .graph_nodes, .unhoisted_tests, .list_gets => {},
     };
     return n;
 }
@@ -139,7 +139,7 @@ fn countIn(t: Term, c: Component, kinds: Kinds) u64 {
         // regions; a literal switch's keys are not.
         .arms_and_operands => if (x.sym.op == .switch_ or x.sym.op == .and_ or x.sym.op == .or_) x.args.len -| 1 -| (term.litKeys(x) orelse 0) else 0,
         // First-order terms own no slots, terminators or joins, and call no row.
-        .aggregate_slots, .applies, .forwarding_calls, .terminators, .joins, .graph_nodes => 0,
+        .self_tail_calls, .aggregate_slots, .split_calls, .loop_slots, .loop_returns, .applies, .forwarding_calls, .terminators, .joins, .graph_nodes, .unhoisted_tests, .list_gets => 0,
     };
     for (x.args) |a| n += countIn(a, c, kinds);
     return n;

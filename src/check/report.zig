@@ -5935,6 +5935,12 @@ pub const ReportBuilder = struct {
                 "A Code can name a function's parameter, or what a function returns.",
                 .runtime_error,
             ),
+            .input_not_bound => try Report.init(
+                self.gpa,
+                "Cannot Bind This Captured Value",
+                "This function reads a value that exists only when the program runs, and the site cannot give it to the translator's result as an input slot.",
+                .runtime_error,
+            ),
         };
         errdefer report.deinit();
 
@@ -5963,6 +5969,14 @@ pub const ReportBuilder = struct {
             .captures_a_binding => try D.renderSlice(&.{
                 D.bytes("A translator receives the description on its own, without the scope the"),
                 D.bytes("function was written in. Pass this value as a parameter instead."),
+                D.bytes("A translator whose result is a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes("receives such a value as an input slot."),
+            }, self, &report),
+            .input_not_bound => try D.renderSlice(&.{
+                D.bytes("The program gives each input slot its value where it calls the"),
+                D.bytes("translator, which runs once while the compiler runs. Pass this value"),
+                D.bytes("as a parameter instead, or read it where the call can supply it."),
             }, self, &report),
             .performs_an_effect => try D.renderSlice(&.{
                 D.bytes("A translator runs during"),
@@ -6088,6 +6102,7 @@ pub const ReportBuilder = struct {
             .performs_an_effect => "The effect is:",
             .definition_not_reachable => "The compiler could not follow:",
             .exceeds_a_bound => "The bound is:",
+            .input_not_bound => "The site cannot bind:",
             .not_a_named_function, .outside_staged_position, .argument_not_constant => null,
         };
     }

@@ -978,6 +978,11 @@ hoist_frames: std.ArrayListUnmanaged(HoistFrame) = .empty,
 /// Temporary maximal eligible expression roots that may become selected if an
 /// enclosing expression cannot cover them.
 hoist_expr_candidates: std.ArrayListUnmanaged(CIR.Expr.Idx) = .empty,
+/// The lambdas written at a `Code` position that read a value only the
+/// running program has, waiting for the call that holds them to decide
+/// whether it binds them as input slots (`Code.Bound`). Partitioned by hoist
+/// frame like `hoist_expr_candidates`.
+hoist_runtime_code_sites: std.ArrayListUnmanaged(CIR.Expr.Idx) = .empty,
 /// Last answer from `methodCallPreservesIteratorSourceInput`. The hoist flow
 /// asks the same question about one expression up to five times while
 /// deciding that expression's role (root, cover, binding root, and the two
@@ -1808,6 +1813,7 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .accepted_nominal_constructor_backings = .settled,
     .hoist_frames = .frame_stack,
     .hoist_expr_candidates = .frame_partitioned,
+    .hoist_runtime_code_sites = .frame_partitioned,
     .hoist_iterator_source_memo = .keyed,
     .hoist_deferred_roots = .frame_partitioned,
     .hoist_binding_candidates = .lexical,
@@ -3274,6 +3280,8 @@ const HoistFrame = struct {
     binding_pattern: ?CIR.Pattern.Idx,
     candidate_start: usize,
     deferred_dependency_start: usize,
+    /// Where this frame's children start in `hoist_runtime_code_sites`.
+    runtime_code_site_start: usize = 0,
     promotion_dependency: ?HoistPromotionDependencyId = null,
     has_runtime_dependency: bool = false,
     has_contextual_dependency: bool = false,
@@ -5148,6 +5156,15 @@ pub fn selectedHoistedRootIsTopLevel(self: *const Self, root: hoist_roots.Select
     return self.patternIsTopLevelDef(pattern);
 }
 
+/// Whether a selected root is a call that binds the run-time reads of a lambda
+/// site as input slots. The program reads such a call only through its root
+/// (roc-reify-proposal.md section 10.1), so the root is part of what the
+/// program means, at any depth.
+pub fn selectedHoistedRootBindsCodeInputs(self: *const Self, root: hoist_roots.SelectedHoistedRoot) bool {
+    return root.body == .expr and root.pattern == null and
+        self.cir.codeSiteBindsCall(ModuleEnv.nodeIdxFrom(root.expr));
+}
+
 /// Record a top-level root that will be evaluated as a zero-arg executable
 /// thunk. This must be explicit producer metadata from canonicalization or the
 /// caller; the checker never recovers roots from names or source shape.
@@ -5203,6 +5220,7 @@ fn openHoistFrame(self: *Self, expr: CIR.Expr.Idx, binding_rhs: bool, hoist_posi
         .binding_pattern = if (binding_rhs) self.checking_binding_rhs_pattern else null,
         .candidate_start = self.hoist_expr_candidates.items.len,
         .deferred_dependency_start = self.hoist_deferred_roots.items.len,
+        .runtime_code_site_start = self.hoist_runtime_code_sites.items.len,
     });
     self.last_hoist_result = null;
 }
@@ -5218,6 +5236,7 @@ fn abortHoistFrame(self: *Self, expr: CIR.Expr.Idx) void {
     _ = self.hoist_frames.pop();
     self.hoist_expr_candidates.shrinkRetainingCapacity(frame.candidate_start);
     self.hoist_deferred_roots.shrinkRetainingCapacity(frame.deferred_dependency_start);
+    self.hoist_runtime_code_sites.shrinkRetainingCapacity(frame.runtime_code_site_start);
     self.last_hoist_result = null;
 }
 
@@ -5231,6 +5250,33 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         base.invariant("check invariant violated: finishing the hoist frame of expression {d} but the innermost hoist frame belongs to expression {d}", .{ @backingInt(expr), @backingInt(frame.expr) });
     }
     if (does_fx) frame.has_observable_effect = true;
+
+    // Captured run-time inputs (roc-reify-proposal.md section 10.1). A lambda
+    // at a `Code` position is a description, which never holds a run-time
+    // value, so what it reads at run time does not make its value depend on
+    // run time. The call that holds it decides what that read becomes.
+    const reads_runtime_inputs = frame.has_runtime_dependency and self.isInlineCodeSite(expr);
+    if (reads_runtime_inputs) {
+        try self.hoist_runtime_code_sites.ensureUnusedCapacity(self.gpa, 1);
+        frame.has_runtime_dependency = false;
+    }
+    // A call whose result is a `Code.Bound` binds what its one site reads at
+    // run time as input slots: the call is a root of its own, evaluated while
+    // the compiler runs, and the value the program reads is that root's
+    // result with the run-time values the site lowering adds, so what holds
+    // the call depends on run time. Any other holder depends on run time as
+    // it always did, and the walk refuses the read.
+    // The sites are marked, and leave the list, once nothing below can fail.
+    const runtime_sites = self.hoist_runtime_code_sites.items[frame.runtime_code_site_start..];
+    const binds_inputs = runtime_sites.len != 0 and self.exprIsCodeBound(expr);
+    // Two sites of one call have no one slot order, so the call stays at run
+    // time and publication refuses both.
+    if (runtime_sites.len != 0 and (!binds_inputs or runtime_sites.len != 1)) frame.has_runtime_dependency = true;
+    const self_root_only = binds_inputs and !frame.has_runtime_dependency;
+    // The call is an expression root even as the right side of a binding: a
+    // binding root would let a read of the binder restore the root's value
+    // without the inputs.
+    if (self_root_only) frame.binding_rhs = false;
 
     const semantically_eligible = frame.eligible();
     // Allocate before committing selected roots, preserving finish's atomicity
@@ -5318,6 +5364,13 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         try transaction.commit();
     }
 
+    if (binds_inputs) {
+        for (self.hoist_runtime_code_sites.items[frame.runtime_code_site_start..]) |site| {
+            self.cir.markCodeSiteBound(ModuleEnv.nodeIdxFrom(site), ModuleEnv.nodeIdxFrom(expr));
+        }
+    }
+    self.hoist_runtime_code_sites.shrinkRetainingCapacity(frame.runtime_code_site_start);
+
     if (builtin.mode == .debug and has_child_candidates) {
         switch (action) {
             .suppress_children,
@@ -5353,11 +5406,13 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
 
     if (records_guarded_expr) self.hoist_guarded_exprs.putAssumeCapacity(expr, {});
 
+    // What holds a call that binds inputs reads a value the program
+    // completes at run time, so outside the call it is not compile-time known.
     const completed = CompletedHoistResult{
         .promotion_dependency = frame.promotion_dependency,
         .expr = expr,
-        .eligible = semantically_eligible,
-        .top_level_equivalent = top_level_equivalent,
+        .eligible = semantically_eligible and !self_root_only,
+        .top_level_equivalent = top_level_equivalent and !self_root_only,
         .has_observable_effect = frame.has_observable_effect,
         .reads_code_site = frame.reads_code_site,
         .hoist_position = frame.hoist_position,
@@ -5368,15 +5423,52 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         const parent = &self.hoist_frames.items[frame_index - 1];
         parent.promotion_dependency = parent_dependency;
         if (frame.reads_code_site) parent.reads_code_site = true;
-        if (!completed.eligible) {
+        if (self_root_only) {
+            parent.has_runtime_dependency = true;
+            if (can_be_root and selection_allowed) self.hoist_expr_candidates.appendAssumeCapacity(expr);
+        } else if (!completed.eligible) {
             parent.has_runtime_dependency = true;
         } else if (can_be_root and !frame.binding_rhs and selection_allowed) {
             self.hoist_expr_candidates.appendAssumeCapacity(expr);
         }
     }
+    if (reads_runtime_inputs) self.hoist_runtime_code_sites.appendAssumeCapacity(expr);
 
     _ = self.hoist_frames.pop();
     self.debugAssertHoistSelectionConsistent();
+}
+
+/// Whether `expr` is a lambda written at a `Code` position.
+fn isInlineCodeSite(self: *const Self, expr: CIR.Expr.Idx) bool {
+    const site = self.cir.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr)) orelse return false;
+    return site.kind == .inline_lambda;
+}
+
+/// Whether `expr` is a lambda written at a `Code` position whose run-time
+/// reads a call binds as input slots.
+fn isBoundCodeSite(self: *const Self, expr: CIR.Expr.Idx) bool {
+    const site = self.cir.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr)) orelse return false;
+    return site.kind == .inline_lambda and site.bound_call != can.NodeStore.CodeReificationSite.no_bound_call;
+}
+
+/// Whether the solved type of `expr` is the builtin `Code.Bound`, read
+/// through transparent aliases: the return type a translator declares to
+/// receive captured run-time inputs.
+fn exprIsCodeBound(self: *Self, expr: CIR.Expr.Idx) bool {
+    var current = ModuleEnv.varFrom(expr);
+    var guard = types_mod.debug.IterationGuard.init("exprIsCodeBound");
+    while (true) {
+        guard.tick();
+        switch (self.types.resolveVar(current).desc.content) {
+            .structure => |structure| switch (structure) {
+                .nominal_type => |nominal| return nominal.originIsBuiltin() and
+                    nominal.ident.ident_idx.eql(self.cir.idents.builtin_code_bound),
+                .record, .tuple, .fn_pure, .fn_effectful, .fn_unbound, .empty_record, .tag_union, .empty_tag_union => return false,
+            },
+            .alias => |alias| current = self.types.getAliasBackingVar(alias),
+            .flex, .rigid, .field_presence, .err => return false,
+        }
+    }
 }
 
 fn markCurrentHoistRuntimeDependency(self: *Self) void {
@@ -6501,6 +6593,7 @@ const HoistSelectionTestState = struct {
         checker.hoist_frames = .empty;
         checker.hoist_expr_candidates = .empty;
         checker.hoist_deferred_roots = .empty;
+        checker.hoist_runtime_code_sites = .empty;
         checker.hoist_binding_candidates = .{};
         checker.hoist_binding_scope_patterns = .empty;
         checker.hoist_known_values = .{};
@@ -6535,6 +6628,7 @@ const HoistSelectionTestState = struct {
         self.checker.hoist_frames.deinit(self.allocator);
         self.checker.hoist_expr_candidates.deinit(self.allocator);
         self.checker.hoist_deferred_roots.deinit(self.allocator);
+        self.checker.hoist_runtime_code_sites.deinit(self.allocator);
         self.checker.hoist_binding_candidates.deinit(self.allocator);
         self.checker.hoist_binding_scope_patterns.deinit(self.allocator);
         var known_value_iter = self.checker.hoist_known_values.iterator();
@@ -13843,9 +13937,12 @@ fn hoistedRootExprStep(
         // A retired expression still evaluates its recorded operands before
         // it crashes, so the root depends on everything they read.
         .e_runtime_error => |runtime_error| try self.pushHoistedKeptExprs(pending, runtime_error.evaluated),
+        // A lambda a call binds the inputs of is a description, which reads
+        // nothing when the root is evaluated: what it reads at run time is
+        // supplied where the program reads the root (roc-reify-proposal.md
+        // section 10.1).
+        .e_lambda, .e_closure => self.isBoundCodeSite(expr),
         .e_lookup_required,
-        .e_lambda,
-        .e_closure,
         .e_ellipsis,
         .e_anno_only,
         .e_derived_method,

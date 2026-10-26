@@ -245,8 +245,52 @@ Sql :: {}.{
 	## a script.
 	Statement := { sql : Str, inlined : Str, params : List({ name : Str, value : Value }) }
 
+	## Every column of the rows of `table` that the filter keeps, where the
+	## filter reads values from around the lambda which exist only when the
+	## program runs, such as a parameter of the function the query is written
+	## in. The translator runs while the compiler runs, so it writes a
+	## numbered `?` for each value, and the program receives the values in the
+	## result's `inputs`, one per placeholder, in order.
+	select_where : Table(row), Code(row -> Bool) -> Code.Bound(Try(Str, Error))
+	select_where = |Table.(t), predicate| {
+		rendered = Sql.render(predicate, [Binding.Row(Source.Leaf(t.name))], Sql.placeholder)
+		Code.bound(predicate, rendered.map_ok(|condition| "SELECT *\nFROM ${t.name}\nWHERE ${condition}"))
+	}
+
+	## The statement [Sql.select_where] built, and the captured values that
+	## fill its placeholders.
+	bind_captured : Code.Bound(Try(Str, Error)) -> Try(Statement, Error)
+	bind_captured = |bound| {
+		sql = bound.value()?
+		values = bound.inputs().map_with_index(|input, k| (k, input)).map_try(|(k, input)| Ok({ name: Sql.input_name(k), value: Sql.captured_value(input)? }))?
+		# The last placeholder first, so `?1` never matches the start of `?10`.
+		inlined = values.fold_rev(sql, |v, text| text.replace_each(v.name, v.value.to_sql()))
+		Ok(Statement.({ sql: sql, inlined: inlined, params: values }))
+	}
+
+	## A named parameter is `:name`. A captured value is numbered, `?1`
+	## first, and its name is the placeholder itself.
 	placeholder : Str -> Str
-	placeholder = |name| ":${name}"
+	placeholder = |name| if name.starts_with("?") name else ":${name}"
+
+	input_name : U64 -> Str
+	input_name = |k| "?${(k + 1).to_str()}"
+
+	## The SQL value of one captured value. A column holds one scalar, so a
+	## record, a tag or a list is refused. A nominal value is its backing's.
+	captured_value : Code.Value -> Try(Value, Error)
+	captured_value = |input| match input {
+		Int(n) => match n.to_i64_try() {
+			Ok(i) => Ok(Value.Integer(i))
+			Err(_) => Err(Unsupported("a captured integer outside the range of an SQL INTEGER"))
+		}
+		Dec(d) => Ok(Value.Numeric(d))
+		Str(text) => Ok(Value.Text(text))
+		Bool(b) => Ok(Value.Boolean(b))
+		Wrap(inner) => Sql.captured_value(inner)
+		U128(_) | Frac(_) => Err(Unsupported("a captured U128 or float has no exact SQL value"))
+		Record(_) | Tuple(_) | List(_) | Tag(_, _) => Err(Unsupported("a captured value that is not a scalar has no SQL value; read one of its fields"))
+	}
 
 	selected : { source : Source, aliases : List(Str), from : Str, joins : List(Clause), filters : List(Clause) }, Clause, List(Clause) -> Selected(p, out)
 	selected = |q, columns, groups| Selected.(
@@ -628,6 +672,10 @@ Sql :: {}.{
 		Def(n) => match env.nodes.find_last(|entry| entry.id == n) {
 			Ok(entry) => Ok(entry.binding)
 			Err(_) => Err(Unsupported("a value is read before its block computes it"))
+		}
+		Input(k) => {
+			spell = env.param
+			Ok(Binding.Expr(spell(Sql.input_name(k.to_u64()))))
 		}
 		Arg(_) => Err(Sql.no_loop)
 		Out(_) => Err(Unsupported("a branch that delivers several values has no SQL form"))

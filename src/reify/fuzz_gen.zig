@@ -9,6 +9,10 @@
 //! |---|---|
 //! | M1 | renamed locals, operator or method, literal spelling, parentheses, `and` and `or` or the `if` they mean, `??` or its `match`, a binding or a `var`, an `expect` that describes as nothing, `return` last |
 //! | M2 | two independent bindings in either order, a value bound twice, an unused binding, a binding moved into each branch that reads it |
+//! | M4 | an `if` as a `match` on `Bool` in either arm order, an `if` on `c` as an `if` on `!c` with the branches swapped, an `if` on `x == k` as a `match` on the literal `k`, `a < b` as `b > a`, `!(a < b)` as `a >= b` |
+//! | M5 | an `if` on `a and b` or `a or b` as nested `if`s that repeat a leaf arm, `(a and b) and c` or `(a or b) or c` regrouped, `!(a and b)` as `!a or !b` and `!(a or b)` as `!a and !b` |
+//! | M6 | a `for` over a list, over its `.iter()`, or a `while` over its indices |
+//! | M7 | a loop `var` as one scalar, as a record or as a tuple that carries a field nothing changes; a private helper that takes `a, b`, `{ a, b }`, `(a, b)`, or either destructured, called twice |
 //!
 //! The two prints must describe as one normal form (L4), and the normal form
 //! must compute what Roc computes wherever Roc does not crash (L5, C2).
@@ -21,6 +25,14 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+
+/// What a case may use.
+pub const Options = struct {
+    /// The constructs of M7 (a loop `var` as a record or tuple, a private
+    /// helper that takes its arguments in several shapes). With it off, a
+    /// case is the one the generator made before M7 for the same bytes.
+    m7: bool = true,
+};
 
 /// Bytes the generator reads its choices from. Past the end it reads zeros,
 /// so every input gives a term.
@@ -70,6 +82,8 @@ const Node = union(enum) {
     /// A `for` over the list field that adds `step` to an accumulator per
     /// item; `step` sees the item at scope index `slot`.
     sum: struct { start: *const Node, step: *const Node, slot: u16 },
+    /// A private helper `|p, q| p + q * k` called twice, as `h(x1, y1) + h(x2, y2)`.
+    twice: struct { args: [4]*const Node, k: u64 },
 };
 
 /// One generated case: the module text and the input it is run on.
@@ -114,6 +128,12 @@ const Scope = struct {
 const Builder = struct {
     arena: Allocator,
     reader: *Reader,
+    /// A second stream of choices, so that what M7 adds changes no choice the
+    /// older constructs read from `reader`.
+    extra: *Reader,
+    /// Set inside a `twice`, whose arguments hold none.
+    inside_twice: bool = false,
+    options: Options = .{},
 
     fn node(self: *Builder, value: Node) Allocator.Error!*const Node {
         const n = try self.arena.create(Node);
@@ -143,6 +163,9 @@ const Builder = struct {
     }
 
     fn leaf(self: *Builder, ty: Type, scope: *const Scope) Allocator.Error!*const Node {
+        // M7: some `U64` leaves are a helper called twice, which the older
+        // choices do not see: its arguments come from the extra stream.
+        if (self.options.m7 and ty == .u64_ and !self.inside_twice and self.extra.pick(16) == 0) return self.twiceTerm(scope);
         const kind = self.reader.pick(3);
         if (kind == 0) {
             if (self.local(scope, ty)) |slot| return self.node(.{ .local = slot });
@@ -198,6 +221,13 @@ const Builder = struct {
         };
     }
 
+    fn twiceTerm(self: *Builder, scope: *const Scope) Allocator.Error!*const Node {
+        var inner: Builder = .{ .arena = self.arena, .reader = self.extra, .extra = self.extra, .inside_twice = true, .options = self.options };
+        var args: [4]*const Node = undefined;
+        for (&args) |*a| a.* = try inner.term(.u64_, scope.*, max_depth - 2);
+        return self.node(.{ .twice = .{ .args = args, .k = 1 + @as(u64, self.extra.pick(3)) } });
+    }
+
     fn letTerm(self: *Builder, ty: Type, scope: Scope, depth: u8) Allocator.Error!*const Node {
         if (scope.len >= max_scope) return self.leaf(ty, &scope);
         const bound: Type = if (self.reader.pick(3) == 0) .bool_ else .u64_;
@@ -230,6 +260,13 @@ const Names = struct {
 };
 
 // Whether `n` reads the binding at scope index `slot`.
+fn isLeaf(n: *const Node) bool {
+    return switch (n.*) {
+        .lit_u64, .lit_bool, .field_u64, .field_bool, .local => true,
+        else => false,
+    };
+}
+
 fn reads(n: *const Node, slot: u16) bool {
     return switch (n.*) {
         .lit_u64, .lit_bool, .field_u64, .field_bool => false,
@@ -241,6 +278,7 @@ fn reads(n: *const Node, slot: u16) bool {
         .let => |l| reads(l.value, slot) or reads(l.body, slot),
         .default => |d| reads(d.cond, slot) or reads(d.ok, slot) or reads(d.fallback, slot),
         .sum => |x| reads(x.start, slot) or reads(x.step, slot),
+        .twice => |t| reads(t.args[0], slot) or reads(t.args[1], slot) or reads(t.args[2], slot) or reads(t.args[3], slot),
     };
 }
 
@@ -249,8 +287,13 @@ const Printer = struct {
     gpa: Allocator,
     out: *std.ArrayList(u8),
     choices: *Reader,
+    /// The choices M7 adds, apart from `choices` so that the older ones keep their bytes.
+    extra: *Reader,
     names: *Names,
     symbols: *Symbols,
+    /// The private helpers this print defines at the top level, before its function.
+    helpers: *std.ArrayList(u8),
+    options: Options = .{},
 
     fn write(self: *Printer, text: []const u8) Allocator.Error!void {
         try self.out.appendSlice(self.gpa, text);
@@ -273,6 +316,28 @@ const Printer = struct {
             try self.print(").{s}(", .{method});
             try self.expr(pair[1]);
             try self.write(")");
+        }
+    }
+
+    /// `a < b`, in some prints as `b > a`.
+    fn lessThan(self: *Printer, pair: [2]*const Node) Allocator.Error!void {
+        switch (self.choices.pick(4)) {
+            0 => try self.two(pair, "<", "is_lt"),
+            1 => {
+                try self.write("(");
+                try self.expr(pair[0]);
+                try self.write(").is_lt(");
+                try self.expr(pair[1]);
+                try self.write(")");
+            },
+            2 => try self.two(.{ pair[1], pair[0] }, ">", "is_gt"),
+            else => {
+                try self.write("(");
+                try self.expr(pair[1]);
+                try self.write(").is_gt(");
+                try self.expr(pair[0]);
+                try self.write(")");
+            },
         }
     }
 
@@ -309,7 +374,7 @@ const Printer = struct {
                 try self.expr(t.value);
                 if (self.choices.pick(2) == 0) try self.print(" * {d})", .{t.k}) else try self.print(").times({d})", .{t.k});
             },
-            .is_lt => |pair| try self.two(pair, "<", "is_lt"),
+            .is_lt => |pair| try self.lessThan(pair),
             .is_eq => |pair| try self.two(pair, "==", "is_eq"),
             .is_ne => |pair| if (self.choices.pick(2) == 0) {
                 try self.write("(");
@@ -322,58 +387,104 @@ const Printer = struct {
                 try self.two(pair, "==", "is_eq");
                 try self.write(")");
             },
-            .and_ => |pair| if (self.choices.pick(2) == 0) {
-                try self.write("(");
-                try self.expr(pair[0]);
-                try self.write(" and ");
-                try self.expr(pair[1]);
-                try self.write(")");
-            } else {
-                try self.write("(if ");
-                try self.expr(pair[0]);
-                try self.write(" ");
-                try self.expr(pair[1]);
-                try self.write(" else Bool.False)");
+            .and_ => |pair| switch (self.choices.pick(3)) {
+                0 => {
+                    try self.write("(");
+                    try self.expr(pair[0]);
+                    try self.write(" and ");
+                    try self.expr(pair[1]);
+                    try self.write(")");
+                },
+                // `(a and b) and c` is `a and (b and c)`.
+                2 => if (pair[0].* == .and_) {
+                    try self.write("(");
+                    try self.expr(pair[0].and_[0]);
+                    try self.write(" and (");
+                    try self.expr(pair[0].and_[1]);
+                    try self.write(" and ");
+                    try self.expr(pair[1]);
+                    try self.write("))");
+                } else {
+                    try self.write("(");
+                    try self.expr(pair[0]);
+                    try self.write(" and ");
+                    try self.expr(pair[1]);
+                    try self.write(")");
+                },
+                else => {
+                    try self.write("(if ");
+                    try self.expr(pair[0]);
+                    try self.write(" ");
+                    try self.expr(pair[1]);
+                    try self.write(" else Bool.False)");
+                },
             },
-            .or_ => |pair| if (self.choices.pick(2) == 0) {
-                try self.write("(");
-                try self.expr(pair[0]);
-                try self.write(" or ");
-                try self.expr(pair[1]);
-                try self.write(")");
-            } else {
-                try self.write("(if ");
-                try self.expr(pair[0]);
-                try self.write(" Bool.True else ");
-                try self.expr(pair[1]);
-                try self.write(")");
+            .or_ => |pair| switch (self.choices.pick(3)) {
+                0 => {
+                    try self.write("(");
+                    try self.expr(pair[0]);
+                    try self.write(" or ");
+                    try self.expr(pair[1]);
+                    try self.write(")");
+                },
+                // `(a or b) or c` is `a or (b or c)`.
+                2 => if (pair[0].* == .or_) {
+                    try self.write("(");
+                    try self.expr(pair[0].or_[0]);
+                    try self.write(" or (");
+                    try self.expr(pair[0].or_[1]);
+                    try self.write(" or ");
+                    try self.expr(pair[1]);
+                    try self.write("))");
+                } else {
+                    try self.write("(");
+                    try self.expr(pair[0]);
+                    try self.write(" or ");
+                    try self.expr(pair[1]);
+                    try self.write(")");
+                },
+                else => {
+                    try self.write("(if ");
+                    try self.expr(pair[0]);
+                    try self.write(" Bool.True else ");
+                    try self.expr(pair[1]);
+                    try self.write(")");
+                },
             },
-            .not => |inner| if (self.choices.pick(2) == 0) {
-                try self.write("!(");
-                try self.expr(inner);
-                try self.write(")");
-            } else {
-                try self.write("Bool.not(");
-                try self.expr(inner);
-                try self.write(")");
+            .not => |inner| switch (self.choices.pick(4)) {
+                // De Morgan: `!(a and b)` is `!a or !b`, `!(a or b)` is `!a and !b`.
+                3 => if (inner.* == .and_ or inner.* == .or_) {
+                    const pair = if (inner.* == .and_) inner.and_ else inner.or_;
+                    try self.write("(!");
+                    try self.expr(pair[0]);
+                    try self.write(if (inner.* == .and_) " or !" else " and !");
+                    try self.expr(pair[1]);
+                    try self.write(")");
+                } else {
+                    try self.write("!(");
+                    try self.expr(inner);
+                    try self.write(")");
+                },
+                0 => {
+                    try self.write("!(");
+                    try self.expr(inner);
+                    try self.write(")");
+                },
+                1 => {
+                    try self.write("Bool.not(");
+                    try self.expr(inner);
+                    try self.write(")");
+                },
+                // `!(a < b)` is `a >= b` over integers.
+                else => if (inner.* == .is_lt) {
+                    try self.two(inner.is_lt, ">=", "is_gte");
+                } else {
+                    try self.write("!(");
+                    try self.expr(inner);
+                    try self.write(")");
+                },
             },
-            .if_ => |i| if (self.choices.pick(2) == 0) {
-                try self.write("(if ");
-                try self.expr(i.cond);
-                try self.write(" ");
-                try self.expr(i.then);
-                try self.write(" else ");
-                try self.expr(i.other);
-                try self.write(")");
-            } else {
-                try self.write("(if ");
-                try self.expr(i.cond);
-                try self.write(" { ");
-                try self.expr(i.then);
-                try self.write(" } else { ");
-                try self.expr(i.other);
-                try self.write(" })");
-            },
+            .if_ => |i| try self.ifTerm(i.cond, i.then, i.other),
             .let => |l| try self.let(l.value, l.body, l.slot),
             .default => |d| {
                 const tag = try self.symbols.tag(d.tag);
@@ -400,15 +511,221 @@ const Printer = struct {
             .sum => |s| {
                 const acc = try self.symbols.fresh("$ac");
                 const item = try self.symbols.fresh("lc");
+                // M7: the accumulator as a scalar, as a record, or as a tuple,
+                // the last two with a field that nothing changes.
+                const shape = if (self.options.m7) self.extra.pick(3) else 0;
+                const f1 = try self.symbols.fresh("fo");
+                const f2 = try self.symbols.fresh("fo");
                 try self.print("{{\nvar {s} = ", .{acc});
-                try self.expr(s.start);
+                switch (shape) {
+                    0 => try self.expr(s.start),
+                    1 => {
+                        try self.print("{{ {s}: ", .{f1});
+                        try self.expr(s.start);
+                        try self.print(", {s}: 0.U64 }}", .{f2});
+                    },
+                    else => {
+                        try self.write("(");
+                        try self.expr(s.start);
+                        try self.write(", 0.U64)");
+                    },
+                }
                 // The start may bind this slot in a block of its own.
                 self.names.locals[s.slot] = item;
                 self.names.twins[s.slot] = null;
-                try self.print("\nfor {s} in {s}.{s} {{\n{s} = {s} + ", .{ item, self.names.param, self.names.fields[3], acc, acc });
-                try self.expr(s.step);
-                try self.print("\n}}\n{s}\n}}", .{acc});
+                const list = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ self.names.param, self.names.fields[3] });
+                defer self.gpa.free(list);
+                // M6: a `for` over the list, over its iterator, or a `while` over its indices.
+                switch (self.choices.pick(3)) {
+                    0 => try self.print("\nfor {s} in {s} {{\n", .{ item, list }),
+                    1 => try self.print("\nfor {s} in {s}.iter() {{\n", .{ item, list }),
+                    else => {
+                        const at = try self.symbols.fresh("$ix");
+                        try self.print("\nvar {s} = 0\nwhile {s} < {s}.len() {{\n{s} = {s}.get({s}) ?? 0\n", .{ at, at, list, item, list, at });
+                        try self.accStep(shape, acc, f1, f2, s.step);
+                        try self.print("\n{s} = {s} + 1\n}}\n", .{ at, at });
+                        try self.accResult(shape, acc, f1);
+                        try self.write("\n}");
+                        return;
+                    },
+                }
+                try self.accStep(shape, acc, f1, f2, s.step);
+                try self.write("\n}\n");
+                try self.accResult(shape, acc, f1);
+                try self.write("\n}");
             },
+            .twice => |t| try self.twice(t.args, t.k),
+        }
+    }
+
+    /// The statement that adds `step` to the accumulator.
+    fn accStep(self: *Printer, shape: u8, acc: []const u8, f1: []const u8, f2: []const u8, step: *const Node) Allocator.Error!void {
+        switch (shape) {
+            0 => try self.print("{s} = {s} + ", .{ acc, acc }),
+            1 => try self.print("{s} = {{ {s}: {s}.{s} + ", .{ acc, f1, acc, f1 }),
+            else => try self.print("{s} = ({s}.0 + ", .{ acc, acc }),
+        }
+        try self.expr(step);
+        switch (shape) {
+            0 => {},
+            1 => try self.print(", {s}: {s}.{s} }}", .{ f2, acc, f2 }),
+            else => try self.print(", {s}.1)", .{acc}),
+        }
+    }
+
+    /// The accumulator's value.
+    fn accResult(self: *Printer, shape: u8, acc: []const u8, f1: []const u8) Allocator.Error!void {
+        switch (shape) {
+            0 => try self.write(acc),
+            1 => try self.print("{s}.{s}", .{ acc, f1 }),
+            else => try self.print("{s}.0", .{acc}),
+        }
+    }
+
+    /// `h(x1, y1) + h(x2, y2)` for a private helper `h(p, q) = p + q * k`,
+    /// which takes its arguments as two, as a record, as a tuple, or as
+    /// either of the last two destructured.
+    fn twice(self: *Printer, args: [4]*const Node, k: u64) Allocator.Error!void {
+        const name = try self.symbols.fresh("hp");
+        const p = try self.symbols.fresh("lc");
+        const q = try self.symbols.fresh("lc");
+        const whole = try self.symbols.fresh("lc");
+        const shape = self.extra.pick(5);
+        switch (shape) {
+            0 => try self.helpers.print(self.gpa, "{s} : U64, U64 -> U64\n{s} = |{s}, {s}| {s} + {s} * {d}\n\n", .{ name, name, p, q, p, q, k }),
+            1 => try self.helpers.print(self.gpa, "{s} : {{ {s} : U64, {s} : U64 }} -> U64\n{s} = |{s}| {s}.{s} + {s}.{s} * {d}\n\n", .{ name, p, q, name, whole, whole, p, whole, q, k }),
+            2 => try self.helpers.print(self.gpa, "{s} : (U64, U64) -> U64\n{s} = |{s}| {s}.0 + {s}.1 * {d}\n\n", .{ name, name, whole, whole, whole, k }),
+            3 => try self.helpers.print(self.gpa, "{s} : {{ {s} : U64, {s} : U64 }} -> U64\n{s} = |{{ {s}, {s} }}| {s} + {s} * {d}\n\n", .{ name, p, q, name, p, q, p, q, k }),
+            else => try self.helpers.print(self.gpa, "{s} : (U64, U64) -> U64\n{s} = |({s}, {s})| {s} + {s} * {d}\n\n", .{ name, name, p, q, p, q, k }),
+        }
+        try self.write("(");
+        for (0..2) |call| {
+            if (call == 1) try self.write(" + ");
+            const x = args[call * 2];
+            const y = args[call * 2 + 1];
+            switch (shape) {
+                0 => {
+                    try self.print("{s}(", .{name});
+                    try self.expr(x);
+                    try self.write(", ");
+                    try self.expr(y);
+                    try self.write(")");
+                },
+                1, 3 => {
+                    try self.print("{s}({{ {s}: ", .{ name, p });
+                    try self.expr(x);
+                    try self.print(", {s}: ", .{q});
+                    try self.expr(y);
+                    try self.write(" })");
+                },
+                else => {
+                    try self.print("{s}((", .{name});
+                    try self.expr(x);
+                    try self.write(", ");
+                    try self.expr(y);
+                    try self.write("))");
+                },
+            }
+        }
+        try self.write(")");
+    }
+
+    /// `if cond then else other`, in some prints braced, as a `match` on
+    /// `Bool` in either arm order, as an `if` on the negation with the
+    /// branches swapped, and, when `cond` tests a `U64` against a literal, as
+    /// a `match` on the literal.
+    fn ifTerm(self: *Printer, cond: *const Node, then: *const Node, other: *const Node) Allocator.Error!void {
+        const literal_test = cond.* == .is_eq and cond.is_eq[1].* == .lit_u64;
+        // The last choice nests the `if`s of an `and` or `or` condition, which
+        // repeats the arm the connective shares, so that arm must be a leaf.
+        const nestable = (cond.* == .and_ and isLeaf(other)) or (cond.* == .or_ and isLeaf(then));
+        const plain: u8 = if (literal_test) 6 else 5;
+        const choice = self.choices.pick(plain + 1);
+        switch (if (choice == plain and !nestable) 0 else choice) {
+            0 => {
+                try self.write("(if ");
+                try self.expr(cond);
+                try self.write(" ");
+                try self.expr(then);
+                try self.write(" else ");
+                try self.expr(other);
+                try self.write(")");
+            },
+            1 => {
+                try self.write("(if ");
+                try self.expr(cond);
+                try self.write(" { ");
+                try self.expr(then);
+                try self.write(" } else { ");
+                try self.expr(other);
+                try self.write(" })");
+            },
+            2, 3 => |k| {
+                try self.write("(match ");
+                try self.expr(cond);
+                try self.write(" {\n");
+                const Arm = struct { tag: []const u8, body: *const Node };
+                const true_arm: Arm = .{ .tag = "Bool.True", .body = then };
+                const false_arm: Arm = .{ .tag = "Bool.False", .body = other };
+                const arms = if (k == 2) [_]Arm{ true_arm, false_arm } else [_]Arm{ false_arm, true_arm };
+                for (arms) |arm| {
+                    try self.print("{s} => ", .{arm.tag});
+                    try self.expr(arm.body);
+                    try self.write("\n");
+                }
+                try self.write("})");
+            },
+            4 => {
+                try self.write("(if !(");
+                try self.expr(cond);
+                try self.write(") ");
+                try self.expr(other);
+                try self.write(" else ");
+                try self.expr(then);
+                try self.write(")");
+            },
+            5 => if (literal_test) {
+                try self.write("(match ");
+                try self.expr(cond.is_eq[0]);
+                try self.write(" {\n");
+                // A pattern takes no parentheses and gets its type from the scrutinee.
+                try self.print("{d} => ", .{cond.is_eq[1].lit_u64});
+                try self.expr(then);
+                try self.write("\n_ => ");
+                try self.expr(other);
+                try self.write("\n})");
+            } else try self.nestedIf(cond, then, other),
+            else => try self.nestedIf(cond, then, other),
+        }
+    }
+
+    /// `if a and b t else o` as `if a { if b t else o } else o`, and
+    /// `if a or b t else o` as `if a t else { if b t else o }`.
+    fn nestedIf(self: *Printer, cond: *const Node, then: *const Node, other: *const Node) Allocator.Error!void {
+        if (cond.* == .and_) {
+            try self.write("(if ");
+            try self.expr(cond.and_[0]);
+            try self.write(" { (if ");
+            try self.expr(cond.and_[1]);
+            try self.write(" ");
+            try self.expr(then);
+            try self.write(" else ");
+            try self.expr(other);
+            try self.write(") } else ");
+            try self.expr(other);
+            try self.write(")");
+        } else {
+            try self.write("(if ");
+            try self.expr(cond.or_[0]);
+            try self.write(" ");
+            try self.expr(then);
+            try self.write(" else (if ");
+            try self.expr(cond.or_[1]);
+            try self.write(" ");
+            try self.expr(then);
+            try self.write(" else ");
+            try self.expr(other);
+            try self.write("))");
         }
     }
 
@@ -441,7 +758,7 @@ const Printer = struct {
                 try self.write(" })");
                 return;
             },
-            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum => {},
+            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice => {},
         }
         try self.write("{\n");
         try self.bind(value, slot);
@@ -498,12 +815,21 @@ const Symbols = struct {
 
 /// Generate one case from `bytes`.
 pub fn generate(gpa: Allocator, bytes: []const u8) Allocator.Error!Case {
+    return generateWith(gpa, bytes, .{});
+}
+
+/// Generate one case from `bytes`, with the constructs `options` allows.
+pub fn generateWith(gpa: Allocator, bytes: []const u8, options: Options) Allocator.Error!Case {
     var arena_impl = std.heap.ArenaAllocator.init(gpa);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
     var reader: Reader = .{ .bytes = bytes };
-    var builder: Builder = .{ .arena = arena, .reader = &reader };
+    // The extra choices read the same bytes from the other end.
+    const reversed = try arena.dupe(u8, bytes);
+    std.mem.reverse(u8, reversed);
+    var extra: Reader = .{ .bytes = reversed };
+    var builder: Builder = .{ .arena = arena, .reader = &reader, .extra = &extra, .options = options };
     const root = try builder.term(.u64_, .{}, 0);
 
     var symbols: Symbols = .{ .arena = arena };
@@ -537,18 +863,31 @@ pub fn generate(gpa: Allocator, bytes: []const u8) Allocator.Error!Case {
     const half = rest.len / 2;
     var left_choices: Reader = .{ .bytes = rest[0..half] };
     var right_choices: Reader = .{ .bytes = rest[half..] };
-    for ([_]struct { name: []const u8, names: *Names, choices: *Reader }{
-        .{ .name = left_fn, .names = &left_names, .choices = &left_choices },
-        .{ .name = right_fn, .names = &right_names, .choices = &right_choices },
+    const left_reversed = try arena.dupe(u8, rest[0..half]);
+    std.mem.reverse(u8, left_reversed);
+    const right_reversed = try arena.dupe(u8, rest[half..]);
+    std.mem.reverse(u8, right_reversed);
+    var left_extra: Reader = .{ .bytes = left_reversed };
+    var right_extra: Reader = .{ .bytes = right_reversed };
+    for ([_]struct { name: []const u8, names: *Names, choices: *Reader, extra: *Reader }{
+        .{ .name = left_fn, .names = &left_names, .choices = &left_choices, .extra = &left_extra },
+        .{ .name = right_fn, .names = &right_names, .choices = &right_choices, .extra = &right_extra },
     }) |side| {
-        try out.print(gpa, "{s} : {s} -> U64\n{s} = |{s}| ", .{ side.name, input_ty, side.name, side.names.param });
-        var printer: Printer = .{ .gpa = gpa, .out = &out, .choices = side.choices, .names = side.names, .symbols = &symbols };
+        // The body first: the helpers it defines come before the function.
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        var helpers: std.ArrayList(u8) = .empty;
+        defer helpers.deinit(gpa);
+        var printer: Printer = .{ .gpa = gpa, .out = &body, .choices = side.choices, .extra = side.extra, .names = side.names, .symbols = &symbols, .helpers = &helpers, .options = options };
         // `return` last, in some prints.
         if (side.choices.pick(3) == 0) {
-            try out.appendSlice(gpa, "{\nreturn ");
+            try body.appendSlice(gpa, "{\nreturn ");
             try printer.expr(root);
-            try out.appendSlice(gpa, "\n}");
+            try body.appendSlice(gpa, "\n}");
         } else try printer.expr(root);
+        try out.appendSlice(gpa, helpers.items);
+        try out.print(gpa, "{s} : {s} -> U64\n{s} = |{s}| ", .{ side.name, input_ty, side.name, side.names.param });
+        try out.appendSlice(gpa, body.items);
         try out.appendSlice(gpa, "\n\n");
     }
 

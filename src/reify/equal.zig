@@ -40,7 +40,7 @@ pub const Comparison = struct {
         if (a == b) return true;
         if (a.kind != b.kind or a.output != b.output) return false;
         switch (a.kind) {
-            .row_param => return false,
+            .row_param, .input => return false,
             .region_param => {
                 for (self.pairs.items) |p| if (p[0] == a.regionId() and p[1] == b.regionId()) return true;
                 return false;

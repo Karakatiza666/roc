@@ -14,6 +14,7 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const types_mod = @import("types.zig");
 const prims = @import("prims.zig");
+const float_bits = @import("builtins").float_bits;
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -113,6 +114,9 @@ pub const Evaluator = struct {
     fuel: u64 = 1_000_000,
     /// Per region, its nodes in id order, which is a dependency order.
     by_region: [][]NodeId,
+    /// The value of each input slot of the store, by slot id (N18). A test
+    /// that builds slots sets it before `run`.
+    inputs: []const Value = &.{},
 
     /// Index the store's regions. Call again after adding nodes.
     pub fn init(arena: Allocator, store: *const ir.Store, types: *const types_mod.Types, mode: Mode) Allocator.Error!Evaluator {
@@ -167,6 +171,7 @@ pub const Evaluator = struct {
             // it was read, so strict evaluation crashes on reading it.
             .row_param => if (self.mode == .strict and frame.args[ref.output].hasBottom()) error.Crash else frame.args[ref.output],
             .region_param => frame.params[ref.target].?[ref.output],
+            .input => self.inputs[ref.target],
             .node => (try self.evalNode(frame, ref.nodeId()))[ref.output],
         };
     }
@@ -267,8 +272,24 @@ pub const Evaluator = struct {
         switch (node.op) {
             .lit => return litValue(self, ir.LitId.of(node.payload)),
             .crash => return self.crash(),
-            .derived, .closure, .lambda, .apply, .elem, .opt_field, .list => return error.Unsupported,
-            .record, .tuple => return .{ .agg = try self.evalRefs(frame, node.args) },
+            .derived, .closure, .lambda, .apply, .opt_field => return error.Unsupported,
+            .list => return .{ .list = try self.evalRefs(frame, node.args) },
+            // A bound the normalizer proved dominates an `Elem`; where it does not hold, the body is not normal.
+            .elem => {
+                const args = try self.evalRefs(frame, node.args);
+                for (args) |a| if (a == .bottom) return .bottom;
+                const at = args[1].int;
+                if (at < 0 or at >= args[0].list.len) return self.crash();
+                return args[0].list[@intCast(at)];
+            },
+            .record => {
+                // A record that leaves a member unset has no value for it, and
+                // the evaluator has no value of an absent member.
+                const members = self.types.memberSlice(self.types.get(self.store.tySlice(node.tys)[0]).record);
+                if (node.args.len != members.len) return error.Unsupported;
+                return .{ .agg = try self.evalRefs(frame, node.args) };
+            },
+            .tuple => return .{ .agg = try self.evalRefs(frame, node.args) },
             .tag => return .{ .tag = .{ .name = types_mod.NameId.of(node.payload), .payload = try self.evalRefs(frame, node.args) } },
             .wrap, .unwrap => return self.evalRef(frame, self.store.refSlice(node.args)[0]),
             .field, .index => {
@@ -392,7 +413,7 @@ pub const Evaluator = struct {
             switch (node.op) {
                 .for_range => {
                     const i = args[0].int + turn;
-                    if (i >= args[1].int) return slots;
+                    if (if (node.payload == 1) i > args[1].int else i >= args[1].int) return slots;
                     try params.append(self.arena, .{ .int = i });
                 },
                 .for_list => {
@@ -437,7 +458,22 @@ pub const Evaluator = struct {
                 .bottom, .int, .float, .bool_, .agg, .tag => unreachable, // concat's operands are strs or lists by the typing of the body
             },
             .len => .{ .int = args[0].list.len },
-            .get, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => error.Unsupported,
+            // `Try(elem, [OutOfBounds])`: the tags are found by name.
+            .get => blk: {
+                const xs = args[0].list;
+                const at = args[1].int;
+                const ok = self.types.findName("Ok") orelse return error.Unsupported;
+                const err = self.types.findName("Err") orelse return error.Unsupported;
+                const out_of_bounds = self.types.findName("OutOfBounds") orelse return error.Unsupported;
+                const payload = try self.arena.alloc(Value, 1);
+                if (at >= 0 and at < xs.len) {
+                    payload[0] = xs[@intCast(at)];
+                    break :blk .{ .tag = .{ .name = ok, .payload = payload } };
+                }
+                payload[0] = .{ .tag = .{ .name = out_of_bounds, .payload = &.{} } };
+                break :blk .{ .tag = .{ .name = err, .payload = payload } };
+            },
+            .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => error.Unsupported,
         };
     }
 
@@ -447,6 +483,7 @@ pub const Evaluator = struct {
         return switch (prims.foldIntAll(int, method, vals) orelse return self.crash()) {
             .bool_ => |v| .{ .bool_ = v },
             .int => |v| .{ .int = v },
+            .float, .str => unreachable, // integer builtins fold to a Bool or an integer
         };
     }
 };
@@ -466,6 +503,10 @@ fn evalFloat(float: types_mod.FloatTy, method: prims.Method, args: []const Value
     }
 }
 
+fn canonicalNan(comptime F: type, bits: @Int(.unsigned, @bitSizeOf(F))) u64 {
+    return if (F == f32) float_bits.normalizeF32NanBits(bits) else float_bits.normalizeF64NanBits(bits);
+}
+
 fn floatResult(comptime F: type, method: prims.Method, a: F, b: F) Error!Value {
     const Bits = @Int(.unsigned, @bitSizeOf(F));
     return switch (method) {
@@ -474,9 +515,10 @@ fn floatResult(comptime F: type, method: prims.Method, a: F, b: F) Error!Value {
         .is_lte => .{ .bool_ = a <= b },
         .is_gt => .{ .bool_ = a > b },
         .is_gte => .{ .bool_ = a >= b },
-        .plus => .{ .float = @as(Bits, @bitCast(a + b)) },
-        .minus => .{ .float = @as(Bits, @bitCast(a - b)) },
-        .times => .{ .float = @as(Bits, @bitCast(a * b)) },
+        // A `NaN` result is Roc's canonical `NaN`, as Roc gives one it observes.
+        .plus => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a + b))) },
+        .minus => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a - b))) },
+        .times => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a * b))) },
         .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable, // float prims admit no other methods (prims.admits)
     };
 }

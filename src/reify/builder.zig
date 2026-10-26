@@ -19,7 +19,9 @@ const prims = @import("prims.zig");
 const table = @import("rules/table.zig");
 const equal = @import("equal.zig");
 const polarity = @import("polarity.zig");
+const match = @import("match.zig");
 const provenance = @import("provenance.zig");
+const scalar = @import("scalar.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -54,7 +56,13 @@ pub const Fact = struct {
     key: u32,
     lit: ?LitId = null,
     excluded: ir.Span = .empty,
+    /// Set when `ref` is the index parameter of the body of a `ForList` over
+    /// a list: the fact then names no arm, and only N13m reads it.
+    loop: ?ListLoop = null,
 };
+
+/// The list a `ForList` body runs over, and the body's element parameter.
+pub const ListLoop = struct { list: Ref, element: Ref };
 
 const OpenRegion = struct {
     /// The region nodes are built in: the region the caller opened, or the
@@ -72,6 +80,12 @@ const Link = struct {
     sw: NodeId,
     join: RegionId,
 };
+
+/// The context rules that are algorithms, not rows (plan 3.3): N7b over
+/// positions, N13r over a switch's arms, N13m over the facts of a bound, and
+/// N13d over `Bool.not`, and N14a over a call. A test turns one off to see
+/// its rule stop.
+pub const Algorithm = enum { interchange, case_of_case, bounded_get, decided_not, scalar_call };
 
 /// The rules on exits and joins (normal-form 3.11), which run when an
 /// exiting switch's region closes. T1 is how the walk builds them.
@@ -160,6 +174,23 @@ pub const Specialized = struct {
     order: ?[]const u32,
 };
 
+/// What a call of a row N14a splits calls instead: the row with the split
+/// parameters, in its order when finalizing it renumbered them, and the
+/// shape of each parameter of the row the call named.
+pub const Scalarized = struct {
+    row: RowId,
+    order: ?[]const u32,
+    shapes: []const scalar.Shape,
+};
+
+/// The row a call of a finalized row (N14a) is made to: `row` with each
+/// parameter its shape splits replaced by the components. Returns null where
+/// no parameter of the row splits.
+pub const Scalarizer = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, b: *Builder, row: RowId) SpecializeError!?Scalarized,
+};
+
 /// Why a specialization stopped: the driver's errors, which the builder
 /// hands back through the call it was building.
 pub const SpecializeError = error{ MeasureDidNotFall, RoundBoundExceeded, InvariantBroken } || Allocator.Error;
@@ -196,6 +227,18 @@ pub const Builder = struct {
     /// N8d). The driver sets it; the row is simplified and finalized before
     /// the call is built.
     specializer: ?Specializer = null,
+    /// Where set, a call of a finalized row with an aggregate parameter that
+    /// the row only reads by field or index calls the row with the parameter
+    /// split (N14a). The driver sets it.
+    scalarizer: ?Scalarizer = null,
+    /// The value switch output that the switch being built is the only reader
+    /// of, which the rebuild knows from the placement's uses: N13r moves the
+    /// switch into the arms of the value switch only then, so the value switch
+    /// dies and nothing is computed twice.
+    sole_reader: ?Ref = null,
+    /// While case-of-case copies an outer arm (N13r): the switch output that
+    /// the arm reads, and the known value it stands for in the arm.
+    case_subst: ?struct { from: Ref, to: Ref } = null,
     /// The origins of what is being built (N10): every node built, or found
     /// again by hash-consing, takes them. The walk sets one per expression,
     /// and a rebuild the copied node's.
@@ -211,6 +254,8 @@ pub const Builder = struct {
         algorithm_steps: u32 = 0,
         exits_off: std.EnumSet(ExitRule) = .empty,
         exits_fired: std.EnumArray(ExitRule, u32) = .initFill(0),
+        algorithms_off: std.EnumSet(Algorithm) = .empty,
+        algorithms_fired: std.EnumArray(Algorithm, u32) = .initFill(0),
         /// Where set, the driver's placements break ties at random from it
         /// (L6, `place.Ties`).
         shuffle: ?std.Random = null,
@@ -225,6 +270,17 @@ pub const Builder = struct {
     fn exitRuleFired(self: *Builder, rule: ExitRule) void {
         if (!hooks_enabled) return;
         self.hooks.exits_fired.getPtr(rule).* += 1;
+        self.hooks.algorithm_steps += 1;
+    }
+
+    fn algorithmOn(self: *Builder, a: Algorithm) bool {
+        if (!hooks_enabled) return true;
+        return !self.hooks.rules_off and !self.hooks.algorithms_off.contains(a);
+    }
+
+    fn algorithmFired(self: *Builder, a: Algorithm) void {
+        if (!hooks_enabled) return;
+        self.hooks.algorithms_fired.getPtr(a).* += 1;
         self.hooks.algorithm_steps += 1;
     }
 
@@ -496,6 +552,19 @@ pub const Builder = struct {
         return r;
     }
 
+    /// Note that the open region `body` is the body of a `ForList` over
+    /// `list`: its index parameter is in range of `list`, and its element
+    /// parameter is the element at that index (N13m). The fact holds until
+    /// the body closes.
+    pub fn noteListLoop(self: *Builder, body: RegionId, list: Ref) Allocator.Error!void {
+        std.debug.assert(self.open.items[self.open.items.len - 1].region == body);
+        try self.facts.append(self.gpa, .{
+            .ref = Ref.regionParam(body, 0),
+            .key = 0,
+            .loop = .{ .list = list, .element = Ref.regionParam(body, 1) },
+        });
+    }
+
     /// How a region ends, as the caller states it.
     pub const EndSpec = union(ir.EndKind) {
         open: void,
@@ -507,10 +576,25 @@ pub const Builder = struct {
         break_: []const Ref,
     };
 
+    // N13d on a region's value: a `Bool` that a dominating arm or an earlier
+    // `And` or `Or` operand decided is the literal it decided, so `if c a else c`
+    // ends its `False` arm in `False` and meets `c and a`.
+    fn decidedRefs(self: *Builder, refs: []const Ref) Allocator.Error!ir.Span {
+        var out: ?[]Ref = null;
+        defer if (out) |o| self.gpa.free(o);
+        for (refs, 0..) |r, i| {
+            if (self.types.get(self.store.refTy(self.row, r)) != .bool_) continue;
+            const key = self.knownKey(r) orelse continue;
+            if (out == null) out = try self.gpa.dupe(Ref, refs);
+            out.?[i] = try self.litBool(key == 1);
+        }
+        return self.store.addRefs(out orelse refs);
+    }
+
     fn endOf(self: *Builder, end: EndSpec) Allocator.Error!ir.End {
         return switch (end) {
             .open => unreachable, // callers pass the end of a region being closed, never an open one
-            .value => |refs| .{ .kind = .value, .target = 0, .refs = try self.store.addRefs(refs) },
+            .value => |refs| .{ .kind = .value, .target = 0, .refs = try self.decidedRefs(refs) },
             .jump => |j| .{ .kind = .jump, .target = j.join.index(), .refs = try self.store.addRefs(j.args) },
             .return_ => |r| .{ .kind = .return_, .target = 0, .refs = try self.store.addRefs(&.{r}) },
             .branch => |n| .{ .kind = .branch, .target = n.index(), .refs = .empty },
@@ -806,7 +890,7 @@ pub const Builder = struct {
         while (i > 0) {
             i -= 1;
             const f = self.facts.items[i];
-            if (f.ref == ref) return f.key;
+            if (f.ref == ref and f.loop == null) return f.key;
         }
         return null;
     }
@@ -820,7 +904,7 @@ pub const Builder = struct {
         while (i > 0) {
             i -= 1;
             const f = self.facts.items[i];
-            if (f.ref != ref) continue;
+            if (f.ref != ref or f.loop != null) continue;
             if (f.lit) |l| return l == lit;
             if (std.mem.findScalar(u32, self.store.wordSlice(f.excluded), lit.index()) != null) return false;
         }
@@ -886,6 +970,29 @@ pub const Builder = struct {
         return self.make(.{ .op = .record, .args = fields, .tys = &.{ty} });
     }
 
+    /// `Record` of `ty` that sets only the members at `set`, which are
+    /// optional or all of them, in the type's order; `fields` are their
+    /// values in that order. A record that sets every member is the dense
+    /// form `record` builds, so one value has one form (`ir.RecordForm`).
+    pub fn recordSetting(self: *Builder, ty: TyId, set: []const u32, fields: []const Ref) Allocator.Error!Ref {
+        std.debug.assert(set.len == fields.len);
+        const members = self.types.memberSlice(self.types.get(ty).record);
+        if (set.len == members.len) return self.record(ty, fields);
+        return self.make(.{ .op = .record, .args = fields, .tys = &.{ty}, .aux = set });
+    }
+
+    /// Where the value of member `k` of the record type of the `record` node
+    /// `nd` sits among the node's arguments, or null when the node leaves the
+    /// member unset.
+    pub fn recordArgAt(self: *const Builder, nd: ir.Node, k: u32) ?u32 {
+        const members = self.types.memberSlice(self.types.get(self.store.tySlice(nd.tys)[0]).record);
+        if (nd.args.len == members.len) return k;
+        for (self.store.wordSlice(nd.aux), 0..) |set, at| {
+            if (set == k) return @intCast(at);
+        }
+        return null;
+    }
+
     /// `Tuple` of `ty`.
     pub fn tuple(self: *Builder, ty: TyId, elems: []const Ref) Allocator.Error!Ref {
         return self.make(.{ .op = .tuple, .args = elems, .tys = &.{ty} });
@@ -943,15 +1050,22 @@ pub const Builder = struct {
     /// otherwise one this store names. A builtin the table lacks and a
     /// function of another package (N8h) are both named ones.
     pub fn namedPrim(self: *Builder, owner: []const u8, method: []const u8) Allocator.Error!ir.PrimId {
-        if (prims.findNamed(owner, method)) |id| return id;
-        const key = try std.fmt.allocPrint(self.gpa, "{s}\x00{s}", .{ owner, method });
+        return self.namedPrimWithRole(owner, method, .none);
+    }
+
+    /// `namedPrim`, for a builtin iterator procedure the checker gave a role
+    /// (N11k). The role is part of the primitive's identity: two primitives
+    /// with one owner and method and different roles are two primitives.
+    pub fn namedPrimWithRole(self: *Builder, owner: []const u8, method: []const u8, role: ir.IteratorRole) Allocator.Error!ir.PrimId {
+        if (role == .none) if (prims.findNamed(owner, method)) |id| return id;
+        const key = try std.fmt.allocPrint(self.gpa, "{s}\x00{s}\x00{d}", .{ owner, method, @backingInt(role) });
         const gop = try self.named_prims.getOrPut(self.gpa, key);
         if (gop.found_existing) {
             self.gpa.free(key);
             return gop.value_ptr.*;
         }
         const id = ir.PrimId.of(@intCast(prims.table.len + self.store.named_prims.items.len));
-        try self.store.named_prims.append(self.gpa, .{ .owner = try self.store.addBytes(owner), .method = try self.store.addBytes(method) });
+        try self.store.named_prims.append(self.gpa, .{ .owner = try self.store.addBytes(owner), .method = try self.store.addBytes(method), .role = role });
         gop.value_ptr.* = id;
         return id;
     }
@@ -1122,8 +1236,25 @@ pub const Builder = struct {
         return self.make(.{ .op = op, .args = args, .tys = outputs, .regions = &.{body} });
     }
 
+    /// The input slot of the run-time name the walk numbered `leaf` (N18a).
+    pub fn input(self: *Builder, ty: TyId, leaf: u32) Allocator.Error!Ref {
+        return Ref.input(try self.store.slot(ty, .{ .leaf = leaf }));
+    }
+
     /// Build a node: apply the first rule that matches, or hash-cons it.
     pub fn make(self: *Builder, spec: NodeSpec) Allocator.Error!Ref {
+        // N18b: a projection of a slot is a slot. This is the form of the
+        // value, not a rewrite, so it holds with the rules off too.
+        if (spec.args.len == 1 and spec.args[0].kind == .input) {
+            const of = spec.args[0].slotId();
+            const source: ?ir.Slot.Source = switch (spec.op) {
+                .field => .{ .field = .{ .of = of, .k = spec.payload } },
+                .index => .{ .index = .{ .of = of, .k = spec.payload } },
+                .unwrap => .{ .unwrap = of },
+                .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .payload, .elem, .opt_field, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => null,
+            };
+            if (source) |projected| return Ref.input(try self.store.slot(spec.tys[0], projected));
+        }
         if (std.debug.runtime_safety and spec.op == .switch_ and spec.aux.len == 0) {
             // A tag switch has one arm per member of its scrutinee's own type.
             if (self.types.armCount(self.store.refTy(self.row, spec.args[0]))) |count| {
@@ -1137,9 +1268,17 @@ pub const Builder = struct {
         if (self.rulesActive() and (spec.op == .and_ or spec.op == .or_)) {
             if (try self.decidedOperands(spec)) |r| return r;
         }
+        if (self.rulesActive() and spec.op == .prim) {
+            if (try self.decidedNot(spec)) |r| return r;
+            if (try self.boundedGet(spec)) |r| return r;
+        }
+        if (self.rulesActive() and spec.op == .elem) {
+            if (self.loopElement(spec)) |r| return r;
+        }
         if (self.rulesActive() and spec.op == .call) {
             if (try self.forwardedCall(spec)) |r| return r;
             if (try self.specializedCall(spec)) |r| return r;
+            if (try self.scalarizedCall(spec)) |r| return r;
         }
         if (self.rulesActive() and spec.op == .apply) {
             if (try self.appliedClosure(spec)) |r| return r;
@@ -1259,6 +1398,45 @@ pub const Builder = struct {
         return try self.callRowAt(target.row, args, spec.tys[0]);
     }
 
+    // N14a: a call of a finalized row, with an aggregate parameter that the
+    // row only reads by field or index, is a call of the row with that
+    // parameter split, over the components of the argument. A component of a
+    // construction is the value the construction was given, so the call that
+    // passes `{ a, b }` passes `a` and `b`. The row was built over the leaves
+    // in order, and its finalize may have renumbered its parameters since.
+    fn scalarizedCall(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        const scalarizer = self.scalarizer orelse return null;
+        if (!self.algorithmOn(.scalar_call)) return null;
+        const row = RowId.of(spec.payload);
+        const found = scalarizer.run(scalarizer.ctx, self, row) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            // The driver keeps the reason and stops after the caller's round.
+            error.MeasureDidNotFall, error.RoundBoundExceeded, error.InvariantBroken => return null,
+        };
+        const target = found orelse return null;
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const leaves = try scalar.leavesOf(scratch.allocator(), target.shapes);
+        const count = if (target.order) |order| order.len else leaves.len;
+        const args = try self.gpa.alloc(Ref, count);
+        defer self.gpa.free(args);
+        for (args, 0..) |*a, k| {
+            const leaf = leaves[if (target.order) |order| order[k] else k];
+            var ref = spec.args[leaf.index];
+            for (leaf.path) |component| {
+                const ty = self.store.refTy(self.row, ref);
+                ref = switch (self.types.get(ty)) {
+                    .record => try self.field(ref, component),
+                    .tuple => try self.index(ref, component),
+                    .bool_, .str, .int, .float, .dec, .tag_union, .list, .nominal, .func, .opaque_, .recursive => unreachable, // a shape splits records and tuples only
+                };
+            }
+            a.* = ref;
+        }
+        self.algorithmFired(.scalar_call);
+        return try self.callRowAt(target.row, args, spec.tys[0]);
+    }
+
     // N13d over `And` and `Or` operands (normal-form 3.13): an operand that
     // an earlier operand, or a dominating arm, already decided to the value
     // that lets the connective go on, `True` for `And` and `False` for `Or`,
@@ -1297,6 +1475,110 @@ pub const Builder = struct {
         return try self.make(.{ .op = spec.op, .args = &.{next}, .tys = spec.tys, .regions = kept.items[1..] });
     }
 
+    // N13m (normal-form 3.13): `List.get(xs, i)` where a dominating test
+    // proved `i < List.len(xs)`, or inside the body of a `ForList` over `xs`
+    // whose index is `i`, is `Ok` of the element: `Elem(xs, i)`, or the
+    // body's element parameter. The result has the call's type, which is the
+    // `Try` nominal when the call is read at it.
+    fn boundedGet(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;
+        if (p.owner != .list or p.method != .get or !self.algorithmOn(.bounded_get)) return null;
+        const xs = spec.args[0];
+        const i = spec.args[1];
+        const ty = spec.tys[0];
+        const backing = switch (self.types.get(ty)) {
+            .nominal => try self.types.unfold(ty),
+            .tag_union => ty,
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .list, .func, .opaque_, .recursive => @import("base").invariant("reify builder: List.get does not give a Try", .{}),
+        };
+        const ok = self.types.findName("Ok") orelse @import("base").invariant("reify builder: List.get gives a type without Ok", .{});
+        const at = self.types.memberIndex(backing, ok) orelse @import("base").invariant("reify builder: List.get gives a type without Ok", .{});
+        const element_ty = self.types.tySlice(self.types.memberSlice(self.types.get(backing).tag_union)[at].tys)[0];
+        const element = for (self.facts.items) |f| {
+            const loop = f.loop orelse continue;
+            if (loop.list == xs and f.ref == i) break loop.element;
+        } else blk: {
+            if (!self.provedInBounds(xs, i)) return null;
+            break :blk try self.elem(xs, i, element_ty);
+        };
+        self.algorithmFired(.bounded_get);
+        const tagged = try self.tag(backing, ok, &.{element});
+        return if (backing == ty) tagged else try self.wrap(ty, tagged);
+    }
+
+    // N13m over `Item`: the item of the list a `ForList` body is over, at
+    // that body's own index, is the body's element parameter, whichever
+    // spelling of the loop gave the read.
+    fn loopElement(self: *Builder, spec: NodeSpec) ?Ref {
+        if (!self.algorithmOn(.bounded_get)) return null;
+        for (self.facts.items) |f| {
+            const loop = f.loop orelse continue;
+            if (loop.list == spec.args[0] and f.ref == spec.args[1]) {
+                self.algorithmFired(.bounded_get);
+                return loop.element;
+            }
+        }
+        return null;
+    }
+
+    // Whether a dominating test proved `i < List.len(xs)`.
+    fn provedInBounds(self: *const Builder, xs: Ref, i: Ref) bool {
+        for (self.facts.items) |f| {
+            if (f.loop != null) continue;
+            if (self.impliesInBounds(f.ref, f.key, xs, i)) return true;
+        }
+        return false;
+    }
+
+    // Whether `ref` having arm `key` (1 for `True`) implies `i < List.len(xs)`.
+    fn impliesInBounds(self: *const Builder, ref: Ref, key: u32, xs: Ref, i: Ref) bool {
+        const n = self.nodeOf(ref) orelse return false;
+        switch (n.op) {
+            .prim => {
+                const p = prims.lookup(ir.PrimId.of(n.payload)) orelse return false;
+                const args = self.store.refSlice(n.args);
+                if (p.owner == .bool_ and p.method == .not) return self.impliesInBounds(args[0], 1 - key, xs, i);
+                if (p.owner != .u64) return false;
+                // `i < len` is true, or `len <= i` is false.
+                if (key == 1 and p.method == .is_lt) return args[0] == i and self.isLen(args[1], xs);
+                if (key == 0 and p.method == .is_lte) return args[1] == i and self.isLen(args[0], xs);
+                return false;
+            },
+            // Every operand of a true `And`, and of a false `Or`, has that value.
+            .and_, .or_ => {
+                if (key != @intFromBool(n.op == .and_)) return false;
+                if (self.impliesInBounds(self.store.refSlice(n.args)[0], key, xs, i)) return true;
+                for (self.store.regionSlice(n.regions)) |r| {
+                    const v = self.armValue(r) orelse continue;
+                    if (self.impliesInBounds(v, key, xs, i)) return true;
+                }
+                return false;
+            },
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .call, .switch_, .for_range, .for_list, .loop, .lambda, .apply => return false,
+        }
+    }
+
+    // Whether `ref` is `List.len(xs)`.
+    fn isLen(self: *const Builder, ref: Ref, xs: Ref) bool {
+        const n = self.nodeOf(ref) orelse return false;
+        if (n.op != .prim) return false;
+        const p = prims.lookup(ir.PrimId.of(n.payload)) orelse return false;
+        return p.owner == .list and p.method == .len and self.store.refSlice(n.args)[0] == xs;
+    }
+
+    // N13d over `Bool.not` (normal-form 3.13): the negation of a value that a
+    // dominating arm, or an earlier operand of an enclosing `And` or `Or`,
+    // decided is the opposite literal. So `if c !c else b` is
+    // `Switch(c) { False: b, True: False }`, which N13o turns into
+    // `And(Bool.not(c), b)`.
+    fn decidedNot(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;
+        if (p.owner != .bool_ or p.method != .not or !self.algorithmOn(.decided_not)) return null;
+        const key = self.knownKey(spec.args[0]) orelse return null;
+        self.algorithmFired(.decided_not);
+        return try self.litBool(key == 0);
+    }
+
     // N13d over a `Bool` or tag switch (normal-form 3.13): a scrutinee that a
     // dominating arm, or an earlier operand of an enclosing `And` or `Or`,
     // tested selects its arm, when the switch has one output and that arm
@@ -1321,8 +1603,272 @@ pub const Builder = struct {
                 if (hooks_enabled) self.hooks.fired[i] += 1;
                 return self.instantiate(rule.result, &b, spec.tys);
             }
+            if (spec.op == .switch_) {
+                if (try self.caseOfCase(spec)) |r| return r;
+                if (try self.interchange(spec)) |r| return r;
+            }
         }
         return self.cons_(spec);
+    }
+
+    // N7b (normal-form 3.7, rule 2): a switch one of whose arms ends in a
+    // switch on a position that comes before its own, in the canonical order
+    // of match.zig, is rebuilt with that position first. For each constructor
+    // of the earlier position, the switch on its own position has the arms
+    // the earlier test left: an arm that ended in the earlier test is its arm
+    // for the constructor, and an arm that did not test it is copied under
+    // the constructor's fact. So two matches with the same mapping from
+    // inputs to arms reach one tree, whichever position their patterns test
+    // first. What the rule leaves alone, each by a stated limit:
+    //
+    // | Left alone | Why |
+    // |---|---|
+    // | two `Bool` switches | N7d and N13o own their order: nested `if`s meet `and`, in the operand order the nesting gave |
+    // | a position of another root | the order of two roots waits for N15c's parameter half (plan 4.2, M11) |
+    // | a test that is not a position | a guard keeps its place: the first guard that holds wins |
+    // | a switch with several outputs, or joins | N13c and N13d decide only single-output switches |
+    fn interchange(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        if (!self.algorithmOn(.interchange)) return null;
+        if (spec.tys.len != 1 or spec.regions.len != spec.payload) return null;
+        for (spec.regions) |r| if (self.armValue(r) == null or !match.copyable(self.store, null, r)) return null;
+        const p = spec.args[0];
+        var p_steps: std.ArrayList(match.Step) = .empty;
+        defer p_steps.deinit(self.gpa);
+        const p_root = try match.positionOf(self.gpa, self.store, p, &p_steps);
+        const p_is_bool = self.types.get(self.store.refTy(self.row, p)) == .bool_;
+
+        // The earliest position an arm ends in a test of, and which arms do.
+        const inner_of = try self.gpa.alloc(?NodeId, spec.regions.len);
+        defer self.gpa.free(inner_of);
+        var best: ?Ref = null;
+        var best_steps: std.ArrayList(match.Step) = .empty;
+        defer best_steps.deinit(self.gpa);
+        var steps: std.ArrayList(match.Step) = .empty;
+        defer steps.deinit(self.gpa);
+        for (spec.regions, inner_of) |arm, *slot| {
+            slot.* = self.topSwitch(arm);
+            const inner = slot.* orelse continue;
+            const q = self.store.refSlice(self.store.node(inner).args)[0];
+            steps.clearRetainingCapacity();
+            const root = try match.positionOf(self.gpa, self.store, q, &steps);
+            const q_is_bool = self.types.get(self.store.refTy(self.row, q)) == .bool_;
+            if (root != p_root or !match.before(self.types, steps.items, p_steps.items) or (p_is_bool and q_is_bool) or !self.readable(q)) {
+                slot.* = null;
+                continue;
+            }
+            if (best == null or match.before(self.types, steps.items, best_steps.items)) {
+                best = q;
+                best_steps.clearRetainingCapacity();
+                try best_steps.appendSlice(self.gpa, steps.items);
+            }
+        }
+        const first = best orelse return null;
+        // Only the arms that end in a test of that position take part; one that ends in a test of another position is copied whole.
+        for (spec.regions, inner_of) |_, *slot| {
+            const inner = slot.* orelse continue;
+            steps.clearRetainingCapacity();
+            _ = try match.positionOf(self.gpa, self.store, self.store.refSlice(self.store.node(inner).args)[0], &steps);
+            if (!match.samePosition(self.types, steps.items, best_steps.items)) slot.* = null;
+        }
+
+        // The constructors of the position: the arms of a tag or `Bool`
+        // switch, or the keys that any of the tests names, and a default.
+        const q = try self.available(first);
+        const q_ty = self.store.refTy(self.row, q);
+        const by_arm = self.types.armCount(q_ty) != null;
+        var keys: std.ArrayList(u32) = .empty;
+        defer keys.deinit(self.gpa);
+        const count: u32 = if (self.types.armCount(q_ty)) |n| n else blk: {
+            for (inner_of) |slot| {
+                const inner = slot orelse continue;
+                for (self.store.wordSlice(self.store.node(inner).aux)) |k| {
+                    if (std.mem.findScalar(u32, keys.items, k) == null) try keys.append(self.gpa, k);
+                }
+            }
+            std.mem.sort(u32, keys.items, self, struct {
+                fn lt(b: *const Builder, x: u32, y: u32) bool {
+                    return match.keyLess(b.store, b.types, x, y);
+                }
+            }.lt);
+            break :blk @intCast(keys.items.len + 1);
+        };
+
+        const arms = try self.gpa.dupe(RegionId, spec.regions);
+        defer self.gpa.free(arms);
+        const p_keys = try self.gpa.dupe(u32, spec.aux);
+        defer self.gpa.free(p_keys);
+        const out_ty = try self.gpa.dupe(TyId, spec.tys);
+        defer self.gpa.free(out_ty);
+        // The inner tests, copied out of the store, which building grows.
+        const InnerTest = struct { keys: []u32, arms: []RegionId };
+        const inners = try self.gpa.alloc(?InnerTest, arms.len);
+        defer {
+            for (inners) |t| if (t) |x| {
+                self.gpa.free(x.keys);
+                self.gpa.free(x.arms);
+            };
+            self.gpa.free(inners);
+        }
+        for (inners, inner_of) |*t, slot| {
+            const inner = slot orelse {
+                t.* = null;
+                continue;
+            };
+            const n = self.store.node(inner);
+            t.* = .{ .keys = try self.gpa.dupe(u32, self.store.wordSlice(n.aux)), .arms = try self.gpa.dupe(RegionId, self.store.regionSlice(n.regions)) };
+        }
+
+        const q_arms = try self.gpa.alloc(RegionId, count);
+        defer self.gpa.free(q_arms);
+        const new_arms = try self.gpa.alloc(RegionId, arms.len);
+        defer self.gpa.free(new_arms);
+        for (q_arms, 0..) |*q_arm, c| {
+            q_arm.* = try self.openArmAt(q, keys.items, @intCast(c));
+            for (new_arms, arms, inners, 0..) |*na, old, inner, i| {
+                na.* = try self.openArmAt(p, p_keys, @intCast(i));
+                if (inner) |t| {
+                    // The inner arm for this constructor: the arm of its index, or for a key the test does not name, its default.
+                    const at = if (by_arm)
+                        c
+                    else if (c < keys.items.len)
+                        std.mem.findScalar(u32, t.keys, keys.items[c]) orelse t.keys.len
+                    else
+                        t.keys.len;
+                    try self.fillFrom(t.arms[at]);
+                } else try self.fillFrom(old);
+            }
+            const inner_switch = try self.switchOn(p, new_arms, &.{}, out_ty, p_keys);
+            try self.close(.{ .value = &.{inner_switch} });
+        }
+        self.algorithmFired(.interchange);
+        return try self.switchOn(q, q_arms, &.{}, out_ty, keys.items);
+    }
+
+    // N13r, case-of-case (normal-form 3.13): a switch on the output of a
+    // value switch `s` that stands in this region, where every arm of `s` ends
+    // in a known `Tag` or `Lit`, is `s` with each arm continuing into the
+    // outer arm its value selects. The outer arm is built in the arm of `s`,
+    // with the output standing for the value the arm gave, so N13a and N13c
+    // read its payloads and its own tests off it. Every test runs in the order
+    // it ran, and an outer arm runs in the cases it ran. An outer arm that
+    // two arms of `s` select would be copied, and the normal form shares such
+    // an arm in a join of `s`; an exiting switch carries one join, the code
+    // after it, so the rule does not apply there (plan 3.3, N13r).
+    fn caseOfCase(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        const outer_t = spec.args[0];
+        if (self.sole_reader != outer_t or !self.algorithmOn(.case_of_case)) return null;
+        // The output may be read through the `Unwrap`s of a nominal, which the
+        // arms built with `Wrap`s.
+        var t = outer_t;
+        var depth: u32 = 0;
+        while (self.nodeOf(t)) |n| {
+            if (n.op != .unwrap) break;
+            t = self.store.refSlice(n.args)[0];
+            depth += 1;
+        }
+        if (t.kind != .node or t.output != 0) return null;
+        const inner = self.store.node(t.nodeId());
+        if (inner.op != .switch_ or inner.region != self.current() or inner.tys.len != 1) return null;
+        const inner_arms = self.store.regionSlice(inner.regions);
+        if (inner_arms.len != inner.payload) return null;
+        const joins_given = spec.regions[spec.payload..];
+        if (spec.tys.len > 0 and joins_given.len != 0) return null;
+        if (spec.tys.len == 0 and joins_given.len > 1) return null;
+        for (spec.regions[0..spec.payload]) |r| {
+            if (spec.tys.len > 0 and self.armValue(r) == null) return null;
+        }
+
+        // The outer arm each inner arm selects, once each.
+        const known = try self.gpa.alloc(Ref, inner_arms.len);
+        defer self.gpa.free(known);
+        const selected = try self.gpa.alloc(u32, inner_arms.len);
+        defer self.gpa.free(selected);
+        const t_ty = self.store.refTy(self.row, outer_t);
+        for (inner_arms, known, selected) |arm, *v, *sel| {
+            v.* = self.armValue(arm) orelse return null;
+            for (0..depth) |_| {
+                const w = self.nodeOf(v.*) orelse return null;
+                if (w.op != .wrap) return null;
+                v.* = self.store.refSlice(w.args)[0];
+            }
+            const n = self.nodeOf(v.*) orelse return null;
+            sel.* = switch (n.op) {
+                .tag => self.types.memberIndex(t_ty, NameId.of(n.payload)) orelse return null,
+                .lit => blk: {
+                    const lit = self.store.lit(LitId.of(n.payload));
+                    switch (lit.value) {
+                        .bool_ => |b| break :blk @intFromBool(b),
+                        .int, .str => {
+                            const at = std.mem.findScalar(u32, spec.aux, n.payload) orelse break :blk @intCast(spec.aux.len);
+                            break :blk @intCast(at);
+                        },
+                        .float, .dec, .bytes => return null,
+                    }
+                },
+                .crash, .derived, .record, .tuple, .list, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => return null,
+            };
+        }
+        for (selected, 0..) |a, i| {
+            if (std.mem.findScalar(u32, selected[0..i], a) != null) return null;
+        }
+
+        // `s` rebuilt with the outer arms in its arms.
+        const outer = try self.gpa.dupe(RegionId, spec.regions[0..spec.payload]);
+        defer self.gpa.free(outer);
+        const joins = try self.gpa.dupe(RegionId, joins_given);
+        defer self.gpa.free(joins);
+        const keys = try self.gpa.dupe(u32, self.store.wordSlice(inner.aux));
+        defer self.gpa.free(keys);
+        const out_tys = try self.gpa.dupe(TyId, spec.tys);
+        defer self.gpa.free(out_tys);
+        const scrutinee = self.store.refSlice(inner.args)[0];
+        const new_arms = try self.gpa.alloc(RegionId, inner_arms.len);
+        defer self.gpa.free(new_arms);
+        for (new_arms, known, selected, 0..) |*arm, v, sel, i| {
+            arm.* = try self.openArmAt(scrutinee, keys, @intCast(i));
+            const value = try self.available(v);
+            const saved = self.case_subst;
+            self.case_subst = .{ .from = outer_t, .to = value };
+            defer self.case_subst = saved;
+            try self.fillFrom(outer[sel]);
+        }
+        self.algorithmFired(.case_of_case);
+        if (spec.tys.len == 0) return Ref.of(try self.exitingSwitch(scrutinee, new_arms, joins, keys));
+        return try self.switchOn(scrutinee, new_arms, &.{}, out_tys, keys);
+    }
+
+    // The switch an arm ends in, when the arm ends in exactly its one
+    // output, the switch has no joins, and its arms all end in a value.
+    fn topSwitch(self: *const Builder, arm: RegionId) ?NodeId {
+        const end = self.store.region(arm).end;
+        if (end.kind != .value) return null;
+        const refs = self.store.refSlice(end.refs);
+        if (refs.len != 1 or refs[0].kind != .node or refs[0].output != 0) return null;
+        const id = refs[0].nodeId();
+        const n = self.store.node(id);
+        if (n.op != .switch_ or n.region != arm or n.tys.len != 1) return null;
+        const regions = self.store.regionSlice(n.regions);
+        if (regions.len != n.payload) return null;
+        for (regions) |r| if (self.store.region(r).end.kind != .value) return null;
+        return id;
+    }
+
+    // Whether the position `q` can be read where the switch being built
+    // stands: its root is visible, and every payload on the way is of a tag
+    // that a dominating arm decided.
+    fn readable(self: *const Builder, q: Ref) bool {
+        var at = q;
+        while (at.kind == .node) {
+            const n = self.store.node(at.nodeId());
+            const arg = self.store.refSlice(n.args);
+            switch (n.op) {
+                .field, .index, .unwrap => {},
+                .payload => if (self.knownKey(arg[0]) != n.payload) return false,
+                .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .opt_field, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => break,
+            }
+            at = arg[0];
+        }
+        return self.visible(at);
     }
 
     // N7 over one literal switch (normal-form 3.7, 3.13). An arm that a
@@ -1390,15 +1936,9 @@ pub const Builder = struct {
         b: *const Builder,
         keys: []const u32,
 
-        // Integers by value, strings by their bytes.
+        // Integers by value, strings by their bytes (`match.keyLess`).
         fn lt(self: LitOrder, x: u32, y: u32) bool {
-            const a = self.b.store.lit(LitId.of(self.keys[x]));
-            const c = self.b.store.lit(LitId.of(self.keys[y]));
-            return switch (a.value) {
-                .int => litIntValue(self.b.types, a).? < litIntValue(self.b.types, c).?,
-                .str => |sa| std.mem.order(u8, self.b.store.byteSlice(sa), self.b.store.byteSlice(c.value.str)) == .lt,
-                .bool_, .float, .dec, .bytes => unreachable, // literal switch keys are ints or strings
-            };
+            return match.keyLess(self.b.store, self.b.types, self.keys[x], self.keys[y]);
         }
     };
 
@@ -1407,7 +1947,7 @@ pub const Builder = struct {
     fn litKnown(self: *Builder, scrutinee: Ref, excluded: *std.ArrayList(u32)) Allocator.Error!?LitId {
         if (self.nodeOf(scrutinee)) |n| if (n.op == .lit) return LitId.of(n.payload);
         for (self.facts.items) |f| {
-            if (f.ref != scrutinee) continue;
+            if (f.ref != scrutinee or f.loop != null) continue;
             if (f.lit) |l| return l;
             try excluded.appendSlice(self.gpa, self.store.wordSlice(f.excluded));
         }
@@ -1940,8 +2480,17 @@ pub const Builder = struct {
             },
             .identity => {
                 const n = self.nodeOf(ref) orelse return false;
-                if (n.op != .lit) return false;
                 const p = prims.get(ir.PrimId.of(root.payload));
+                // The identity of `List.concat` is the empty list, and of `Str.concat` the empty string.
+                if (p.method == .concat) return switch (p.owner) {
+                    .list => n.op == .list and n.args.len == 0,
+                    .str => n.op == .lit and switch (self.store.lit(LitId.of(n.payload)).value) {
+                        .str => |text| text.len == 0,
+                        .int, .float, .bool_, .dec, .bytes => false,
+                    },
+                    .bool_, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => false,
+                };
+                if (n.op != .lit) return false;
                 const want = prims.identityInt(p.owner.int() orelse return false, p.method) orelse return false;
                 return litIntValue(self.types, self.store.lit(LitId.of(n.payload))) == want;
             },
@@ -1977,7 +2526,10 @@ pub const Builder = struct {
                     .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => return false,
                 };
                 const args = self.store.refSlice(n.args);
-                return self.bindVar(c.bind, args[position], b);
+                // A record that leaves a member unset lists the members it
+                // sets, and a read of an unset member has no value to bind.
+                const at = if (n.op == .record) self.recordArgAt(n, position) orelse return false else position;
+                return self.bindVar(c.bind, args[at], b);
             },
             .bool_switch => |bs| {
                 const n = self.nodeOf(ref) orelse return false;
@@ -2009,7 +2561,7 @@ pub const Builder = struct {
     fn nodeOf(self: *const Builder, ref: Ref) ?ir.Node {
         return switch (ref.kind) {
             .node => self.store.node(ref.nodeId()),
-            .row_param, .region_param => null,
+            .row_param, .region_param, .input => null,
         };
     }
 
@@ -2021,13 +2573,13 @@ pub const Builder = struct {
     fn boundCondsHold(self: *Builder, b: *const Bindings) Allocator.Error!bool {
         for (b.conds) |c| {
             const bound = switch (c) {
-                .int_owner, .not_float_owner => |k| b.owners[k] != null,
+                .int_owner, .key_owner, .not_float_owner => |k| b.owners[k] != null,
                 .is_lit, .speculatable, .nonzero_lit, .polarity_flips, .same_ty, .lit_bool_switch, .not_lit => |k| b.vars[k] != null or b.lits[k] != null,
                 .movable => |k| b.regions[k] != null,
                 .movable_rest => |k| b.seqs[k] != null,
                 .speculatable_rest => |k| b.arg_seqs[k] != null,
                 // Its operands are the root's, checked once the rule matched.
-                .folds => false,
+                .folds, .folds_pair => false,
             };
             if (bound and !try self.condHolds(c, b)) return false;
         }
@@ -2042,12 +2594,13 @@ pub const Builder = struct {
                 .nonzero_lit => litNonzero(self.store.lit(l).value),
                 .same_ty => self.store.lit(l).ty == b.root.tys[0],
                 .polarity_flips, .lit_bool_switch, .not_lit => false,
-                .int_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds => unreachable, // these conditions are not literal-indexed, so the outer prong never selects them
+                .int_owner, .key_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds, .folds_pair => unreachable, // these conditions are not literal-indexed, so the outer prong never selects them
             },
-            .int_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds => {},
+            .int_owner, .key_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds, .folds_pair => {},
         }
         return switch (c) {
             .int_owner => |k| b.owners[k].?.int() != null,
+            .key_owner => |k| b.owners[k].?.int() != null or b.owners[k].? == .str,
             .not_float_owner => |k| b.owners[k].?.float() == null,
             .is_lit => |k| if (self.nodeOf(b.vars[k].?)) |n| n.op == .lit else false,
             .speculatable => |k| if (self.nodeOf(b.vars[k].?)) |n| n.flags.speculatable else true,
@@ -2070,36 +2623,72 @@ pub const Builder = struct {
                 break :blk true;
             },
             .polarity_flips => |k| polarity.flips(self.store, self.types, b.vars[k].?),
-            .folds => try self.foldOf(b.root) != null,
+            .folds => blk: {
+                const folded = try self.foldOf(b.root) orelse break :blk false;
+                if (folded == .str) self.gpa.free(folded.str);
+                break :blk true;
+            },
+            .folds_pair => |pair| blk: {
+                const folded = try self.foldPair(b, pair) orelse break :blk false;
+                if (folded == .str) self.gpa.free(folded.str);
+                break :blk true;
+            },
             .same_ty => |k| self.store.refTy(self.row, b.vars[k].?) == b.root.tys[0],
             .lit_bool_switch => |k| if (self.nodeOf(b.vars[k].?)) |n| n.op == .switch_ and n.aux.len > 0 and polarity.boolArms(self.store, self.types, n) != null else false,
             .not_lit => |k| if (self.nodeOf(b.vars[k].?)) |n| n.op != .lit else true,
         };
     }
 
+    // The root's builtin over the two literals the variables of `pair` bound.
+    fn foldPair(self: *const Builder, b: *const Bindings, pair: [2]table.Var) Allocator.Error!?prims.Folded {
+        const args = [2]Ref{ b.vars[pair[0]].?, b.vars[pair[1]].? };
+        return self.foldOf(.{ .op = .prim, .payload = b.root.payload, .args = &args, .tys = b.root.tys });
+    }
+
     // The value of the builtin `spec` builds over its literal operands, or
-    // null where it fails or its owner does not fold. Integers fold by the
-    // evaluator's arithmetic, which is exact; floats fold at S2, through the
-    // implementations in `src/builtins` (plan 1.9), and `Str` and `List`
-    // builtins with them.
+    // null where it fails or no literal of its owner folds. Integers fold by
+    // the evaluator's arithmetic, which is exact; floats fold by the IEEE
+    // operations of their type in strict float mode, with Roc's canonical
+    // `NaN` (`prims.foldFloat`), so the bits do not depend on the host; and
+    // `Str` folds its equality and its concatenation. A `str` result is owned
+    // by the caller.
     fn foldOf(self: *const Builder, spec: NodeSpec) Allocator.Error!?prims.Folded {
-        const p = prims.get(ir.PrimId.of(spec.payload));
+        // A builtin the table does not hold, or a function of another package,
+        // has no semantics to fold with.
+        const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;
         if (p.owner.int()) |int| {
             const ints = try self.gpa.alloc(i256, spec.args.len);
             defer self.gpa.free(ints);
             for (spec.args, ints) |a, *v| v.* = litIntValue(self.types, self.store.lit(LitId.of(self.nodeOf(a).?.payload))).?;
             return prims.foldIntAll(int, p.method, ints);
         }
-        var vals: [2]ir.Lit = undefined;
-        for (spec.args, vals[0..spec.args.len]) |a, *v| v.* = self.store.lit(LitId.of(self.nodeOf(a).?.payload));
+        const lits = try self.gpa.alloc(ir.Lit, spec.args.len);
+        defer self.gpa.free(lits);
+        for (spec.args, lits) |a, *v| v.* = self.store.lit(LitId.of(self.nodeOf(a).?.payload));
+        if (p.owner.float()) |float| {
+            const second: u64 = if (lits.len > 1) lits[1].value.float else 0;
+            return prims.foldFloat(float, p.method, lits[0].value.float, second);
+        }
         return switch (p.owner) {
             .bool_ => switch (p.method) {
-                .not => .{ .bool_ = !vals[0].value.bool_ },
-                .is_eq => .{ .bool_ = vals[0].value.bool_ == vals[1].value.bool_ },
+                .not => .{ .bool_ = !lits[0].value.bool_ },
+                .is_eq => .{ .bool_ = lits[0].value.bool_ == lits[1].value.bool_ },
                 .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable, // bool owners only have the not and is_eq folds
             },
-            .str, .list, .f32, .f64 => null,
-            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => unreachable, // integer owners fold through foldIntAll above
+            .str => switch (p.method) {
+                .is_eq => .{ .bool_ = std.mem.eql(u8, self.store.byteSlice(lits[0].value.str), self.store.byteSlice(lits[1].value.str)) },
+                // A chain N15a flattened concatenates every operand in order.
+                .concat => blk: {
+                    var out: std.ArrayList(u8) = .empty;
+                    errdefer out.deinit(self.gpa);
+                    for (lits) |l| try out.appendSlice(self.gpa, self.store.byteSlice(l.value.str));
+                    break :blk .{ .str = try out.toOwnedSlice(self.gpa) };
+                },
+                .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .len, .get => unreachable, // str owners only have the is_eq and concat folds
+            },
+            // A list literal is the embedded bytes of a file, whose elements the rules do not read.
+            .list => null,
+            .f32, .f64, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => unreachable, // number owners fold above
         };
     }
 
@@ -2107,11 +2696,7 @@ pub const Builder = struct {
     // of `-1` at `I128` and of the highest `U128` are one `u128`; only the
     // type tells them apart.
     fn litIntValue(types: *const types_mod.Types, lit: ir.Lit) ?i256 {
-        const bits = switch (lit.value) {
-            .int => |bits| bits,
-            .bool_, .float, .str, .dec, .bytes => return null,
-        };
-        return if (types.get(lit.ty).int.signed()) @as(i128, @bitCast(bits)) else bits;
+        return match.litIntValue(types, lit);
     }
 
     fn litNonzero(v: ir.LitValue) bool {
@@ -2146,7 +2731,7 @@ pub const Builder = struct {
                         defer self.gpa.free(run);
                         for (run) |a| try args.append(self.gpa, try self.available(a));
                     },
-                    .var_, .prim, .bool_switch, .and_, .or_, .region_value, .lit_bool, .lit_int, .folded, .negation, .lit_switch => try args.append(self.gpa, try self.instantiate(sub, b, tys)),
+                    .var_, .prim, .bool_switch, .and_, .or_, .region_value, .lit_bool, .lit_int, .folded, .folded_pair, .negation, .lit_switch => try args.append(self.gpa, try self.instantiate(sub, b, tys)),
                 };
                 // A chain of one operand is that operand, as a one-operand `And` is.
                 if (args.items.len == 1 and prims.associativeOf(pp.method)) return args.items[0];
@@ -2192,7 +2777,7 @@ pub const Builder = struct {
                 // node where no node holds it.
                 const key: u32 = switch (ls.key.*) {
                     .var_ => |k| if (b.lits[k]) |l| l.index() else self.nodeOf(try self.instantiate(ls.key.*, b, tys)).?.payload,
-                    .prim, .bool_switch, .and_, .or_, .region_value, .lit_bool, .lit_int, .folded, .rest, .negation, .lit_switch => self.nodeOf(try self.instantiate(ls.key.*, b, tys)).?.payload,
+                    .prim, .bool_switch, .and_, .or_, .region_value, .lit_bool, .lit_int, .folded, .folded_pair, .rest, .negation, .lit_switch => self.nodeOf(try self.instantiate(ls.key.*, b, tys)).?.payload,
                 };
                 const keys = [_]u32{key};
                 var arms: [2]RegionId = undefined;
@@ -2208,11 +2793,22 @@ pub const Builder = struct {
                 }
                 return self.switchOn(scrutinee, &arms, &.{}, tys, &keys);
             },
-            .folded => return switch ((try self.foldOf(b.root)).?) {
-                .bool_ => |v| self.litBool(v),
-                .int => |v| self.litRef(tys[0], .{ .int = @truncate(@as(u256, @bitCast(v))) }),
-            },
+            .folded => return self.literalOf((try self.foldOf(b.root)).?, tys[0]),
+            .folded_pair => |pair| return self.literalOf((try self.foldPair(b, pair)).?, tys[0]),
         }
+    }
+
+    // The literal of type `ty` that holds a folded value.
+    fn literalOf(self: *Builder, folded: prims.Folded, ty: TyId) Allocator.Error!Ref {
+        return switch (folded) {
+            .bool_ => |v| self.litBool(v),
+            .int => |v| self.litRef(ty, .{ .int = @truncate(@as(u256, @bitCast(v))) }),
+            .float => |bits| self.litRef(ty, .{ .float = bits }),
+            .str => |text| {
+                defer self.gpa.free(text);
+                return self.litStr(text);
+            },
+        };
     }
 
     /// The negation of `ref`, built in the current region with the
@@ -2321,9 +2917,10 @@ pub const Builder = struct {
     /// when its node or parameter is visible here, else a copy built here,
     /// with every region the copied nodes own copied too.
     pub fn available(self: *Builder, ref: Ref) Allocator.Error!Ref {
+        if (self.case_subst) |sub| if (ref == sub.from) return sub.to;
         if (self.visible(ref)) return ref;
         switch (ref.kind) {
-            .row_param => unreachable, // a row parameter is visible in every region of its own row
+            .row_param, .input => unreachable, // a row parameter or a slot is visible in every region of its own row
             .region_param => {
                 if (self.param_subst.get(ref.regionId())) |values| return values[ref.output];
                 const c = self.region_copy.items[ref.target];
@@ -2342,7 +2939,7 @@ pub const Builder = struct {
     fn visible(self: *const Builder, ref: Ref) bool {
         const here = self.current();
         return switch (ref.kind) {
-            .row_param => true,
+            .row_param, .input => true,
             .region_param => self.store.encloses(ref.regionId(), here),
             .node => self.store.encloses(self.store.nodes.items(.region)[ref.target], here),
         };
@@ -2399,6 +2996,7 @@ pub const Builder = struct {
                     .join, .loop_body, .lambda_body => try self.openRegion(kind, params),
                     .row_body => unreachable, // row_body regions are never owned by a node
                 };
+                if (kind == .loop_body and nd.op == .for_list) try self.noteListLoop(regions[i], args[0]);
                 self.region_copy.items[old.index()] = regions[i];
                 try self.fillFrom(old);
             }
@@ -2453,7 +3051,7 @@ pub const Builder = struct {
         defer stack.deinit(self.gpa);
         for (regions) |r| try self.pushEnd(&stack, r);
         while (stack.pop()) |ref| switch (ref.kind) {
-            .row_param, .region_param => {},
+            .row_param, .region_param, .input => {},
             .node => {
                 const n = ref.nodeId();
                 if (!self.inRegions(regions, n)) {
@@ -2806,6 +3404,55 @@ test "N13i: a switch on a negation swaps its arms, and knocking out N13i and N13
     const kept = f.store.node((try f.b.switchOn(nc, &.{ b0, b1 }, &.{}, &.{i64_ty}, &.{})).nodeId());
     try testing.expectEqual(nc, f.store.refSlice(kept.args)[0]);
     try f.b.endRow(.{ .value = &.{Ref.rowParam(1)} });
+}
+
+test "the critical pair of N13q and N13i: a switch on the negation of an integer comparison is one switch by either rule, and each knockout stops its rule" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const i64_ty = try f.types.intTy(.i64);
+    _ = try f.b.beginRow(&.{ i64_ty, i64_ty, i64_ty, i64_ty }, i64_ty);
+    const a = Ref.rowParam(0);
+    const b = Ref.rowParam(1);
+    const lt = try f.b.call(.i64, .is_lt, &.{ a, b });
+    // The negation as written: N13i takes the switch.
+    f.b.hooks.rules_off = true;
+    const negated = try f.b.call(.bool_, .not, &.{lt});
+    f.b.hooks.rules_off = false;
+    // The negation rewritten first: N13q takes the prim, then the switch.
+    const lte = try f.b.call(.bool_, .not, &.{lt});
+    try testing.expectEqual(try f.b.call(.i64, .is_lte, &.{ b, a }), lte);
+    const Arms = struct {
+        fn on(fx: *Fixture, scrutinee: Ref, ty: TyId) !Ref {
+            const a0 = try fx.b.openArm(scrutinee, 0);
+            try fx.b.close(.{ .value = &.{Ref.rowParam(2)} });
+            const a1 = try fx.b.openArm(scrutinee, 1);
+            try fx.b.close(.{ .value = &.{Ref.rowParam(3)} });
+            return fx.b.switchOn(scrutinee, &.{ a0, a1 }, &.{}, &.{ty}, &.{});
+        }
+    };
+    const by_i = try Arms.on(&f, negated, i64_ty);
+    const by_q = try Arms.on(&f, lte, i64_ty);
+    for ([_]Ref{ by_i, by_q }) |sw| {
+        const n = f.store.node(sw.nodeId());
+        try testing.expectEqual(lt, f.store.refSlice(n.args)[0]);
+        try testing.expectEqual(Ref.rowParam(3), armOf(&f.b, sw, 0));
+        try testing.expectEqual(Ref.rowParam(2), armOf(&f.b, sw, 1));
+    }
+    var cmp: equal.Comparison = .{ .gpa = testing.allocator, .store = &f.store };
+    defer cmp.deinit();
+    try testing.expect(try cmp.values(by_i, by_q));
+
+    // With N13i and N13s knocked out the switch on the negation stays; with
+    // the switch half of N13q knocked out the switch on `is_lte` stays.
+    f.b.hooks.knocked_out[switchRuleIndex("N13i", .{ .region = 0 })] = true;
+    f.b.hooks.knocked_out[ruleIndex("N13s", .switch_)] = true;
+    const kept_negated = try Arms.on(&f, negated, i64_ty);
+    try testing.expectEqual(negated, f.store.refSlice(f.store.node(kept_negated.nodeId()).args)[0]);
+    f.b.hooks.knocked_out[ruleIndex("N13q", .switch_)] = true;
+    const kept_lte = try Arms.on(&f, lte, i64_ty);
+    try testing.expectEqual(lte, f.store.refSlice(f.store.node(kept_lte.nodeId()).args)[0]);
+    try f.b.endRow(.{ .value = &.{by_i} });
 }
 
 test "N13c and N13g: a switch on a known tag is that tag's arm, one on any union with equal arms is the arm, and the knockouts stop them" {
@@ -3817,6 +4464,103 @@ test "N15c: a literal operand of integer is_eq, plus and times goes last, and tw
     try f.b.endRow(.{ .value = &.{p(0)} });
 }
 
+test "N13j over floats: a fold is the IEEE result of the type, with Roc's one NaN and the bits of a negative zero" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const f64_ty = try f.types.floatTy(.f64);
+    const f32_ty = try f.types.floatTy(.f32);
+    const bool_ty = try f.types.boolTy();
+    _ = try f.b.beginRow(&.{}, bool_ty);
+    const lit = struct {
+        fn at(x: *Fixture, ty: TyId, bits: u64) Allocator.Error!Ref {
+            return x.b.litFloatBits(ty, bits);
+        }
+    }.at;
+    // 1.5 + 2.25 = 3.75
+    try testing.expectEqual(try lit(&f, f64_ty, 0x400e000000000000), try f.b.call(.f64, .plus, &.{ try lit(&f, f64_ty, 0x3ff8000000000000), try lit(&f, f64_ty, 0x4002000000000000) }));
+    // 0.1 + 0.2 is not 0.3 in F64, and is 0.3 rounded in F32.
+    try testing.expectEqual(try lit(&f, f64_ty, 0x3fd3333333333334), try f.b.call(.f64, .plus, &.{ try lit(&f, f64_ty, 0x3fb999999999999a), try lit(&f, f64_ty, 0x3fc999999999999a) }));
+    try testing.expectEqual(try lit(&f, f32_ty, 0x3e99999a), try f.b.call(.f32, .plus, &.{ try lit(&f, f32_ty, 0x3dcccccd), try lit(&f, f32_ty, 0x3e4ccccd) }));
+    // inf - inf is the canonical NaN of the type.
+    try testing.expectEqual(try lit(&f, f64_ty, 0x7ff8000000000000), try f.b.call(.f64, .minus, &.{ try lit(&f, f64_ty, 0x7ff0000000000000), try lit(&f, f64_ty, 0x7ff0000000000000) }));
+    try testing.expectEqual(try lit(&f, f32_ty, 0x7fc00000), try f.b.call(.f32, .minus, &.{ try lit(&f, f32_ty, 0x7f800000), try lit(&f, f32_ty, 0x7f800000) }));
+    // -0.0 * 1.0 keeps the sign bit.
+    try testing.expectEqual(try lit(&f, f64_ty, 0x8000000000000000), try f.b.call(.f64, .times, &.{ try lit(&f, f64_ty, 0x8000000000000000), try lit(&f, f64_ty, 0x3ff0000000000000) }));
+    // Comparisons follow IEEE: NaN equals nothing, and -0.0 equals 0.0.
+    const nan = try lit(&f, f64_ty, 0x7ff8000000000000);
+    try testing.expectEqual(try f.b.litBool(false), try f.b.call(.f64, .is_eq, &.{ nan, nan }));
+    try testing.expectEqual(try f.b.litBool(false), try f.b.call(.f64, .is_lt, &.{ nan, try lit(&f, f64_ty, 0) }));
+    try testing.expectEqual(try f.b.litBool(true), try f.b.call(.f64, .is_eq, &.{ try lit(&f, f64_ty, 0x8000000000000000), try lit(&f, f64_ty, 0) }));
+    try f.b.endRow(.{ .value = &.{try f.b.litBool(true)} });
+}
+
+test "N13j over Str: equality and concatenation of literals fold, and the knockout stops them" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const str_ty = try f.types.strTy();
+    const bool_ty = try f.types.boolTy();
+    _ = try f.b.beginRow(&.{}, bool_ty);
+    try testing.expectEqual(try f.b.litBool(true), try f.b.call(.str, .is_eq, &.{ try f.b.litStr("ab"), try f.b.litStr("ab") }));
+    try testing.expectEqual(try f.b.litBool(false), try f.b.call(.str, .is_eq, &.{ try f.b.litStr("ab"), try f.b.litStr("abc") }));
+    try testing.expectEqual(try f.b.litStr("abc"), try f.b.call(.str, .concat, &.{ try f.b.litStr("ab"), try f.b.litStr("c") }));
+    _ = str_ty;
+    f.b.hooks.knocked_out[ruleIndexArgs("N13j", .prim, 0)] = true;
+    f.b.hooks.knocked_out[ruleIndexArgs("N13j", .prim, 1)] = true;
+    const kept = try f.b.call(.str, .is_eq, &.{ try f.b.litStr("x"), try f.b.litStr("x") });
+    try testing.expect(f.store.node(kept.nodeId()).op == .prim);
+    try f.b.endRow(.{ .value = &.{try f.b.litBool(true)} });
+}
+
+test "N13j in a chain: two adjacent literals fold into one, and a Str literal goes last in an equality" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const u64_ty = try f.types.intTy(.u64);
+    const str_ty = try f.types.strTy();
+    _ = try f.b.beginRow(&.{ u64_ty, str_ty }, u64_ty);
+    const p = Ref.rowParam;
+    // p0 +% 1 +% 2 is p0 +% 3, in either grouping.
+    const left = try f.b.call(.u64, .plus_wrap, &.{ try f.b.call(.u64, .plus_wrap, &.{ p(0), try f.b.litInt(u64_ty, 1) }), try f.b.litInt(u64_ty, 2) });
+    const right = try f.b.call(.u64, .plus_wrap, &.{ p(0), try f.b.litInt(u64_ty, 3) });
+    try testing.expectEqual(right, left);
+    // "a" == p1 is p1 == "a".
+    const lit = try f.b.litStr("a");
+    const swapped = try f.b.call(.str, .is_eq, &.{ lit, p(1) });
+    try testing.expectEqualSlices(Ref, &.{ p(1), lit }, f.store.refSlice(f.store.node(swapped.nodeId()).args));
+    try f.b.endRow(.{ .value = &.{left} });
+    try verifyOk(&f);
+}
+
+test "N13d on Bool.not: a negation of a Bool an earlier And operand decided is the opposite literal, and the knockout stops it" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const bool_ty = try f.types.boolTy();
+    _ = try f.b.beginRow(&.{bool_ty}, bool_ty);
+    const p = Ref.rowParam(0);
+    // p and !p: the second operand sees p true, so it is False, and False absorbs.
+    const r = try f.b.openOperand(&.{p}, .and_);
+    const negated = try f.b.call(.bool_, .not, &.{p});
+    try testing.expectEqual(try f.b.litBool(false), negated);
+    try testing.expectEqual(@as(u32, 1), f.b.hooks.algorithms_fired.get(.decided_not));
+    try f.b.close(.{ .value = &.{negated} });
+    try f.b.endRow(.{ .value = &.{try f.b.andOf(p, &.{r})} });
+
+    var g: Fixture = undefined;
+    g.init();
+    defer g.deinit();
+    g.b.hooks.algorithms_off.insert(.decided_not);
+    const g_bool = try g.types.boolTy();
+    _ = try g.b.beginRow(&.{g_bool}, g_bool);
+    _ = try g.b.openOperand(&.{Ref.rowParam(0)}, .and_);
+    const kept = try g.b.call(.bool_, .not, &.{Ref.rowParam(0)});
+    try testing.expect(g.store.node(kept.nodeId()).op == .prim);
+    try g.b.close(.{ .value = &.{kept} });
+    try g.b.endRow(.{ .value = &.{Ref.rowParam(0)} });
+}
+
 test "N13n mirrors: a match on x == k meets the And an if on x == k is, and the nested if N7d merges, and their knockout stops them" {
     var f: Fixture = undefined;
     f.init();
@@ -4231,4 +4975,24 @@ test "N8c: a closure of a row that only calls another with its parameters is a c
         try testing.expectEqual(swapped.index(), f.store.node(d.nodeId()).payload);
         try verifyOk(&f);
     }
+}
+
+test "N18b: a field of an input slot is a slot, and one projection written twice is one slot" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const i64_ty = try f.types.intTy(.i64);
+    const bool_ty = try f.types.boolTy();
+    const rec_ty = try f.types.recordTy(&.{ .{ .name = "x", .ty = i64_ty }, .{ .name = "y", .ty = bool_ty } });
+    _ = try f.b.beginRow(&.{}, i64_ty);
+    const whole = try f.b.input(rec_ty, 0);
+    const x = try f.b.field(whole, 0);
+    const x_again = try f.b.field(try f.b.input(rec_ty, 0), 0);
+    try testing.expectEqual(Ref.Kind.input, x.kind);
+    try testing.expectEqual(x, x_again);
+    try testing.expect(x != whole);
+    // The whole record and its field `x`: no node reads either.
+    try testing.expectEqual(@as(usize, 2), f.store.slots.items.len);
+    try testing.expectEqual(i64_ty, f.store.slots.items[x.slotId().index()].ty);
+    try f.b.endRow(.{ .value = &.{x} });
 }

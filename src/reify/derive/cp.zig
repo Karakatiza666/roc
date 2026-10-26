@@ -54,15 +54,31 @@ pub const Status = enum { joined, unjoined };
 /// Every critical pair of the first-order rows, with `knocked_out` rows disabled
 /// both as sources of pairs and in the normalizer.
 pub fn all(arena: Allocator, gpa: Allocator, knocked_out: []const bool) Allocator.Error![]Pair {
+    return among(arena, gpa, knocked_out, null);
+}
+
+/// The critical pairs `all` gives whose two rows `rows` both marks, or every
+/// pair where it is null. Each pair is the one `all` gives: `knocked_out`
+/// still disables rows in the normalizer, and `rows` only says which pairs
+/// to check. A knockout test asks about a few pairs of rows, and checking
+/// every pair under each knockout is most of the derivation tests' time.
+pub fn among(arena: Allocator, gpa: Allocator, knocked_out: []const bool, rows: ?[]const bool) Allocator.Error![]Pair {
     var out: std.ArrayList(Pair) = .empty;
+    // What one instance builds that its pair does not keep: the instance's
+    // terms and normal forms, copied into `arena` for a pair that is kept.
+    // Most instances keep nothing, and the literal choices make many.
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
     const lits = try namedLits(arena);
     for (table.rules, 0..) |outer, oi| {
         if (outer.tier != .first_order or knocked_out[oi]) continue;
+        if (rows) |only| if (!only[oi]) continue;
         for (try term.instances(arena, outer), 0..) |lo, ok| {
             var paths: std.ArrayList([]const u8) = .empty;
             try positions(arena, lo.lhs, &.{}, &paths);
             for (table.rules, 0..) |inner, ii| {
                 if (inner.tier != .first_order or knocked_out[ii]) continue;
+                if (rows) |only| if (!only[ii]) continue;
                 for (try term.instances(arena, inner), 0..) |li, ik| {
                     const offset = @max(lo.lhs.varBound(), 1);
                     const owner_offset = table.ownerVarCount(outer);
@@ -82,13 +98,26 @@ pub fn all(arena: Allocator, gpa: Allocator, knocked_out: []const bool) Allocato
                         const choice = try arena.alloc(usize, lit_vars.items.len);
                         @memset(choice, 0);
                         while (true) {
-                            const si = try withLits(arena, s, lit_vars.items, choice, lits);
-                            const peak = try si.apply(arena, lo.lhs);
-                            const left = try si.apply(arena, lo.rhs);
-                            const right = try si.apply(arena, try term.replaceAt(arena, lo.lhs, path, inner_rhs));
+                            _ = scratch.reset(.retain_capacity);
+                            const sa = scratch.allocator();
+                            const si = try withLits(sa, s, lit_vars.items, choice, lits);
+                            const peak = try si.apply(sa, lo.lhs);
+                            const left = try si.apply(sa, lo.rhs);
+                            const right = try si.apply(sa, try term.replaceAt(sa, lo.lhs, path, inner_rhs));
                             const probe: Probe = .{ .outer = oi, .inner = ii, .path = path };
-                            if (try joins(arena, gpa, si, peak, left, right, knocked_out, probe)) |j| {
-                                try out.append(arena, .{ .outer = oi, .inner = ii, .outer_instance = ok, .inner_instance = ik, .path = path, .peak = peak, .left = left, .right = right, .status = if (j.same) .joined else .unjoined, .normal = j.normal });
+                            if (try joins(sa, gpa, si, peak, left, right, knocked_out, probe)) |j| {
+                                try out.append(arena, .{
+                                    .outer = oi,
+                                    .inner = ii,
+                                    .outer_instance = ok,
+                                    .inner_instance = ik,
+                                    .path = path,
+                                    .peak = try term.dupe(arena, peak),
+                                    .left = try term.dupe(arena, left),
+                                    .right = try term.dupe(arena, right),
+                                    .status = if (j.same) .joined else .unjoined,
+                                    .normal = .{ try term.dupe(arena, j.normal[0]), try term.dupe(arena, j.normal[1]) },
+                                });
                             }
                             if (!nextChoice(choice, lits.len)) break;
                         }
@@ -129,13 +158,17 @@ fn resolvedOwner(s: term.Subst, k: u8) prims.Owner {
 fn checkConds(arena: Allocator, s: term.Subst, rule: table.Rule, rt: term.RuleTerms, var_offset: term.Var, owner_offset: u8) Allocator.Error!bool {
     for (rule.conds) |c| switch (c) {
         .int_owner => |k| if (resolvedOwner(s, k + owner_offset).int() == null) return false,
+        .key_owner => |k| {
+            const o = resolvedOwner(s, k + owner_offset);
+            if (o.int() == null and o != .str) return false;
+        },
         .not_float_owner => |k| if (resolvedOwner(s, k + owner_offset).float() != null) return false,
         .polarity_flips => |k| if (rt.shapes[k]) |f| {
             if (!term.polarityFlips(try s.apply(arena, try term.shift(arena, f, var_offset, owner_offset)))) return false;
         },
         .is_lit, .speculatable, .nonzero_lit, .movable, .movable_rest, .speculatable_rest, .same_ty, .lit_bool_switch, .not_lit => {},
         // Only an evaluation row folds, and `all` pairs first-order rows.
-        .folds => unreachable, // only an evaluation row folds, and `all` pairs first-order rows
+        .folds, .folds_pair => unreachable, // only an evaluation row folds, and `all` pairs first-order rows
     };
     return true;
 }
@@ -148,8 +181,8 @@ fn literalVars(arena: Allocator, s: term.Subst, rule: table.Rule, var_offset: te
             .var_ => |v| if (std.mem.findScalar(term.Var, out.items, v) == null) try out.append(arena, v),
             .app => {},
         },
-        .int_owner, .not_float_owner, .speculatable, .speculatable_rest, .same_ty, .movable, .movable_rest, .polarity_flips, .lit_bool_switch, .not_lit => {},
-        .folds => unreachable, // only an evaluation row folds, and `all` pairs first-order rows
+        .int_owner, .key_owner, .not_float_owner, .speculatable, .speculatable_rest, .same_ty, .movable, .movable_rest, .polarity_flips, .lit_bool_switch, .not_lit => {},
+        .folds, .folds_pair => unreachable, // only an evaluation row folds, and `all` pairs first-order rows
     };
 }
 
@@ -399,7 +432,8 @@ const Materializer = struct {
                 const want = expected orelse i64_ty;
                 switch (x.sym.op) {
                     .lit => {
-                        if (x.sym.int == null) return self.types.boolTy();
+                        // A literal with neither integer nor Bool is the empty string.
+                        if (x.sym.int == null) return if (x.sym.lit == null) self.types.strTy() else self.types.boolTy();
                         switch (self.types.get(want)) {
                             .int, .float => {},
                             .bool_, .dec, .str, .record, .tuple, .tag_union, .list, .nominal, .opaque_, .recursive, .func => self.ill_typed = true,
@@ -473,7 +507,9 @@ const Materializer = struct {
                         _ = try self.infer(x.args[0], backing);
                         return e;
                     },
-                    .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
+                    // The empty `List` that is the identity of `List.concat`.
+                    .list => return self.types.listTy(try self.types.intTy(.i64)),
+                    .crash, .derived, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
                 }
             },
         }
@@ -610,7 +646,8 @@ const Materializer = struct {
                 for (x.args, a, 0..) |arg, *r, i| r.* = try self.buildArg(i, arg, operand_ty);
                 const b = self.b;
                 return switch (x.sym.op) {
-                    .lit => if (x.sym.int) |n| b.litInt(want orelse try self.types.intTy(.i64), n) else b.litBool(x.sym.lit.?),
+                    .lit => if (x.sym.int) |n| b.litInt(want orelse try self.types.intTy(.i64), n) else if (x.sym.lit) |v| b.litBool(v) else b.litStr(""),
+                    .list => b.listOf(try self.types.listTy(try self.types.intTy(.i64)), &.{}),
                     .prim => b.call(self.owner(x.sym.owner.?), x.sym.method.?, a),
                     .field => b.field(a[0], 0),
                     .index => b.index(a[0], 0),
@@ -621,7 +658,7 @@ const Materializer = struct {
                     .wrap => b.wrap(try self.types.nominalTy("N", self.refTy(a[0])), a[0]),
                     .unwrap => b.unwrap(a[0]),
                     .switch_, .and_, .or_ => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
-                    .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
+                    .crash, .derived, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
                 };
             },
         }
@@ -681,9 +718,12 @@ test "knocking out the is_lte half of N13q leaves the pair with N13h unjoined" {
     defer arena.deinit();
     var knocked: [table.count]bool = @splat(false);
     knocked[rowIndex("N13q", .is_lte)] = true;
-    const pairs = try all(arena.allocator(), testing.allocator, &knocked);
     const n13h = rowIndex("N13h", .not);
     const n13q = rowIndex("N13q", .is_lt);
+    var rows: [table.count]bool = @splat(false);
+    rows[n13h] = true;
+    rows[n13q] = true;
+    const pairs = try among(arena.allocator(), testing.allocator, &knocked, &rows);
     var found = false;
     for (pairs) |p| {
         if (p.outer == n13h and p.inner == n13q) {
@@ -705,7 +745,7 @@ fn isMirror(r: table.Rule) bool {
 fn negatesFirst(t: table.Tmpl) bool {
     return switch (t) {
         .and_, .or_ => |ops| ops[0] == .value and ops[0].value.* == .prim,
-        .var_, .prim, .bool_switch, .region_value, .lit_bool, .lit_int, .negation, .folded, .rest, .lit_switch => false,
+        .var_, .prim, .bool_switch, .region_value, .lit_bool, .lit_int, .negation, .folded, .folded_pair, .rest, .lit_switch => false,
     };
 }
 
@@ -742,16 +782,25 @@ test "criterion 2: knocking out the mirrors, or the switch half of N13q with N13
     // N13s knocks out with the switch half, which it generalizes.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
+    // Only pairs of the rows the criterion names are checked
+    // (`knockoutUnjoins` reads no other); the step 1 test in triage.zig
+    // checks every pair of the full table.
     const none: [table.count]bool = @splat(false);
-    const full = try all(arena.allocator(), testing.allocator, &none);
+    var named: [table.count]bool = @splat(false);
+    for (table.rules, 0..) |r, i| {
+        for ([_][]const u8{ "N7d", "N13i", "N13q", "N13o" }) |step| {
+            if (std.mem.eql(u8, r.step, step)) named[i] = true;
+        }
+    }
+    const full = try among(arena.allocator(), testing.allocator, &none, &named);
     var mirrors: [table.count]bool = @splat(false);
     var switch_half: [table.count]bool = @splat(false);
     for (table.rules, 0..) |r, i| {
         mirrors[i] = isMirror(r);
         switch_half[i] = isSwitchHalf(r);
     }
-    const without_mirrors = try all(arena.allocator(), testing.allocator, &mirrors);
-    const without_switch_half = try all(arena.allocator(), testing.allocator, &switch_half);
+    const without_mirrors = try among(arena.allocator(), testing.allocator, &mirrors, &named);
+    const without_switch_half = try among(arena.allocator(), testing.allocator, &switch_half, &named);
     try testing.expect(knockoutUnjoins(full, without_mirrors, "N7d", "N13i"));
     try testing.expect(knockoutUnjoins(full, without_mirrors, "N7d", "N13q"));
     try testing.expect(knockoutUnjoins(full, without_mirrors, "N13o", "N13i"));

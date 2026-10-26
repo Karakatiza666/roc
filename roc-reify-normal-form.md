@@ -125,12 +125,13 @@ report it (7.2).
 
 ```
 Code(fn)
+ ├─ slots             the types of the root's input slots, in slot order (3.18)
  ├─ rows              canonical order, root first
  │   └─ row f_i
  │       ├─ params    positional: p0, p1, ...; types only
  │       ├─ body      a region
  │       │   ├─ nodes n0, n1, ...    one def per operation, in canonical order
- │       │   │   └─ node = op + args (refs to params, earlier nodes, slots) + type + speculatable
+ │       │   │   └─ node = op + args (refs to params, earlier nodes, slots, inputs) + type + speculatable
  │       │   │        op ∈ Lit | Prim | Call(row) | Closure(row) | Record | Tuple | List | Tag
  │       │   │             | Wrap | Unwrap | Field | Index | Payload | Elem | OptField
  │       │   │             | Switch(arms, joins), with one output per value it delivers
@@ -259,12 +260,14 @@ it names a parameter by the region that binds it, so two arms that bind equal
 regions of their own digest apart.
 
 Every rule in the simplify phase decreases one measure, ordered
-lexicographically: first the number of loops (N16 removes loops), then the
-number of general `Loop`s (N11 raises them to `ForRange` and `ForList`), then
-aggregate-typed parameters and slots (N14), then loop slots (N11o), then
-`Apply` nodes (N8i), then switches (N7, and N13's case-of-case), then
+lexicographically: first the calls a row makes to itself when N12 applies to it
+(N12 removes them all at the price of one loop), then the number of loops (N16
+removes loops), then the number of general `Loop`s (N11 raises them to `ForRange` and `ForList`), then
+aggregate-typed parameters and slots (N14), then the slots and outputs of loops (N11g to N11j, N11o), then the
+`Return` terminators on the paths of loops (N11j turns one into `Break`), then
+`Apply` nodes (N8i), then the tests in an order `match.before` rejects (N7b hoists them), then switches (N7, and N13's case-of-case), then
 `Bool.not` nodes over an `And`, an `Or` or a `Bool` switch (N13t), then calls
-of a row that only calls another row over its parameters (N8c), then nodes,
+of a row that only calls another row over its parameters (N8c), then `List.get` calls (N13m turns a bounded one into `Ok(Elem(..))`, which adds nodes), then nodes,
 where each read of a parameter counts as one
 (N13, N15, N11), then `is_gt` and `is_gte` nodes (N1l), then the integer
 `is_lte` leaves of scrutinees (N13q), then the `Bool` switches whose
@@ -329,6 +332,12 @@ goes the rest of the way:
 | `{ ..r, y: 3 }` | `Record` with `y: 3` and `Field(r, f)` for every other field `f` of the type; reified bodies are monomorphic (proposal rule 4), so the field set is closed and known |
 | a record literal that omits a field declared `port : U16 ?? 8080` | the same `Record` with `port: 8080` written in, so omitting a default and writing it are one form |
 | `.port` read from a type with a default | `Field(port)`, because every construction now carries the field |
+| `{ a: v, b: _ }`, or `{ a: v }`, where `b` is `b ?: T` | a `Record` that sets `a` only: its arguments are the fields it sets, and `aux` lists their positions in the type's order. A node that sets every field lists none |
+| `{ ..r, a: v }` where `r` has an optional field `b` | a `Switch` on `Unwrap(OptField(r, b))`: the `Ok` arm is a `Record` that sets `b` to the payload, the `Err` arm one that leaves it unset. One level of switch for each such field |
+| `{ a, ..rest }` in a pattern | `rest` is the `Record` of the fields the pattern did not name, each read with `Field` from the matched record, or by the `OptField` switch above for an optional field |
+| `r.?a.b`, `r.?a.?b` | a `Switch` on `Unwrap(OptField(r, a))` whose `Err` arm is `Err(MissingField)` of the path's `Try` and whose `Ok` arm reads the rest. A last optional segment is its own `OptField`, whose `Try` is the path's |
+| `"a${x}b${y}"` as a pattern | `Prim("Str.starts_with")` and `Prim("Str.drop_prefix")` for the prefix, `Prim("Str.split_first")` and a `Switch` on its `Try` for each delimiter, and `Prim("Str.is_empty")` for an exact end |
+| a literal of your own type whose `from_numeral` or `from_quote` is a Roc function | a `Call` of its row, with the `Num.Numeral` the compiler builds as the argument, then a `Switch` on the `Try`: the `Ok` payload is the value, and the `Err` arm is a `Crash` |
 | `expect cond` inside a body | nothing: an assertion for Roc's own test run has no meaning in a target (`roc-reify-proposal.md:1187-1192`) |
 
 Evaluation order inside one operation follows the operator's definition, so
@@ -470,7 +479,18 @@ only on which arm each input reaches:
    that established them, numbered by N9.
 
 N7 is defined over nested `Switch` nodes, not over patterns, which are gone
-after the walk. The walk builds a `match` as a cascade of switches in source
+after the walk. N7b covers the part of a tree that N7a does not: `Builder.interchange`
+(`src/reify/builder.zig`) takes a value switch with one output whose arm ends
+in a switch on a position of the same root that `match.before` puts before the
+position the switch tests, and builds the switch on that position first. Each of
+its arms holds the inner arm for that constructor, or a copy of the arm that
+does not test it. The positions go in the order of the field index, then the tag
+name, then the payload index. It leaves alone two `Bool` switches (N7d and
+N13o own their order), switches on different roots (the parameter half of N15c
+orders them, at M11), a guard, which is not a position, and a switch with a
+join or with more than one output. It never copies an arm that holds a loop, an `Apply`, a `Lambda` or a `Closure` (`match.copyable`), because the measure counts those before the switches a copy adds. `match.inversions` counts the tests left
+out of order in a switch whose arms it may copy, and the measure above uses it before it counts switches, because
+copying an arm adds switches. The walk builds a `match` as a cascade of switches in source
 order, where the first arm whose tests hold wins, and N7 rebuilds every
 tree of switches whose scrutinees are positions of one node into the canonical
 tree. So the rule also applies to trees that exist only after simplification:
@@ -660,6 +680,7 @@ alone:
 | a switch's joins | the order the walk of its arms, in the order of 3.7, first reaches each join |
 | rows | the order the walk first reaches a `Call` or `Closure` of each row, starting from the root; a component's members together, by their 3.8 positions |
 | record fields | the type's field order, by name |
+| input slots | the order in which the root first reads each slot: its nodes in index order, each node's arguments and then the ends of the regions it holds, and the body's end last (3.18) |
 
 A walk that starts at the result numbers operands before their users, so every
 def precedes its uses, which is the order a translator emits statements in.
@@ -695,7 +716,7 @@ terminator rather than a value:
 
 ```
 ForRange(start, end, inclusive, slots, body)   body params: the index, then the slots
-ForList(list, slots, body)                     body params: the element, the index, then the slots
+ForList(list, slots, body)                     body params: the index, the element, then the slots
 Loop(slots, body)                              body params: the slots
 
   slots   initial values, one per state slot
@@ -707,6 +728,14 @@ Loop(slots, body)                              body params: the slots
 
 `Return` can end a path of any region of a row, inside a loop or not.
 `Continue` and `Break` end paths of a loop body only.
+
+`ForRange` and `ForList` deliver their slots when the indices run out, and a
+`Break` carries them too, so a bounded loop has one output per slot. A
+general `Loop` ends only through `Break` or `Return`, so what it delivers is
+what its `Break`s carry, and its outputs are its own: the node lists their
+types, `Break` has one value for each, and they need not be the slots. This
+is what lets a tail-recursive row (3.12) be a `Loop` that delivers the row's
+result and no slot.
 
 `ForRange` runs its body once for each index from `start` up to `end`,
 excluding `end` unless `inclusive`; `ForList` runs it once for each element of
@@ -809,8 +838,9 @@ in the simplify phase:
 
 | Pattern | Becomes | Condition, all exact |
 |---|---|---|
-| a `Loop` whose body ends in `Branch` on a `Switch` on `is_lt(s, b)`, where `s` is a slot of a builtin integer type starting at `a` | `ForRange(a, b, False)` with `s` as the index and the other slots kept | `b` does not depend on the slots; the `False` arm is `Break` of the other slots; every `Continue` passes `plus(s, 1)` or `plus(1, s)` for `s`. The checked `plus` cannot overflow under `s < b`, so dropping it is exact. The slot is the one the test reads, so at most one slot can match, and no order among slots is consulted |
+| a `Loop` whose body ends in `Branch` on a `Switch` on `is_lt(s, b)`, where `s` is a slot of a builtin integer type starting at `a` | `ForRange(a, b, False)` with `s` as the index and the other slots kept | `b` does not depend on the slots; the `False` arm is `Break` of the other slots; every `Continue` passes `plus(s, 1)` or `plus(1, s)` for `s`. The checked `plus` cannot overflow under `s < b`, so dropping it is exact. The slot is the one the test reads, so at most one slot can match, and no order among slots is consulted. The test may also be `is_lte(b, s)` with the `True` arm leaving, which is how `if s >= b { break }` arrives: N13q turns the test of a value switch into `is_lt`, and an exiting switch keeps the form the walk gave it |
 | `ForRange(Lit(0), List.len(xs), False)` | `ForList(xs)`, with every `Elem(xs, index)` in the body replaced by the element | `xs` does not depend on the slots |
+| a `Loop` with an iterator slot that starts as `List.iter(xs)` (through `Iter.iter`, which is the identity), whose body switches on `Iter.next` of that slot, ends in `Break` of the other slots on `Done`, and passes the `rest` of the step as the iterator on every `Continue` | `ForList(xs)` with the other slots kept; the `item` the body reads is the element | the iterator and the step are read by nothing else. The procedures are recognized by the checker-authored `IteratorProcedureId` on the named primitive, never by a name |
 
 With them, and N13's rule for `List.get` under a bound (3.13):
 
@@ -858,7 +888,8 @@ wrote it:
 
 | Exit | Rule |
 |---|---|
-| a `Return(v)` terminator in a loop whose value is its row's result | becomes `Break(v)`: both end the row with `v` |
+| a `Return(v)` terminator in a loop whose value is its row's result | becomes `Break(v)`: both end the row with `v`. It applies to a general `Loop` whose one output is the row's result type |
+| an output of a general `Loop` that every `Break` gives as one value defined outside the loop | is that value, and the loop no longer delivers it. A loop whose outputs nothing reads is dropped as any unread node is, so the rule assumes a loop ends, as that drop does |
 | `Break(state)` terminators, and the normal end of a bounded loop, in a loop whose value is read only through `Index` or `Field` | each carries only the components that are read, and the reads after the loop are removed. Exactly one exit runs, so the value is computed once, at the same point |
 
 In Roc, `for x in xs` already means a loop over `xs.iter()` that switches on
@@ -906,6 +937,12 @@ intent, and `Code.Graph.iteration` reads it off the node:
 | `ForRange(a, b, inclusive)` | `OverRange({ start, end, inclusive, index, exits_early })` |
 | `Loop` | `General` |
 
+In the Roc API, `item` and `index` are `Read(Val)` when the body reads the
+parameter and `Unread` when it does not, and `exits_early` is `True` when a
+`Break` of this loop, or a `Return`, ends a path of the body, a nested loop's
+`Break` and a lambda's body not counted. The accessor is
+`Code.Row.iteration(row, node_index)` (`src/build/roc/Builtin.roc`).
+
 Two properties keep the accessor from reopening the remark:
 
 1. It reads the node and nothing else: never provenance and never regions,
@@ -928,7 +965,9 @@ Non-tail recursion is not a loop at all, so there is nothing to classify.
 
 A row whose every call to itself is in tail position becomes a row whose body
 is a `Loop`. The parameters become slots, a tail call becomes `Continue` with
-the call's arguments, and every other return becomes `Return`. A parameter
+the call's arguments, and every other path end becomes `Break` of the row's
+value. The row's value is the loop. A `Return` in the body becomes a `Break`
+too, by the exit rule of 3.11. A parameter
 every tail call passes unchanged is invariant and is removed from the slots by
 N11, and a loop that counts is raised to `ForRange` or `ForList` by 3.11.
 N12 runs in the simplify phase, so a call that N13 moves into tail position is
@@ -956,7 +995,7 @@ already known from the graph:
 | `Unwrap(Wrap(v))` | `v` | none |
 | `Switch` on `Tag(t, ...)` or on `Lit` | the arm for `t`, or for the literal | none |
 | `Switch` at a position a dominating arm already decided | that arm | the dominating arm tested the same node at the same position |
-| `Switch` on an output of another switch `s`, where every arm of `s` gives that output as a known `Tag` or `Lit` (case-of-case) | `s`, with each of its arms continuing into the outer arm its value selects: an outer arm that one arm of `s` selects is inlined there, and one that several select becomes a join of `s` they jump to, with the tag's payload and `s`'s other outputs as its parameters | none: every test runs in the order it ran, each outer arm runs in exactly the cases it ran, and nothing is copied |
+| `Switch` on an output of another switch `s`, where every arm of `s` gives that output as a known `Tag` or `Lit` (case-of-case) | `s`, with each of its arms continuing into the outer arm its value selects: an outer arm that one arm of `s` selects is inlined there, and one that several select becomes a join of `s` they jump to, with the tag's payload and `s`'s other outputs as its parameters | none: every test runs in the order it ran, each outer arm runs in exactly the cases it ran, and nothing is copied. The build holds this for a switch `s` with one output, no other reader (the rebuild tells the builder), and arms that select different outer arms. An outer arm that two arms select needs a second join, which an exiting switch cannot carry (3.11), so that case stays a switch on `s`'s output |
 | `Switch` on a `Bool` whose arms are `Lit(False)` and `Lit(True)` | the scrutinee | none |
 | `Switch` on a `Bool` whose arms are `Lit(True)` and `Lit(False)` | `Prim("Bool.not")` of the scrutinee | none |
 | `Bool.not(Bool.not(x))` | `x` | none |
@@ -970,8 +1009,13 @@ already known from the graph:
 | `And` with a `Lit(False)` operand, `Or` with a `Lit(True)` operand | that literal | none: C2 lets the other operands' work go |
 | an `And` operand that an earlier operand, or a dominating arm, already decided `True`; an `Or` operand decided `False` | removed; with no operand left, the `And` is `Lit(True)` and the `Or` `Lit(False)` | the same fact rule as for `Switch`. The `Or` half is the dual that N13t needs: `Bool.not(And(a, a))` becomes `Or(Bool.not(a), Bool.not(a))`, and the two meet only if both halves remove the repeated operand |
 | `Prim(p)` over `Lit` arguments, `p` speculatable | the `Lit` the compiler's interpreter computes | none |
+| `Prim(p)` over `Lit` arguments, `p` a float builtin | the `Lit` whose bits Roc's float code gives, with Roc's one `NaN` for any `NaN` | none: `0.1 + 0.2` folds to `0x3fd3333333333334` at `F64` and to `0x3e99999a` at `F32`, and `-0.0 == 0.0` holds |
+| `Str.is_eq` or `Str.concat` over `Str` literals | the `Bool` or `Str` literal | none |
+| a chain of `plus_wrap`, `times_wrap`, `bitwise_and`, `bitwise_or`, `bitwise_xor` or `Str.concat` with two literals side by side | the chain with the two replaced by the literal they compute | none: the order of the other operands is kept |
+| `Bool.not(x)` where a dominating arm or an earlier `And` or `Or` operand decided `x` | the opposite `Lit` | the same fact rule as for `Switch` (`Builder.decidedNot`) |
+| a `Bool` that ends an arm or an operand, where a dominating arm or an earlier operand decided it | the `Lit` it decided | the same fact rule as for `Switch` (`Builder.decidedRefs`): `if c a else c` ends its `False` arm in `False` |
 | `Prim(p)` over `Lit` arguments, `p` not speculatable | the `Lit` it computes | only when this evaluation does not fail: `7 // 2` folds, `1 // 0` stays, because folding it into a `Crash` would evaluate where the body might not |
-| `List.get(xs, i)` under a dominating `is_lt(i, List.len(xs))`, `i` a `U64` | `Tag(Ok, Elem(xs, i))` | the index is in bounds |
+| `List.get(xs, i)` under a dominating `is_lt(i, List.len(xs))`, `i` a `U64` | `Tag(Ok, Elem(xs, i))` | the index is in bounds. The bound comes from a dominating arm, from an `And` operand or `Or` operand, from `Bool.not` of the inverse test, or from `is_lte(List.len(xs), i)` in the other arm (`Builder.boundedGet`) |
 | `List.get(xs, i)` in the body of `ForList(xs)` whose index is `i` | `Tag(Ok, element)`, where `element` is the body's element parameter | none |
 | `Bool.not(is_lt(a, b))`, `Bool.not(is_lte(a, b))` | `is_lte(b, a)`, `is_lt(b, a)` | a builtin integer type |
 | `Switch` on `is_lte(a, b)` | `Switch` on `is_lt(b, a)` with the two arms swapped | a builtin integer type |
@@ -1120,7 +1164,7 @@ A nested chain of one such builtin becomes one n-ary `Prim` with its arguments
 flattened in their written order, and identity literals are dropped. A chain
 with its absorber among its operands is the absorber, where every other
 operand is speculatable, so dropping them drops no failure. A chain left with
-one operand is that operand. Order is kept, because none of these is declared
+one operand is that operand. `Str.concat` and `List.concat` chains flatten the same way, and `""` and `[]` are their identities. Order is kept, because none of these is declared
 commutative in the normal form (section 7.2). Interpolation desugars to
 `Str.concat` (N1), so `"${a}${b}c"` and `a.concat(b.concat("c"))` meet here.
 
@@ -1247,6 +1291,24 @@ What stays apart, or unchanged:
 A translator that has arrays and reads a literal switch whose keys are `0` to
 `n - 1` can emit a constant array for it. That is the translator's choice; the
 normal form keeps one form.
+
+### 3.18 N18: input slots
+
+A site whose translator returns a `Code.Bound` (`roc-reify-proposal.md`
+section 10.1) can read values that exist only when the program runs. Each one
+is an input slot of the root, read as `Input(k)`.
+
+| Rule | Statement |
+|---|---|
+| N18a | A name that the walk cannot replay and that the compiler does not fix is a slot. |
+| N18b | `Field`, `Index` and `Unwrap` of a slot is a slot: the slot of its leaf with one more step. No node reads a slot through a projection. |
+| N18c | Only the root row reads a slot. A lifted row receives a slot value as a `Closure` argument. |
+| N18d | The slot list holds exactly the slots the final root reads, in the order of 3.9. |
+
+N18b keeps two R rows where a slot stands: "bind a value once, or write the
+expression twice" and "destructure a record or tuple, or read its fields". A
+slot has no name. The site keeps, apart from the value, which run-time name and
+which projections each slot reads, as it keeps the provenance table.
 
 ---
 
@@ -1597,6 +1659,7 @@ absorbing them costs more than the refactor they would absorb:
 | mutual tail recursion as one `Loop` with a dispatch slot | the slot's tags are the compiler's, so an author's state loop over its own tags would not meet it (3.12) |
 | a callee's set of result tags, read by its callers | it removes only arms the callee never returns; a helper matched by its caller meets its tests in place only by case-of-case in `inline` (5.1), so no refactor moves into R |
 | a call of a row whose result is always parameter `k`, replaced by argument `k` | a row that can crash would lose a `crash` its author wrote; a speculatable one is already reduced to the parameter, so only calls of an identity row would change |
+| `OptField` of a `Record` node, which names the fields it sets | the answer is `Ok` of the field or `Err(MissingField)`, but the result has to be built as a `Try` of a type the table's `Tmpl` has no template for; the description keeps the read, and a translator that wants the answer reads the `Record`'s field names |
 
 ---
 
@@ -1676,6 +1739,7 @@ Code(_fn) :: { ... }.{
 		rows : Graph -> List(Row)               # canonical order, root first
 		row : Graph, RowId -> Row
 		inputs : Graph -> List({ name : Str, ty : Ty })   # root parameter fields, by name
+		slots : Graph -> List(Ty)                         # the root's input slots, in slot order (3.18)
 		iteration : Graph, NodeRef -> Iteration   # the NodeRef names a loop node; read off the node
 		to_tree : Graph, RowId -> Tree
 	}
@@ -1700,6 +1764,7 @@ Code(_fn) :: { ... }.{
 		Node(U32),
 		Out({ node : U32, k : U32 }),        # output k of a Switch node
 		Arg({ owner : U32, k : U32 }),       # param k of the loop body or join the node owner holds; in ForRange, param 0 is the index; in ForList, param 0 is the element and param 1 the index
+		Input(U32),                          # input slot k of the root (3.18)
 	]
 
 	Node := { op : Op, args : List(Val), ty : Ty, speculatable : Bool }
@@ -1709,7 +1774,7 @@ Code(_fn) :: { ... }.{
 		Prim({ owner : Str, method : Str }),   # Num.F32 and sin; Glsl.Vec3 and scale
 		Call(RowId),
 		Closure(RowId),             # args are the captured values
-		Record(List(Str)),          # field names in the type's order
+		Record(List(Str)),          # the names of the fields the node sets, in the type's order
 		Tuple,
 		List,
 		Tag(Str),

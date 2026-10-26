@@ -817,7 +817,7 @@ fn countdown(f: *Fixture, callee: Callee) Allocator.Error!RowId {
     };
     try f.b.close(.{ .value = &.{try f.b.callRow(target, &.{next})} });
     const arm1 = try f.b.openArm(c, 1);
-    try f.b.close(.{ .value = &.{try f.b.litInt(i64_ty, 0)} });
+    try f.b.close(.{ .value = &.{Ref.rowParam(0)} });
     try f.b.endRow(.{ .value = &.{try f.b.switchOn(c, &.{ arm0, arm1 }, &.{}, &.{i64_ty}, &.{})} });
     return r;
 }
@@ -840,18 +840,19 @@ test "N8g: two recursive rows that call each other alike are bisimilar and meet 
         \\row r0 (I64) -> I64
         \\  n0 = call r1(p0) : I64 !spec
         \\  value n0
-        \\row r1 (I64) -> I64 recursive
+        \\row r1 (I64) -> I64
         \\  n0 = 1 : I64
-        \\  n1 = Num.I64.is_lt(p0, n0) : Bool
-        \\  n5 = switch n1 : I64 !spec
-        \\    arm 0
-        \\      n2 = Num.I64.minus(p0, n0) : I64 !spec
-        \\      n3 = call r1(n2) : I64 !spec
-        \\      value n3
-        \\    arm 1
-        \\      n4 = 0 : I64
-        \\      value n4
-        \\  value n5
+        \\  n4 = loop(p0) : I64 !spec
+        \\    body (s4.0: I64)
+        \\      n1 = Num.I64.is_lt(s4.0, n0) : Bool
+        \\      n3 = switch n1 : !spec
+        \\        arm 0
+        \\          n2 = Num.I64.minus(s4.0, n0) : I64 !spec
+        \\          continue n2
+        \\        arm 1
+        \\          break s4.0
+        \\      branch n3
+        \\  value n4
         \\
     , dumps[0]);
 }

@@ -39,7 +39,7 @@ pub const Report = struct {
         return self.messages.items.len == 0;
     }
 
-    fn add(self: *Report, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+    pub fn add(self: *Report, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
         try self.messages.append(self.gpa, try std.fmt.allocPrint(self.gpa, fmt, args));
     }
 };
@@ -79,6 +79,12 @@ const Verifier = struct {
         switch (ref.kind) {
             .row_param => if (ref.output >= self.store.row(row_id).params.len)
                 try self.report.add("{s} {d}: row parameter {d} out of range", .{ what, id, ref.output }),
+            // N18c: only the root reads a slot, and the root is the one row
+            // with fixed parameters that no call reaches.
+            .input => {
+                if (ref.target >= self.store.slots.items.len) return self.report.add("{s} {d}: input slot {d} does not exist", .{ what, id, ref.target });
+                if (!self.store.row(row_id).fixed_params) try self.report.add("{s} {d}: reads input slot {d} in a row that is not the root", .{ what, id, ref.target });
+            },
             .region_param => {
                 const p = ref.regionId();
                 if (p.index() >= self.store.regionCount()) return self.report.add("{s} {d}: region {d} does not exist", .{ what, id, p.index() });
@@ -158,10 +164,29 @@ const Verifier = struct {
                 const t = self.types.get(tys[0]);
                 if (t != .record) break :blk true;
                 const members = self.types.memberSlice(t.record);
-                if (members.len != args.len) break :blk true;
-                const slots = try self.report.gpa.alloc(TyId, members.len);
+                const set = self.store.wordSlice(nd.aux);
+                // A node that sets every member lists none, and one that
+                // leaves a member unset lists the members it sets, in the
+                // type's order, with every required member among them.
+                if (args.len == members.len) {
+                    if (set.len != 0) break :blk true;
+                } else {
+                    if (set.len != args.len) break :blk true;
+                    var from: usize = 0;
+                    for (set) |k| {
+                        if (k < from or k >= members.len) break :blk true;
+                        from = k + 1;
+                    }
+                    for (members, 0..) |m, k| {
+                        if (!m.optional and std.mem.findScalar(u32, set, @intCast(k)) == null) break :blk true;
+                    }
+                }
+                const slots = try self.report.gpa.alloc(TyId, args.len);
                 defer self.report.gpa.free(slots);
-                for (members, slots) |m, *slot| slot.* = self.types.tySlice(m.tys)[0];
+                for (slots, 0..) |*slot, at| {
+                    const k = if (args.len == members.len) at else set[at];
+                    slot.* = self.types.tySlice(members[k].tys)[0];
+                }
                 break :blk !try self.argsFit(nd, 0, slots);
             },
             .tuple => blk: {
@@ -264,7 +289,16 @@ const Verifier = struct {
                     .loop => 0,
                     .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // this branch is reached for loop ops only
                 };
-                if (args.len < lead or params.len != header + (args.len - lead) or tys.len != args.len - lead) break :blk true;
+                if (args.len < lead or params.len != header + (args.len - lead)) break :blk true;
+                // A bounded loop's outputs are its slots, as they stand when
+                // the indices run out. A general loop ends only in `Break`,
+                // so its outputs are the values its `Break`s carry, and they
+                // are free of its slots (N12).
+                if (nd.op == .loop) {
+                    for (0..args.len - lead) |k| if (!try self.argFits(nd, lead + k, params[header + k])) break :blk true;
+                    break :blk false;
+                }
+                if (tys.len != args.len - lead) break :blk true;
                 for (tys, 0..) |t, k| if (t != params[header + k] or !try self.argFits(nd, lead + k, t)) break :blk true;
                 break :blk false;
             },
@@ -368,9 +402,16 @@ const Verifier = struct {
             },
             .continue_, .break_ => {
                 const lb = loop orelse return self.report.add("region {d}: {s} outside a loop body", .{ r.index(), @tagName(reg.end.kind) });
-                // `Continue` carries the next slots and `Break` the loop's outputs: one per slot either way.
-                const want = self.store.node(self.store.region(lb).owner).tys.len;
-                if (reg.end.refs.len != want) try self.report.add("region {d}: {s} carries {d} values for {d} slots", .{ r.index(), @tagName(reg.end.kind), reg.end.refs.len, want });
+                // `Continue` carries the next slots and `Break` the loop's outputs.
+                const owner = self.store.node(self.store.region(lb).owner);
+                const slots = self.store.tySlice(self.store.region(lb).params).len - switch (owner.op) {
+                    .for_range => @as(usize, 1),
+                    .for_list => 2,
+                    .loop => 0,
+                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // a loop body is owned by a loop
+                };
+                const want = if (reg.end.kind == .continue_) slots else owner.tys.len;
+                if (reg.end.refs.len != want) try self.report.add("region {d}: {s} carries {d} values for {d}", .{ r.index(), @tagName(reg.end.kind), reg.end.refs.len, want });
             },
             .branch => {
                 const sw = NodeId.of(reg.end.target);
@@ -603,4 +644,31 @@ test "a call may carry a wider type than its row's result, and not a narrower on
     var report = try verifyAll(testing.allocator, &store, &types);
     defer report.deinit();
     try testing.expect(!report.ok());
+}
+
+test "an input slot verifies in the root and is reported in any other row" {
+    var store = ir.Store.init(testing.allocator);
+    defer store.deinit();
+    var types = types_mod.Types.init(testing.allocator);
+    defer types.deinit();
+    var b = builder_mod.Builder.init(testing.allocator, &store, &types);
+    defer b.deinit();
+    const i64_ty = try types.intTy(.i64);
+    const row = try b.beginRow(&.{i64_ty}, i64_ty);
+    const sum = try b.call(.i64, .plus_wrap, &.{ Ref.rowParam(0), try b.input(i64_ty, 0) });
+    try b.endRow(.{ .value = &.{sum} });
+
+    var not_root = try verifyAll(testing.allocator, &store, &types);
+    defer not_root.deinit();
+    try testing.expect(!not_root.ok());
+    var saw = false;
+    for (not_root.messages.items) |m| {
+        if (std.mem.find(u8, m, "in a row that is not the root") != null) saw = true;
+    }
+    try testing.expect(saw);
+
+    store.rows.items[row.index()].fixed_params = true;
+    var root = try verifyAll(testing.allocator, &store, &types);
+    defer root.deinit();
+    try testing.expect(root.ok());
 }

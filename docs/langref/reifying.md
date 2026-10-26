@@ -62,9 +62,10 @@ These forms are refused. Most of them are a function that is only known when the
 | --- | --- |
 | A function parameter of the surrounding function, named at the `Code` place itself | `cannot reify this function` |
 | A function read from a list | `cannot reify this expression` |
-| A top-level value that computes a function, as in `doubler = make(2.0)` | `cannot reify this expression` |
 | A function that performs an effect | `reified function performs an effect` |
 | A lambda that reads a parameter or a `var` of the function around it | `reified function captures a value` |
+
+A top-level value that computes a function, as in `doubler = make(2.0)`, isn't refused when a described function uses it. The description reads the definition where the name stands, so `doubler(x)` is a call of the lambda inside `make` with `2.0` as its captured value. Naming such a value as the function to describe, as in `Calc.to_expr(doubler)`, is refused. Write `|x| doubler(x)` there instead.
 
 A function parameter that a call fixes is not refused. In `apply_all = |xs, f| xs.map(|x| f(x))`, the call `apply_all(xs, |x| x * 3)` fixes `f`, so the description names that lambda inside the lambda that `List.map` receives. `xs.map(f)` also describes.
 

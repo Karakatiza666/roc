@@ -425,6 +425,10 @@ pub const StagedCode = struct {
         /// returns, and nothing else. It has no runtime representation, so a
         /// record field or a list element holding one has nothing to hold.
         outside_staged_position,
+        /// The staged lambda reads a value that exists only when the program
+        /// runs, its translator returns a `Code.Bound`, and the site cannot
+        /// bind the value as an input slot.
+        input_not_bound,
     };
 };
 

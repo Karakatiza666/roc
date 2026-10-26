@@ -103,7 +103,10 @@ pub const BuiltinIndices = struct {
     code_row_type: Statement.Idx,
     code_graph_type: Statement.Idx,
     code_tree_type: Statement.Idx,
+    code_iteration_type: Statement.Idx,
     code_inlined_type: Statement.Idx,
+    code_value_type: Statement.Idx,
+    code_bound_type: Statement.Idx,
 
     // Ident indices - simple unqualified names (e.g., "Bool", "U8")
     bool_ident: Ident.Idx,
@@ -174,7 +177,10 @@ pub const BuiltinIndices = struct {
     code_row_ident: Ident.Idx,
     code_graph_ident: Ident.Idx,
     code_tree_ident: Ident.Idx,
+    code_iteration_ident: Ident.Idx,
     code_inlined_ident: Ident.Idx,
+    code_value_ident: Ident.Idx,
+    code_bound_ident: Ident.Idx,
     // Tag idents for Try type
     ok_ident: Ident.Idx,
     err_ident: Ident.Idx,
@@ -338,7 +344,10 @@ pub const builtin_type_specs = [_]BuiltinTypeSpec{
     .{ .display_name = "Row", .qualified_name = "Builtin.Code.Row", .type_field = "code_row_type", .ident_field = "code_row_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Row" } }, .auto_import = false },
     .{ .display_name = "Graph", .qualified_name = "Builtin.Code.Graph", .type_field = "code_graph_type", .ident_field = "code_graph_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Graph" } }, .auto_import = false },
     .{ .display_name = "Tree", .qualified_name = "Builtin.Code.Tree", .type_field = "code_tree_type", .ident_field = "code_tree_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Tree" } }, .auto_import = false },
+    .{ .display_name = "Iteration", .qualified_name = "Builtin.Code.Iteration", .type_field = "code_iteration_type", .ident_field = "code_iteration_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Iteration" } }, .auto_import = false },
     .{ .display_name = "Inlined", .qualified_name = "Builtin.Code.Inlined", .type_field = "code_inlined_type", .ident_field = "code_inlined_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Inlined" } }, .auto_import = false },
+    .{ .display_name = "Value", .qualified_name = "Builtin.Code.Value", .type_field = "code_value_type", .ident_field = "code_value_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Value" } }, .auto_import = false },
+    .{ .display_name = "Bound", .qualified_name = "Builtin.Code.Bound", .type_field = "code_bound_type", .ident_field = "code_bound_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Bound" } }, .auto_import = false },
 };
 
 /// The registry entry for the builtin type whose `BuiltinIndices` statement

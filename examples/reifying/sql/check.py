@@ -38,8 +38,11 @@ def main():
             db.executescript("\n".join(lines))
             continue
         name = header.removeprefix("-- query: ")
-        sql = "\n".join(line for line in lines[1:] if not line.startswith("-- roc:"))
-        cursor = db.execute(sql)
+        # A statement with `?` placeholders carries its values on a line of
+        # their own, and the driver binds them.
+        params = [json.loads(line.removeprefix("-- params: ")) for line in lines[1:] if line.startswith("-- params: ")]
+        sql = "\n".join(line for line in lines[1:] if not line.startswith("-- roc:") and not line.startswith("-- params: "))
+        cursor = db.execute(sql, params[0] if params else ())
         columns = [c[0] for c in cursor.description]
         got = normalized([dict(zip(columns, row)) for row in cursor.fetchall()])
         print(f"-- {name}")

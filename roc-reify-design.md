@@ -34,7 +34,9 @@ Legend
 | `Row` | One function: `id`, `params`, `result`, `nodes`, `body`, `recursive`. | `src/build/roc/Builtin.roc:24056` |
 | `Node` | `{ op, args, ty, speculatable }`. | `src/build/roc/Builtin.roc:24020` |
 | `Op` | What a node computes. 24 ops. | `src/build/roc/Builtin.roc:23960` |
-| `Val` | `Param(k)`, `Node(i)`, `Out({ node, k })`, `Arg({ owner, k })`. | `src/build/roc/Builtin.roc:23847` |
+| `Val` | `Param(k)`, `Node(i)`, `Out({ node, k })`, `Arg({ owner, k })`, `Input(k)`. | `src/build/roc/Builtin.roc:23847` |
+| `Graph.slots` | The types of the root's input slots, in slot order. Empty unless the translator returns a `Code.Bound`. | `src/build/roc/Builtin.roc` (`Graph.slots`) |
+| `Bound`, `Value` | `Code.Bound(a)` is a translator's result with the site's run-time values, `{ value, inputs }`. `Code.Value` is one run-time value of a slot. | `src/build/roc/Builtin.roc` (`Code.Bound`, `Code.Value`) |
 | `Region`, `End` | A body and how it ends: `Value`, `Jump`, `Return`, `Continue`, `Break`, `Branch`. | `src/build/roc/Builtin.roc:23880`, `:23897` |
 | `Key` | The value one `Switch` arm takes: `Tag`, `Lit`, `Len`, `AtLeast`, `Default`. | `src/build/roc/Builtin.roc:23864` |
 | `Tree` | One row as nested expressions, from `Graph.to_tree`. | `src/build/roc/Builtin.roc:24138` |
@@ -49,7 +51,7 @@ holds a `Return` in a loop or in a switch arm. The `inline` view keeps such a
 row too. Inlining it would make the caller return the value of the callee and
 skip the rest of its own body. A `Return` in a lambda body ends the lambda, so
 it does not count, and a `Return` in tail position folds to a value (rule T6
-of `roc-reify-normal-form.md`). The rules are in `src/reify/views.zig:1`. The normal-form version is 3
+of `roc-reify-normal-form.md`). The rules are in `src/reify/views.zig:1`. The normal-form version is 5
 (`src/reify/mod.zig:33`). `Code.version` returns it.
 
 ---
@@ -84,24 +86,42 @@ of `roc-reify-normal-form.md`). The rules are in `src/reify/views.zig:1`. The no
       numeral names no width, so it takes the widest form `Lit` holds, `I128`
       or `F64` (`src/check/code_reifier.zig` (`generatedNumeral`)): a fractional one rounds to
       `F64` where the author's `from_numeral` would have seen exact digits.
-- [ ] A literal of a type of your own whose conversion is a Roc function of the
-      package being described. "a conversion whose argument the compiler
-      generates". The argument is a number the compiler writes, and a row
-      parameter has the type the method declares, not `I128` or `F64`
-      (`src/check/code_reifier.zig` (`dispatchWithArgs`)).
+- [x] A literal of a type of your own whose conversion is a Roc function of the
+      package being described. It describes as a `Call` of the row of that
+      function (`src/check/code_reifier.zig` (`dispatchWithArgs`)). A quoted
+      literal passes its text as a `Str`. A numeral passes the `Num.Numeral`
+      the compiler builds from the digits the author wrote: a
+      `Wrap("Builtin.Num.Numeral")` of a `Tag("Literal")` of a `Record` with
+      `digits_after_pt`, `digits_after_pt_count`, `digits_before_pt` and
+      `is_negative`, the fields Monotype fills (`numeralArgument`). The
+      digits are exact, so this form has no `F64` rounding. The checker reads
+      the row's `Try` as a conversion: the value is the `Ok` payload, and an
+      `Err` is a literal the conversion rejected, which is a `Crash` with the
+      message "this literal was rejected by its conversion"
+      (`convertedLiteral`). A conversion that returns `Ok` of a known value
+      folds to the value. Pinned by the staging cases at
+      `src/eval/test/eval_staging_tests.zig:2054` and `:2060`, and by
+      `src/compile/test/code_reifier_test.zig:1686`, `:1749` and `:1815`.
 - [ ] A literal of a type of your own through `from_interpolation`. "a custom
       string interpolation". The conversion runs in two stages (design.md,
       "An interpolated string literal converts in two stages"):
       `from_interpolation` reads the segments while the compiler runs and
       hands back an assembler, and the value is that assembler applied to the
-      interpolated values. The assembler is a function value the compiler
-      computes, and no node can apply it
-      (`src/check/code_reifier.zig` (`dispatchExpr`)). Pinned by the staging case "an
-      interpolated literal of the author's own type is refused".
+      interpolated values. The assembler is a function value the conversion
+      computes, and no node can apply a computed function: a call through
+      the `Try` payload of a row is an `Apply` that no simplification
+      resolves, and the assembler of `Str.from_interpolation` is a function
+      that a `Prim` returns. This box needs a decision on the normal form
+      (see the report options in `roc-reify-proposal.md` section 10). The
+      refusal is `src/check/code_reifier.zig` (`plannedDispatch`). Pinned by
+      the staging case "an interpolated literal of the author's own type is
+      refused" (`src/eval/test/eval_staging_tests.zig:2090`).
 - [x] A literal of a type of your own in a `match` pattern. The pattern binds
       the matched value, and the checker's own equality of that type against
       its conversion of the literal becomes a `Bool` `Switch`
-      (`src/check/code_reifier.zig` (`guardedTest`)).
+      (`src/check/code_reifier.zig` (`guardedTest`)). Each alternative of
+      `7 | 8` converts its own literal. Pinned by
+      `src/eval/test/eval_staging_tests.zig:2066`.
 - [x] An embedded file. One imported as `List(U8)` describes as
       `Code.Lit.Bytes(List(U8))`, a single literal holding the blob rather than
       one `Int` node per byte, because a file is as large as it is
@@ -130,12 +150,10 @@ stays shared, so a binding written once stays written once.
       path that folds a literal (`src/check/code_reifier.zig` (`foldedConstant`)).
       `x > limit` describes as `x > 7.0 * 2.0`, and a constant the definition
       reads folds in turn, so `List.len([1, 2, 3])` stands where `limit` did.
-      Two cases stay refused. A computed value of another package is a body of
+      One case stays refused. A computed value of another package is a body of
       that package, which the walk does not read (N8h): "a computed constant
       of another package" (`src/check/code_reifier.zig` (`foldedConstant`)). A top-level
-      value that computes a function names no definition, so a call on it has
-      no row to name: "a top-level constant that computes a function"
-      (`src/check/code_reifier.zig` (`reachedHere`)).
+      value that computes a function is the item after the alias item below.
 - [x] A value the block around a lambda written at a `Code` position binds,
       read by that lambda. The statement that bound it is replayed at the head
       of the lambda's body, so the lambda holds the node that computes it
@@ -146,10 +164,28 @@ stays shared, so a binding written once stays written once.
       no room for an added parameter, and folding the value needs a constant
       the compiler evaluated, which a block is only inside a top-level
       constant.
-- [ ] A name the compiler does not fix: a function parameter, a branch or loop
-      binder, or a `var`, whether the lambda reads it or a replayed statement
-      does. Refused as a capture, naming it
-      (`src/check/code_reifier.zig` (`unboundRef`)).
+- [x] A name the compiler does not fix, a function parameter or a branch or
+      loop binder, read by a lambda whose translator returns a
+      `Code.Bound`, whether the lambda reads it or a replayed statement does.
+      It is an input slot `Input(k)`, with the longest chain of `Field`,
+      `Index` and `Unwrap` reads of it (rule N18 of
+      `roc-reify-normal-form.md`). The program receives its value at run
+      time in `Code.Bound.inputs` (`src/check/code_reifier.zig`
+      (`unboundRef`, `inputSlot`), `roc-reify-proposal.md` section 10.1).
+- [ ] The same name, read where the translator does not return a
+      `Code.Bound`. Refused as a capture, naming it, with the line "A
+      translator whose result is a `Code.Bound` receives such a value as an
+      input slot." (`src/check/code_reifier.zig` (`unboundRef`)).
+- [ ] A `var` read from around the lambda. "a `var`, whose value at the call
+      is not always the value the description reads".
+- [ ] A slot whose type holds a function, an opaque type or an optional record
+      field. "a captured function value", "a captured value of an opaque
+      type", "a captured record with an optional field".
+- [ ] A translator call with captured inputs whose other arguments are not
+      fixed at build time: "a translator that receives captured inputs runs
+      while the compiler runs, so the other arguments of its call must be
+      fixed then". A call that holds two such sites: "a call that binds the
+      inputs of two sites".
 
 ## 3 Operators
 
@@ -240,6 +276,16 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       the call does not fix is refused as "a type variable this call does not
       fix", except a row variable, which a call may leave unbound because no
       description names a row (`src/check/code_reifier.zig` (`rowVars`)).
+      A use can also lift a structural record or tag union of the scheme
+      into a nominal (`src/check/unify.zig` (`mergeToNominal`)): `check =
+      |m| if m < 10 Ok(m) else Err(m)` read by `check(input)?` is read at
+      `Try`. The match records that structure as fixed to the nominal, and
+      the key names it, so the row is built at `Try`, its tags are wrapped,
+      and a use at the helper's own union is another row
+      (`src/check/code_reifier.zig` (`matchType`, `instantiationKey`)).
+      Pinned by "a `?` on the Try a block-generalized helper returns
+      describes as the helper's body in place" and the tests after it in
+      `src/compile/test/code_reifier_test.zig`.
       A lambda written in the generic callee is part of that callee, so its
       row is built under the instantiation of the callee's row: the same
       substitution, the same evidence, and a key that extends the callee's
@@ -299,11 +345,41 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       `Call` of that procedure's row and the alias and the name share one row.
       An alias another module exports is followed the same way through its
       export row (`src/check/code_reifier.zig` (`reachedProcedure`)). An alias of a computed
-      function, `f = make(2)`, has no forwarded lookup and stays refused as "a
-      top-level constant that computes a function". Pinned by
+      function, `f = make(2)`, has no forwarded lookup, so it is the next item. Pinned by
       `src/eval/test/eval_staging_tests.zig:1823` ("staging - a call through an
       alias calls the row of the function it names") and
       `src/compile/test/code_reifier_test.zig:532`.
+- [x] A top-level value that computes a function, `doubler = make(2.0)` with
+      `make = |k| |x| x * k`, used in a described body. The compiler
+      evaluates such a value after the description is built, so the walk has
+      no closure value to read. It reads the definition, as it reads a computed
+      constant: the checker records the checked expression the binding was
+      written as (`CallableEvalTemplate.body`,
+      `src/check/checked_artifact.zig:16986`), and the walk builds that
+      expression where the name stands (`src/check/code_reifier.zig`
+      (`computedFunction`, `foldedBody`)). The definition names the lambda and
+      its captures, so the capture `2.0` is the literal the definition wrote.
+      A call on the name is the curried call of the definition and the use,
+      one `Call` of the lambda's row over the capture and then the argument
+      (`curriedCall`, `constructorCall`, `computedConstructor`). The name used
+      as a value is a `Closure` of the row over the capture. A function the
+      definition captures is a row of its own by the same rule, and a value
+      written as another such value, `renamed = doubler`, is the one it names.
+      A value of another module of the same package is read in that module's
+      reader (`ForeignLookup.resolve_exported_computed`,
+      `src/check/checked_artifact.zig` (`exportedComputed`)). A capture the walk
+      cannot describe stops the walk with its own reason, for example "dbg".
+      Three cases stay refused: a value of another package, whose definition is
+      that package's body (N8h), where a call is a `Prim` named by the module and
+      the value and a use as a value is "a function of the compiler or of another
+      package used as a value"; a value that reads itself, "a top-level constant
+      that computes a function and reads itself"; and a site that names such a
+      value as the function to describe, "a top-level constant that computes a
+      function, named as the function to describe", because the site's root
+      needs a lambda whose parameters it can list (`reachedHere`). Pinned by
+      `src/eval/test/eval_staging_tests.zig:2066`, `:2072`, `:2078`, `:2084`,
+      `:2090` and `:2107`, and by `src/compile/test/code_reifier_test.zig:1388`,
+      `:1420`, `:1448`, `:1483`, `:1503` and `:1527` (a value of another package).
 - [x] A function chosen by an `if` between known functions, and then called:
       `(if c double else triple)(x)`. The call is first an `Apply` of the value,
       and simplifying turns each `Apply` whose function is a known closure into
@@ -444,21 +520,38 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       covered by the previous box.
 - [x] Record update, `{ ..r, b: 1 }`, expanded into the `Record` it stands
       for: the fields the update wrote, and every other field of the type read
-      out of the subject (`src/check/code_reifier.zig` (`recordExpr`)). One over a record
-      with an optional field is refused: "a record update over a record with an
-      optional field". The result carries whatever the subject had there, and a
-      `Field` read of a field that may be absent is not that.
-- [ ] An unset record field (`b: _`). "a record literal that unsets an optional
-      field" (`src/check/code_reifier.zig` (`recordExpr`)). Pinned by the staging case
-      `staged_unset_field` (`src/eval/test/eval_staging_tests.zig:1355`).
+      out of the subject (`src/check/code_reifier.zig` (`recordExpr`)). An
+      optional field the update did not write carries whatever the subject
+      had, and only the subject's value says if it had the field. The update
+      is then a `Switch` on `unwrap(OptField(r, b))`: the `Ok` arm is a
+      `Record` that sets `b` to the payload, and the `Err` arm is a `Record`
+      that leaves `b` unset. Two such fields make nested switches, one level
+      for each field (`recordSetting`). Pinned by
+      `src/eval/test/eval_staging_tests.zig:2162`.
+- [x] An unset record field (`b: _`), and an optional field a literal leaves
+      out. The `Record` node does not set the member. It lists the members it
+      sets, so `Record(["a", "c"])` has two arguments for a type with three
+      fields, and the type's `Record` entry for `b` says `Optional`
+      (`ir.RecordForm`, `src/reify/ir.zig`). A record that sets every member
+      lists nothing, so one value has one form. An update that unsets a field
+      does not read the subject for it. Pinned by
+      `src/eval/test/eval_staging_tests.zig:2120`, `:2156` and `:2168`, and by
+      `src/compile/test/code_reifier_test.zig:1237`.
 - [x] An optional record field (`timeout ?: U64`), as the `presence` a
       `Ty.Record` entry carries and `OptField(Str)` for the `.?timeout` that
       reads it (`src/check/code_reifier.zig` (`fieldAccessExpr`)). The read hands back the
       `Try(a, [MissingField])` the value sits in rather than the value, which
-      is why it is a node of its own. A `.?` that is not the last segment of a
-      path is refused: "a field read through an optional field". The checker
-      gives such a path one flat `Try` however many optional segments it holds,
-      and nested nodes cannot say that.
+      is why it is a node of its own. The checker gives a path one flat `Try`
+      of the last field's type however many optional segments it holds, and
+      the first optional segment that is missing is the `Err` of all of it. A
+      `.?` that is not the last segment is a `Switch` on its own `Try`: the
+      `Err` arm is `Err(MissingField)` of the path's type, and the `Ok` arm
+      reads the rest of the path. A required segment after the last optional
+      one is read in the `Ok` arm and wrapped in `Ok` (`optionalPath`).
+      Pinned by `src/eval/test/eval_staging_tests.zig:2174` and `:2180`.
+      The read of a field a record literal did not set is not folded: the
+      description keeps `OptField` of the `Record`, which names the field it
+      does not list. Pinned by `src/eval/test/eval_staging_tests.zig:2126`.
 
 ## 7b Patterns a `match` branch may test with
 
@@ -481,12 +574,17 @@ and binds below.
 | `[p, q]` and `[p, .., q]` | A `Switch` with a `Len` key for an exact length and an `AtLeast` key for a rest, then `Item` reads. | `src/check/code_reifier.zig` (`listTest`) |
 | A literal of a type of your own | The equality the checker wrote, as a `Bool` `Switch`. | `src/check/code_reifier.zig` (`guardedTest`) |
 | `{ a, .. }` | The entries beside the rest. A rest that binds nothing stands for the fields the pattern did not name. | `src/check/code_reifier.zig` (`testQueue`) |
+| `{ a, ..others }` | The entries beside the rest, and `others` is bound to the `Record` of the fields the pattern did not name, each read from the matched record. A field the matched type marks optional is read by a `Switch` on its `OptField`, as in a record update. Pinned by `src/eval/test/eval_staging_tests.zig:2186` and `:2192`. | `src/check/code_reifier.zig` (`restRecord`) |
+| `"a${x}b${y}c"` | `Str.starts_with` of the prefix, then `Str.drop_prefix`. Each delimiter is a `Str.split_first` of the text that is left, a `Switch` on its `Try`: `Err` goes to the next alternative, and `Ok` binds `before` to the capture and goes on with `after`. A last capture with no text after it takes the text that is left. An exact end tests `Str.is_empty` of the text that is left. Pinned by `src/eval/test/eval_staging_tests.zig:2144` and `:2198`. | `src/check/code_reifier.zig` (`strTest`) |
 
 | Refused pattern | Reason |
 | --- | --- |
-| `{ a, ..others }` | "a record pattern whose `..` binds a name". It binds a record the pattern builds out of what is left rather than one it takes apart. |
-| A string interpolation pattern | "a string interpolation pattern" (`src/check/code_reifier.zig` (`patternFormName`), pinned by `src/compile/test/code_reifier_test.zig:1825`). A target that cannot split a string has nothing to read. |
 | A tag pattern on a type that is not a tag union | "a tag pattern on this type" |
+
+The string pattern follows `LIR.strMatchStep` (`src/lir/LIR.zig:821`): the
+capture stops at the first place the delimiter appears, and there is no
+search again after a later step fails. A target that cannot split a string
+refuses the `Str.split_first` `Prim` by name.
 
 ## 8 Nominal and opaque types
 
@@ -638,24 +736,22 @@ and binds below.
       is still refused as "an open record" (`src/check/code_reifier.zig` (`collectRecordFields`)):
       `Ty.Record` is a closed list of fields, so a record with no fixed set of
       them has no shape to write.
-- [ ] A tag union whose row is still open, so its extension is a variable that
+- [x] A tag union whose row is still open, so its extension is a variable that
       carries no closing mark: a rigid `..` or a variable that is constrained.
-      "an open tag union" (`src/check/code_reifier.zig` (`collectVariants`)):
-      the union stands for many, and a description is monomorphic. A flexible
-      row with a recorded row default seals to the empty union and is not
-      refused (`checkedRowVariableClosesTagRow`).
+      The row seals to the empty union the way Monotype seals it
+      (`lowerCheckedTypeVariable`), so the description has the variants the
+      definition names and no others (`src/check/code_reifier.zig`
+      (`collectVariants`)). A flexible row with a recorded row default seals
+      the same way. A `match` arm for a variant the definition does not name,
+      such as `_` over `[Red, Green, ..]`, is dead and has no arm. Pinned by
+      `src/eval/test/eval_staging_tests.zig:2150` and by
+      `src/compile/test/code_reifier_test.zig:1256`.
 
-      What closed the open record above does not close this one, and the
-      position is the difference. A record's row reaches the walk through a
-      parameter, where the site's type is the precise one: the value handed to
-      the described function has every field the site named, so binding the
-      site's row describes what the body receives. A union's row reaches it
-      through a result, where the definition's variants are the precise ones
-      and the site's are wider, so binding there would write a description
-      claiming a body hands back variants it cannot build. What this box wants
-      is the other move: drop the open tail and describe the variants the
-      definition has, which is already the reading where a site widens a row
-      the checker closed.
+      The position is why this is sound. A record's row reaches the walk
+      through a parameter, where the site's type is the precise one. A union's
+      row reaches it through a result, where the definition's variants are the
+      precise ones and the site's are wider, so binding the site's variants
+      there would claim a body hands back variants it cannot build.
 
 ## 10 Derived methods
 
@@ -702,9 +798,12 @@ node, whose `args` are the method's arguments
       `Json.to_str(value)` is still refused as "a call to a function the
       compiler provides" when the compiler has no export name for the callee
       (`src/check/code_reifier.zig` (`resolvedTarget`)).
-- [ ] Derived `is_eq` over an empty tag union. "derived equality on an empty tag
-      union": nothing inhabits it, so there is no pair of values to compare
-      (`src/check/code_reifier.zig` (`eqOver`, `tagUnionEq`)).
+- [x] Derived `is_eq` over an empty tag union. Nothing inhabits it, so no
+      pair of values reaches the comparison. It describes as
+      `Derived("is_eq", subject)` over the two operands, as every derivation
+      the walk does not expand does, and a stage that expands it meets no
+      variants (`src/check/code_reifier.zig` (`derivedEq`)). Pinned by
+      `src/compile/test/code_reifier_test.zig:1211`.
 - [ ] Derived `is_eq` on a function type. "derived equality on a function"
       (`src/check/code_reifier.zig` (`eqOver`)).
 - [x] Derived `is_eq` or `to_hash` through a nominal component. The compiler
@@ -732,12 +831,14 @@ node, whose `args` are the method's arguments
       container stays the symbolic `Derived` node the stage expands. A builtin
       whose equality the registry calls derived is refused: "derived equality
       on this builtin type".
-- [ ] Derived `is_eq` or `to_hash` through an opaque nominal that derives it.
+- [x] Derived `is_eq` or `to_hash` through an opaque nominal that derives it.
       An opaque type's `Ty` names it without its backing, and the derivation is
       that backing's comparison, so expanding here would describe a
-      representation the description hides everywhere else. The refusal names
-      the type (`src/check/code_reifier.zig` (`nominalEq`)). One that writes its own
-      method describes as the call, which hides it.
+      representation the description hides everywhere else. It describes as
+      `Derived("is_eq", subject)` over the two operands, and `to_hash` already
+      did the same (`src/check/code_reifier.zig` (`nominalEq`, `derivedEq`)).
+      One that writes its own method describes as the call, which hides it.
+      Pinned by `src/compile/test/code_reifier_test.zig:1177`.
 - [x] Derived `map`, as a `Derived(method, subject_type)` carrying the value and
       the mapping function in that order in `args`. The mapping function is a
       `Closure` like any other, and the subject is the parametric nominal read
@@ -928,12 +1029,9 @@ auto-imported, so a user module may still be named `Ty` or `Node`.
 | --- | --- |
 | No function taken from a list | `[double].first()` and then a call: simplifying does not read a closure back out of a list, so the call stays an `Apply` and the site is refused; a function chosen by an `if` between known functions does describe |
 | No name whose value exists only at run time | a lambda cannot read a parameter, binder or `var` of the function it is written in; the value becomes a parameter of the lambda, or a template fixes it |
-| No computed function at top level | `doubler = make(2.0)` names no definition, so a call on it is refused; the author writes it as a lambda, `doubler = \|x\| x * 2.0`, or as a template; an exact alias, `same = add_one`, does describe |
+| No computed function at a site | `main = Stage.describe(doubler)` where `doubler = make(2.0)` is refused, because the site's root needs a lambda; the author writes `\|x\| doubler(x)` at the site, or writes `doubler` as a lambda. A use of `doubler` inside a described body, and an exact alias, `same = add_one`, do describe |
 | No computed value of another package | `limit = xs.len()` in a package the app depends on is refused, because its body is that package's; a value written as data still folds |
-| No open tag union | a result whose row nothing closed has no one set of variants to describe |
-| No unset optional field | `{ a: v, b: _ }` is refused |
-| No string interpolation pattern | a `match` on `"a${x}"` is refused |
-| No literal conversion written in the package | `from_numeral` or `from_interpolation` in the package being described is refused at the literal; a conversion of a builtin or of another package describes |
+| No custom string interpolation | `from_interpolation` of a type of your own is refused at the literal, because its value is a function the conversion computes and no node applies one; a conversion of a builtin or of another package, and every `from_numeral` and `from_quote`, describes |
 
 A shader or a codec is written as one function calling others, over as many
 modules as its author split it into, and that describes whole: the compiler

@@ -88,6 +88,7 @@ pub const Lookup = struct {
         asked.context = self;
         asked.resolve_method = resolveMethod;
         asked.resolve_exported = resolveExported;
+        asked.resolve_exported_computed = resolveExportedComputed;
         asked.resolve_inspect_override = resolveInspectOverride;
         return asked;
     }
@@ -103,6 +104,18 @@ pub const Lookup = struct {
         }
         for (self.imports) |view| {
             if (std.meta.eql(view.key.bytes, artifact.bytes)) return check.CheckedArtifact.exportedDefinition(view, def);
+        }
+        return null;
+    }
+
+    fn resolveExportedComputed(
+        context: *const anyopaque,
+        artifact: check.CanonicalNames.ArtifactRef,
+        def: can.CIR.Def.Idx,
+    ) ?CodeReifier.ForeignComputed {
+        const self: *const Lookup = @ptrCast(@alignCast(context));
+        for (self.imports) |view| {
+            if (std.meta.eql(view.key.bytes, artifact.bytes)) return check.CheckedArtifact.exportedComputed(view, def);
         }
         return null;
     }
@@ -275,7 +288,12 @@ const Site = struct {
 /// Run the case `bytes` generates, writing its app into `dir`. The
 /// coordinator allocates from `ctx.arena`, which the caller releases.
 pub fn runCase(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, bytes: []const u8) Error!Verdict {
-    var case = try reify.fuzz_gen.generate(ctx.gpa, bytes);
+    return runCaseWith(ctx, builtins, dir, bytes, .{});
+}
+
+/// `runCase` on the case `bytes` generates with the constructs `options` allows.
+pub fn runCaseWith(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, bytes: []const u8, options: reify.fuzz_gen.Options) Error!Verdict {
+    var case = try reify.fuzz_gen.generateWith(ctx.gpa, bytes, options);
     defer case.deinit(ctx.gpa);
     return runGenerated(ctx, builtins, dir, &case) catch |err| {
         std.debug.print("{t} on the generated case:\n{s}\n", .{ err, case.source });

@@ -84,7 +84,7 @@ test "issue 11128 wrapper and callable template appends stay amortized" {
             else if (Table == CheckedArtifact.EntryWrapperTable)
                 try table.append(gpa, @fromBackingInt(@intCast(i)), .{ .proc_base = @fromBackingInt(@intCast(i)), .template = @fromBackingInt(@intCast(i)) }, @fromBackingInt(@intCast(i)), @fromBackingInt(@intCast(i)))
             else
-                try table.append(gpa, @intCast(i), @fromBackingInt(@intCast(i)), @fromBackingInt(@intCast(i)), .{}, @fromBackingInt(@intCast(i)));
+                try table.append(gpa, @intCast(i), @fromBackingInt(@intCast(i)), @fromBackingInt(@intCast(i)), .{}, @fromBackingInt(@intCast(i)), @fromBackingInt(@intCast(i)));
             try std.testing.expectEqual(i, @backingInt(ref));
         }
         for (0..count) |i| {

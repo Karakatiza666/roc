@@ -60,7 +60,7 @@ expect Calc.to_expr(area) == Ok("((p0 * p1) + 1)")
 | Boundary | Meaning |
 | --- | --- |
 | Pure functions only | An effectful function, `dbg`, and a hosted function are refused. |
-| Only what the compiler can fix | A function is described when everything it names is known while the compiler runs. A function value that only the running program knows has no body to read, so it is refused. |
+| Only what the compiler can fix | A function is described when everything it names is known while the compiler runs. A function value that only the running program knows has no body to read, so it is refused. A value that only the running program knows is refused too, unless the translator returns a `Code.Bound` (see [Captured run-time values](#captured-run-time-values)). |
 | A translator checks its own target | The compiler never asks if a GPU can run `Str.split_on`. The translator answers that and refuses. |
 
 The full list of refusals is in [section 4](#4-status-and-limits).
@@ -86,11 +86,11 @@ All the types are in the `Code` module of `Builtin.roc` (lines 23625 to 24212). 
 
 | Type | What it holds | Line in `Builtin.roc` |
 | --- | --- | --- |
-| `Graph` | `{ root, rows }`. The rows that a site reaches, root first. | [24078](../src/build/roc/Builtin.roc) |
+| `Graph` | `{ root, rows, slots }`. The rows that a site reaches, root first, and the types of the root's input slots. | [24078](../src/build/roc/Builtin.roc) |
 | `Row` | One function: `id`, `params`, `result`, `nodes`, `body`, `recursive`. | [24055](../src/build/roc/Builtin.roc) |
 | `Node` | `{ op, args, ty, speculatable }`. | [24019](../src/build/roc/Builtin.roc) |
 | `Op` | What a node does. There are 24 ops: `Lit`, `Prim`, `Call`, `Closure`, `Switch`, `ForList`, and others. | [23959](../src/build/roc/Builtin.roc) |
-| `Val` | What a node reads: `Param(k)`, `Node(i)`, `Out({ node, k })`, `Arg({ owner, k })`. | [23846](../src/build/roc/Builtin.roc) |
+| `Val` | What a node reads: `Param(k)`, `Node(i)`, `Out({ node, k })`, `Arg({ owner, k })`, `Input(k)`. | [23846](../src/build/roc/Builtin.roc) |
 | `Region`, `End` | A body, a switch arm, or a loop body, and how it ends: `Value`, `Jump`, `Return`, `Continue`, `Break`, `Branch`. | [23879](../src/build/roc/Builtin.roc), [23896](../src/build/roc/Builtin.roc) |
 | `Ty` | The type of a node: `F64`, `Str`, `ListOf(..)`, `Record(..)`, `TagUnion(..)`, `Named(name, backing)`, and more. | [23632](../src/build/roc/Builtin.roc) |
 | `Tree` | One row as nested expressions. | [24137](../src/build/roc/Builtin.roc) |
@@ -99,6 +99,8 @@ A node does not carry a name or a source place. A parameter is `Param(0)`, not `
 
 A function of another package, and a builtin, is a `Prim`. The body is not read. A translator maps it by name. The GLSL example maps `Glsl.Vec3.scale` to `*`.
 
+A `Record` node holds the names of the fields it sets. They are every field of the type, unless the type marks a field `Optional` and the record leaves it unset (`{ a: v, b: _ }`). A translator reads the names, and the type says which fields may be absent.
+
 ### How a translator walks a graph
 
 `Graph.to_tree(id)` turns one row into nested expressions ([../src/build/roc/Builtin.roc:24107](../src/build/roc/Builtin.roc)). A value that is read one time is written where it is read. A value that is read more than once stays a `Def`, so shared work stays shared.
@@ -106,6 +108,20 @@ A function of another package, and a builtin, is a `Prim`. The body is not read.
 The GLSL translator, the SQL translator, and the DBSP translator all use `to_tree`. A translator that wants to refuse with `refuse_at` must keep the index of a node, so it walks `row.nodes` and `Val` as the hello example does.
 
 The description is a normal form. Some forms are not the ones you wrote. For example, `x >= 10` over integers arrives as `is_lte(10, x)`, and `"a${x}b"` arrives as one n-ary `concat`. Each form is a rule of the normal form, so it holds for every `Code` of one version. The table is in the docs of `Code.Op` ([../src/build/roc/Builtin.roc:23935](../src/build/roc/Builtin.roc)).
+
+### Captured run-time values
+
+A lambda can read a value that exists only when the program runs, such as a parameter of the function around it. The translator receives such a value as an input slot when its declared return type is `Code.Bound(a)`. The rules are in section 10.1 of [../roc-reify-proposal.md](../roc-reify-proposal.md), and N18 of [../roc-reify-normal-form.md](../roc-reify-normal-form.md).
+
+| Item | Rule |
+| --- | --- |
+| A slot | A run-time name with the `Field`, `Index` and `Unwrap` reads of it. `order.price` is one slot. The description reads it as `Input(k)`. |
+| Slot types | `Graph.slots`, in the order in which the root first reads each slot. |
+| The translator | Runs once, while the compiler runs, and returns `Code.bound(code, value)`. It emits one placeholder for each slot, for example `?1` in SQL. |
+| The program | Reads `bound.value()` and `bound.inputs()`: one `Code.Value` for each slot, built where the program reads the call. |
+| Refused | A `var`, a read in a row other than the root, a slot type that holds a function, an opaque type or an optional field, a call with two such sites, a call whose other arguments are not fixed while the compiler runs, and a translator result that holds a function. |
+
+The SQL example binds a captured value as a `?` parameter (`orders_of_at_least` in [../examples/reifying/sql/main.roc](../examples/reifying/sql/main.roc)).
 
 ### Refusal, and where errors point
 
@@ -141,7 +157,7 @@ Checking commits nothing for a described function. The walk that builds the desc
 
 | Item | Rule |
 | --- | --- |
-| `Code.version` | The version of the normal form. It is 3 today ([../src/reify/mod.zig:33](../src/reify/mod.zig)). |
+| `Code.version` | The version of the normal form. It is 9 today ([../src/reify/mod.zig:36](../src/reify/mod.zig)). |
 | When the version changes | When the rules, the builtin table, or the speculatable lists change. A fingerprint test pins this. |
 | `==` and `to_hash` on a `Code` | They read the normal form and the version. They ignore the site key. Two sites with the same normal form are equal. |
 | A translator cache | Use `Code.version` and `Code.to_hash` as the key. |
@@ -185,8 +201,8 @@ Notes on accuracy:
 | Part | State |
 | --- | --- |
 | Where | The `reify` branch. Not merged into `main`. |
-| What works | Pure Roc as listed in [../roc-reify-design.md](../roc-reify-design.md): literals, operators, calls (helpers, generic, recursive, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods. |
-| Tests | 86 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 81 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 45 fixtures `test/cli/Staged*.roc`. 118 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
+| What works | Pure Roc as listed in [../roc-reify-design.md](../roc-reify-design.md): literals, operators, calls (helpers, generic, recursive, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods, and captured run-time values for a translator that returns a `Code.Bound`. |
+| Tests | 116 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 162 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 48 fixtures `test/cli/Staged*.roc`. 160 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
 | Not done | The translator cannot yet declare which functions of another package it reads (`code_primitives`, milestone M13 of [../roc-reify-normalization-plan.md](../roc-reify-normalization-plan.md)). |
 
 ### What is refused today
@@ -196,19 +212,18 @@ A refusal names the construct. The rule is that the function must name only thin
 | Refused | Reason |
 | --- | --- |
 | A function value that nothing fixes: an item of a list, a `var` that holds a function | There is no body to read. A function chosen by an `if` between known functions is described. |
-| A lambda that reads a parameter, a binder, or a `var` of the function around it | The value exists only when the program runs. A value that the block binds, or a top-level value, is described. |
-| A top-level value that computes a function, like `doubler = make(2.0)` | No definition names the function. An exact alias such as `same = add_one` is described. |
+| A lambda that reads a parameter, a binder, or a `var` of the function around it, where the translator does not return a `Code.Bound` | The value exists only when the program runs. A value that the block binds, or a top-level value, is described. The report names the opt-in. |
+| A captured `var`, a captured value read in a row other than the root, a captured function value, a captured value of an opaque type, a captured record with an optional field | The program supplies a slot's value at the call, as one `Code.Value`. These have no such value. |
+| A call that binds the slots of two sites, a call whose other arguments are not fixed while the compiler runs, a call whose result type it does not fix, a translator result that holds a function | The call must be a compile-time root of its own. |
+| A site that names a top-level value which computes a function, like `Calc.to_expr(doubler)` with `doubler = make(2.0)` | The site's root must be a lambda with parameters that the walk can list. A use of `doubler` inside a described function is described. Write `\|x\| doubler(x)` at the site. |
 | A computed top-level value of another package | The body belongs to that package, and the walk does not read it. A value written as data is folded. |
 | The body of a function of another package | It is a `Prim`. The translator maps it by name. |
 | An effect, `dbg`, a hosted function | Out of scope by design. |
 | A type variable that nothing fixes and no default seals | The body reads differently at each type. |
 | A numeric default that does not fit its use | For example `\|x\| x * 2.U8`. |
-| A tag union whose row has no default to seal it | A description is monomorphic. |
 | A template argument that is computed when the program runs | A description is built before the program runs. |
-| An unset record field `b: _`, a record update over a record with an optional field, a `.?` that is not the last segment of a path | Refused by name. |
-| A string interpolation pattern, a record pattern with `..name` | Refused by name. |
-| A literal of your own type whose `from_numeral` is a function of the same package, and a custom `from_interpolation` | The conversion cannot be described. |
-| Derived `is_eq` on a function, on an empty tag union, or on an opaque type that derives it | Refused by name. |
+| A custom `from_interpolation` of your own type, also as a template argument | The value is a function that the conversion computes, and no node applies a computed function. |
+| Derived `is_eq` on a function | Roc has no equality on functions. |
 
 The list with the exact reason lines is in the section "What the remaining unticked boxes cost" of [../roc-reify-design.md](../roc-reify-design.md).
 
@@ -261,7 +276,7 @@ Key source files:
 | [../src/check/Check.zig](../src/check/Check.zig) | Code positions (`stagedCode` at line 27442, `rejectMisplacedStagedCode` at 21149) and sites. |
 | [../src/check/code_reifier.zig](../src/check/code_reifier.zig) | The walk that describes a function. |
 | [../src/check/checked_artifact.zig](../src/check/checked_artifact.zig) | `reifyStagedCode` (line 38310) and the provenance table. |
-| [../src/reify/mod.zig](../src/reify/mod.zig) | The normal-form version, line 33. |
+| [../src/reify/mod.zig](../src/reify/mod.zig) | The normal-form version, line 36. |
 | [../src/reify/views.zig](../src/reify/views.zig) | The two views. |
 | [../src/reify/provenance.zig](../src/reify/provenance.zig) | The table from nodes to source places. |
 | [../src/check/report.zig](../src/check/report.zig) | The reports, including `translation refused`. |

@@ -23894,6 +23894,7 @@ test "boxy planner walks callable eval finalized const function bodies" {
             .root = @fromBackingInt(@intCast(fixtureTableIndex(0))),
             .source_scheme = .{},
             .checked_fn_root = @fromBackingInt(@intCast(1)),
+            .body = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         },
     };
     const patterns = [_]checked.StoredCheckedPattern{.{
@@ -26616,6 +26617,7 @@ test "boxy planner resolves callable eval bindings to finalized const function e
             .root = @fromBackingInt(@intCast(fixtureTableIndex(0))),
             .source_scheme = typeSchemeKey(1),
             .checked_fn_root = @fromBackingInt(@intCast(1)),
+            .body = @fromBackingInt(@intCast(fixtureTableIndex(0))),
         },
     };
     checked_module.callable_eval_templates = .{ .templates = .{ .items = &callable_templates, .capacity = callable_templates.len, .pointer_stability = .{} } };

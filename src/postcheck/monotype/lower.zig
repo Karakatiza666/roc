@@ -22300,6 +22300,8 @@ const BodyContext = struct {
     /// Frame stacks of finished instantiation runs, reused by later runs so
     /// a deep type does not regrow a stack for every instantiation.
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
+    /// Helpers that build the `Code.Value` of an input slot's value, by type.
+    code_value_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
     encoder_defs: std.AutoHashMap(GeneratedEncoderDefAddress, DraftGeneratedHelperDefEntry),
@@ -23139,6 +23141,7 @@ const BodyContext = struct {
             .codec_support_path = collections.DenseMap(Type.TypeId, void).init(allocator),
             .hash_expansion_stack = collections.DenseMap(Type.TypeId, void).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
+            .code_value_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
             .encoder_defs = std.AutoHashMap(GeneratedEncoderDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
@@ -23164,6 +23167,7 @@ const BodyContext = struct {
         self.hash_defs.deinit();
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
+        self.code_value_defs.deinit();
         self.hash_expansion_stack.deinit();
         self.equality_expansion_stack.deinit();
         self.codec_support_path.deinit();
@@ -36944,7 +36948,7 @@ const BodyContext = struct {
         ty: Type.TypeId,
     ) Allocator.Error!?DraftExprId {
         const entry = self.restoredHoistedConstEntry(expr_id) orelse return null;
-        return try self.restoredHoistedConstAtType(entry, ty);
+        return try self.boundCodeValue(expr_id, try self.restoredHoistedConstAtType(entry, ty), ty);
     }
 
     fn restoredHoistedExprAtNode(
@@ -36953,6 +36957,13 @@ const BodyContext = struct {
         request_node: NodeId,
     ) Allocator.Error!?DraftExprId {
         const entry = self.restoredHoistedConstEntry(expr_id) orelse return null;
+        // A call that binds input slots is read at the one type publication
+        // fixed for it, with the slot values added.
+        if (self.view.bodies.codeBinding(expr_id) != null) {
+            const ty = try self.boundCodeType(entry);
+            try relateRequestComponent(self.graph, request_node, try self.graph.importMono(ty));
+            return try self.boundCodeValue(expr_id, try self.restoredHoistedConstAtType(entry, ty), ty);
+        }
         return try self.restoredHoistedConstAtNode(entry, request_node);
     }
 
@@ -36976,6 +36987,474 @@ const BodyContext = struct {
     /// stored value. Its original expression and declaration lower in place.
     fn hoistedConstRunsAtRuntime(view: ModuleView, entry: checked.HoistedConstEntry) bool {
         return view.compile_time_roots.root(entry.root).payload == .runtime;
+    }
+
+    // Captured run-time inputs (roc-reify-proposal.md section 10.1).
+    //
+    // A call whose result is a `Code.Bound` is a compile-time root. The
+    // program reads the root's value with `inputs` set to one `Code.Value`
+    // per input slot, in slot order. Each slot is a run-time name read
+    // through its projections, as publication recorded it, and its value is
+    // built by one generated helper per type, so a recursive type reaches its
+    // own helper again.
+
+    /// The Monotype type a call that binds input slots is read at.
+    fn boundCodeType(self: *BodyContext, entry: checked.HoistedConstEntry) Allocator.Error!Type.TypeId {
+        return switch (self.view.const_templates.get(entry.const_ref).state) {
+            .stored_const => |stored| try self.storedConstRootMonoType(self.view, stored, entry.checked_type),
+            // Publication refused a call whose type it does not fix.
+            .eval_template => try self.lowerType(entry.checked_type),
+            .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
+            .unimplemented => Common.invariant("declaration with no implementation reached hoisted const restoration"),
+        };
+    }
+
+    /// The types a `Code.Value` is built from, read off the `Code.Bound` the
+    /// call returns.
+    const CodeValueTypes = struct {
+        bound: Type.TypeId,
+        /// `Code.Value`.
+        value: Type.TypeId,
+        /// The tags of `Code.Value`'s backing.
+        tags: Type.Span,
+        /// `List(Code.Value)`.
+        list: Type.TypeId,
+        str: Type.TypeId,
+        i128: Type.TypeId,
+        f64: Type.TypeId,
+        u64: Type.TypeId,
+        bool: Type.TypeId,
+    };
+
+    /// A generated helper whose body is still to be built.
+    const PendingCodeValueDef = struct {
+        def_id: DraftDefId,
+        value_ty: Type.TypeId,
+        arg_local: DraftLocalId,
+    };
+
+    /// `restored`, the value of the call `call` at `bound_ty`, with the
+    /// values of the input slots the call binds, or `restored` itself when
+    /// the call binds none.
+    fn boundCodeValue(
+        self: *BodyContext,
+        call: checked.CheckedExprId,
+        restored: DraftExprId,
+        bound_ty: Type.TypeId,
+    ) Allocator.Error!DraftExprId {
+        const slots = self.view.bodies.codeBinding(call) orelse return restored;
+        const bound_backing = nominalExprBackingType(self.typeStore(), bound_ty) orelse
+            Common.invariant("a call that binds input slots did not return a nominal Code.Bound");
+        const inputs_field = self.boundCodeField(bound_backing, "inputs");
+        const value_field = self.boundCodeField(bound_backing, "value");
+        const value_ty = switch (self.typeStore().get(inputs_field.ty)) {
+            .list => |elem| elem,
+            .primitive, .named, .record, .tuple, .tag_union, .box, .func, .erased, .zst, .hole => Common.invariant("Code.Bound inputs was not a list"),
+        };
+        const value_backing = nominalExprBackingType(self.typeStore(), value_ty) orelse
+            Common.invariant("Code.Value was not a nominal type");
+        const tags = switch (self.typeStore().get(value_backing)) {
+            .tag_union => |span| span,
+            .primitive, .named, .record, .tuple, .list, .box, .func, .erased, .zst, .hole => Common.invariant("Code.Value was not a tag union"),
+        };
+        const v = CodeValueTypes{
+            .bound = bound_ty,
+            .value = value_ty,
+            .tags = tags,
+            .list = inputs_field.ty,
+            .str = try self.primitiveType(.str),
+            .i128 = try self.primitiveType(.i128),
+            .f64 = try self.primitiveType(.f64),
+            .u64 = try self.primitiveType(.u64),
+            .bool = try self.primitiveType(.bool),
+        };
+        var pending = std.ArrayList(PendingCodeValueDef).empty;
+        defer pending.deinit(self.allocator);
+
+        const values = try self.allocator.alloc(DraftExprId, slots.len);
+        defer self.allocator.free(values);
+        for (slots, values) |slot, *out| out.* = try self.boundSlotValue(slot, v, &pending);
+        while (pending.pop()) |def| try self.buildCodeValueDef(def, v, &pending);
+
+        const inputs = try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(values) } });
+        const value = try self.addFieldAccessExpr(restored, value_field.name, value_field.ty);
+        const fields = recordFields(self.typeStore(), bound_backing);
+        const field_count = GuardedList.borrowLen(fields);
+        const field_exprs = try self.allocator.alloc(DraftFieldExpr, field_count);
+        defer self.allocator.free(field_exprs);
+        for (field_exprs, 0..) |*field_expr, index| {
+            const field = GuardedList.at(recordFields(self.typeStore(), bound_backing), index);
+            field_expr.* = .{
+                .name = field.name,
+                .value = if (field.name == inputs_field.name) inputs else if (field.name == value_field.name) value else Common.invariant("Code.Bound had a field other than value and inputs"),
+            };
+        }
+        return try self.addConstructorExpr(bound_ty, .{ .record = try self.addFieldExprSpan(field_exprs) });
+    }
+
+    fn boundCodeField(self: *BodyContext, record_ty: Type.TypeId, comptime text: []const u8) Type.Field {
+        const fields = recordFields(self.typeStore(), record_ty);
+        for (0..GuardedList.borrowLen(fields)) |index| {
+            const field = GuardedList.at(fields, index);
+            if (std.mem.eql(u8, self.nameStore().recordFieldLabelText(field.name), text)) return field;
+        }
+        Common.invariant("Code.Bound has no field " ++ text);
+    }
+
+    /// The `Code.Value` of one input slot: its run-time name read through
+    /// its projections, an unwrap binding the backing of a nominal value.
+    fn boundSlotValue(
+        self: *BodyContext,
+        slot: checked.CheckedCodeSlot,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!DraftExprId {
+        const binder_ty = checkedBinderType(self.view, slot.leaf);
+        std.debug.assert(self.checkedTypeIsClosed(binder_ty));
+        var ty = try self.lowerType(binder_ty);
+        const local = self.binders.get(slot.leaf) orelse
+            Common.invariant("an input slot read a name the body has not bound");
+        var value = try self.lowerLocalAtRequestedNode(local, self.localTypeCell(local), try self.graph.importMono(ty));
+        const Unwrap = struct { pat: DraftPatId, value: DraftExprId };
+        var unwraps = std.ArrayList(Unwrap).empty;
+        defer unwraps.deinit(self.allocator);
+        for (self.view.bodies.codeSlotSteps(slot)) |step| {
+            const shape_ty = self.codeValueShapeType(ty);
+            switch (step.kind) {
+                .field => {
+                    const text = self.view.names.recordFieldLabelText(@fromBackingInt(step.value));
+                    const fields = recordFields(self.typeStore(), shape_ty);
+                    const field = for (0..GuardedList.borrowLen(fields)) |index| {
+                        const field = GuardedList.at(fields, index);
+                        if (std.mem.eql(u8, self.nameStore().recordFieldLabelText(field.name), text)) break field;
+                    } else Common.invariant("an input slot read a field its record type does not have");
+                    value = try self.addFieldAccessExpr(value, field.name, field.ty);
+                    ty = field.ty;
+                },
+                .index => {
+                    const item_ty = GuardedList.at(tupleItemTypes(self.typeStore(), shape_ty), step.value);
+                    value = try self.addExpr(.{ .ty = item_ty, .data = .{ .tuple_access = .{ .tuple = value, .elem_index = step.value } } });
+                    ty = item_ty;
+                },
+                .unwrap => {
+                    const backing = nominalExprBackingType(self.typeStore(), shape_ty) orelse
+                        Common.invariant("an input slot unwrapped a value that is not nominal");
+                    const inner = try self.addLocal(self.builder.symbols.fresh(), backing);
+                    try unwraps.append(self.allocator, .{
+                        .pat = try self.addPat(.{ .ty = shape_ty, .data = .{ .nominal = try self.bindPat(inner, backing) } }),
+                        .value = value,
+                    });
+                    value = try self.localExpr(inner, backing);
+                    ty = backing;
+                },
+            }
+        }
+        if (std.debug.runtime_safety) {
+            if (!try self.codeValueShapeMatches(ty, self.view.bodies.codeSlotShape(slot))) {
+                Common.invariant("an input slot's Monotype type differs from the shape of its slot type");
+            }
+        }
+        var out = try self.codeValueCall(value, ty, v, pending);
+        while (unwraps.pop()) |unwrap| {
+            out = try self.addExpr(.{ .ty = v.value, .data = .{ .let_ = .{ .bind = unwrap.pat, .value = unwrap.value, .rest = out } } });
+        }
+        return out;
+    }
+
+    /// `ty` with its transparent aliases read through: the type a
+    /// `Code.Value` follows.
+    fn codeValueShapeType(self: *BodyContext, ty: Type.TypeId) Type.TypeId {
+        var current = ty;
+        while (true) switch (self.typeStore().get(current)) {
+            .named => |named| switch (named.kind) {
+                .alias => current = (named.backing orelse Common.invariant("an alias in a slot type had no backing")).ty,
+                .nominal, .@"opaque" => return current,
+            },
+            .primitive, .record, .tuple, .tag_union, .list, .box, .func, .erased, .zst, .hole => return current,
+        };
+    }
+
+    /// A call of the helper that builds the `Code.Value` of a value of `ty`,
+    /// reserving the helper when the body has none yet.
+    fn codeValueCall(
+        self: *BodyContext,
+        value: DraftExprId,
+        ty: Type.TypeId,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!DraftExprId {
+        const address = GeneratedHelperDefAddress{ .value_ty = @backingInt(ty), .result_ty = @backingInt(v.value) };
+        const def_id = if (self.code_value_defs.get(address)) |entry| entry.id() else blk: {
+            const def_id = try self.draft.reserveDef(self.draft.current_owner);
+            try self.code_value_defs.put(address, .{ .reserved = def_id });
+            try pending.append(self.allocator, .{
+                .def_id = def_id,
+                .value_ty = ty,
+                .arg_local = try self.addLocal(self.builder.symbols.fresh(), ty),
+            });
+            break :blk def_id;
+        };
+        const callee = try self.addExprWithTypeCell(
+            .{ .sealed = try self.functionType(&.{ty}, v.value) },
+            .{ .def_ref = .{ .draft = def_id } },
+        );
+        return try self.addExpr(.{ .ty = v.value, .data = .{ .call_value = .{
+            .callee = callee,
+            .args = try self.addExprSpan(&.{value}),
+        } } });
+    }
+
+    fn buildCodeValueDef(
+        self: *BodyContext,
+        def: PendingCodeValueDef,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!void {
+        const arg = try self.localExpr(def.arg_local, def.value_ty);
+        const body = try self.codeValueBody(arg, def.value_ty, v, pending);
+        self.draft.setDef(def.def_id, .{
+            .symbol = self.builder.symbols.fresh(),
+            .fn_def = null,
+            .identity_seed = .{ .kind = "code-value-helper", .cells = .{ DraftTypeCell.fromSealed(def.value_ty), DraftTypeCell.fromSealed(v.value), null, null } },
+            .args = try self.addTypedLocalSpan(&.{.{ .local = def.arg_local, .ty = def.value_ty }}),
+            .body = .{ .roc = body },
+            .ret = try self.draftTypeCell(v.value),
+        });
+        try self.code_value_defs.put(.{ .value_ty = @backingInt(def.value_ty), .result_ty = @backingInt(v.value) }, .{ .ready = def.def_id });
+    }
+
+    /// The `Code.Value` variant `text` holding `payloads`.
+    fn codeValueVariant(self: *BodyContext, v: CodeValueTypes, comptime text: []const u8, payloads: []const DraftExprId) Allocator.Error!DraftExprId {
+        const tags = self.typeStore().tagSpan(v.tags);
+        const name = for (0..GuardedList.borrowLen(tags)) |index| {
+            const tag = GuardedList.at(self.typeStore().tagSpan(v.tags), index);
+            if (std.mem.eql(u8, self.nameStore().tagLabelText(tag.name), text)) break tag.name;
+        } else Common.invariant("Code.Value has no variant " ++ text);
+        return try self.addConstructorExpr(v.value, .{ .tag = .{ .name = name, .payloads = try self.addExprSpan(payloads) } });
+    }
+
+    /// One layer of the `Code.Value` of `value`, a value of `ty`: each
+    /// component's value is a call of its type's helper.
+    fn codeValueBody(
+        self: *BodyContext,
+        value: DraftExprId,
+        ty: Type.TypeId,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!DraftExprId {
+        const shape_ty = self.codeValueShapeType(ty);
+        switch (self.typeStore().get(shape_ty)) {
+            .primitive => |primitive| return switch (primitive) {
+                .bool => try self.codeValueVariant(v, "Bool", &.{value}),
+                .str => try self.codeValueVariant(v, "Str", &.{value}),
+                .u128 => try self.codeValueVariant(v, "U128", &.{value}),
+                .i128 => try self.codeValueVariant(v, "Int", &.{value}),
+                inline .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64 => |int| try self.codeValueVariant(v, "Int", &.{
+                    try self.lowLevelExpr(@field(can.CIR.Expr.LowLevel, @tagName(int) ++ "_to_i128"), &.{value}, v.i128),
+                }),
+                .f32 => try self.codeValueVariant(v, "Frac", &.{try self.lowLevelExpr(.f32_to_f64, &.{value}, v.f64)}),
+                .f64 => try self.codeValueVariant(v, "Frac", &.{value}),
+                .dec => try self.codeValueVariant(v, "Dec", &.{value}),
+                .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => Common.invariant("a slot type held a vector, which the walk refuses"),
+            },
+            .named => {
+                const backing = nominalExprBackingType(self.typeStore(), shape_ty) orelse
+                    Common.invariant("a nominal type in a slot type had no backing");
+                const inner = try self.addLocal(self.builder.symbols.fresh(), backing);
+                const pat = try self.addPat(.{ .ty = shape_ty, .data = .{ .nominal = try self.bindPat(inner, backing) } });
+                const wrapped = try self.codeValueVariant(v, "Wrap", &.{try self.codeValueCall(try self.localExpr(inner, backing), backing, v, pending)});
+                return try self.addExpr(.{ .ty = v.value, .data = .{ .let_ = .{ .bind = pat, .value = value, .rest = wrapped } } });
+            },
+            .record => |span| {
+                const items = try self.allocator.alloc(DraftExprId, span.len);
+                defer self.allocator.free(items);
+                for (items, 0..) |*item, index| {
+                    const field = self.spanFieldAt(span, index);
+                    item.* = try self.codeValueCall(try self.addFieldAccessExpr(value, field.name, field.ty), field.ty, v, pending);
+                }
+                return try self.codeValueVariant(v, "Record", &.{try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(items) } })});
+            },
+            .zst => return try self.codeValueVariant(v, "Record", &.{try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(&.{}) } })}),
+            .tuple => |span| {
+                const items = try self.allocator.alloc(DraftExprId, span.len);
+                defer self.allocator.free(items);
+                for (items, 0..) |*item, index| {
+                    const item_ty = self.spanTypeAt(span, index);
+                    const read = try self.addExpr(.{ .ty = item_ty, .data = .{ .tuple_access = .{ .tuple = value, .elem_index = @intCast(index) } } });
+                    item.* = try self.codeValueCall(read, item_ty, v, pending);
+                }
+                return try self.codeValueVariant(v, "Tuple", &.{try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(items) } })});
+            },
+            .tag_union => |span| {
+                var branches = std.ArrayList(DraftBranch).empty;
+                defer branches.deinit(self.allocator);
+                for (0..span.len) |index| {
+                    const tag = GuardedList.at(self.typeStore().tagSpan(span), index);
+                    if (try self.tagHasProvenUninhabitedPayload(tag)) continue;
+                    const pats = try self.allocator.alloc(DraftPatId, tag.payloads.len);
+                    defer self.allocator.free(pats);
+                    const payloads = try self.allocator.alloc(DraftExprId, tag.payloads.len);
+                    defer self.allocator.free(payloads);
+                    for (pats, payloads, 0..) |*pat, *payload, payload_index| {
+                        const payload_ty = self.spanTypeAt(tag.payloads, payload_index);
+                        const local = try self.addLocal(self.builder.symbols.fresh(), payload_ty);
+                        pat.* = try self.bindPat(local, payload_ty);
+                        payload.* = try self.codeValueCall(try self.localExpr(local, payload_ty), payload_ty, v, pending);
+                    }
+                    const tag_pat = try self.addPat(.{ .ty = shape_ty, .data = .{ .tag = .{
+                        .name = tag.name,
+                        .payloads = try self.addPatSpan(pats),
+                    } } });
+                    const name = try self.stringExpr(self.nameStore().tagLabelText(tag.name), v.str);
+                    const list = try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(payloads) } });
+                    try branches.append(self.allocator, .{ .pat = tag_pat, .body = try self.codeValueVariant(v, "Tag", &.{ name, list }) });
+                }
+                return try self.addExpr(.{ .ty = v.value, .data = .{ .match_ = .{
+                    .scrutinee = value,
+                    .branches = try self.addBranchSpan(branches.items),
+                } } });
+            },
+            .list => |elem_ty| {
+                // let len = list_len(value)
+                // loop (i = 0, out = with_capacity(len))
+                //   if i == len then break out
+                //   else continue (i + 1, append_unsafe(out, value_of(get_unsafe(value, i))))
+                const len_local = try self.addLocal(self.builder.symbols.fresh(), v.u64);
+                const len_value = try self.lowLevelExpr(.list_len, &.{value}, v.u64);
+                const index_local = try self.addLocal(self.builder.symbols.fresh(), v.u64);
+                const out_local = try self.addLocal(self.builder.symbols.fresh(), v.list);
+                const index = try self.localExpr(index_local, v.u64);
+                const done = try self.lowLevelExpr(.num_is_eq, &.{ index, try self.localExpr(len_local, v.u64) }, v.bool);
+                const finish = try self.addExpr(.{ .ty = v.list, .data = .{ .break_ = try self.localExpr(out_local, v.list) } });
+                const item = try self.lowLevelExpr(.list_get_unsafe, &.{ value, try self.localExpr(index_local, v.u64) }, elem_ty);
+                const appended = try self.lowLevelExpr(.list_append_unsafe, &.{ try self.localExpr(out_local, v.list), try self.codeValueCall(item, elem_ty, v, pending) }, v.list);
+                const next_index = try self.lowLevelExpr(.num_plus, &.{ try self.localExpr(index_local, v.u64), try self.intLiteralExpr(1, v.u64) }, v.u64);
+                const step = try self.addExpr(.{ .ty = v.list, .data = .{ .continue_ = .{ .values = try self.addExprSpan(&.{ next_index, appended }) } } });
+                const params = [_]BodyTypedLocal{
+                    .{ .local = index_local, .ty = v.u64 },
+                    .{ .local = out_local, .ty = v.list },
+                };
+                const initial_values = [_]DraftExprId{
+                    try self.intLiteralExpr(0, v.u64),
+                    try self.lowLevelExpr(.list_with_capacity, &.{try self.localExpr(len_local, v.u64)}, v.list),
+                };
+                const loop = try self.addExpr(.{ .ty = v.list, .data = .{ .loop_ = .{
+                    .params = try self.addTypedLocalSpan(&params),
+                    .initial_values = try self.addExprSpan(&initial_values),
+                    .body = try self.ifExpr(done, finish, step, v.list),
+                } } });
+                const items = try self.addExpr(.{ .ty = v.list, .data = .{ .let_ = .{
+                    .bind = try self.bindPat(len_local, v.u64),
+                    .value = len_value,
+                    .rest = loop,
+                } } });
+                return try self.codeValueVariant(v, "List", &.{items});
+            },
+            .box, .func, .erased, .hole => Common.invariant("a slot type held a shape no Code.Value expresses, which publication refuses"),
+        }
+    }
+
+    /// Whether `ty` has the shape `words` (`checked.CodeValueShape`) say,
+    /// which the reifier wrote from the slot's type. Debug builds only.
+    fn codeValueShapeMatches(self: *BodyContext, ty: Type.TypeId, words: []const u32) Allocator.Error!bool {
+        const S = checked.CodeValueShape;
+        const Item = union(enum) { ty: Type.TypeId, field: names.RecordFieldNameId, tag: Type.Tag };
+        var pending = std.ArrayList(Item).empty;
+        defer pending.deinit(self.allocator);
+        try pending.append(self.allocator, .{ .ty = ty });
+        var at: usize = 0;
+        while (pending.pop()) |item| {
+            if (at >= words.len) return false;
+            const word = words[at];
+            at += 1;
+            const current = switch (item) {
+                .field => |name| {
+                    if (!std.mem.eql(u8, self.view.names.recordFieldLabelText(@fromBackingInt(word)), self.nameStore().recordFieldLabelText(name))) return false;
+                    continue;
+                },
+                .tag => |tag| {
+                    if (!std.mem.eql(u8, self.view.names.tagLabelText(@fromBackingInt(word)), self.nameStore().tagLabelText(tag.name))) return false;
+                    if (at >= words.len or words[at] != tag.payloads.len) return false;
+                    at += 1;
+                    continue;
+                },
+                .ty => |current| self.codeValueShapeType(current),
+            };
+            const shape = std.enums.fromInt(S, word) orelse return false;
+            const content = self.typeStore().get(current);
+            switch (shape) {
+                .int => {
+                    if (at >= words.len) return false;
+                    const want = words[at];
+                    at += 1;
+                    const got: u32 = switch (content) {
+                        .primitive => |primitive| switch (primitive) {
+                            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => @intFromEnum(primitive) - @intFromEnum(Type.Primitive.u8),
+                            else => return false,
+                        },
+                        else => return false,
+                    };
+                    if (got != want) return false;
+                },
+                .frac => {
+                    if (at >= words.len) return false;
+                    const want: Type.Primitive = if (words[at] == 1) .f64 else .f32;
+                    at += 1;
+                    if (content != .primitive or content.primitive != want) return false;
+                },
+                .dec => if (content != .primitive or content.primitive != .dec) return false,
+                .bool_ => if (content != .primitive or content.primitive != .bool) return false,
+                .str => if (content != .primitive or content.primitive != .str) return false,
+                .list => switch (content) {
+                    .list => |elem| try pending.append(self.allocator, .{ .ty = elem }),
+                    else => return false,
+                },
+                .wrap => try pending.append(self.allocator, .{ .ty = nominalExprBackingType(self.typeStore(), current) orelse return false }),
+                .recursive => if (content != .named) return false,
+                .tuple => {
+                    if (at >= words.len or content != .tuple or content.tuple.len != words[at]) return false;
+                    at += 1;
+                    var index = content.tuple.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try pending.append(self.allocator, .{ .ty = self.spanTypeAt(content.tuple, index) });
+                    }
+                },
+                .record => {
+                    if (at >= words.len) return false;
+                    const span: Type.Span = switch (content) {
+                        .record => |span| span,
+                        .zst => .empty(),
+                        else => return false,
+                    };
+                    if (span.len != words[at]) return false;
+                    at += 1;
+                    var index = span.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const field = self.spanFieldAt(span, index);
+                        try pending.append(self.allocator, .{ .ty = field.ty });
+                        try pending.append(self.allocator, .{ .field = field.name });
+                    }
+                },
+                .tag_union => {
+                    if (at >= words.len or content != .tag_union or content.tag_union.len != words[at]) return false;
+                    at += 1;
+                    var index = content.tag_union.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const tag = GuardedList.at(self.typeStore().tagSpan(content.tag_union), index);
+                        var payload = tag.payloads.len;
+                        while (payload > 0) {
+                            payload -= 1;
+                            try pending.append(self.allocator, .{ .ty = self.spanTypeAt(tag.payloads, payload) });
+                        }
+                        try pending.append(self.allocator, .{ .tag = tag });
+                    }
+                },
+            }
+        }
+        return at == words.len;
     }
 
     fn selectedHoistedConstEntry(

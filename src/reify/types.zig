@@ -483,6 +483,48 @@ pub const Types = struct {
         };
     }
 
+    /// Whether N14 splits a value of `ty`: a record or tuple with at least one
+    /// component, none of which a value may lack.
+    pub fn isSplittable(self: *const Types, ty: TyId) bool {
+        return switch (self.get(ty)) {
+            .record => |span| blk: {
+                const members = self.memberSlice(span);
+                if (members.len == 0) break :blk false;
+                for (members) |m| if (m.optional) break :blk false;
+                break :blk true;
+            },
+            .tuple => |span| span.len > 0,
+            .bool_, .str, .int, .float, .dec, .tag_union, .list, .nominal, .func, .opaque_, .recursive => false,
+        };
+    }
+
+    /// How many components `ty` has, when N14 splits it.
+    pub fn componentCount(self: *const Types, ty: TyId) u32 {
+        return switch (self.get(ty)) {
+            .record, .tuple => |span| span.len,
+            .bool_, .str, .int, .float, .dec, .tag_union, .list, .nominal, .func, .opaque_, .recursive => 0,
+        };
+    }
+
+    /// The type of component `i` of the record or tuple `ty`, in the type's order.
+    pub fn componentTy(self: *const Types, ty: TyId, i: u32) TyId {
+        return switch (self.get(ty)) {
+            .record => |span| self.tySlice(self.memberSlice(span)[i].tys)[0],
+            .tuple => |span| self.tySlice(span)[i],
+            .bool_, .str, .int, .float, .dec, .tag_union, .list, .nominal, .func, .opaque_, .recursive => unreachable, // only a record or tuple has components
+        };
+    }
+
+    /// The layers of records and tuples that N14 splits in `ty`, counted
+    /// through the components it splits: a splittable record of splittable
+    /// records counts one for each. Splitting a layer lowers the count by one.
+    pub fn splitLayers(self: *const Types, ty: TyId) u32 {
+        if (!self.isSplittable(ty)) return 0;
+        var layers: u32 = 1;
+        for (0..self.componentCount(ty)) |i| layers += self.splitLayers(self.componentTy(ty, @intCast(i)));
+        return layers;
+    }
+
     /// The position of the tag `name` among the members of the tag union `union_ty`,
     /// which are in name order. Null when the union has no such tag.
     pub fn memberIndex(self: *const Types, union_ty: TyId, name_id: NameId) ?u32 {

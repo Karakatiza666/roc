@@ -2518,6 +2518,45 @@ pub const CheckedFieldDefault = extern struct {
 /// construction site. This remains separate from the record's final checked
 /// type because ordinary value unification may normalize that shared field to
 /// `required` after the construction decision has already been made.
+/// The words of a captured slot's shape (`code_reifier.slotShape`), which
+/// the site lowering compares with the type it builds each `Code.Value` at in
+/// debug builds. The words are in pre-order. `int` is followed by the
+/// `reify.types.IntTy` of the integer, `frac` by 1 for `F64` and 0 for
+/// `F32`, `tuple` by its item count, `record` by its field count and then a
+/// field label and the field's shape per field, and `tag_union` by its tag
+/// count and then a tag label, a payload count and the payloads' shapes per
+/// tag. `recursive` is a reference back to an enclosing `wrap`.
+pub const CodeValueShape = enum(u32) { int, frac, dec, bool_, str, list, record, tuple, tag_union, wrap, recursive };
+
+/// A call whose result is a `Code.Bound`, with the input slots the program
+/// supplies at run time (roc-reify-proposal.md section 10.1). The slots are
+/// `code_slot_pool[slots_start..][0..slots_len]`, in slot order.
+pub const CheckedCodeBinding = extern struct {
+    call: CheckedExprId,
+    slots_start: u32,
+    slots_len: u32,
+};
+
+/// One input slot: the run-time name the program reads, the projections it
+/// reads it through (`code_slot_step_pool`), and the slot type's shape
+/// (`code_shape_pool`, words of `CodeValueShape`).
+pub const CheckedCodeSlot = extern struct {
+    leaf: PatternBinderId,
+    steps_start: u32,
+    steps_len: u32,
+    shape_start: u32,
+    shape_len: u32,
+};
+
+/// One projection of an input slot: a record field by its label, a tuple
+/// item by its index, or the backing of a nominal value.
+pub const CheckedCodeSlotStep = extern struct {
+    kind: Kind,
+    value: u32,
+
+    pub const Kind = enum(u32) { field, index, unwrap };
+};
+
 pub const CheckedRecordOmittedDefault = extern struct {
     expr: CheckedExprId,
     field_name: canonical.RecordFieldLabelId,
@@ -11599,6 +11638,40 @@ pub const CheckedBodyStoreView = struct {
     string_ranges: []const CheckedStringRange = &.{},
     default_exprs: []const CheckedBodyStore.CheckedDefaultExpr = &.{},
     record_omitted_defaults: []const CheckedRecordOmittedDefault = &.{},
+    code_bindings: []const CheckedCodeBinding = &.{},
+    code_slot_pool: []const CheckedCodeSlot = &.{},
+    code_slot_step_pool: []const CheckedCodeSlotStep = &.{},
+    code_shape_pool: []const u32 = &.{},
+
+    /// The input slots `call` binds, in slot order, or null when `call`
+    /// binds none.
+    pub fn codeBinding(self: CheckedBodyStoreView, call: CheckedExprId) ?[]const CheckedCodeSlot {
+        var lo: usize = 0;
+        var hi: usize = self.code_bindings.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const at = @backingInt(self.code_bindings[mid].call);
+            if (at < @backingInt(call)) {
+                lo = mid + 1;
+            } else if (at > @backingInt(call)) {
+                hi = mid;
+            } else {
+                const binding = self.code_bindings[mid];
+                return self.code_slot_pool[binding.slots_start..][0..binding.slots_len];
+            }
+        }
+        return null;
+    }
+
+    /// The projections a slot reads its leaf through, outermost last.
+    pub fn codeSlotSteps(self: CheckedBodyStoreView, slot: CheckedCodeSlot) []const CheckedCodeSlotStep {
+        return self.code_slot_step_pool[slot.steps_start..][0..slot.steps_len];
+    }
+
+    /// The words of a slot type's shape (`CodeValueShape`).
+    pub fn codeSlotShape(self: CheckedBodyStoreView, slot: CheckedCodeSlot) []const u32 {
+        return self.code_shape_pool[slot.shape_start..][0..slot.shape_len];
+    }
 
     /// Resolve a locally-declared field default's `DefaultId.expr_node` to
     /// its published checked expression (design.md "Defaulted Fields").
@@ -12725,6 +12798,12 @@ pub const CheckedBodyStore = struct {
     default_exprs: std.ArrayList(CheckedDefaultExpr) = .empty,
     /// Checker-selected defaults attached to their exact omission sites.
     record_omitted_defaults: std.ArrayList(CheckedRecordOmittedDefault) = .empty,
+    /// Calls that bind the input slots of a site (`CheckedCodeBinding`),
+    /// sorted by call.
+    code_bindings: std.ArrayList(CheckedCodeBinding) = .empty,
+    code_slot_pool: std.ArrayList(CheckedCodeSlot) = .empty,
+    code_slot_step_pool: std.ArrayList(CheckedCodeSlotStep) = .empty,
+    code_shape_pool: std.ArrayList(u32) = .empty,
     source_node_map: CheckedSourceNodeMap = .{},
     /// Synthesized conversion, matched-value lookup, and equality expressions
     /// for custom literal patterns, ordered by source node. Pattern nodes
@@ -13070,6 +13149,10 @@ pub const CheckedBodyStore = struct {
             .string_ranges = self.string_ranges.items,
             .default_exprs = self.default_exprs.items,
             .record_omitted_defaults = self.record_omitted_defaults.items,
+            .code_bindings = self.code_bindings.items,
+            .code_slot_pool = self.code_slot_pool.items,
+            .code_slot_step_pool = self.code_slot_step_pool.items,
+            .code_shape_pool = self.code_shape_pool.items,
         };
     }
 
@@ -13532,6 +13615,50 @@ pub const CheckedBodyStore = struct {
         self.stagedSiteData(expr_id).* = .{ .runtime_error = .{} };
     }
 
+    /// Record that `call` binds `slots`, the input slots of the one site it
+    /// holds, in slot order. Calls arrive in any order; `sortCodeBindings`
+    /// orders them once every call is recorded.
+    pub fn attachCodeBinding(
+        self: *CheckedBodyStore,
+        allocator: Allocator,
+        call: CheckedExprId,
+        slots: []const code_reifier.SlotSource,
+    ) Allocator.Error!void {
+        try self.code_bindings.ensureUnusedCapacity(allocator, 1);
+        const slots_start: u32 = @intCast(self.code_slot_pool.items.len);
+        for (slots) |slot| {
+            const steps_start: u32 = @intCast(self.code_slot_step_pool.items.len);
+            for (slot.steps) |step| try self.code_slot_step_pool.append(allocator, switch (step) {
+                .field => |label| .{ .kind = .field, .value = @backingInt(label) },
+                .index => |index| .{ .kind = .index, .value = index },
+                .unwrap => .{ .kind = .unwrap, .value = 0 },
+            });
+            const shape_start: u32 = @intCast(self.code_shape_pool.items.len);
+            try self.code_shape_pool.appendSlice(allocator, slot.shape);
+            try self.code_slot_pool.append(allocator, .{
+                .leaf = slot.leaf,
+                .steps_start = steps_start,
+                .steps_len = @intCast(slot.steps.len),
+                .shape_start = shape_start,
+                .shape_len = @intCast(slot.shape.len),
+            });
+        }
+        self.code_bindings.appendAssumeCapacity(.{
+            .call = call,
+            .slots_start = slots_start,
+            .slots_len = @intCast(slots.len),
+        });
+    }
+
+    /// Order the bindings by call, which `codeBinding` searches.
+    pub fn sortCodeBindings(self: *CheckedBodyStore) void {
+        std.mem.sort(CheckedCodeBinding, self.code_bindings.items, {}, struct {
+            fn lessThan(_: void, a: CheckedCodeBinding, b: CheckedCodeBinding) bool {
+                return @backingInt(a.call) < @backingInt(b.call);
+            }
+        }.lessThan);
+    }
+
     fn stagedSiteData(self: *CheckedBodyStore, expr_id: CheckedExprId) *StoredCheckedExprData {
         const data = &self.stored_exprs.items[@backingInt(expr_id)].data;
         switch (data.*) {
@@ -13801,11 +13928,15 @@ pub const CheckedBodyStore = struct {
         string_ranges: SerializedSlice(CheckedStringRange) = .{},
         default_exprs: SerializedSlice(CheckedDefaultExpr) = .{},
         record_omitted_defaults: SerializedSlice(CheckedRecordOmittedDefault) = .{},
+        code_bindings: SerializedSlice(CheckedCodeBinding) = .{},
+        code_slot_pool: SerializedSlice(CheckedCodeSlot) = .{},
+        code_slot_step_pool: SerializedSlice(CheckedCodeSlotStep) = .{},
+        code_shape_pool: SerializedSlice(u32) = .{},
 
         comptime {
-            // 26 SerializedSlice fields → 26 base-pointer fixups, independent of
+            // 30 SerializedSlice fields → 30 base-pointer fixups, independent of
             // stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 26);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 30);
         }
 
         const Serde = artifact_serialize.SliceStoreSerde(CheckedBodyStore, @This());
@@ -16851,6 +16982,11 @@ pub const CallableEvalTemplate = struct {
     /// direct call that forwards to that lookup inside the alias's own
     /// evidence scope, its entry wrapper; no compile-time evaluator runs.
     forwarded_lookup: ?CheckedExprId = null,
+    /// The checked expression the binding was written as. A description that
+    /// reaches a use of a binding that computes a function reads it where the
+    /// name stands, so no evaluated closure is needed to name the lambda and
+    /// its captures.
+    body: CheckedExprId,
 };
 
 /// Public `CallableEvalTemplateTableView` declaration.
@@ -16877,6 +17013,7 @@ pub const CallableEvalTemplateTable = struct {
         root: ComptimeRootId,
         source_scheme: canonical.CanonicalTypeSchemeKey,
         checked_fn_root: CheckedTypeId,
+        body: CheckedExprId,
     ) Allocator.Error!CallableEvalTemplateId {
         const id: CallableEvalTemplateId = @fromBackingInt(@intCast(@as(u32, @intCast(self.templates.items.len))));
         try self.templates.append(allocator, .{
@@ -16886,6 +17023,7 @@ pub const CallableEvalTemplateTable = struct {
             .root = root,
             .source_scheme = source_scheme,
             .checked_fn_root = checked_fn_root,
+            .body = body,
         });
         return id;
     }
@@ -17005,6 +17143,7 @@ const SelectedHoistedCallableTable = struct {
                 root.id,
                 source_scheme,
                 root.checked_type,
+                root.expr,
             );
             const binding = try procedure_bindings.appendCallableEval(
                 allocator,
@@ -31026,6 +31165,7 @@ pub const TopLevelValueTable = struct {
                     root_id,
                     source_scheme,
                     checked_fn_root,
+                    root.expr,
                 );
                 const binding = try procedure_bindings.appendCallableEval(
                     allocator,
@@ -34796,8 +34936,9 @@ pub const CheckedModuleArtifact = struct {
             // export requirements, and the portability column one more. Stored
             // function evidence keeps its target and structural payloads in
             // two pools of their own. Template demand vectors add one. The
-            // code provenance table adds its seven slices.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 253);
+            // code provenance table adds its seven slices, and the calls that
+            // bind input slots four in the body store.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 257);
         }
 
         /// Every field but the inline POD `key`, `source_hash`, and
@@ -38039,6 +38180,7 @@ const ForeignStagedLookup = struct {
             .resolve_alias = resolveAlias,
             .resolve_exported = resolveExported,
             .resolve_exported_alias = resolveExportedAlias,
+            .resolve_exported_computed = resolveExportedComputed,
             .resolve_constant = resolveConstant,
             .resolve_method = resolveMethod,
             .resolve_inspect_override = resolveInspectOverride,
@@ -38184,6 +38326,25 @@ const ForeignStagedLookup = struct {
         }
         return null;
     }
+
+    /// A top-level value of a named artifact that computes a function, which
+    /// a use inside a description reads as the expression it was written as.
+    fn resolveExportedComputed(
+        context: *const anyopaque,
+        artifact: canonical.ArtifactRef,
+        def: CIR.Def.Idx,
+    ) ?code_reifier.ForeignComputed {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        for (self.imports) |import_artifact| {
+            if (!std.meta.eql(import_artifact.key.bytes, artifact.bytes)) continue;
+            return exportedComputed(import_artifact.view, def);
+        }
+        for (self.available) |view| {
+            if (!std.meta.eql(view.key.bytes, artifact.bytes)) continue;
+            return exportedComputed(view, def);
+        }
+        return null;
+    }
 };
 
 /// One registry's answer for a nominal named by content identity and
@@ -38302,6 +38463,23 @@ pub fn exportedAlias(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.F
     return null;
 }
 
+/// The expression an exported top-level value that computes a function was
+/// written as, or null when the definition is not one. An exact alias is not:
+/// it forwards to the procedure its lookup names (`exportedAlias`).
+pub fn exportedComputed(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.ForeignComputed {
+    for (view.exported_procedure_bindings.bindings) |binding| {
+        if (binding.binding.def != def) continue;
+        const template_id = switch (binding.body) {
+            .callable_eval_template => |template| template,
+            .direct_template, .checked_error => return null,
+        };
+        const template = view.callable_eval_templates.templates[@backingInt(template_id)];
+        if (template.forwarded_lookup != null) return null;
+        return .{ .module = foreignModule(view), .body = template.body };
+    }
+    return null;
+}
+
 /// Walk every function this module stages into `store`, recording each
 /// description on its site and reporting every walk that could not finish.
 ///
@@ -38327,6 +38505,7 @@ fn reifyStagedCode(
     imports: []const PublishImportArtifact,
     available: []const ImportedModuleView,
     store: *ConstStore,
+    hoisted_constants: *const HoistedConstTable,
     problem_store: ?*problem.Store,
 ) Allocator.Error!CodeProvenanceTable {
     var foreign = ForeignStagedLookup{
@@ -38397,7 +38576,56 @@ fn reifyStagedCode(
             },
         }
     }
+    try bindCodeInputs(allocator, type_publication, checked_bodies, hoisted_constants, sites.outcomes, problem_store);
     return CodeProvenanceTable.init(allocator, sites.provenance);
+}
+
+/// Record, on each call whose result is a `Code.Bound`, the input slots of
+/// the one site it holds (roc-reify-proposal.md section 10.1), and refuse a
+/// site whose slots the call cannot supply.
+///
+/// The program reads the call's compile-time value with the slot values
+/// added, so the call has to be a compile-time root of its own whose type
+/// the call fixes, and it has to hold one site, because two sites have no
+/// one slot order.
+fn bindCodeInputs(
+    allocator: Allocator,
+    type_publication: *const CheckedTypePublication,
+    checked_bodies: *CheckedBodyStore,
+    hoisted_constants: *const HoistedConstTable,
+    outcomes: []const code_reifier.SiteOutcome,
+    problem_store: ?*problem.Store,
+) Allocator.Error!void {
+    defer checked_bodies.sortCodeBindings();
+    for (outcomes) |site| {
+        const call_node = site.bound_call orelse continue;
+        if (site.slots.len == 0) continue;
+        if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
+        const detail: []const u8 = refused: {
+            var sharing: usize = 0;
+            for (outcomes) |other| {
+                if (other.bound_call == call_node) sharing += 1;
+            }
+            if (sharing != 1) break :refused "a call that binds the inputs of two sites";
+            const call = checked_bodies.exprIdAtRawNode(call_node) orelse
+                checkedArtifactInvariant("a call that binds input slots has no checked expression", .{});
+            const entry = hoisted_constants.lookupByExpr(call) orelse
+                break :refused "a translator that receives captured inputs runs while the compiler runs, so the other arguments of its call must be fixed then";
+            std.debug.assert(entry.pattern == null);
+            if (type_publication.store.rootContainsIdentityVariables(checked_bodies.expr(call).ty))
+                break :refused "a translator result whose type the call does not fix";
+            try checked_bodies.attachCodeBinding(allocator, call, site.slots);
+            continue;
+        };
+        checked_bodies.refuseCodeReification(site.expr);
+        const problems = problem_store orelse continue;
+        _ = try problems.appendProblem(.{ .staged_code = .{
+            .reason = .input_not_bound,
+            .region = checked_bodies.expr(site.expr).source_region,
+            .detail = try problems.putExtraString(detail),
+            .open = null,
+        } });
+    }
 }
 
 /// What a refusal at a type variable names: the variable, as its annotation
@@ -38440,6 +38668,7 @@ fn stagedCodeReason(kind: code_reifier.Rejection.Kind) problem.StagedCode.Reason
         .unresolved_reference => .definition_not_reachable,
         .argument_not_constant => .argument_not_constant,
         .bound_exceeded => .exceeds_a_bound,
+        .input_not_bound => .input_not_bound,
     };
 }
 
@@ -38974,6 +39203,7 @@ pub fn publishFromTypedModule(
         inputs.imports,
         inputs.available_artifacts,
         &checked_const_store,
+        &hoisted_constants,
         inputs.problem_store,
     );
     errdefer code_provenance.deinit(allocator);
@@ -41581,8 +41811,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0x02, 0xBE, 0xA3, 0x5E, 0x0F, 0xB6, 0xDE, 0x00, 0x1D, 0x4C, 0x43, 0x43, 0x31, 0x31, 0xA6, 0x63,
-        0x3D, 0xC4, 0xC6, 0x19, 0x21, 0x5F, 0xA6, 0x37, 0x0C, 0x33, 0x49, 0xF4, 0x62, 0x3A, 0x54, 0x6A,
+        0x8F, 0xD6, 0xFB, 0x16, 0x46, 0x99, 0xDD, 0x55, 0xB6, 0xF1, 0xFA, 0xAB, 0x5C, 0xBB, 0x96, 0x2A,
+        0x67, 0x8F, 0x92, 0xA8, 0x58, 0x46, 0x79, 0x67, 0x9F, 0x48, 0xC8, 0x70, 0x9C, 0x6D, 0xCC, 0x32,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

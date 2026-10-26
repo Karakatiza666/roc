@@ -23565,7 +23565,23 @@ Invariants:
   `src/check/code_reifier.zig`. A record or tag row tail still open seals to
   its recorded row default by `CheckedTypePayload.variableSealsToRowDefault`,
   as Monotype seals it (`r` in `|r| r.id > 0` is `{ id : Dec }`), so checking
-  closes no row at a `Code` site.
+  closes no row at a `Code` site. A tag row tail that carries no row default
+  seals to the empty union too, as `lowerCheckedTypeVariable` does, so a tag
+  union the checker left open has the variants the definition names
+  (`collectVariants`).
+- A `Record` node sets every member of its type, or, where the type marks a
+  member optional, lists the members it sets in `aux` (`ir.RecordForm`). A
+  record literal that unsets or omits an optional field, and a record pattern
+  rest or an update over a record with an optional field, are described this
+  way. A member the subject may lack is read by a switch on its `OptField`
+  `Try`, so the description decides what Roc decides at run time.
+- A literal of the author's own type whose conversion is a Roc function is a
+  `Call` of that function's row. A `from_numeral` row takes the `Num.Numeral`
+  the compiler builds from the digits of the literal, field by field as
+  Monotype builds it (`numeralArgument`). The conversion's `Try` is read as the
+  checker reads it: the `Ok` payload is the value, and an `Err` is a crash.
+  A custom `from_interpolation` is refused, because its value is a function
+  the conversion computes and no node applies a computed function.
 - A binder's name in a description is the identifier the canonicalizer
   recorded on its pattern, written to `CheckedPatternBinder.name`, never
   text read back through the pattern's region.
@@ -23608,6 +23624,27 @@ Invariants:
   changes exactly when the rules, the builtin table or the speculatable lists
   change. A fingerprint test pins it. `Code.version` carries it, so a
   translator can key a cache with it.
+- A loop has one of three forms, `ForRange`, `ForList` and a general `Loop`
+  (`src/reify/loops.zig`). A row whose every call to itself is a tail call
+  becomes a `Loop` whose `Break` delivers the row's value (N12). The loop rules
+  rewrite one loop per round as a hook on the rebuild: slots and outputs
+  first, then the kind. A general `Loop` has outputs of its own, so `Break`
+  has one value per output and `Continue` one per slot. A bounded loop has one
+  output per slot. A loop over `List.iter(xs)` is recognized by the
+  checker-authored `IteratorRole` of the named primitive, never by a name.
+  `Code.Row.iteration` reads what a loop iterates over off its node.
+- A record or tuple that a non-root row or a loop slot only reads by `Field`
+  or `Index` is split into its components (N14, `src/reify/scalar.zig`). A
+  value splits when no node, and no region end but the loop's own `Continue`
+  and `Break` at the slot, uses it in another way; a component splits again
+  under the same condition. A tag union, a record with a member a value may
+  lack, and an empty record never split. A `Call` of a finalized row with such
+  a parameter is a `Call` of a row built on the spot (`Builder.scalarizedCall`,
+  `Specialize.scalarize`), keyed by the row's digest and the shapes. A loop
+  slot splits in `loops.analyze` when every `Continue` gives it unchanged or
+  as a construction. The measure counts the layers still to split (`split_calls`
+  for calls, `aggregate_slots` for parameters and slots), and the driver's
+  L2 check fails a site that reaches a call it should have split.
 - Equality and hashing of a `Code` read the normal form and the version, and
   never the site key.
 - The provenance table that maps a node to its source regions is for the
@@ -23616,6 +23653,36 @@ Invariants:
   and they never rewrite it.
 - A condition that reads a code reification site draws no compile-time
   condition warning (see "Checked Boundary").
+- A lambda at a `Code` position that reads a value only the running program
+  has is no run-time dependency of its own. The call that holds it decides
+  (`finishHoistFrame` in `src/check/Check.zig`). A call whose solved type is
+  the builtin `Code.Bound` and that holds exactly one such site marks the
+  site (`CodeReificationSite.bound_call`), becomes an expression root of its
+  own and is a run-time dependency of what holds it. The marked lambda is no
+  dependency of that root when pruning checks what a kept root reads
+  (`isBoundCodeSite` in `hoistedRootExprStep`). Any other holder keeps the
+  run-time dependency, and the walk refuses the read. This is hoist
+  selection, which writes no solved type and no dispatch plan.
+- The root of a call that binds inputs is part of what the program means,
+  because the program reads that call only through its root. A caller that
+  publishes only some of the selected roots (the eval harness publishes only
+  top-level roots, `src/eval/inspected.zig`) still publishes it
+  (`selectedHoistedRootBindsCodeInputs` in `src/check/Check.zig`).
+- The walk makes an input slot only at a marked site, only in the root row,
+  and never for a `var` (`inputSlot` in `src/check/code_reifier.zig`).
+  Publication records the slots of a call that it hoisted as an expression
+  root, whose type is closed, on the call (`CheckedCodeBinding` and
+  `bindCodeInputs` in `src/check/checked_artifact.zig`), and refuses every
+  other marked site that reads a slot. A slot is a binder and the
+  projections the description reads it through, in slot order, with the
+  shape of the slot type.
+- Lowering reads the recorded slots and nothing else. Where the program
+  reads a call that binds slots, it reads the call's compile-time value with
+  `inputs` set to one `Code.Value` per slot (`boundCodeValue` in
+  `src/postcheck/monotype/lower.zig`). A value is built by one generated
+  helper per Monotype type, so a recursive type reaches its own helper. In
+  debug builds lowering asserts that each slot's Monotype type has the shape
+  the walk recorded.
 
 ## Test Root Ownership
 

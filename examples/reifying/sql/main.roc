@@ -197,6 +197,13 @@ revenue_by_country =
 		.aggregate(country_revenue)
 		.order_by(|r| r.revenue, Desc)
 
+## A query written inside a function, which reads the function's own
+## parameter. The value exists only when the program runs, so the translator
+## writes a `?` for it while the compiler runs, and the program binds the
+## value the function was called with.
+orders_of_at_least : I64 -> Try(Sql.Statement, Sql.Error)
+orders_of_at_least = |min_quantity| Sql.bind_captured(Sql.select_where(orders, |o| o.quantity >= min_quantity))
+
 # ------------------------------------------------ the same queries, in Roc
 
 ## The join, as ordinary Roc. It is what the SQL result is checked against.
@@ -216,6 +223,9 @@ revenue_by_country_in_memory = {
 	countries = purchases_in_memory.fold([], |seen, purchase| if seen.contains(purchase.0.0.country) seen else seen.append(purchase.0.0.country))
 	countries.map(|country| country_revenue(country, purchases_in_memory.keep_if(|purchase| purchase.0.0.country == country)))
 }
+
+orders_of_at_least_in_memory : I64 -> List(Order)
+orders_of_at_least_in_memory = |min_quantity| seed_orders.keep_if(|o| o.quantity >= min_quantity)
 
 # ---------------------------------------------------------------- refusals
 
@@ -252,7 +262,7 @@ expect taxed.to_sql() == Ok("SELECT (products.price * 2.0) * 1.2 AS doubled, pro
 # SQL has no recursion to spell a function that calls itself with, so a call
 # of one is refused and the reason is named.
 halve_until : Dec, U8 -> Dec
-halve_until = |x, n| if n == 0 x else halve_until(x / 2, n - 1)
+halve_until = |x, n| if n == 0 x else halve_until(x, n - 1) / 2
 
 halved = Sql.from(products).select(|p| { small: halve_until(p.price, 3) })
 
@@ -303,6 +313,23 @@ query = |name, bound, reference| {
 	section("query: ${name}", bound.map_ok(|statement| "${statement.inlined};${checked}"))
 }
 
+## A statement with `?` placeholders. Its values go on a line of their own,
+## as JSON, which `check.py` binds.
+bound_query : Str, Try(Sql.Statement, Sql.Error), Str -> Str
+bound_query = |name, bound, reference| {
+	json = |value| match value {
+		Integer(n) => n.to_str()
+		Numeric(d) => d.to_str()
+		Text(text) => Json.to_str(text)
+		Boolean(b) => if b "true" else "false"
+		Null => "null"
+	}
+	section(
+		"query: ${name}",
+		bound.map_ok(|statement| "-- params: [${Str.join_with(statement.params.map(|p| json(p.value)), ", ")}]\n${statement.sql};\n-- roc: ${reference}"),
+	)
+}
+
 script : Str
 script =
 	Str.join_with(
@@ -316,6 +343,7 @@ script =
 			query("contacts", contacts.bind({}), ""),
 			query("bulk_lines", bulk_lines.bind({}), Json.to_str(bulk_lines_in_memory)),
 			query("revenue_by_country", revenue_by_country.bind({}), Json.to_str(revenue_by_country_in_memory)),
+			bound_query("orders_of_at_least", orders_of_at_least(10), Json.to_str(orders_of_at_least_in_memory(10))),
 		],
 		"\n\n",
 	)

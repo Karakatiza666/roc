@@ -67,7 +67,7 @@ pub const Ties = union(enum) {
 };
 
 /// Where a use of a node is: in a node that reads it, or in a region's end.
-const Site = union(enum) { node: NodeId, region: RegionId };
+pub const Site = union(enum) { node: NodeId, region: RegionId };
 
 /// The placement of one row.
 pub const Plan = struct {
@@ -517,7 +517,7 @@ fn everyArm(p: *Plan, returns: *live_mod.Returns) Allocator.Error!void {
                 if (store.node(kept).op.ownsRegions()) for (tables[1..]) |t| {
                     if (!try sameRegions(p, a, kept, t.get(e.key_ptr.*).?)) continue :next_key;
                 };
-                for (tables[1..]) |t| p.info.getPtr(t.get(e.key_ptr.*).?).?.alias = kept;
+                for (tables[1..]) |t| retarget(p, t.get(e.key_ptr.*).?, kept);
                 p.info.getPtr(kept).?.place = home;
                 p.info.getPtr(kept).?.merged = true;
                 merged = true;
@@ -525,6 +525,16 @@ fn everyArm(p: *Plan, returns: *live_mod.Returns) Allocator.Error!void {
             if (!merged) break;
             try fillMembers(p);
         }
+    }
+}
+
+// Merge node `from` into `kept`, and every node already merged into `from`,
+// so a node's alias is always the node the rebuild builds for it, never a node
+// that merged away after it.
+fn retarget(p: *Plan, from: NodeId, kept: NodeId) void {
+    var it = p.info.valueIterator();
+    while (it.next()) |info| {
+        if (info.alias == from) info.alias = kept;
     }
 }
 
@@ -614,7 +624,7 @@ fn readRegions(p: *const Plan, a: Allocator, n: NodeId, out: *collections.DenseM
 
 fn readRegion(p: *const Plan, a: Allocator, ref: Ref, owner: NodeId, out: *collections.DenseMapUnmanaged(RegionId, void)) Allocator.Error!void {
     const r = switch (ref.kind) {
-        .row_param => return,
+        .row_param, .input => return,
         .region_param => ref.regionId(),
         .node => p.info.get(p.aliasOf(ref.nodeId())).?.place,
     };
@@ -1020,6 +1030,58 @@ test "N5c: a value switch every arm computes from values outside the arms is one
         \\      n7 = 3 : I64
         \\      n8 = Num.I64.times(n4, n7) : I64 !spec
         \\      value n8
+        \\  value n9
+        \\
+    );
+}
+
+test "N5c: a node merged out of an inner switch and then out of an outer one is built once, in the outer switch's region" {
+    // `if b < 5 then a else if flag then 1 - a else a - b`: the `a` read of
+    // the inner arms merges into the inner switch's region, which then
+    // merges with the `a` read of the outer arm. The inner arms' nodes read
+    // the node the rebuild builds, never the one that merged away.
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const b = &f.b;
+    const i64_ty = try f.types.intTy(.i64);
+    const bool_ty = try f.types.boolTy();
+    const rec_ty = try f.types.recordTy(&.{ .{ .name = "a", .ty = i64_ty }, .{ .name = "b", .ty = i64_ty }, .{ .name = "flag", .ty = bool_ty } });
+    const row = try b.beginRow(&.{rec_ty}, i64_ty);
+    const input = Ref.rowParam(0);
+    const small = try b.call(.i64, .is_lt, &.{ try b.field(input, 1), try b.litInt(i64_ty, 5) });
+    const big_arm = try b.openArm(small, 0);
+    const flag = try b.field(input, 2);
+    const flag_off = try b.openArm(flag, 0);
+    try b.close(.{ .value = &.{try b.call(.i64, .minus, &.{ try b.field(input, 0), try b.field(input, 1) })} });
+    const flag_on = try b.openArm(flag, 1);
+    try b.close(.{ .value = &.{try b.call(.i64, .minus, &.{ try b.litInt(i64_ty, 1), try b.field(input, 0) })} });
+    const inner = try b.switchOn(flag, &.{ flag_off, flag_on }, &.{}, &.{i64_ty}, &.{});
+    try b.close(.{ .value = &.{inner} });
+    const small_arm = try b.openArm(small, 1);
+    try b.close(.{ .value = &.{try b.field(input, 0)} });
+    const out = try b.switchOn(small, &.{ big_arm, small_arm }, &.{}, &.{i64_ty}, &.{});
+    try b.endRow(.{ .value = &.{out} });
+    try f.expectSite(row,
+        \\row r0 ({ a : I64, b : I64, flag : Bool }) -> I64
+        \\  n0 = field 1(p0) : I64
+        \\  n1 = 5 : I64
+        \\  n2 = Num.I64.is_lt(n0, n1) : Bool
+        \\  n4 = field 0(p0) : I64
+        \\  n9 = switch n2 : I64 !spec
+        \\    arm 0
+        \\      n3 = field 2(p0) : Bool
+        \\      n8 = switch n3 : I64 !spec
+        \\        arm 0
+        \\          n5 = Num.I64.minus(n4, n0) : I64 !spec
+        \\          value n5
+        \\        arm 1
+        \\          n6 = 1 : I64
+        \\          n7 = Num.I64.minus(n6, n4) : I64 !spec
+        \\          value n7
+        \\      value n8
+        \\    arm 1
+        \\      value n4
         \\  value n9
         \\
     );

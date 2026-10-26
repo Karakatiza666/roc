@@ -111,6 +111,9 @@ Glsl :: {}.{
 	## construct and, where there is one, the alternative.
 	Error := [Unsupported(Str), BadType(Str), BadInterface(Str)]
 
+	no_input : Error
+	no_input = Unsupported("a value the shader reads from around itself has no GLSL form; pass it as a uniform")
+
 	## Compile a reified Roc function to a GLSL 330 fragment shader.
 	##
 	## Naming a function here reifies it: the compiler describes the function
@@ -263,7 +266,7 @@ Glsl :: {}.{
 			}
 			Ok(Rendered.({ statements: placed.statements, value }))
 		}
-		Op(_) | Param(_) | Arg(_) | Out(_) | Def(_) => Ok(Rendered.({ statements: "", value: Glsl.render(tree, scope)? }))
+		Op(_) | Param(_) | Input(_) | Arg(_) | Out(_) | Def(_) => Ok(Rendered.({ statements: "", value: Glsl.render(tree, scope)? }))
 	}
 
 	## Whether a def only reads a field, a lane or a nominal's backing out of a
@@ -275,7 +278,7 @@ Glsl :: {}.{
 			(Field(_), [inner]) | (Index(_), [inner]) | (Unwrap, [inner]) => Glsl.is_read(inner)
 			_ => Bool.False
 		}
-		Arg(_) | Out(_) | Block(_) => Bool.False
+		Input(_) | Arg(_) | Out(_) | Block(_) => Bool.False
 	}
 
 	## The type a def is declared at. A nominal's backing is read under the
@@ -292,6 +295,7 @@ Glsl :: {}.{
 		}
 		Def(n) => Ok(scope.row.node(n).ty)
 		Arg(_) | Out(_) | Block(_) => Err(Unsupported("a value that carries a loop's or a branch's state has no GLSL local"))
+		Input(_) => Err(Glsl.no_input)
 	}
 
 	## Render one expression. A field read straight off one of the shader's two
@@ -305,6 +309,7 @@ Glsl :: {}.{
 			Err(_) => Err(Unsupported("a value read before the translator placed it"))
 		}
 		Arg(_) | Out(_) => Err(Unsupported("a value that carries a loop's or a branch's state has no GLSL expression"))
+		Input(_) => Err(Glsl.no_input)
 		Block(_) => {
 			inner = Glsl.render_block(tree, scope)?
 			if inner.statements.is_empty() {

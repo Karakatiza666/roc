@@ -49,6 +49,9 @@ pub const Emitter = struct {
     str_cache: std.StringHashMapUnmanaged(ConstNodeId) = .empty,
     /// Per row of the site being written: its index in the graph.
     row_index: collections.DenseMapUnmanaged(RowId, u32) = .empty,
+    /// The input slots the root of the graph last written reads, in slot
+    /// order (N18d). `Input(k)` reads `slot_order[k]`.
+    slot_order: []ir.SlotId = &.{},
 
     /// An emitter over `store`, whose rows are in their normal form.
     pub fn init(gpa: Allocator, out: *ConstStore, store: *const ir.Store, types: *const types_mod.Types) Allocator.Error!Emitter {
@@ -66,6 +69,7 @@ pub const Emitter = struct {
         while (keys.next()) |k| self.gpa.free(k.*);
         self.str_cache.deinit(self.gpa);
         self.row_index.deinit(self.gpa);
+        self.gpa.free(self.slot_order);
     }
 
     fn clearRegions(self: *Emitter) void {
@@ -98,10 +102,17 @@ pub const Emitter = struct {
         }
         try reify.number.siteRows(self.gpa, self.store, &returns, root, &rows);
         for (rows.keys(), 0..) |r, i| try self.row_index.put(self.gpa, r, @intCast(i));
+        self.gpa.free(self.slot_order);
+        self.slot_order = &.{};
+        self.slot_order = try reify.number.slotOrder(self.gpa, self.store, root, &rows.values()[0]);
         const row_nodes = try self.gpa.alloc(ConstNodeId, rows.count());
         defer self.gpa.free(row_nodes);
         for (rows.keys(), rows.values(), row_nodes) |r, *numbering, *node| node.* = try self.rowValue(r, numbering);
-        return self.record(&.{ try self.u32Node(0), try self.listOf(row_nodes) });
+        const slot_tys = try self.gpa.alloc(TyId, self.slot_order.len);
+        defer self.gpa.free(slot_tys);
+        for (self.slot_order, slot_tys) |slot, *t| t.* = self.store.slots.items[slot.index()].ty;
+        // `Graph := { root, rows, slots }`, in label order.
+        return self.record(&.{ try self.u32Node(0), try self.listOf(row_nodes), try self.tyList(slot_tys) });
     }
 
     // `Row := { id, params, result, nodes, body, recursive }`.
@@ -168,6 +179,11 @@ pub const Emitter = struct {
     fn val(self: *Emitter, ref: Ref) Allocator.Error!ConstNodeId {
         return switch (ref.kind) {
             .row_param => self.tag("Param", &.{try self.u32Node(ref.output)}),
+            .input => blk: {
+                const k = std.mem.findScalar(ir.SlotId, self.slot_order, ref.slotId()) orelse
+                    invariant("a live value reads an input slot the root's slot order does not hold");
+                break :blk self.tag("Input", &.{try self.u32Node(@intCast(k))});
+            },
             .region_param => blk: {
                 const owner = self.store.region(ref.regionId()).owner;
                 break :blk self.tag("Arg", &.{try self.record(&.{ try self.u32Node(ref.output), try self.u32Node(self.index[owner.index()]) })});
@@ -211,10 +227,17 @@ pub const Emitter = struct {
             .call => self.tag("Call", &.{try self.u32Node(self.row_index.get(RowId.of(nd.payload)).?)}),
             .closure => self.tag("Closure", &.{try self.u32Node(self.row_index.get(RowId.of(nd.payload)).?)}),
             .record => blk: {
+                // The names of the fields the node sets: every field of the
+                // type, or the ones it lists where it leaves a field unset
+                // (`ir.RecordForm`).
                 const fields = self.types.memberSlice(self.types.get(tys[0]).record);
-                const names = try self.gpa.alloc(ConstNodeId, fields.len);
+                const set = self.store.wordSlice(nd.aux);
+                const names = try self.gpa.alloc(ConstNodeId, args.len);
                 defer self.gpa.free(names);
-                for (fields, names) |f, *o| o.* = try self.str(self.types.nameText(f.name));
+                for (names, 0..) |*o, at| {
+                    const field = if (args.len == fields.len) fields[at] else fields[set[at]];
+                    o.* = try self.str(self.types.nameText(field.name));
+                }
                 break :blk self.tag("Record", &.{try self.listOf(names)});
             },
             .tuple => self.tag("Tuple", &.{}),
@@ -239,7 +262,10 @@ pub const Emitter = struct {
             .or_ => self.tag("Or", &.{try self.regionList(regions)}),
             .for_range => self.tag("ForRange", &.{try self.record(&.{ try self.regionValue(regions[0]), try self.boolNode(nd.payload == 1) })}),
             .for_list => self.tag("ForList", &.{try self.regionValue(regions[0])}),
-            .loop => self.tag("Loop", &.{try self.regionValue(regions[0])}),
+            .loop => self.tag("Loop", &.{try self.record(&.{
+                try self.regionValue(regions[0]),
+                try self.tyList(self.store.tySlice(nd.tys)),
+            })}),
             .lambda => self.tag("Lambda", &.{try self.regionValue(regions[0])}),
             .switch_ => self.switchOp(r, nd, args[0], regions),
             // An `Apply` a site reaches refuses the site before it is emitted (N8j).

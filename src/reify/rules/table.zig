@@ -59,7 +59,9 @@ pub const Pat = union(enum) {
     /// sequence variable once, and the matcher tries the shortest run first.
     rest: SeqVar,
     /// The literal that is the identity of the `prim` root's builtin at its
-    /// type (`prims.identityInt`). Only in a `prim` root's arguments.
+    /// type: `prims.identityInt` for an integer, the empty string for
+    /// `Str.concat`, the empty list for `List.concat`. Only in a `prim`
+    /// root's arguments.
     identity,
     /// The literal that absorbs the `prim` root's builtin at its type
     /// (`prims.absorbingInt`); binds pattern variable `k`. Only in a `prim`
@@ -123,6 +125,10 @@ pub const Tmpl = union(enum) {
     /// The root's builtin evaluated over its literal operands, as a literal
     /// of the root's type. Only a row with the `folds` condition uses it.
     folded,
+    /// The root's builtin evaluated over the two literal operands the pattern
+    /// variables bound, as a literal of the root's type. Only a row with the
+    /// `folds_pair` condition for the same variables uses it, in a chain.
+    folded_pair: [2]Var,
     /// The operands sequence variable `k` bound, in order. Only in the
     /// arguments of a `prim` template of an associative builtin, which over
     /// one operand is that operand, as a one-operand `And` is (N15a).
@@ -167,6 +173,9 @@ pub const OperandTmpl = union(enum) {
 pub const Cond = union(enum) {
     /// Owner variable `k` is a builtin integer type.
     int_owner: u8,
+    /// Owner variable `k` is a builtin integer type or `Str`, a type whose
+    /// equality against a literal a literal switch can key (N13n).
+    key_owner: u8,
     /// Owner variable `k` is not a float type.
     not_float_owner: u8,
     /// Pattern variable `k` is a literal.
@@ -196,6 +205,10 @@ pub const Cond = union(enum) {
     /// The root is a builtin whose every operand is a literal, and it
     /// evaluates there without failing (N13j, N13k).
     folds,
+    /// The root is an associative builtin, and it evaluates over the two
+    /// literals the pattern variables bound without failing: a run of two
+    /// adjacent literal operands of a chain folds into one (N13j).
+    folds_pair: [2]Var,
     /// Pattern variable `k` has the root's type. A `Wrap` names its nominal
     /// in its type, not through its operand, so `Wrap(Unwrap(x))` is `x`
     /// only where `x` is of that nominal.
@@ -249,6 +262,61 @@ const written = [_]Rule{
         .args = &.{ .{ .any = 0 }, .{ .any = 1 } },
         .conds = &.{ .{ .is_lit = 0 }, .{ .is_lit = 1 }, .folds },
         .result = .folded,
+    },
+    // Two adjacent literal operands of a chain fold into one, so `1 + (2 + a)` and `(1 + 2) + a` meet.
+    .{
+        .step = "N13j",
+        .tier = .evaluation,
+        .root = .prim,
+        .root_prim = .{ .method = .plus_wrap, .owner = .{ .bind = 0 } },
+        .args = &.{ .{ .rest = 0 }, .{ .any = 0 }, .{ .any = 1 }, .{ .rest = 1 } },
+        .conds = &.{ .{ .is_lit = 0 }, .{ .is_lit = 1 }, .{ .folds_pair = .{ 0, 1 } } },
+        .result = .{ .prim = .{ .method = .plus_wrap, .owner = .{ .bind = 0 }, .args = &.{ .{ .rest = 0 }, .{ .folded_pair = .{ 0, 1 } }, .{ .rest = 1 } } } },
+    },
+    .{
+        .step = "N13j",
+        .tier = .evaluation,
+        .root = .prim,
+        .root_prim = .{ .method = .times_wrap, .owner = .{ .bind = 0 } },
+        .args = &.{ .{ .rest = 0 }, .{ .any = 0 }, .{ .any = 1 }, .{ .rest = 1 } },
+        .conds = &.{ .{ .is_lit = 0 }, .{ .is_lit = 1 }, .{ .folds_pair = .{ 0, 1 } } },
+        .result = .{ .prim = .{ .method = .times_wrap, .owner = .{ .bind = 0 }, .args = &.{ .{ .rest = 0 }, .{ .folded_pair = .{ 0, 1 } }, .{ .rest = 1 } } } },
+    },
+    .{
+        .step = "N13j",
+        .tier = .evaluation,
+        .root = .prim,
+        .root_prim = .{ .method = .bitwise_and, .owner = .{ .bind = 0 } },
+        .args = &.{ .{ .rest = 0 }, .{ .any = 0 }, .{ .any = 1 }, .{ .rest = 1 } },
+        .conds = &.{ .{ .is_lit = 0 }, .{ .is_lit = 1 }, .{ .folds_pair = .{ 0, 1 } } },
+        .result = .{ .prim = .{ .method = .bitwise_and, .owner = .{ .bind = 0 }, .args = &.{ .{ .rest = 0 }, .{ .folded_pair = .{ 0, 1 } }, .{ .rest = 1 } } } },
+    },
+    .{
+        .step = "N13j",
+        .tier = .evaluation,
+        .root = .prim,
+        .root_prim = .{ .method = .bitwise_or, .owner = .{ .bind = 0 } },
+        .args = &.{ .{ .rest = 0 }, .{ .any = 0 }, .{ .any = 1 }, .{ .rest = 1 } },
+        .conds = &.{ .{ .is_lit = 0 }, .{ .is_lit = 1 }, .{ .folds_pair = .{ 0, 1 } } },
+        .result = .{ .prim = .{ .method = .bitwise_or, .owner = .{ .bind = 0 }, .args = &.{ .{ .rest = 0 }, .{ .folded_pair = .{ 0, 1 } }, .{ .rest = 1 } } } },
+    },
+    .{
+        .step = "N13j",
+        .tier = .evaluation,
+        .root = .prim,
+        .root_prim = .{ .method = .bitwise_xor, .owner = .{ .bind = 0 } },
+        .args = &.{ .{ .rest = 0 }, .{ .any = 0 }, .{ .any = 1 }, .{ .rest = 1 } },
+        .conds = &.{ .{ .is_lit = 0 }, .{ .is_lit = 1 }, .{ .folds_pair = .{ 0, 1 } } },
+        .result = .{ .prim = .{ .method = .bitwise_xor, .owner = .{ .bind = 0 }, .args = &.{ .{ .rest = 0 }, .{ .folded_pair = .{ 0, 1 } }, .{ .rest = 1 } } } },
+    },
+    .{
+        .step = "N13j",
+        .tier = .evaluation,
+        .root = .prim,
+        .root_prim = .{ .method = .concat, .owner = .{ .fixed = .str } },
+        .args = &.{ .{ .rest = 0 }, .{ .any = 0 }, .{ .any = 1 }, .{ .rest = 1 } },
+        .conds = &.{ .{ .is_lit = 0 }, .{ .is_lit = 1 }, .{ .folds_pair = .{ 0, 1 } } },
+        .result = .{ .prim = .{ .method = .concat, .owner = .{ .fixed = .str }, .args = &.{ .{ .rest = 0 }, .{ .folded_pair = .{ 0, 1 } }, .{ .rest = 1 } } } },
     },
     .{
         .step = "N13a",
@@ -390,18 +458,18 @@ const written = [_]Rule{
         .args = &.{.{ .tag_arm = 0 }},
         .result = .{ .region_value = 0 },
     },
-    // N15c, literal half: a literal operand of integer `is_eq`, `plus` and
-    // `times` goes last. `Str.is_eq` waits for string literals in the tool's
-    // terms. It needs the condition "is not a literal", which the tool's
-    // generalization does not try (`roc-reify-rule-derivation.md` 3.4), so it
-    // is written by hand; the tool checks its pairs and orients it.
+    // N15c, literal half: a literal operand of `is_eq` over an integer type
+    // or `Str`, and of integer `plus` and `times`, goes last. It needs the
+    // condition "is not a literal", which the tool's generalization does not
+    // try (`roc-reify-rule-derivation.md` 3.4), so it is written by hand; the
+    // tool checks its pairs and orients it.
     .{
         .step = "N15c",
         .tier = .first_order,
         .root = .prim,
         .root_prim = .{ .method = .is_eq, .owner = .{ .bind = 0 } },
         .args = &.{ .{ .any = 0 }, .{ .any = 1 } },
-        .conds = &.{ .{ .int_owner = 0 }, .{ .is_lit = 0 }, .{ .not_lit = 1 } },
+        .conds = &.{ .{ .key_owner = 0 }, .{ .is_lit = 0 }, .{ .not_lit = 1 } },
         .result = .{ .prim = .{ .method = .is_eq, .owner = .{ .bind = 0 }, .args = &.{ .{ .var_ = 1 }, .{ .var_ = 0 } } } },
     },
     .{
@@ -422,7 +490,7 @@ const written = [_]Rule{
         .conds = &.{ .{ .int_owner = 0 }, .{ .is_lit = 0 }, .{ .not_lit = 1 } },
         .result = .{ .prim = .{ .method = .times, .owner = .{ .bind = 0 }, .args = &.{ .{ .var_ = 1 }, .{ .var_ = 0 } } } },
     },
-    // N13n: a switch on an integer `x == Lit` is a literal switch on `x`.
+    // N13n: a switch on an integer or `Str` `x == Lit` is a literal switch on `x`.
     // N15c puts the literal last first. It needs the literal switch, a symbol
     // the tool does not choose (`roc-reify-rule-derivation.md` 2.3), so it is
     // written by hand; the tool checks its pairs and orients it.
@@ -431,7 +499,7 @@ const written = [_]Rule{
         .tier = .first_order,
         .root = .switch_,
         .args = &.{.{ .bool_switch = .{ .scrutinee = &.{ .prim = .{ .method = .is_eq, .owner = .{ .bind = 0 }, .args = &.{ .{ .any = 0 }, .{ .any = 1 } } } }, .arms = .{ .{ .region = 0 }, .{ .region = 1 } } } }},
-        .conds = &.{ .{ .int_owner = 0 }, .{ .is_lit = 1 } },
+        .conds = &.{ .{ .key_owner = 0 }, .{ .is_lit = 1 } },
         .result = .{ .lit_switch = .{ .scrutinee = &.{ .var_ = 0 }, .key = &.{ .var_ = 1 }, .arms = .{ .{ .region = 1 }, .{ .region = 0 } } } },
     },
     .{
@@ -674,6 +742,14 @@ const written = [_]Rule{
         .args = &.{ .{ .rest = 0 }, .{ .prim = .{ .method = .concat, .owner = .{ .fixed = .str }, .args = &.{.{ .rest = 1 }} } }, .{ .rest = 2 } },
         .result = .{ .prim = .{ .method = .concat, .owner = .{ .fixed = .str }, .args = &.{ .{ .rest = 0 }, .{ .rest = 1 }, .{ .rest = 2 } } } },
     },
+    .{
+        .step = "N15a",
+        .tier = .first_order,
+        .root = .prim,
+        .root_prim = .{ .method = .concat, .owner = .{ .fixed = .list } },
+        .args = &.{ .{ .rest = 0 }, .{ .prim = .{ .method = .concat, .owner = .{ .fixed = .list }, .args = &.{.{ .rest = 1 }} } }, .{ .rest = 2 } },
+        .result = .{ .prim = .{ .method = .concat, .owner = .{ .fixed = .list }, .args = &.{ .{ .rest = 0 }, .{ .rest = 1 }, .{ .rest = 2 } } } },
+    },
     // An identity operand drops out of a chain; a chain left with one operand is that operand.
     .{
         .step = "N15a",
@@ -719,6 +795,23 @@ const written = [_]Rule{
         .args = &.{ .{ .rest = 0 }, .identity, .{ .rest = 1 } },
         .conds = &.{.{ .int_owner = 0 }},
         .result = .{ .prim = .{ .method = .bitwise_xor, .owner = .{ .bind = 0 }, .args = &.{ .{ .rest = 0 }, .{ .rest = 1 } } } },
+    },
+    // The identity of `Str.concat` is `""` and of `List.concat` is `[]`.
+    .{
+        .step = "N15a",
+        .tier = .first_order,
+        .root = .prim,
+        .root_prim = .{ .method = .concat, .owner = .{ .fixed = .str } },
+        .args = &.{ .{ .rest = 0 }, .identity, .{ .rest = 1 } },
+        .result = .{ .prim = .{ .method = .concat, .owner = .{ .fixed = .str }, .args = &.{ .{ .rest = 0 }, .{ .rest = 1 } } } },
+    },
+    .{
+        .step = "N15a",
+        .tier = .first_order,
+        .root = .prim,
+        .root_prim = .{ .method = .concat, .owner = .{ .fixed = .list } },
+        .args = &.{ .{ .rest = 0 }, .identity, .{ .rest = 1 } },
+        .result = .{ .prim = .{ .method = .concat, .owner = .{ .fixed = .list }, .args = &.{ .{ .rest = 0 }, .{ .rest = 1 } } } },
     },
     // An absorbing operand is the chain, where the operands it drops cannot fail.
     .{
@@ -1092,7 +1185,7 @@ const mirrors = struct {
         for (r.args, &args) |a, *o| o.* = pat(a, ms);
         var conds: [r.conds.len + ms.len]Cond = undefined;
         for (r.conds, 0..) |c, i| conds[i] = c;
-        for (ms, 0..) |m, i| conds[r.conds.len + i] = .{ .int_owner = m.o };
+        for (ms, 0..) |m, i| conds[r.conds.len + i] = .{ .key_owner = m.o };
         const final_args = args;
         const final_conds = conds;
         return .{ .step = r.step ++ "/N13n", .tier = r.tier, .root = r.root, .args = &final_args, .root_prim = r.root_prim, .conds = &final_conds, .result = tmpl(r.result, ms) };
@@ -1109,7 +1202,7 @@ const mirrors = struct {
             for (r.args) |a| uses += usesOf(a, v);
             const in_cond = for (r.conds) |c| switch (c) {
                 .is_lit, .speculatable, .nonzero_lit, .polarity_flips, .same_ty, .lit_bool_switch, .not_lit => |k| if (k == v) break true,
-                .int_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds => {},
+                .int_owner, .key_owner, .not_float_owner, .movable, .movable_rest, .speculatable_rest, .folds, .folds_pair => {},
             } else false;
             if (uses == 1 and !in_cond) kept = kept ++ .{v};
         }
@@ -1244,7 +1337,7 @@ const mirrors = struct {
                 .{ .prim = .{ .method = .is_eq, .owner = .{ .bind = m.o }, .args = ptr([2]Tmpl, .{ .{ .var_ = m.s }, .{ .var_ = m.k } }) } }
             else
                 t,
-            .region_value, .lit_bool, .lit_int, .folded, .rest => t,
+            .region_value, .lit_bool, .lit_int, .folded, .folded_pair, .rest => t,
             .prim => |pp| blk: {
                 var args: [pp.args.len]Tmpl = undefined;
                 for (pp.args, &args) |a, *o| o.* = tmpl(a, ms);
@@ -1489,6 +1582,7 @@ fn hashTmpl(h: *std.hash.Wyhash, t: Tmpl) void {
             hashTmpl(h, v.*);
         },
         .folded => h.update(&.{9}),
+        .folded_pair => |pair| h.update(&.{ 12, pair[0], pair[1] }),
         .rest => |k| h.update(&.{ 10, k }),
         .lit_switch => |ls| {
             h.update(&.{11});
@@ -1529,10 +1623,12 @@ fn hashCond(h: *std.hash.Wyhash, c: Cond) void {
         .movable_rest => |k| h.update(&.{ 6, k }),
         .polarity_flips => |k| h.update(&.{ 7, k }),
         .folds => h.update(&.{8}),
+        .folds_pair => |pair| h.update(&.{ 14, pair[0], pair[1] }),
         .same_ty => |k| h.update(&.{ 9, k }),
         .speculatable_rest => |k| h.update(&.{ 10, k }),
         .lit_bool_switch => |k| h.update(&.{ 11, k }),
         .not_lit => |k| h.update(&.{ 12, k }),
+        .key_owner => |k| h.update(&.{ 13, k }),
     }
 }
 
@@ -1548,14 +1644,18 @@ test "every rule's variables and owners are bound before its result reads them" 
         for (r.args) |p| markKeys(p, &lits);
         try checkTmpl(r.result, counts, r.conds, &lits, false);
         for (r.conds) |c| switch (c) {
-            .int_owner, .not_float_owner => |k| try std.testing.expect(k < counts.owners),
+            .int_owner, .key_owner, .not_float_owner => |k| try std.testing.expect(k < counts.owners),
             .is_lit, .speculatable, .nonzero_lit, .polarity_flips, .same_ty, .lit_bool_switch, .not_lit => |k| try std.testing.expect(k < counts.vars),
             .movable => |k| try std.testing.expect(k < counts.regions),
             .movable_rest, .speculatable_rest => |k| try std.testing.expect(k < counts.seqs),
             .folds => try std.testing.expect(r.root == .prim and r.tier == .evaluation),
+            .folds_pair => |pair| {
+                try std.testing.expect(r.root == .prim and r.tier == .evaluation and prims.associativeOf(r.root_prim.?.method));
+                try std.testing.expect(pair[0] < counts.vars and pair[1] < counts.vars);
+            },
         };
         // Only an evaluation row computes its result.
-        try std.testing.expectEqual(r.tier == .evaluation, r.result == .folded);
+        try std.testing.expectEqual(r.tier == .evaluation, computes(r.result));
         if (r.root_prim != null) try std.testing.expectEqual(Op.prim, r.root);
         if (r.root == .switch_) try std.testing.expect(r.args.len == 1 and (r.args[0] == .bool_switch or r.args[0] == .same_arms or r.args[0] == .tag_arm or r.args[0] == .lit_switch));
         for (r.args) |p| try std.testing.expect(!nestsRootOnly(p, true));
@@ -1578,6 +1678,17 @@ test "every rule's variables and owners are bound before its result reads them" 
         }
         for (splices) |u| try std.testing.expect(u <= 1);
     }
+}
+
+// Whether a result template evaluates the root's builtin over literals.
+fn computes(t: Tmpl) bool {
+    return switch (t) {
+        .folded, .folded_pair => true,
+        .prim => |p| for (p.args) |a| {
+            if (computes(a)) break true;
+        } else false,
+        .var_, .bool_switch, .and_, .or_, .region_value, .lit_bool, .lit_int, .rest, .negation, .lit_switch => false,
+    };
 }
 
 // Whether a pattern the builder matches only at a `switch_` root appears
@@ -1666,7 +1777,7 @@ fn countArmSeqBinds(a: Arm, bound: *[8]u8) void {
 
 fn countUses(t: Tmpl, uses: *[8]u8, splices: *[8]u8) void {
     switch (t) {
-        .var_, .lit_bool, .lit_int, .folded => {},
+        .var_, .lit_bool, .lit_int, .folded, .folded_pair => {},
         .rest => |k| splices[k] += 1,
         .prim => |p| for (p.args) |a| countUses(a, uses, splices),
         .bool_switch => |bs| {
@@ -1752,6 +1863,9 @@ fn checkTmpl(t: Tmpl, counts: Counts, conds: []const Cond, lits: *const [16]bool
         .lit_bool => {},
         .folded => for (conds) |c| {
             if (c == .folds) break;
+        } else return error.TestUnexpectedResult,
+        .folded_pair => |pair| for (conds) |c| {
+            if (c == .folds_pair and std.mem.eql(Var, &c.folds_pair, &pair)) break;
         } else return error.TestUnexpectedResult,
     }
 }

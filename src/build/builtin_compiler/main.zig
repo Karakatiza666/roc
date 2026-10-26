@@ -26,7 +26,7 @@ const CIR = can.CIR;
 const CompactWriter = collections.CompactWriter;
 const CheckedModuleArtifact = check.CheckedArtifact.CheckedModuleArtifact;
 
-const max_builtin_bytes = 1024 * 1024;
+const max_builtin_bytes = 2 * 1024 * 1024;
 
 // Stderr writer for diagnostic reporting
 var stderr_buffer: [4096]u8 = undefined;
