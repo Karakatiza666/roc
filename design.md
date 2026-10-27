@@ -19709,6 +19709,14 @@ its last arm as the switch default (a single-variant union emits no dispatch at
 all); open matches keep the `comptime_exhaustiveness_failed` / `runtime_error`
 terminal.
 
+In debug builds the emitter checks that its statement count stays within a
+linear bound of the pattern node count (`LINT_MULT` and `LINT_BASE` in
+`src/postcheck/match_tree.zig`). The count leaves out statements of bodies and
+guards, and statements the host reports through `hostStmtCount`. `.boxy`
+reports the reads and binds it lowers (`scopedRead` and `bindPatternLocal` in
+`src/postcheck/boxy/lower.zig`), because each converts between representations
+and its size follows the type, not the pattern.
+
 Named record-rest binders are derived values, not durable pattern decisions.
 Monotype pattern lowering removes the rest binder from the record pattern,
 captures that exact record occurrence in a compiler-generated local, and
@@ -23738,6 +23746,9 @@ Invariants:
   helper per Monotype type, so a recursive type reaches its own helper. In
   debug builds lowering asserts that each slot's Monotype type has the shape
   the walk recorded.
+  The walk records `Bool` as the `Bool` shape, and Monotype lowers `Bool` as a
+  nominal tag union, so `codeValueBody` builds `Bool` for a type whose owner is
+  the builtin `Bool`, never `Wrap`.
 - `.boxy` reads the same recorded slots. It runs the call where the program
   reads it, and builds the call's `Code.Bound` again around the result's
   `value` with one `Code.Value` per slot. A value is built by one generated

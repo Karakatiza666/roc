@@ -37243,6 +37243,8 @@ const BodyContext = struct {
         pending: *std.ArrayList(PendingCodeValueDef),
     ) Allocator.Error!DraftExprId {
         const shape_ty = self.codeValueShapeType(ty);
+        // `Bool` lowers as a nominal tag union, and its `Code.Value` is `Bool`, not `Wrap`.
+        if (self.typeHasBuiltinOwner(shape_ty, .bool)) return try self.codeValueVariant(v, "Bool", &.{value});
         switch (self.typeStore().get(shape_ty)) {
             .primitive => |primitive| return switch (primitive) {
                 .bool => try self.codeValueVariant(v, "Bool", &.{value}),
@@ -37403,7 +37405,7 @@ const BodyContext = struct {
                     if (content != .primitive or content.primitive != want) return false;
                 },
                 .dec => if (content != .primitive or content.primitive != .dec) return false,
-                .bool_ => if (content != .primitive or content.primitive != .bool) return false,
+                .bool_ => if (!self.typeHasBuiltinOwner(current, .bool) and (content != .primitive or content.primitive != .bool)) return false,
                 .str => if (content != .primitive or content.primitive != .str) return false,
                 .list => switch (content) {
                     .list => |elem| try pending.append(self.allocator, .{ .ty = elem }),

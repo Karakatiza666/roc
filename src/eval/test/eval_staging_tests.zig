@@ -1856,6 +1856,21 @@ const bound_generic_nominal = bind ++
     \\main = shown_tree(Tree.Node(Tree.Leaf("l"), Tree.Leaf("r")), Err("bad"))
 ;
 
+// A `Bool` slot, alone and nested inside a record and a list.
+const bound_bool = bind ++
+    \\g : Bool -> Str
+    \\g = |b| Bind.shown(Bind.render(|x| (x == 1.I64, b)))
+    \\main = g(True)
+;
+
+const bound_nested_bool = bind ++
+    \\Flags : { on : Bool, all : List(Bool) }
+    \\
+    \\g : Flags -> Str
+    \\g = |flags| Bind.shown(Bind.render(|x| (x == 1.I64, flags)))
+    \\main = g({ on: False, all: [True, False] })
+;
+
 // A `var` can be written again before the call, so it is no slot.
 const bound_var = bind ++
     \\counted : U16 -> Str
@@ -2641,6 +2656,36 @@ pub const tests = [_]TestCase{
         .source_kind = .module,
         .source = bound_generic_nominal,
         .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0, in1) / 2 slots / Wrap(Node(Wrap(Leaf('l')), Wrap(Leaf('r')))), Wrap(Err('bad'))\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - a captured Bool is one input slot with a Bool value",
+        .source_kind = .module,
+        .source = bound_bool,
+        .expected = .{ .inspect_str = "\"(Num.I64.is_eq(p0, 1), in0) / 1 slots / True\"" },
+    },
+    .{
+        .name = "staging - a captured Bool inside a record and a list is read as Bool values",
+        .source_kind = .module,
+        .source = bound_nested_bool,
+        .expected = .{ .inspect_str = "\"(Num.I64.is_eq(p0, 1), in0) / 1 slots / {[True, False], False}\"" },
+    },
+    .{
+        .name = "staging - boxy: a captured Bool is one input slot with a Bool value",
+        .source_kind = .module,
+        .source = bound_bool,
+        .expected = .{ .inspect_str = "\"(Num.I64.is_eq(p0, 1), in0) / 1 slots / True\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - boxy: a captured Bool inside a record and a list is read as Bool values",
+        .source_kind = .module,
+        .source = bound_nested_bool,
+        .expected = .{ .inspect_str = "\"(Num.I64.is_eq(p0, 1), in0) / 1 slots / {[True, False], False}\"" },
         .specialization_strategy = .boxy,
         // The wasm evaluator runs a module without the Boxy runtime object.
         .skip = .{ .wasm = true },

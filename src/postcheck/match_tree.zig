@@ -1093,6 +1093,7 @@ pub fn Compiler(comptime Ctx: type) type {
         /// ```
         /// const LirLocal / CFStmtId / JoinPointId / StrArm / LowerError
         /// stmtCount() usize
+        /// hostStmtCount() usize                          // statements of host work whose size follows the types, counted by the host
         /// freshJoinPointId() JoinPointId
         /// joinJump(JoinPointId) CFStmtId
         /// addExitJoin(id, body, remainder) CFStmtId      // empty params
@@ -1216,6 +1217,8 @@ pub fn Compiler(comptime Ctx: type) type {
             request_start: ?usize = null,
             /// Statement count when emission began.
             machinery_start: usize = 0,
+            /// `Ctx.hostStmtCount` when emission began.
+            host_start: usize = 0,
             /// Suspended emission steps. Tree depth never becomes native
             /// call depth, and a request suspends the whole emission until
             /// the host answers it.
@@ -1347,6 +1350,7 @@ pub fn Compiler(comptime Ctx: type) type {
                 try env.locals.put(arena, .root, .{ .value = scrutinee });
 
                 self.machinery_start = self.ctx.stmtCount();
+                self.host_start = self.ctx.hostStmtCount();
                 var entry_extractions: std.ArrayList(Extraction) = .empty;
                 try self.enterScope(env, .top, &entry_extractions);
                 try self.frames.append(arena, .{ .task = .{ .root = .{ .env = env, .extractions = entry_extractions.items } } });
@@ -1392,7 +1396,7 @@ pub fn Compiler(comptime Ctx: type) type {
                         var body = input.?;
                         body = try self.emitExtractions(task.extractions, task.env, body);
                         if (std.debug.runtime_safety) {
-                            const machinery = (self.ctx.stmtCount() - self.machinery_start) - self.delegated_stmts;
+                            const machinery = (self.ctx.stmtCount() - self.machinery_start) - self.delegated_stmts - (self.ctx.hostStmtCount() - self.host_start);
                             const bound = @as(usize, LINT_MULT) * @as(usize, self.tree_stats.pattern_nodes) + LINT_BASE;
                             if (machinery > bound) {
                                 base.invariant(

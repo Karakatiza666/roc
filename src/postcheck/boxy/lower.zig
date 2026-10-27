@@ -29616,6 +29616,8 @@ const ProcBodyBuilder = struct {
         /// Each branch body, once lowered; alternatives share it.
         bodies: []?LIR.CFStmtId = &.{},
         shapes: std.StringHashMapUnmanaged(u32) = .empty,
+        /// Statements the reads emitted, which the match-tree size lint excludes.
+        host_stmts: usize = 0,
     };
 
     const BoxyMatchCtx = struct {
@@ -30049,6 +30051,10 @@ const ProcBodyBuilder = struct {
             return ctx.b.parent.result.store.cf_stmts.len();
         }
 
+        pub fn hostStmtCount(ctx: BoxyMatchCtx) usize {
+            return ctx.state.host_stmts;
+        }
+
         pub fn freshJoinPointId(ctx: BoxyMatchCtx) LIR.JoinPointId {
             return ctx.b.freshJoinPointId();
         }
@@ -30235,7 +30241,10 @@ const ProcBodyBuilder = struct {
             var entered = try ctx.enterScopes(target_state.scopes);
             errdefer ctx.dropScopes(&entered);
             try ctx.b.scoped_descriptor_locals.appendSlice(ctx.b.parent.allocator, target_state.pending_scoped);
+            const start = ctx.stmtCount();
             const read = try @call(.auto, emit, args);
+            // A read converts between representations, so its size follows the types.
+            ctx.state.host_stmts += ctx.stmtCount() - start;
             return try ctx.leaveScopes(&entered, read);
         }
 
@@ -30532,7 +30541,10 @@ const ProcBodyBuilder = struct {
             const source_rep = if (ctx.layoutOf(binder_rep) == ctx.layoutOf(ty.rep)) binder_rep else ty.rep;
             var entered = try ctx.enterScopes(ctx.localState(source).scopes);
             errdefer ctx.dropScopes(&entered);
+            const start = ctx.stmtCount();
             const bind = try b.bindMatchBinderFromRep(binder, source, source_rep, remaps, next);
+            // Binding converts to the binder's representation, so its size follows the types.
+            ctx.state.host_stmts += ctx.stmtCount() - start;
             return try ctx.leaveScopes(&entered, bind);
         }
 
