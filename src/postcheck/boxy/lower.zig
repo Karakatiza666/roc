@@ -22895,12 +22895,21 @@ const ProcBodyBuilder = struct {
         }
         const locals = try self.parent.allocator.alloc(LIR.LocalId, items.len);
         defer self.parent.allocator.free(locals);
-        for (children, locals) |child, *local| local.* = try self.addFrameLocalForRep(child.rep);
-        const continuation = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
+        const field_reps = try self.parent.allocator.alloc(Plan.TypeRepId, items.len);
+        defer self.parent.allocator.free(field_reps);
+        for (children, locals, field_reps) |child, *local, *field_rep| {
+            field_rep.* = child.rep;
+            local.* = try self.addFrameLocalForRep(child.rep);
+        }
+        const stored_fields = try self.parent.allocator.alloc(LIR.LocalId, items.len);
+        defer self.parent.allocator.free(stored_fields);
+        try self.aggregateStoredFieldLocals(self.parent.result.store.getLocal(target).layout_idx, locals, stored_fields);
+        const assign_struct = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
             .target = target,
-            .fields = try self.parent.result.store.addLocalSpan(locals),
+            .fields = try self.parent.result.store.addLocalSpan(stored_fields),
             .next = next,
         } }, self.scaffoldOrigin());
+        const continuation = try self.prependAggregateStoredFieldBoxes(locals, stored_fields, field_reps, assign_struct);
         const chain_items = try self.parent.allocator.alloc(ExprChainItem, items.len);
         for (chain_items, 0..) |*item, offset| {
             const index = items.len - 1 - offset;
@@ -22985,12 +22994,21 @@ const ProcBodyBuilder = struct {
 
         const fields = try self.parent.allocator.alloc(LIR.LocalId, tag.payloads.len);
         defer self.parent.allocator.free(fields);
-        for (payload_children, fields) |child, *field| field.* = try self.addFrameLocalForRep(child.rep);
-        const continuation = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
+        const field_reps = try self.parent.allocator.alloc(Plan.TypeRepId, tag.payloads.len);
+        defer self.parent.allocator.free(field_reps);
+        for (payload_children, fields, field_reps) |child, *field, *field_rep| {
+            field_rep.* = child.rep;
+            field.* = try self.addFrameLocalForRep(child.rep);
+        }
+        const stored_fields = try self.parent.allocator.alloc(LIR.LocalId, tag.payloads.len);
+        defer self.parent.allocator.free(stored_fields);
+        try self.aggregateStoredFieldLocals(payload_layout, fields, stored_fields);
+        const assign_struct = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
             .target = payload,
-            .fields = try self.parent.result.store.addLocalSpan(fields),
+            .fields = try self.parent.result.store.addLocalSpan(stored_fields),
             .next = assign_tag,
         } }, self.scaffoldOrigin());
+        const continuation = try self.prependAggregateStoredFieldBoxes(fields, stored_fields, field_reps, assign_struct);
         const chain_items = try self.parent.allocator.alloc(ExprChainItem, tag.payloads.len);
         for (chain_items, 0..) |*item, offset| {
             const index = tag.payloads.len - 1 - offset;
@@ -28843,6 +28861,7 @@ const ProcBodyBuilder = struct {
             try self.addFrameLocal(self.workerRuntimeLayoutForRep(access.field_rep).layoutIdx())
         else
             try self.addFrameLocalForRep(access.field_rep);
+        if (nested_desc_index != null) try self.describeConcreteReadTargetStatically(read_target, access.field_rep);
         // Record the descriptor supplied by the field read before lowering its
         // adapter. Its initializer executes before the read and conversion; it
         // must not become a type-wide slot initialized in the worker prologue.
@@ -28990,6 +29009,11 @@ const ProcBodyBuilder = struct {
             boxyLowerInvariant("tuple field read source did not have a tuple representation");
         if (!self.payloadFieldCarriesRuntimeDesc(tuple_rep, elem_index)) return read;
         const nested_index = self.tupleElemNestedDescriptorIndex(tuple_rep, elem_index);
+        try self.describeConcreteReadTargetStatically(target, self.tupleElemRep(tuple_rep, elem_index) orelse
+            boxyLowerInvariant("tuple field read referenced an element outside its representation"));
+        if (self.parent.result.store.getLocal(target).boxy_desc) |desc| {
+            if (desc.localOrNull() == null) return read;
+        }
         const desc_local = try self.mutableDescriptorLocalForValue(target);
         // The frame's own descriptor input already describes the element.
         if (self.localIsReadOnlyDescriptorInput(desc_local)) return read;
@@ -43129,6 +43153,23 @@ const ProcBodyBuilder = struct {
         if (desc_ref) |desc| {
             try self.parent.result.store.setLocalBoxyDesc(local, desc);
         }
+    }
+
+    /// Describe `target` by the static descriptor of `value_rep` when it has
+    /// no descriptor of its own and `value_rep` is concrete. A field read
+    /// into such a target writes no descriptor local: the target can be the
+    /// result of a branch that other producers fill, and those producers
+    /// write no descriptor for it.
+    fn describeConcreteReadTargetStatically(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        value_rep: Plan.TypeRepId,
+    ) Allocator.Error!void {
+        if (self.parent.result.store.getLocal(target).boxy_desc != null) return;
+        const identity_rep = self.parent.descriptorStorageRep(value_rep);
+        const rep = self.parent.plan.representations.items[@backingInt(identity_rep)];
+        if (rep.descriptor.get() != null or rep.contains_dynamic) return;
+        try self.parent.result.store.setLocalBoxyDesc(target, try self.parent.staticDescRefForRep(identity_rep));
     }
 
     fn mutableDescriptorLocalForValue(self: *ProcBodyBuilder, value: LIR.LocalId) Allocator.Error!LIR.LocalId {

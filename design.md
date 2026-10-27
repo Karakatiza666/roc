@@ -18594,7 +18594,10 @@ A local that several producers fill (the result of each branch of an `if` or
 `match`) is described the same way on every path. A concrete record, tuple, or
 tag union constructed into a target that has no descriptor of its own is
 therefore described by its static descriptor, never by a descriptor local
-only that branch writes. Likewise a descriptor slot that the body fills later
+only that branch writes. A record field or tuple item of a concrete
+representation, read into a target that has no descriptor of its own, is
+described the same way: the read gives the target the field's static
+descriptor and writes no descriptor local. Likewise a descriptor slot that the body fills later
 is not read by the templates initialized at procedure entry. A pattern that
 checking rejected binds nothing, so planning gives it no representation.
 
@@ -19164,7 +19167,8 @@ tuple representation boundary follows the same rule for each field: it reads a
 field whose source struct layout stores it boxed into that stored box and
 unboxes it, and it boxes a converted field whose target struct layout stores it
 boxed. A restored `ConstStore` record, tuple, or multi-payload tag boxes each
-restored field the same way. The committed struct layout of the target is the
+restored field the same way, both when it is restored at a checked type and
+when it is restored at a stored constant's own stored type. The committed struct layout of the target is the
 only input to this step (`aggregateStoredFieldLocals` in
 `src/postcheck/boxy/lower.zig`).
 
