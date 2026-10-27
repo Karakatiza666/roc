@@ -570,7 +570,7 @@ const State = struct {
                 hashU32(&site, try self.nextOrdinal(ordinals, class_digest));
             },
             .expr => |expr| switch (root.kind) {
-                .numeral_conversion, .quote_conversion => {
+                .numeral_conversion, .quote_conversion, .interpolation_conversion => {
                     const text = self.regionText(env.store.getExprRegion(expr));
                     hashBytes(&value, text);
                     var class = Sha256.init(.{});

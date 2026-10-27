@@ -6129,7 +6129,7 @@ fn failedRootPayload(
     if (root.guarded) return .runtime;
     return switch (root.kind) {
         .expect => .expect,
-        .hoisted_validation => .discarded,
+        .hoisted_validation, .interpolation_conversion => .discarded,
         .constant,
         .hoisted_constant,
         .callable_binding,
@@ -6324,7 +6324,7 @@ fn compileTimeRootForRequest(
     }
     const root = module.compile_time_roots.roots[raw];
     const kind_matches = switch (request.kind) {
-        .compile_time_constant => root.kind == .constant or root.kind == .hoisted_constant or root.kind == .hoisted_validation or root.kind == .numeral_conversion or root.kind == .quote_conversion,
+        .compile_time_constant => root.kind == .constant or root.kind == .hoisted_constant or root.kind == .hoisted_validation or root.kind == .numeral_conversion or root.kind == .quote_conversion or root.kind == .interpolation_conversion,
         .compile_time_callable => root.kind == .callable_binding,
         .repl_expr => root.kind == .repl_expr,
         .runtime_entrypoint,
@@ -6349,7 +6349,7 @@ fn storeRootValue(
     compile_time_root: checked.CompileTimeRoot,
     value: @import("value.zig").Value,
 ) ConstStoreWriter.Error!checked.CompileTimeRootPayload {
-    if (compile_time_root.kind == .hoisted_validation) return .discarded;
+    if (compile_time_root.kind == .hoisted_validation or compile_time_root.kind == .interpolation_conversion) return .discarded;
     return writer.storeRoot(root, value);
 }
 
@@ -6371,6 +6371,7 @@ fn completeRoot(
         .expect,
         .numeral_conversion,
         .quote_conversion,
+        .interpolation_conversion,
         .repl_expr,
         => null,
     };
@@ -6427,6 +6428,7 @@ pub fn finishConstRoot(
         .expect,
         .numeral_conversion,
         .quote_conversion,
+        .interpolation_conversion,
         .repl_expr,
         => unreachable, // finishConstRoot returned above for every kind other than constant and hoisted_constant
     };

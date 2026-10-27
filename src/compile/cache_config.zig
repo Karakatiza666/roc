@@ -392,7 +392,9 @@ pub const Constants = struct {
     ///      the nominal.
     /// 173: Normal form 11: a crash records who wrote it, and N13w drops the
     ///      tests of a literal's conversion that reach its rejection.
-    pub const CACHE_VERSION = 173;
+    /// 174: An interpolation of a type of the author's own has a conversion
+    ///      root, and a `Code` site records the conversion roots its walk met.
+    pub const CACHE_VERSION = 174;
 };
 
 /// Configuration for the Roc cache system.

@@ -6633,7 +6633,7 @@ const Builder = struct {
             => {},
             .empty_record => try actions.append(self.allocator, .{ .omitted_defaults = site }),
             .str_from_quote => |quote| try actions.append(self.allocator, .{ .string_literal_conversion = .{ .view = view, .expr = expr_id, .plan = quote.plan } }),
-            .code_from_lambda => |maybe_node| try self.pushCodeConversion(actions, view, expr_id, maybe_node),
+            .code_from_lambda => |staged| try self.pushCodeConversion(actions, view, expr_id, staged.node),
             .lookup_local,
             .lookup_external,
             .lookup_required,

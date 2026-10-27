@@ -219,7 +219,7 @@ fn copyRoot(module: *checked.CheckedModuleArtifact, previous: *const Previous, m
                     &module.canonical_names,
                     storedRootType(previous, match.previous),
                 ),
-                .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .repl_expr => null,
+                .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .interpolation_conversion, .repl_expr => null,
             },
         },
         .discarded => .{ .payload = .discarded, .root_type = null },
@@ -502,7 +502,7 @@ fn constRefForRoot(module: *const checked.CheckedModuleArtifact, root: checked.C
         },
         .hoisted_constant => (module.hoisted_constants.lookupByRoot(root.id) orelse
             base.invariant("hoisted constant root had no hoisted const entry", .{})).const_ref,
-        .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .repl_expr => base.invariant("compile-time root kind has no constant template", .{}),
+        .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .interpolation_conversion, .repl_expr => base.invariant("compile-time root kind has no constant template", .{}),
     };
 }
 
@@ -536,6 +536,7 @@ pub fn publishPortability(module: *checked.CheckedModuleArtifact) Allocator.Erro
             .const_node => |node| switch (root.kind) {
                 .repl_expr, .callable_binding, .expect => false,
                 .numeral_conversion, .quote_conversion, .hoisted_validation => try module.const_store.valuePortable(node, own),
+                .interpolation_conversion => base.invariant("an interpolation conversion root stored a value", .{}),
                 .constant, .hoisted_constant => try module.const_store.valuePortable(node, own) and
                     try module.const_store.type_store.typePortable(&module.canonical_names, storedTemplateType(module, root), own, own_identity),
             },

@@ -28342,6 +28342,7 @@ const BodyContext = struct {
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .interpolation_conversion,
             .repl_expr,
             => saved_source_region_override,
         };
@@ -28364,6 +28365,7 @@ const BodyContext = struct {
             },
             .numeral_conversion,
             .quote_conversion,
+            .interpolation_conversion,
             => Common.invariant("literal-conversion root bypassed literal-conversion lowering"),
         };
         const declared_ret_node = try ret_cell.toGraphNode(self.graph);
@@ -34917,11 +34919,10 @@ const BodyContext = struct {
             // materialized type instead would ask the graph to resolve
             // `Code(f)` here, and `f` may still hold a row the seal has yet to
             // close to its default.
-            .code_from_lambda => |maybe_node| {
+            .code_from_lambda => |site| {
                 // Publication wrote every site: a refused walk became a
                 // checked error, so a site that reaches here holds a node.
-                const node = maybe_node orelse unreachable; // publication wrote every staged site
-                return loweredExprStep(try self.restoreConstNodeAtNode(self.view, self.view, node, expected_node));
+                return loweredExprStep(try self.restoreCodeSiteAtNode(site, expected_node));
             },
             .call => return requestLowerTask(self, .{ .call_expr_at_node = .{ .expr = checked_expr, .expected_node = expected_node } }),
             .numeral => |numeral| if (numeral.conversion_root) |root_id| {
@@ -35421,9 +35422,8 @@ const BodyContext = struct {
             // evaluating anything. A refused walk reported itself at
             // publication, so its site is a checked error and adds no second
             // report.
-            .code_from_lambda => |maybe_node| {
-                const node = maybe_node orelse unreachable; // publication wrote every staged site
-                return self.withTypeDone(task, try self.restoreConstNodeAtNode(self.view, self.view, node, try self.graph.importMono(ty)));
+            .code_from_lambda => |site| {
+                return self.withTypeDone(task, try self.restoreCodeSiteAtNode(site, try self.graph.importMono(ty)));
             },
             .str_segment => |str| .{ .str_lit = try self.lowerStringLiteral(str) },
             .bytes_literal => |str| blk: {
@@ -47581,6 +47581,23 @@ const BodyContext = struct {
         };
     }
 
+    /// A `Code` site's description, restored as a constant. The site also
+    /// reads the conversion roots of the literals its walk met, so a rejected
+    /// literal is evaluated and reported though nothing runs the function it
+    /// is in.
+    fn restoreCodeSiteAtNode(
+        self: *BodyContext,
+        site: checked.CheckedCodeSite,
+        request_node: NodeId,
+    ) Allocator.Error!DraftExprId {
+        const node = site.node orelse unreachable; // publication wrote every staged site
+        const restored = try self.restoreConstNodeAtNode(self.view, self.view, node, request_node);
+        for (site.reads) |read| {
+            try self.draft.recordRestoredRootRead(restored, .{ .bytes = read.module }, @fromBackingInt(read.root));
+        }
+        return restored;
+    }
+
     fn restoreConstNodeAtNode(
         self: *BodyContext,
         store_view: ModuleView,
@@ -51256,7 +51273,8 @@ const BodyContext = struct {
         return switch (self.view.bodies.expr(expr_id).data) {
             .numeral => |numeral| numeral.plan,
             .str_from_quote => |quote| quote.plan,
-            .pending, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("literal conversion did not point at a conversion expression"),
+            .interpolation => |interpolation| interpolation.plan,
+            .pending, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("literal conversion did not point at a conversion expression"),
         };
     }
 
@@ -51280,7 +51298,20 @@ const BodyContext = struct {
         const try_ty = self.literalConversionTryType(plan);
         const try_node = try self.instNode(try_ty);
         const value = try self.lowerDispatchExprAtType(try_ty, plan, DraftTypeCell.fromGraphNode(try_node));
-        return try self.unwrapLiteralConversionAtNode(value, try_node, try ret_cell.toGraphNode(self.graph), self.literalRejectionSite(expr_id));
+        const site = self.literalRejectionSite(expr_id);
+        if (site.kind != .interpolation) {
+            return try self.unwrapLiteralConversionAtNode(value, try_node, try ret_cell.toGraphNode(self.graph), site);
+        }
+        // An interpolation's first stage yields the assembler, a function no
+        // root can store: the root only runs the stage, so a rejection is
+        // reported, and its value is `{}`.
+        const assembler_node = (try self.graphTryPayloads(try_node)).ok;
+        const assembler = try self.unwrapLiteralConversionAtNode(value, try_node, assembler_node, site);
+        const checked_stage = try self.addStmt(.{ .expr = assembler });
+        return try self.addExprWithTypeCell(ret_cell, .{ .block = .{
+            .statements = try self.addStmtSpan(&.{checked_stage}),
+            .final_expr = try self.addExprWithTypeCell(ret_cell, .unit),
+        } });
     }
 
     /// Lower one use of a literal whose conversion checking selected, as that
@@ -51321,6 +51352,7 @@ const BodyContext = struct {
         const expected_kind: Common.LiteralRejectionKind = switch (kind) {
             .numeral => .numeral,
             .quote => .quote,
+            .interpolation => Common.invariant("an interpolation root reached a literal use"),
         };
         if (site.kind != expected_kind) Common.invariant("literal conversion root kind differed from its literal");
         const value = try self.unwrapLiteralConversionAtNode(try_value, try_node, request_node, site);

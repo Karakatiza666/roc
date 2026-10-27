@@ -2066,6 +2066,7 @@ pub const Reifier = struct {
             .str_from_quote => |quote| blk: {
                 const ty = try self.tyOf(expr_data.ty, region);
                 if (self.rt().get(ty) == .str) break :blk try b.litStr(self.bodies.stringLiteral(quote.literal));
+                if (quote.conversion_root) |root| try self.walk.noteRead(self.artifact.bytes, root);
                 break :blk try self.dispatchExpr(quote.plan, expr_data.ty, region);
             },
             // An interpolated literal of the author's own type is the
@@ -2196,6 +2197,7 @@ pub const Reifier = struct {
         const value_list = try b.listOf(try types.listTy(item_ty), values);
         switch (try self.dispatchTarget(DispatchSpec.ofPlan(plan), region)) {
             .definition => |target| {
+                if (interpolation.conversion_root) |root| try self.walk.noteRead(self.artifact.bytes, root);
                 self.walk.stage_one += 1;
                 defer self.walk.stage_one -= 1;
                 const converted = try self.inlineCall(target, &.{segment_list}, null, region);
@@ -2209,8 +2211,10 @@ pub const Reifier = struct {
     /// A numeric literal: one `Lit` of its type (N1i), or, for a literal of
     /// the author's own type, the `from_numeral` call the checker wrote.
     fn numeralExpr(self: *Reifier, data: checked.CheckedNumeralData, checked_ty: CheckedTypeId, region: base.Region) Error!Ref {
-        const primitive = self.primitiveOf(checked_ty) orelse
+        const primitive = self.primitiveOf(checked_ty) orelse {
+            if (data.conversion_root) |root| try self.walk.noteRead(self.artifact.bytes, root);
             return self.dispatchExpr(data.plan, checked_ty, region);
+        };
         return self.numeralLit(data.literal, primitive, try self.tyOf(checked_ty, region), region);
     }
 
@@ -7797,6 +7801,9 @@ pub const SiteOutcome = struct {
     /// The call that binds the site's input slots, as the checker recorded
     /// it, or null.
     bound_call: ?u32 = null,
+    /// The conversion roots of the custom literals the walk met, which
+    /// lowering reads where the site stands. Owned.
+    reads: []checked.CheckedCodeRead = &.{},
 };
 
 /// What the program supplies for one input slot: a run-time name, read
@@ -8225,6 +8232,9 @@ pub const Walk = struct {
     /// The input slots of the site last finished, in slot order: what the
     /// program supplies for each. Owned; `takeSlots` hands it over.
     slots: []SlotSource = &.{},
+    /// The conversion roots of the custom literals the site's walk met, in
+    /// the order it met them, once each. `takeReads` hands them over.
+    reads: std.ArrayList(checked.CheckedCodeRead) = .empty,
 
     /// The run-time names a site that binds inputs reads.
     pub const Inputs = struct {
@@ -8278,6 +8288,7 @@ pub const Walk = struct {
         self.normalized.deinit(self.gpa);
         self.endInputs();
         self.freeSlots();
+        self.reads.deinit(self.gpa);
         self.sources.deinit(self.gpa);
         self.source_ids.deinit(self.gpa);
         for (self.published.items) |*p| p.deinit(self.gpa);
@@ -8321,7 +8332,22 @@ pub const Walk = struct {
         self.rejection = null;
         self.endInputs();
         self.freeSlots();
+        self.reads.clearRetainingCapacity();
         if (binds_inputs) self.inputs = .{ .reader = site_reader };
+    }
+
+    /// Note that the walk met a literal whose conversion is a compile-time
+    /// root of `module`, so lowering reads that root where the site stands.
+    fn noteRead(self: *Walk, module: [32]u8, root: checked.ComptimeRootId) Allocator.Error!void {
+        for (self.reads.items) |read| {
+            if (read.root == @backingInt(root) and std.mem.eql(u8, &read.module, &module)) return;
+        }
+        try self.reads.append(self.gpa, .{ .module = module, .root = @backingInt(root) });
+    }
+
+    /// The roots of the site last finished, which the caller now owns.
+    pub fn takeReads(self: *Walk) Allocator.Error![]checked.CheckedCodeRead {
+        return self.reads.toOwnedSlice(self.gpa);
     }
 
     fn endInputs(self: *Walk) void {
@@ -8682,7 +8708,9 @@ pub fn reifyModuleSites(
         };
         const slots = walk.takeSlots();
         errdefer freeSlotSources(gpa, slots);
-        try results.append(gpa, .{ .expr = site_expr, .outcome = outcome, .slots = slots, .bound_call = bound_call });
+        const reads = try walk.takeReads();
+        errdefer gpa.free(reads);
+        try results.append(gpa, .{ .expr = site_expr, .outcome = outcome, .slots = slots, .bound_call = bound_call, .reads = reads });
     }
 
     const outcomes = try results.toOwnedSlice(gpa);
@@ -8705,7 +8733,10 @@ pub const ModuleSites = struct {
     provenance: []SiteProvenance = &.{},
 
     pub fn deinit(self: *ModuleSites, gpa: Allocator) void {
-        for (self.outcomes) |outcome| freeSlotSources(gpa, outcome.slots);
+        for (self.outcomes) |outcome| {
+            freeSlotSources(gpa, outcome.slots);
+            gpa.free(outcome.reads);
+        }
         gpa.free(self.outcomes);
         for (self.provenance) |*p| p.deinit(gpa);
         gpa.free(self.provenance);

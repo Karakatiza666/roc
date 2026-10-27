@@ -1034,7 +1034,7 @@ pub const RootRequestTable = struct {
             try appendRoot(&requests, allocator, .{
                 .module_idx = root.module_idx,
                 .kind = switch (root.kind) {
-                    .constant, .hoisted_constant, .hoisted_validation, .numeral_conversion, .quote_conversion => .compile_time_constant,
+                    .constant, .hoisted_constant, .hoisted_validation, .numeral_conversion, .quote_conversion, .interpolation_conversion => .compile_time_constant,
                     .callable_binding => .compile_time_callable,
                     .expect => .test_expect,
                     .repl_expr => .repl_expr,
@@ -1044,7 +1044,7 @@ pub const RootRequestTable = struct {
                 .checked_type = entryWrapperForRoot(entry_wrappers, root.id).checked_fn_root,
                 .abi = switch (root.kind) {
                     .expect => .test_expect,
-                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr => .compile_time,
+                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .interpolation_conversion, .repl_expr => .compile_time,
                 },
                 .exposure = .private,
                 .procedure_template = templateForEntryWrapperRoot(entry_wrappers, root.id),
@@ -1974,7 +1974,7 @@ fn compileTimeRootKindMatchesRequest(
         .callable_binding => request_kind == .compile_time_callable,
         .expect => request_kind == .test_expect,
         .repl_expr => request_kind == .repl_expr,
-        .numeral_conversion, .quote_conversion => request_kind == .compile_time_constant,
+        .numeral_conversion, .quote_conversion, .interpolation_conversion => request_kind == .compile_time_constant,
     };
 }
 
@@ -2535,6 +2535,25 @@ pub const CheckedCodeBinding = extern struct {
     call: CheckedExprId,
     slots_start: u32,
     slots_len: u32,
+};
+
+/// A compile-time root that the walk of a `Code` site met: the conversion root
+/// of a literal in a function the description reaches. Lowering reads it where
+/// the site stands, so a rejected literal is reported though nothing calls
+/// the function it is in.
+pub const CheckedCodeRead = extern struct {
+    /// The key of the module that holds the root.
+    module: [32]u8,
+    /// The root's id in that module's compile-time root table.
+    root: u32,
+};
+
+/// What publication leaves on a `Code` site (`code_from_lambda`).
+pub const CheckedCodeSite = struct {
+    /// The description. Null only between copying and publication.
+    node: ?ConstNodeId,
+    /// The literal conversion roots the walk met, in the order it met them.
+    reads: []const CheckedCodeRead = &.{},
 };
 
 /// One input slot: the run-time name the program reads, the projections it
@@ -11156,7 +11175,7 @@ pub const CheckedExprData = union(enum) {
     /// that description here. Null is only the state copying leaves the site
     /// in until publication fills it: a refused walk, and the name a template
     /// call calls, become `runtime_error`, so no published body holds a null.
-    code_from_lambda: ?ConstNodeId,
+    code_from_lambda: CheckedCodeSite,
     str_segment: CheckedStringLiteralId,
     str: []const CheckedExprId,
     bytes_literal: CheckedStringLiteralId,
@@ -11312,6 +11331,11 @@ pub const CheckedInterpolation = struct {
     segments: []const CheckedExprId,
     values: []const CheckedExprId,
     assembler_ty: CheckedTypeId,
+    /// The `interpolation_conversion` compile-time root that evaluates this
+    /// literal's first stage, when the target is a non-builtin type and the
+    /// finalized dispatch is independent of specialization. Only a read of the
+    /// root demands it: the literal itself still lowers its own first stage.
+    conversion_root: ?ComptimeRootId = null,
 };
 
 /// Public `CheckedReturnContext` declaration.
@@ -11642,6 +11666,7 @@ pub const CheckedBodyStoreView = struct {
     code_slot_pool: []const CheckedCodeSlot = &.{},
     code_slot_step_pool: []const CheckedCodeSlotStep = &.{},
     code_shape_pool: []const u32 = &.{},
+    code_read_pool: []const CheckedCodeRead = &.{},
 
     /// The input slots `call` binds, in slot order, or null when `call`
     /// binds none.
@@ -12804,6 +12829,7 @@ pub const CheckedBodyStore = struct {
     code_slot_pool: std.ArrayList(CheckedCodeSlot) = .empty,
     code_slot_step_pool: std.ArrayList(CheckedCodeSlotStep) = .empty,
     code_shape_pool: std.ArrayList(u32) = .empty,
+    code_read_pool: std.ArrayList(CheckedCodeRead) = .empty,
     source_node_map: CheckedSourceNodeMap = .{},
     /// Synthesized conversion, matched-value lookup, and equality expressions
     /// for custom literal patterns, ordered by source node. Pattern nodes
@@ -13153,6 +13179,7 @@ pub const CheckedBodyStore = struct {
             .code_slot_pool = self.code_slot_pool.items,
             .code_slot_step_pool = self.code_slot_step_pool.items,
             .code_shape_pool = self.code_shape_pool.items,
+            .code_read_pool = self.code_read_pool.items,
         };
     }
 
@@ -13604,8 +13631,15 @@ pub const CheckedBodyStore = struct {
     /// A site that named a function holds the empty description body copying
     /// left on it. A lambda written in place holds itself, because the walk
     /// had to read it to build the description now taking its place.
-    pub fn attachCodeReification(self: *CheckedBodyStore, expr_id: CheckedExprId, node: ConstNodeId) void {
-        self.stagedSiteData(expr_id).* = .{ .code_from_lambda = node };
+    pub fn attachCodeReification(
+        self: *CheckedBodyStore,
+        allocator: Allocator,
+        expr_id: CheckedExprId,
+        node: ConstNodeId,
+        reads: []const CheckedCodeRead,
+    ) Allocator.Error!void {
+        const range = try artifact_serialize.appendSpan(CheckedBodyRange, CheckedCodeRead, &self.code_read_pool, allocator, reads);
+        self.stagedSiteData(expr_id).* = .{ .code_from_lambda = .{ .node = node, .reads = range } };
     }
 
     /// Record that the walk refused a staged site. The refusal is reported
@@ -13932,11 +13966,12 @@ pub const CheckedBodyStore = struct {
         code_slot_pool: SerializedSlice(CheckedCodeSlot) = .{},
         code_slot_step_pool: SerializedSlice(CheckedCodeSlotStep) = .{},
         code_shape_pool: SerializedSlice(u32) = .{},
+        code_read_pool: SerializedSlice(CheckedCodeRead) = .{},
 
         comptime {
-            // 30 SerializedSlice fields → 30 base-pointer fixups, independent of
+            // 31 SerializedSlice fields → 31 base-pointer fixups, independent of
             // stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 30);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 31);
         }
 
         const Serde = artifact_serialize.SliceStoreSerde(CheckedBodyStore, @This());
@@ -15510,7 +15545,7 @@ const CheckedBodyPayloadCopier = struct {
         // walk reads to build the description that replaces it.
         if (self.module.moduleEnvConst().codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr_idx))) |site| {
             switch (site.kind) {
-                .named_function, .template_call, .template_callee => return .{ .code_from_lambda = null },
+                .named_function, .template_call, .template_callee => return .{ .code_from_lambda = .{ .node = null } },
                 .inline_lambda, .template => {},
             }
         }
@@ -22292,6 +22327,7 @@ fn sealConstEvalTemplatesForRoots(
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .interpolation_conversion,
             .repl_expr,
             => checkedArtifactInvariant("non-constant root reached const eval template sealing", .{}),
         };
@@ -23700,7 +23736,7 @@ pub const CheckedProcedureTemplateTable = struct {
                 .nested_proc_sites = .{},
                 .target = switch (root.kind) {
                     .expect => .entry,
-                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr => .comptime_only,
+                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .interpolation_conversion, .repl_expr => .comptime_only,
                 },
             });
         }
@@ -26331,6 +26367,17 @@ fn directEvidenceEnter(
     }
 }
 
+/// Whether a checked type is a nominal type the program declares, seen through
+/// aliases: not a builtin, whose conversions never reject a literal.
+fn checkedTypeIsCustomNominal(store: *const CheckedTypeStore, root: CheckedTypeId) bool {
+    var current = root;
+    while (true) switch (store.payload(current)) {
+        .alias => |alias| current = alias.backing,
+        .nominal => |nominal| return nominal.builtin == null,
+        .pending, .err, .flex, .rigid, .record, .tuple, .function, .tag_union, .empty_record, .empty_tag_union => return false,
+    };
+}
+
 /// Literal roots have no lexical evidence parameters. Publish them only after
 /// the ordinary dispatch pass has proved the complete conversion closed. A
 /// concrete receiver alone does not prove this: nested codec requirements can
@@ -26351,6 +26398,7 @@ fn publishLiteralConversionRoots(
     const first_root = roots.roots.len;
     var root_list = std.ArrayList(CompileTimeRoot).empty;
     defer root_list.deinit(allocator);
+    var unit_type: ?CheckedTypeId = null;
 
     for (module.moduleEnvConst().store.literalDispatchPlans()) |literal| {
         switch (literal.dispatchResolution()) {
@@ -26430,6 +26478,37 @@ fn publishLiteralConversionRoots(
             .payload = .pending,
         });
     }
+    // A literal with an interpolation has no dispatch plan record of its own,
+    // so its expressions are found through the source node map. Its root
+    // checks the first stage of a custom conversion and keeps no value.
+    for (0..bodies.source_node_map.entries.len) |raw_node| {
+        const expr_id = bodies.source_node_map.exprAtRawNode(@intCast(raw_node)) orelse continue;
+        const data = &bodies.stored_exprs.items[@backingInt(expr_id)].data;
+        const interpolation = switch (data.*) {
+            .interpolation => |*interpolation| interpolation,
+            else => continue,
+        };
+        const plan_id = interpolation.plan orelse continue;
+        switch (plans.plans[@backingInt(plan_id)].resolution) {
+            .direct_closed => {},
+            .direct_parametric, .evidence_dependent, .checked_error, .@"unreachable", .direct_pending, .structural => continue,
+        }
+        if (!checkedTypeIsCustomNominal(&checked_types.store, bodies.expr(expr_id).ty)) continue;
+        if (interpolation.conversion_root != null) checkedArtifactInvariant("interpolation received a second conversion root", .{});
+        interpolation.conversion_root = @fromBackingInt(@intCast(@as(u32, @intCast(first_root + root_list.items.len))));
+        try CompileTimeRootTable.appendCompileTimeRoot(&root_list, allocator, .{
+            .module_idx = module.moduleIndex(),
+            .kind = .interpolation_conversion,
+            .source = .{ .expr = @fromBackingInt(@intCast(raw_node)) },
+            .pattern = null,
+            .expr = expr_id,
+            .checked_type = unit_type orelse blk: {
+                unit_type = try checked_types.store.ensureEmptyRecordRoot(allocator, names);
+                break :blk unit_type.?;
+            },
+            .payload = .pending,
+        });
+    }
     if (root_list.items.len == 0) return;
     roots.roots = try allocator.realloc(roots.roots, first_root + root_list.items.len);
     const added = roots.roots[first_root..];
@@ -26455,6 +26534,7 @@ fn publishLiteralConversionRoots(
         const plan_id = switch (bodies.expr(root.expr).data) {
             .numeral => |numeral| numeral.plan.?,
             .str_from_quote => |quote| quote.plan.?,
+            .interpolation => |interpolation| interpolation.plan.?,
             .pending,
             .code_from_lambda,
             .str_segment,
@@ -26482,7 +26562,6 @@ fn publishLiteralConversionRoots(
             .unary_not,
             .field_access,
             .dispatch_call,
-            .interpolation,
             .structural_eq,
             .structural_hash,
             .method_eq,
@@ -26501,7 +26580,7 @@ fn publishLiteralConversionRoots(
             .for_,
             .hosted_lambda,
             .run_low_level,
-            => unreachable, // the loop above appends roots only for numeral and str_from_quote expressions
+            => unreachable, // the loops above append roots only for numeral, str_from_quote and interpolation expressions
         };
         const ref_index = first_ref + i;
         plans.template_refs[ref_index] = plan_id;
@@ -28661,6 +28740,13 @@ pub const CompileTimeRootKind = enum {
     /// non-builtin nominal type; works exactly like `numeral_conversion` with
     /// `Err(BadQuotedBytes(..))` reported as the checking problem.
     quote_conversion,
+    /// The first stage of a `from_interpolation` conversion of a string
+    /// literal whose target is a non-builtin nominal type. The root body
+    /// evaluates the dispatch call over the literal's segments and keeps no
+    /// value: `Err(InvalidInterpolation(..))` is reported as the checking
+    /// problem. Only a read demands it (a `Code` site that reaches the
+    /// literal reads it), and its payload is `discarded`.
+    interpolation_conversion,
     /// One explicitly requested REPL expression body whose inspected `Str`
     /// result is evaluated during checking finalization but is not installed
     /// as a source-visible top-level constant.
@@ -28674,6 +28760,7 @@ pub const CompileTimeRootKind = enum {
 pub const CompileTimeLiteralConversionKind = enum(u8) {
     numeral,
     quote,
+    interpolation,
 };
 
 /// Public `CompileTimeRootPayload` declaration.
@@ -28723,6 +28810,7 @@ pub const CompileTimeRoot = struct {
         return switch (self.kind) {
             .numeral_conversion => .numeral,
             .quote_conversion => .quote,
+            .interpolation_conversion => .interpolation,
             .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .expect, .repl_expr => null,
         };
     }
@@ -29029,6 +29117,7 @@ fn publishCompileTimeRootRequestEligibility(
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .interpolation_conversion,
             .repl_expr,
             => false,
         };
@@ -30107,6 +30196,11 @@ fn verifyCompileTimeRootPayloadMatchesKind(root: CompileTimeRoot, payload: Compi
             .const_node, .unevaluated => true,
             .pending, .fn_value, .discarded, .expect, .runtime => false,
         },
+        .interpolation_conversion => switch (payload) {
+            .discarded, .unevaluated => true,
+            .runtime => root.guarded,
+            .pending, .const_node, .fn_value, .expect => false,
+        },
     };
     if (matches) return;
     checkedArtifactInvariant("compile-time root payload does not match root kind", .{});
@@ -30115,7 +30209,7 @@ fn verifyCompileTimeRootPayloadMatchesKind(root: CompileTimeRoot, payload: Compi
 fn compileTimeRootHasConstBody(kind: CompileTimeRootKind) bool {
     return switch (kind) {
         .constant, .hoisted_constant => true,
-        .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .repl_expr => false,
+        .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .interpolation_conversion, .repl_expr => false,
     };
 }
 
@@ -30806,6 +30900,8 @@ fn compileTimeRootReplacesSourceOccurrence(kind: CompileTimeRootKind) bool {
         => true,
         .callable_binding,
         .expect,
+        // Its expression holds runtime values the root never evaluates.
+        .interpolation_conversion,
         => false,
     };
 }
@@ -34937,8 +35033,9 @@ pub const CheckedModuleArtifact = struct {
             // function evidence keeps its target and structural payloads in
             // two pools of their own. Template demand vectors add one. The
             // code provenance table adds its seven slices, and the calls that
-            // bind input slots four in the body store.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 257);
+            // bind input slots four in the body store, and the roots a Code site
+            // reads one.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 258);
         }
 
         /// Every field but the inline POD `key`, `source_hash`, and
@@ -35256,7 +35353,7 @@ pub const CheckedModuleArtifact = struct {
             std.debug.assert(@backingInt(root.expr) < self.checked_bodies.exprCount());
             if (root.pattern) |pattern| std.debug.assert(@backingInt(pattern) < self.checked_bodies.patternCount());
             switch (root.kind) {
-                .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr => switch (root.payload) {
+                .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .interpolation_conversion, .repl_expr => switch (root.payload) {
                     .pending => {},
                     .unevaluated,
                     .const_node,
@@ -38544,7 +38641,7 @@ fn reifyStagedCode(
     for (sites.outcomes) |site| {
         if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
         switch (site.outcome) {
-            .reified => |node| checked_bodies.attachCodeReification(site.expr, node),
+            .reified => |node| try checked_bodies.attachCodeReification(allocator, site.expr, node, site.reads),
             .rejected => |rejection| {
                 checked_bodies.refuseCodeReification(site.expr);
                 // The site is a runtime error either way. Only the report
@@ -41518,7 +41615,7 @@ fn divergenceParityFixture(comptime kind: CheckedExprKind) CheckedExprData {
         .pending => .pending,
         .numeral => .{ .numeral = .{ .literal = .{ .node_idx = 0, .digits_start = 0, .before_len = 0, .after_len = 0, .after_decimal_digit_count = 0, .flags = 0 }, .plan = null } },
         .str_from_quote => .{ .str_from_quote = .{ .plan = null, .literal = string } },
-        .code_from_lambda => .{ .code_from_lambda = null },
+        .code_from_lambda => .{ .code_from_lambda = .{ .node = null } },
         .str_segment => .{ .str_segment = string },
         .str => .{ .str = ops },
         .bytes_literal => .{ .bytes_literal = string },
@@ -41744,7 +41841,7 @@ test "a refused staged site publishes as a runtime error, never a null descripti
         .id = e0,
         .ty = testIndexId(CheckedTypeId, 0),
         .source_region = base.Region.zero(),
-        .data = .{ .code_from_lambda = null },
+        .data = .{ .code_from_lambda = .{ .node = null } },
     }};
     try store.commitExprs(gpa, &exprs);
 
@@ -41811,8 +41908,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0x8F, 0xD6, 0xFB, 0x16, 0x46, 0x99, 0xDD, 0x55, 0xB6, 0xF1, 0xFA, 0xAB, 0x5C, 0xBB, 0x96, 0x2A,
-        0x67, 0x8F, 0x92, 0xA8, 0x58, 0x46, 0x79, 0x67, 0x9F, 0x48, 0xC8, 0x70, 0x9C, 0x6D, 0xCC, 0x32,
+        0x96, 0x23, 0x86, 0xB7, 0x4D, 0x31, 0x18, 0xE8, 0x0C, 0xD9, 0x59, 0x56, 0x77, 0x01, 0x63, 0x11,
+        0x0C, 0x4B, 0x86, 0xE6, 0x19, 0x56, 0xFA, 0xF5, 0x0B, 0xF8, 0x42, 0x96, 0xAB, 0x80, 0x7E, 0x4E,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

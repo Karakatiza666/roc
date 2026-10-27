@@ -23659,6 +23659,20 @@ Invariants:
   never the site key.
 - The provenance table that maps a node to its source regions is for the
   compiler. A translator cannot read it.
+- A function that only the walk reads is never lowered, so a literal in it
+  would never be checked. The walk notes the conversion root of each literal of
+  the author's own type that it converts (`Walk.noteRead`,
+  `src/check/code_reifier.zig:8341`). Publication stores the roots on the site
+  (`CheckedCodeSite.reads`, `src/check/checked_artifact.zig:2552`), and
+  lowering reads them where the site stands (`restoreCodeSiteAtNode`,
+  `src/postcheck/monotype/lower.zig:47588`), which demands each root. A
+  `from_numeral` or `from_quote` literal already had such a root. A literal
+  with an interpolation gets an `interpolation_conversion` root
+  (`publishLiteralConversionRoots`, `src/check/checked_artifact.zig:26386`):
+  it runs the first stage of `from_interpolation`, keeps no value (its payload
+  is `discarded` and its result `{}`), and only a read demands it. A rejected
+  literal is reported at the literal, in `roc check` and in `roc build`,
+  whether or not anything calls the function it is in.
 - Later stages treat a description as a constant. They never read its rows,
   and they never rewrite it.
 - A condition that reads a code reification site draws no compile-time
