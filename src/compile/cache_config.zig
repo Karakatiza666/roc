@@ -386,7 +386,11 @@ pub const Constants = struct {
     ///      operand cone, so `x - x` keeps a loop that can crash.
     /// 171: `Code.Inlined` values hold `inline_digest`'s digests (V5a), and
     ///      `Code.Digest` is a builtin type.
-    pub const CACHE_VERSION = 171;
+    /// 172: An interpolated literal of a type of the author's own describes as
+    ///      the call of the row its conversion's first stage hands back, and a
+    ///      lambda read at a function of the nominal over its result delivers
+    ///      the nominal.
+    pub const CACHE_VERSION = 172;
 };
 
 /// Configuration for the Roc cache system.

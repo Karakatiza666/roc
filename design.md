@@ -23580,8 +23580,15 @@ Invariants:
   the compiler builds from the digits of the literal, field by field as
   Monotype builds it (`numeralArgument`). The conversion's `Try` is read as the
   checker reads it: the `Ok` payload is the value, and an `Err` is a crash.
-  A custom `from_interpolation` is refused, because its value is a function
-  the conversion computes and no node applies a computed function.
+  A custom `from_interpolation` is walked by its definition where the literal
+  stands, with the segments as a literal list: the lambda its `Ok` holds is a
+  closure of a row, and the literal is that row called over its captures and the
+  list of the interpolated values. A builtin the stage calls that hands back a
+  function (`Str.from_interpolation`, `Try.map_ok`) is walked by its Roc
+  definition, and a lambda the stage applies is walked where it is applied. The
+  program compiled, so the stage returned `Ok`: an arm in the tail of the stage
+  that only delivers `Err` is not described. One that can leave its body early
+  with `?` is refused.
 - A binder's name in a description is the identifier the canonicalizer
   recorded on its pattern, written to `CheckedPatternBinder.name`, never
   text read back through the pattern's region.

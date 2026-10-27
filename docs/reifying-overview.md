@@ -202,7 +202,7 @@ Notes on accuracy:
 | --- | --- |
 | Where | The `reify` branch. Not merged into `main`. |
 | What works | Pure Roc as listed in [../roc-reify-design.md](../roc-reify-design.md): literals, operators, calls (helpers, generic, recursive, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods, and captured run-time values for a translator that returns a `Code.Bound`. |
-| Tests | 116 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 169 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 49 fixtures `test/cli/Staged*.roc`. 160 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
+| Tests | 118 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 176 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 49 fixtures `test/cli/Staged*.roc`. 160 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
 | Node identities | `Code.Inlined.inline_digest` names a node of the `inline` view by its content (milestone M8). |
 | Not done | The translator cannot yet declare which functions of another package it reads (`code_primitives`, milestone M13 of [../roc-reify-normalization-plan.md](../roc-reify-normalization-plan.md)). |
 
@@ -223,7 +223,8 @@ A refusal names the construct. The rule is that the function must name only thin
 | A type variable that nothing fixes and no default seals | The body reads differently at each type. |
 | A numeric default that does not fit its use | For example `\|x\| x * 2.U8`. |
 | A template argument that is computed when the program runs | A description is built before the program runs. |
-| A custom `from_interpolation` of your own type, also as a template argument | The value is a function that the conversion computes, and no node applies a computed function. |
+| A custom `from_interpolation` of your own type that returns early with `?`, or is generic in the item type of its assembler | The walk runs the first stage where the literal stands, and a `?` can leave the row it is walked in. |
+| An interpolated literal of your own type as a template argument | The checker binds every interpolated value to a name, so the argument is not a constant. |
 | Derived `is_eq` on a function | Roc has no equality on functions. |
 
 The list with the exact reason lines is in the section "What the remaining unticked boxes cost" of [../roc-reify-design.md](../roc-reify-design.md).

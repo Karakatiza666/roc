@@ -719,6 +719,14 @@ M13 declares the cut with the well-known item `code_primitives` on the
 translator's type (normal-form 12), so it needs no new syntax. Until M13, N8h keeps every
 function of another package a primitive, and no dependency body is read.
 
+After M13 is built, check the delegated form of an interpolated literal of a
+custom type. A translator that declares that type's `from_interpolation` in
+its cut must receive the literal as one named primitive call, with the
+segments and the values as its arguments. For example, a SQL translator
+then emits `?` placeholders, and a Rust translator emits `format!`. A
+translator that does not declare it must still receive the type's Roc
+implementation, walked by its definition. Pin both sides with a test.
+
 M15 and M16 change normal forms when they admit rows, so each one raises
 `normal_form_version`, as every milestone that changes a rule does.
 
@@ -743,6 +751,20 @@ rows. They stay in the table and in force. The milestone builds the rest.
 
 M8 was one milestone. The core took I9, V2 and V6 from it as M8a, and M8
 keeps what the safety document does not need.
+
+After M17 is built, check interpolated literals. An interpolated literal is
+walked through its type's `from_interpolation`, and `Str.from_interpolation`
+assembles the string with a fold over a list of values whose length the
+literal fixes. Until M17, a translator sees that fold. After M17, these must
+meet as one flat `Str.concat` chain:
+
+- `"a${x}b"` at `Str`
+- the same literal at a custom type whose conversion only wraps `Str`'s
+  assembler
+- the hand-written `"a".concat(x).concat("b")`
+
+A conversion that also transforms the values, such as escaping, must give the
+same chain with the transform applied to each value. Pin both with L3 pairs.
 
 Each extension changes normal forms, so after a first release each one ships
 as a language-version change.

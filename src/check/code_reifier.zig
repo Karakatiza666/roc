@@ -210,6 +210,10 @@ pub const DefinitionKey = struct {
     /// parameters. One lambda can be described each way: at a `Code` position
     /// or as a template's argument, and as a call.
     replayed: bool = false,
+    /// The type this row delivers where it is not the one its lambda's own
+    /// type gives: the nominal a lambda is read at, where the checker took
+    /// the lambda's record or tag union for it.
+    result: ?TyId = null,
     /// Which definitions this row's function parameters were fixed to,
     /// digested from the rows they name. Zero for a definition that takes no
     /// function parameter, so one body describes once.
@@ -1243,9 +1247,12 @@ pub const Reifier = struct {
             const place: TypePlace = .{ .parameter = .{ .reader = self, .pattern = lambda.args[index], .position = @intCast(index) } };
             try params.append(self.gpa, try self.placedTy(param_ty, region, place));
         }
-        const result = try self.placedTy(staged_fn.ret, region, .result);
+        const own_result = try self.placedTy(staged_fn.ret, region, .result);
+        const demanded = if (key) |k| k.result else null;
+        const result = demanded orelse own_result;
         const lambdas = [_]CheckedExprId{expr_id};
         return self.buildRow(params.items, result, key, .{
+            .demanded = demanded != null,
             .captures = if (captures == .parameter) captured else &.{},
             .lambdas = &lambdas,
             .body = lambda.body,
@@ -1290,6 +1297,9 @@ pub const Reifier = struct {
     /// whose parameters follow, outermost first, the body, and the checked
     /// result of the function type the row is built at.
     const RowParts = struct {
+        /// Whether the row delivers a type other than the lambda's own
+        /// (`DefinitionKey.result`).
+        demanded: bool = false,
         captures: []const checked.CheckedCapture,
         lambdas: []const CheckedExprId,
         body: CheckedExprId,
@@ -1309,6 +1319,10 @@ pub const Reifier = struct {
 
         const scope_base = self.scope.items.len;
         defer self.scope.shrinkRetainingCapacity(scope_base);
+        // A row is no part of the first stage that reached it.
+        const outer_stage = self.walk.stage_one;
+        self.walk.stage_one = 0;
+        defer self.walk.stage_one = outer_stage;
         // A lambda written inside a loop is a function of its own, so a
         // `break` in it has no loop to leave.
         const outer_loop = self.loop;
@@ -1355,6 +1369,7 @@ pub const Reifier = struct {
     /// has a checked type of its own, narrower than the function's result,
     /// and delivers at the result (design.md "Try Return-Row Composition").
     fn bodyValue(self: *Reifier, parts: RowParts, result: TyId) Error!Ref {
+        if (parts.demanded) return self.conformed(try self.exprAt(parts.body, result), result);
         if (parts.ret == self.bodies.expr(parts.body).ty) return self.exprRef(parts.body);
         return self.exprAt(parts.body, result);
     }
@@ -1379,10 +1394,27 @@ pub const Reifier = struct {
 
     /// A lambda written where a value stands: a closure of its row, over what
     /// it captured (N8b).
-    fn closureExpr(self: *Reifier, expr_id: CheckedExprId) Error!Ref {
+    ///
+    /// `at` is the function type the lambda is read at. The checker takes a
+    /// record or a tag union for the nominal that declares it, so a lambda
+    /// that builds one and is read at a function of the nominal delivers the
+    /// nominal: its row is built at it.
+    fn closureAt(self: *Reifier, expr_id: CheckedExprId, at: ?TyId) Error!Ref {
         const expr = self.bodies.expr(expr_id);
         const fn_ty = try self.tyOf(self.stagedFunctionTypeId(expr), expr.source_region);
-        return self.closureOf(try self.enclosedLambda(expr_id, null, self.capturesOf(expr_id)), fn_ty);
+        var target = try self.enclosedLambda(expr_id, null, self.capturesOf(expr_id));
+        target.key.result = self.readAsNominal(fn_ty, at);
+        const closure_ty = if (target.key.result != null) at.? else fn_ty;
+        if (self.walk.stage_one == 0) return self.closureOf(target, closure_ty);
+        // A lambda a first stage writes may be applied before the stage ends,
+        // where the walk stands, so its target is kept beside its row.
+        const kept = try self.boundTarget(target);
+        errdefer Walk.freeTarget(self.gpa, kept);
+        const closure = try self.closureOf(target, closure_ty);
+        const known = self.bld().knownClosure(closure) orelse invariant("a lambda's closure is a Closure node");
+        const previous = try self.walk.closure_targets.fetchPut(self.gpa, known.row, kept);
+        if (previous) |old| Walk.freeTarget(self.gpa, old.value);
+        return closure;
     }
 
     /// The target of a lambda written in the row being walked.
@@ -1458,6 +1490,194 @@ pub const Reifier = struct {
         }
         const row = try self.calledRow(target);
         return self.bld().closure(row, values.items, fn_ty);
+    }
+
+    /// The result type `at` gives a function of type `own`, where `at` reads
+    /// the nominal over the type `own` delivers, and null for any other `at`.
+    fn readAsNominal(self: *Reifier, own: TyId, at: ?TyId) ?TyId {
+        const types = self.rt();
+        const wanted = at orelse return null;
+        const own_ret = switch (types.get(own)) {
+            .func => |function| function.ret,
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .nominal, .opaque_, .recursive => return null,
+        };
+        const wanted_ret = switch (types.get(wanted)) {
+            .func => |function| function.ret,
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .nominal, .opaque_, .recursive => return null,
+        };
+        if (wanted_ret == own_ret) return null;
+        return switch (types.get(wanted_ret)) {
+            .nominal => |nominal| if (nominal.backing == own_ret) wanted_ret else null,
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .func, .opaque_, .recursive => null,
+        };
+    }
+
+    /// `value` at the nominal `ty` where `ty` is the nominal over its type.
+    fn conformed(self: *Reifier, value: Ref, ty: TyId) Error!Ref {
+        const types = self.rt();
+        if (self.irs().refTy(self.bld().row, value) == ty) return value;
+        return switch (types.get(ty)) {
+            .nominal => |nominal| if (nominal.backing == self.irs().refTy(self.bld().row, value)) self.bld().wrap(ty, value) else value,
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .func, .opaque_, .recursive => value,
+        };
+    }
+
+    // First stage //
+
+    /// Mark `expr_id` as delivering the result of the first stage being
+    /// walked, unexamined.
+    fn markTail(self: *Reifier, expr_id: CheckedExprId) Allocator.Error!void {
+        try self.walk.stage_tail.put(self.gpa, .{ .reader = self, .expr = expr_id }, {});
+    }
+
+    fn inTail(self: *Reifier, expr_id: CheckedExprId) bool {
+        return self.walk.stage_tail.contains(.{ .reader = self, .expr = expr_id });
+    }
+
+    /// Whether an expression delivers an `Err` and nothing else.
+    fn deliversErr(self: *Reifier, expr_id: CheckedExprId) bool {
+        var current = expr_id;
+        while (true) switch (self.bodies.expr(current).data) {
+            .tag => |tag| return std.mem.eql(u8, self.names.tagLabelText(tag.name), "Err"),
+            .row_coerce => |coerce| current = coerce.value,
+            .nominal => |nominal| current = nominal.backing_expr,
+            .block => |block| {
+                if (block.statements.len != 0) return false;
+                current = block.final_expr;
+            },
+            else => return false,
+        };
+    }
+
+    /// Whether this reader's walk is inside the first stage of an
+    /// interpolated literal, at a call whose result holds a function. Such a
+    /// call is walked where it stands, because a node named for it would give
+    /// back a function that nothing can apply.
+    fn walksInline(self: *Reifier, result_ty: CheckedTypeId, region: base.Region) Error!bool {
+        if (self.walk.stage_one == 0) return false;
+        return self.holdsFunction(try self.tyOf(result_ty, region));
+    }
+
+    /// Whether a value of `ty` holds a function.
+    fn holdsFunction(self: *Reifier, ty: TyId) bool {
+        const types = self.rt();
+        return switch (types.get(ty)) {
+            .func => true,
+            .bool_, .str, .int, .float, .dec, .opaque_, .recursive => false,
+            .list => |elem| self.holdsFunction(elem),
+            .nominal => |nominal| self.holdsFunction(nominal.backing),
+            .record, .tuple, .tag_union => |span| {
+                for (types.memberSlice(span)) |member| {
+                    for (types.tySlice(member.tys)) |item| if (self.holdsFunction(item)) return true;
+                }
+                return false;
+            },
+        };
+    }
+
+    /// A definition's body, walked where the call stands with its parameters
+    /// bound to `args`, as a lifted lambda's body is with its captures first.
+    /// Takes the callee's instantiation and bound callees.
+    fn inlineCall(self: *Reifier, callee: CalleeTarget, args: []const Ref, at: ?TyId, region: base.Region) Error!Ref {
+        var target = callee;
+        defer if (target.instantiation) |*instance| instance.substitution.deinit(self.gpa);
+        defer self.releaseBound(target.bound);
+        return target.reader.inlineBody(target, args, at, region);
+    }
+
+    /// `at` is the type the site reads the value at, where it is not the
+    /// definition's own.
+    fn inlineBody(self: *Reifier, target: CalleeTarget, args: []const Ref, at: ?TyId, region: base.Region) Error!Ref {
+        std.debug.assert(std.meta.eql(target.key.artifact, self.artifact.bytes));
+        const lambda_id = target.key.body;
+        const lambda = try self.lambdaData(lambda_id);
+        // A body that reads itself, or that can leave the row it is walked in,
+        // has no value to walk to.
+        if (self.folding.contains(lambda_id)) return self.rejectError(.unsupported_expression, region, "a conversion that calls itself");
+        if (self.transfers(lambda.body)) return self.rejectError(.unsupported_expression, region, "a conversion that leaves its body early");
+        const fn_ty = self.functionOf(self.stagedFunctionTypeId(self.bodies.expr(lambda_id))) orelse
+            return self.rejectError(.unsupported_type, region, "a reified value that is not a function");
+        try self.relateSelectedTargets();
+        try self.folding.put(self.gpa, lambda_id, {});
+        defer _ = self.folding.remove(lambda_id);
+
+        const outer_substitution = self.substitution;
+        const outer_instance_key = self.instance_key;
+        const outer_uses = self.substitution_uses;
+        const outer_evidence = self.evidence;
+        const outer_bound = self.bound;
+        const outer_bound_lambda = self.bound_lambda;
+        const outer_replay = self.replay;
+        self.substitution = if (target.instantiation) |fixed| fixed.substitution else .empty;
+        self.instance_key = target.key.instantiation;
+        self.substitution_uses = 0;
+        self.evidence = target.evidence;
+        self.bound = target.bound;
+        self.bound_lambda = lambda_id;
+        self.replay = null;
+        defer {
+            self.substitution = outer_substitution;
+            self.instance_key = outer_instance_key;
+            self.substitution_uses = outer_uses;
+            self.evidence = outer_evidence;
+            self.bound = outer_bound;
+            self.bound_lambda = outer_bound_lambda;
+            self.replay = outer_replay;
+        }
+        // The body sees none of the names around the call.
+        const outer_scope = self.scope;
+        const outer_loop = self.loop;
+        self.scope = .empty;
+        self.loop = null;
+        defer {
+            self.scope.deinit(self.gpa);
+            self.scope = outer_scope;
+            self.loop = outer_loop;
+        }
+
+        var next: usize = 0;
+        for (target.captures) |capture| {
+            const capture_region = self.bodies.pattern(capture.pattern).source_region;
+            if (self.boundCapture(lambda_id, capture.pattern)) |slot| {
+                try self.bindName(capture.pattern, .{ .callee = slot }, capture_region);
+                continue;
+            }
+            try self.bindName(capture.pattern, .{ .value = args[next] }, capture_region);
+            next += 1;
+        }
+        for (lambda.args, 0..) |pattern_id, index| {
+            if (self.boundCallee(index)) |slot| {
+                try self.bindName(pattern_id, .{ .callee = slot }, self.bodies.pattern(pattern_id).source_region);
+                continue;
+            }
+            try self.bindPattern(pattern_id, args[next]);
+            next += 1;
+        }
+        std.debug.assert(next == args.len);
+
+        const result = at orelse target.key.result orelse try self.tyOf(fn_ty.ret, region);
+        const walked = if (at == null and target.key.result == null and fn_ty.ret == self.bodies.expr(lambda.body).ty)
+            self.exprRef(lambda.body)
+        else
+            self.exprAt(lambda.body, result);
+        const value = walked catch |err| switch (err) {
+            error.Diverged => invariant("a body the scan found no exit in diverged"),
+            error.Rejected, error.OutOfMemory => |e| return e,
+        };
+        return if (at != null or target.key.result != null) self.conformed(value, result) else value;
+    }
+
+    /// The call of a function value that a first stage wrote as a lambda,
+    /// walked where it stands, or null for any other function value.
+    fn appliedInline(self: *Reifier, f: Ref, args: []const Ref, at: TyId, region: base.Region) Error!?Ref {
+        if (self.walk.stage_one == 0) return null;
+        const known = self.bld().knownClosure(f) orelse return null;
+        const registered = self.walk.closure_targets.get(known.row) orelse return null;
+        const all = try self.gpa.alloc(Ref, known.captures.len + args.len);
+        defer self.gpa.free(all);
+        @memcpy(all[0..known.captures.len], known.captures);
+        @memcpy(all[known.captures.len..], args);
+        return try self.inlineCall(try self.boundTarget(registered), all, at, region);
     }
 
     // Scope //
@@ -1756,7 +1976,10 @@ pub const Reifier = struct {
         defer self.bld().origins = outer;
         return switch (expr_data.data) {
             .tag, .zero_argument_tag, .nominal => self.exprAs(expr_id, at),
-            .row_coerce => |coerce| self.exprAt(coerce.value, at),
+            .row_coerce => |coerce| blk: {
+                if (self.inTail(expr_id)) try self.markTail(coerce.value);
+                break :blk self.exprAt(coerce.value, at);
+            },
             // A call whose result is read at a wider union has that union as its type.
             .call => |call| self.callExpr(call.func, call.args, expr_data.ty, at, region),
             // A constant a name folds to is built at `at`.
@@ -1766,8 +1989,11 @@ pub const Reifier = struct {
                 break :blk self.exprRef(expr_id);
             },
             .match_ => |match_expr| (try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .{ .at = at }, region)).?,
-            .block => |block| (try self.blockExpr(block.statements, block.final_expr, .{ .at = at })).?,
-            .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .{ .at = at }, region)).?,
+            .block => |block| blk: {
+                if (self.inTail(expr_id)) try self.markTail(block.final_expr);
+                break :blk (try self.blockExpr(block.statements, block.final_expr, .{ .at = at })).?;
+            },
+            .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .{ .at = at }, self.inTail(expr_id), region)).?,
             // A transfer delivers nothing here, and a crash has every type.
             .return_, .break_ => self.exprRef(expr_id),
             .crash => |literal| self.bld().crash(at, try self.bld().litStr(self.bodies.stringLiteral(literal))),
@@ -1775,7 +2001,8 @@ pub const Reifier = struct {
                 if (run.op != .crash or run.args.len != 1) break :blk self.exprRef(expr_id);
                 break :blk try self.bld().crash(at, try self.exprRef(run.args[0]));
             },
-            .numeral, .str_segment, .str, .binop, .unary_minus, .unary_not, .tuple, .list, .empty_list, .record, .empty_record, .tuple_access, .field_access, .dispatch_call, .type_dispatch_call, .method_eq, .structural_eq, .structural_hash, .dbg, .hosted_lambda, .lambda, .closure, .str_from_quote, .interpolation, .bytes_literal, .expect, .for_, .pending, .code_from_lambda, .runtime_error, .expect_err, .ellipsis, .anno_only => self.exprRef(expr_id),
+            .lambda, .closure => self.closureAt(expr_id, at),
+            .numeral, .str_segment, .str, .binop, .unary_minus, .unary_not, .tuple, .list, .empty_list, .record, .empty_record, .tuple_access, .field_access, .dispatch_call, .type_dispatch_call, .method_eq, .structural_eq, .structural_hash, .dbg, .hosted_lambda, .str_from_quote, .interpolation, .bytes_literal, .expect, .for_, .pending, .code_from_lambda, .runtime_error, .expect_err, .ellipsis, .anno_only => self.exprRef(expr_id),
         };
     }
 
@@ -1807,8 +2034,11 @@ pub const Reifier = struct {
             .str => |segments| try self.interpolatedExpr(segments),
             .lookup_local => |lookup| try self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, expr_id, null, region),
             .match_ => |match_expr| (try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .value, region)).?,
-            .block => |block| (try self.blockExpr(block.statements, block.final_expr, .value)).?,
-            .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .value, region)).?,
+            .block => |block| blk: {
+                if (self.inTail(expr_id)) try self.markTail(block.final_expr);
+                break :blk (try self.blockExpr(block.statements, block.final_expr, .value)).?;
+            },
+            .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .value, self.inTail(expr_id), region)).?,
             .binop => |binop| try self.binopExpr(binop.op, binop.lhs, binop.rhs, expr_data.ty, region),
             .unary_minus => |operand| blk: {
                 const value = try self.exprRef(operand);
@@ -1850,11 +2080,14 @@ pub const Reifier = struct {
             .hosted_lambda => self.rejectError(.effect, region, "a hosted function"),
             .nominal => |nominal| try self.nominalExpr(nominal.backing_expr, expr_data.ty, as, region),
             // The value at the wider tag union this node's type is.
-            .row_coerce => |coerce| try self.exprAt(coerce.value, as orelse try self.tyOf(expr_data.ty, region)),
+            .row_coerce => |coerce| blk: {
+                if (self.inTail(expr_id)) try self.markTail(coerce.value);
+                break :blk try self.exprAt(coerce.value, as orelse try self.tyOf(expr_data.ty, region));
+            },
             .tag => |tag_expr| try self.tagExpr(tag_expr.name, tag_expr.args, expr_data.ty, as, region),
             .zero_argument_tag => |tag_expr| try self.tagExpr(tag_expr.name, &.{}, expr_data.ty, as, region),
             .call => |call| try self.callExpr(call.func, call.args, expr_data.ty, null, region),
-            .lambda, .closure => try self.closureExpr(expr_id),
+            .lambda, .closure => try self.closureAt(expr_id, null),
             // A name of another module holds no binding in the scope, so it is
             // the value it was fixed to, or the definition it names.
             .lookup_external, .lookup_required => |reference| blk: {
@@ -1875,7 +2108,7 @@ pub const Reifier = struct {
             // An interpolated literal of the author's own type is the
             // `from_interpolation` call the checker wrote: the method decides
             // what the pieces become.
-            .interpolation => |interpolation| try self.dispatchExpr(interpolation.plan, expr_data.ty, region),
+            .interpolation => |interpolation| try self.interpolationExpr(interpolation, expr_data.ty, region),
             // An embedded file, which is the one expression a `List(U8)`
             // literal is written as.
             .bytes_literal => |literal| try b.litBytes(try self.tyOf(expr_data.ty, region), self.bodies.stringLiteral(literal)),
@@ -1913,7 +2146,7 @@ pub const Reifier = struct {
         const expr_data = self.bodies.expr(expr_id);
         const region = expr_data.source_region;
         switch (expr_data.data) {
-            .if_ => |if_expr| _ = try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .none, region),
+            .if_ => |if_expr| _ = try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .none, false, region),
             .match_ => |match_expr| _ = try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .none, region),
             .block => |block| _ = try self.blockExpr(block.statements, block.final_expr, .none),
             .for_ => |loop| try self.forLoop(loop.pattern, loop.expr, loop.body, loop.plan, loop.mutations, region),
@@ -1962,6 +2195,54 @@ pub const Reifier = struct {
             .hosted_lambda,
             .run_low_level,
             => _ = try self.exprRef(expr_id),
+        }
+    }
+
+    /// An interpolated literal of the author's own type, which the language
+    /// converts in two stages (langref "Static dispatch"). The first stage is
+    /// `from_interpolation` over the literal's segments, which are literals,
+    /// so the walk runs it by its definition where the literal stands: a
+    /// builtin it wraps, such as `Str.from_interpolation`, is walked too, and
+    /// so is every lambda it applies, until the lambda it hands back in its
+    /// `Ok` is a closure of a row. The second stage is that closure applied
+    /// to the list of the interpolated values, a `Call` of the row over its
+    /// captures and the list. A rejecting branch is a crash, as the `Err` of
+    /// a `from_numeral` is. A conversion of another package is one `Prim`
+    /// over the segments and the values.
+    fn interpolationExpr(self: *Reifier, interpolation: checked.CheckedInterpolation, checked_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        const id = interpolation.plan orelse return self.rejectError(.unresolved_reference, region, "this literal");
+        const plan = self.plans.plans[@backingInt(id)];
+        const b = self.bld();
+        const types = self.rt();
+        const out_ty = try self.tyOf(checked_ty, region);
+        const item_ty = switch (types.get(try self.tyOf(interpolation.assembler_ty, region))) {
+            .func => |assembler| switch (types.get(types.tySlice(assembler.params)[0])) {
+                .list => |item| item,
+                .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .nominal, .func, .opaque_, .recursive => invariant("an assembler takes a list"),
+            },
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .nominal, .opaque_, .recursive => invariant("an interpolation's assembler is a function"),
+        };
+        // Every segment is kept, the empty ones too: the assembler reads them by position.
+        const segments = try self.exprRefs(interpolation.segments);
+        defer self.gpa.free(segments);
+        const values = try self.exprRefs(interpolation.values);
+        defer self.gpa.free(values);
+        const segment_list = try b.listOf(try types.listTy(try types.strTy()), segments);
+        const value_list = try b.listOf(try types.listTy(item_ty), values);
+        switch (try self.dispatchTarget(DispatchSpec.ofPlan(plan), region)) {
+            .definition => |target| {
+                self.walk.stage_one += 1;
+                defer {
+                    self.walk.stage_one -= 1;
+                    if (self.walk.stage_one == 0) self.walk.stage_tail.clearRetainingCapacity();
+                }
+                const lambda = try target.reader.lambdaData(target.key.body);
+                try target.reader.markTail(lambda.body);
+                const converted = try self.inlineCall(target, &.{segment_list}, null, region);
+                return self.convertedWith(converted, value_list, checked_ty, region);
+            },
+            .foreign => |name| return b.primOf(try b.namedPrim(name.owner, name.method), &.{ segment_list, value_list }, out_ty),
+            .provided, .none => return self.rejectError(.unresolved_reference, region, "a method this literal names no target for"),
         }
     }
 
@@ -3137,29 +3418,40 @@ pub const Reifier = struct {
         final_else: CheckedExprId,
         checked_ty: CheckedTypeId,
         want: Want,
+        tail: bool,
         region: base.Region,
     ) Error!?Ref {
         var roots = std.ArrayList(CheckedExprId).empty;
         defer roots.deinit(self.gpa);
         for (branches) |branch| try roots.appendSlice(self.gpa, &.{ branch.cond, branch.body });
         try roots.append(self.gpa, final_else);
+        if (tail) for (branches) |branch| try self.markTail(branch.body);
+        if (tail) try self.markTail(final_else);
         var plan = try self.branchPlan(roots.items, want, try self.valueTy(want, checked_ty, region));
         defer plan.deinit(self.gpa);
         var br = Branching.begin(self, &plan);
-        return self.ifLevel(&br, branches, final_else, true);
+        return self.ifLevel(&br, branches, final_else, true, tail);
     }
 
-    fn ifLevel(self: *Reifier, br: *Branching, branches: []const checked.CheckedIfBranch, final_else: CheckedExprId, top: bool) Error!?Ref {
+    /// `prune` says the `if` delivers the result of a literal's first stage.
+    /// The program compiled, so that stage returned `Ok` for the literal, and
+    /// an arm that only delivers `Err` is not taken: it is no arm, and the
+    /// test that would have chosen it is never made.
+    fn ifLevel(self: *Reifier, br: *Branching, branches: []const checked.CheckedIfBranch, final_else: CheckedExprId, top: bool, prune: bool) Error!?Ref {
         const b = self.bld();
+        if (prune and branches.len != 0) {
+            if (self.deliversErr(branches[0].body)) return self.ifLevel(br, branches[1..], final_else, top, prune);
+            if (branches.len == 1 and self.deliversErr(final_else)) return self.armBody(br, branches[0].body, top);
+        }
         if (branches.len == 0) return self.armBody(br, final_else, top);
         const cond = try self.exprRef(branches[0].cond);
         if (b.knownKey(cond)) |key| {
-            return if (key == 1) self.armBody(br, branches[0].body, top) else self.ifLevel(br, branches[1..], final_else, top);
+            return if (key == 1) self.armBody(br, branches[0].body, top) else self.ifLevel(br, branches[1..], final_else, top, prune);
         }
         const scope_base = self.scope.items.len;
         var arms: [2]RegionId = undefined;
         arms[0] = try br.openArm(cond, 0);
-        try closedArm(self.ifLevel(br, branches[1..], final_else, false));
+        try closedArm(self.ifLevel(br, branches[1..], final_else, false, prune));
         self.scope.shrinkRetainingCapacity(scope_base);
         arms[1] = try br.openArm(cond, 1);
         try br.leaf(self.armCode(branches[0].body, br.plan.want), scope_base);
@@ -4193,7 +4485,13 @@ pub const Reifier = struct {
         // or the checker's own for the call.
         const at = demanded orelse try self.tyOf(result_ty, region);
         if (try self.curriedCall(func, operands, at, region)) |flattened| return flattened;
-        var callee = try self.calleeTarget(func, region);
+        const inline_call = try self.walksInline(result_ty, region);
+        self.walk.open_builtins = inline_call;
+        var callee = self.calleeTarget(func, region) catch |err| {
+            self.walk.open_builtins = false;
+            return err;
+        };
+        self.walk.open_builtins = false;
         switch (callee) {
             .provided => |provided| {
                 const args = try self.exprRefs(operands);
@@ -4210,6 +4508,7 @@ pub const Reifier = struct {
                 const f = try self.exprRef(func);
                 const args = try self.exprRefs(operands);
                 defer self.gpa.free(args);
+                if (try self.appliedInline(f, args, at, region)) |applied| return applied;
                 return self.bld().apply(f, args, try self.tyOf(result_ty, region));
             },
             .definition => {},
@@ -4219,6 +4518,11 @@ pub const Reifier = struct {
         // is in hand here and nowhere inside the body.
         if (self.plans.siteEvidence(func)) |supplied| {
             callee.definition.evidence = try self.supply(supplied, self.evidence);
+        }
+        if (inline_call) {
+            const args = try self.exprRefs(operands);
+            defer self.gpa.free(args);
+            return self.inlineCall(callee.definition, args, at, region);
         }
         // A function argument the call fixes to a definition is no argument
         // of the row: the parameter binds to the definition, and the row is
@@ -4707,16 +5011,18 @@ pub const Reifier = struct {
         // A definition of another module is a builtin by its export name, a
         // function of another package by its module and name (N8h), and
         // otherwise the definition to walk.
-        if (!std.meta.eql(reader.artifact.bytes, self.artifact.bytes)) {
-            if (reader.env.module_role == .builtin) {
+        // A builtin is named wherever it is called, the builtin module's own
+        // bodies included. A first stage walks the Roc definition of a
+        // builtin that hands back a function, and names every other.
+        if (reader.env.module_role == .builtin) {
+            if (!self.walk.open_builtins) {
                 const export_name = providedName(reader.names, reached.template) orelse
                     return self.rejectError(.unsupported_expression, region, "a call to a function the compiler provides");
                 return .{ .provided = .{ .name = export_name.text, .role = roleOf(use.iterator_procedure) } };
             }
-            if (!samePackage(self.env, reader.env)) {
-                const binder = reached.binder orelse return reader.rejectError(.unresolved_reference, region, "this call");
-                return .{ .foreign = .{ .owner = reader.env.module_name, .method = reader.binderName(binder) } };
-            }
+        } else if (!std.meta.eql(reader.artifact.bytes, self.artifact.bytes) and !samePackage(self.env, reader.env)) {
+            const binder = reached.binder orelse return reader.rejectError(.unresolved_reference, region, "this call");
+            return .{ .foreign = .{ .owner = reader.env.module_name, .method = reader.binderName(binder) } };
         }
         // What the use copied the procedure's variables to is keyed by the
         // use, and only a use of the procedure's own scheme has it.
@@ -4950,7 +5256,7 @@ pub const Reifier = struct {
                 generated = .quote;
                 break :blk try self.bld().litStr(self.bodies.stringLiteral(literal));
             },
-            .generated_interpolation_segments => return self.rejectError(.unsupported_expression, region, "a custom string interpolation"),
+            .generated_interpolation_segments => invariant("an interpolation's plan is walked by its literal"),
         };
         return self.dispatchWithArgs(DispatchSpec.ofPlan(plan), args, generated, result_ty, region);
     }
@@ -5001,6 +5307,12 @@ pub const Reifier = struct {
     /// conversion rejected the literal, the crash that rejection is when the
     /// program runs.
     fn convertedLiteral(self: *Reifier, converted: Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        return self.convertedWith(converted, null, result_ty, region);
+    }
+
+    /// `convertedLiteral`, where the `Ok` payload is a function that the
+    /// literal applies to `values`, an interpolated literal's list.
+    fn convertedWith(self: *Reifier, converted: Ref, values: ?Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
         const b = self.bld();
         const ty = try self.tyOf(result_ty, region);
         const found = try self.readable(converted);
@@ -5012,7 +5324,7 @@ pub const Reifier = struct {
         for (arms, names) |*arm, name| {
             arm.* = try b.openTagArm(found, name);
             const delivered = if (name == ok)
-                try b.payload(found, ok, 0)
+                if (values) |list| try b.apply(try b.payload(found, ok, 0), &.{list}, ty) else try b.payload(found, ok, 0)
             else
                 try b.crash(ty, try b.litStr("this literal was rejected by its conversion"));
             try b.close(.{ .value = &.{delivered} });
@@ -5054,8 +5366,16 @@ pub const Reifier = struct {
     /// is a literal the conversion rejected.
     fn dispatchWithArgs(self: *Reifier, spec: DispatchSpec, args: []const Ref, generated: Generated, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
         const b = self.bld();
-        switch (try self.dispatchTarget(spec, region)) {
+        const inline_call = generated == .none and try self.walksInline(result_ty, region);
+        self.walk.open_builtins = inline_call;
+        const found = self.dispatchTarget(spec, region) catch |err| {
+            self.walk.open_builtins = false;
+            return err;
+        };
+        self.walk.open_builtins = false;
+        switch (found) {
             .definition => |target| {
+                if (inline_call) return self.inlineCall(target, args, null, region);
                 // A method takes no captures, so its row's parameters are the
                 // dispatch's operands.
                 const row = try self.calledRow(target);
@@ -5181,8 +5501,15 @@ pub const Reifier = struct {
         }
         const found = owner.methodDefinition(procedure.template, target.def_idx) orelse return .none;
         const reader = switch (found) {
-            .provided => |name| return .{ .provided = .{ .name = name, .role = roleOf(procedure.runtime_target.iteratorProcedure()) } },
+            .provided => |builtin| if (self.walk.open_builtins)
+                try self.walk.reader(builtin.definition.module)
+            else
+                return .{ .provided = .{ .name = builtin.name, .role = roleOf(procedure.runtime_target.iteratorProcedure()) } },
             .here => owner,
+            .here_builtin => |builtin| if (self.walk.open_builtins)
+                owner
+            else
+                return .{ .provided = .{ .name = builtin.name, .role = roleOf(procedure.runtime_target.iteratorProcedure()) } },
             .away => |definition| blk: {
                 if (!samePackage(self.env, definition.module.env)) {
                     const type_name = self.typeName(dispatcher_ty) orelse
@@ -5226,22 +5553,29 @@ pub const Reifier = struct {
     /// export rows, or the builtin module, whose function carries its name.
     const MethodDefinition = union(enum) {
         here: struct { template: checked.CheckedProcedureTemplate, body: CheckedExprId },
+        /// A builtin of the module being read: the name it answers to, and
+        /// its definition.
+        here_builtin: struct { name: []const u8, template: checked.CheckedProcedureTemplate, body: CheckedExprId },
         away: ForeignDefinition,
-        provided: []const u8,
+        /// A builtin: the name it answers to, and its definition, which a
+        /// first stage walks.
+        provided: struct { name: []const u8, definition: ForeignDefinition },
 
         fn template(self: MethodDefinition) checked.CheckedProcedureTemplate {
             return switch (self) {
                 .here => |local| local.template,
+                .here_builtin => |builtin| builtin.template,
                 .away => |definition| definition.template,
-                .provided => unreachable, // methodDefinition's .provided is returned before the template is read
+                .provided => |builtin| builtin.definition.template,
             };
         }
 
         fn body(self: MethodDefinition) CheckedExprId {
             return switch (self) {
                 .here => |local| local.body,
+                .here_builtin => |builtin| builtin.body,
                 .away => |definition| definition.body,
-                .provided => unreachable, // methodDefinition's .provided is returned before the body is read
+                .provided => |builtin| builtin.definition.body,
             };
         }
     };
@@ -5259,11 +5593,18 @@ pub const Reifier = struct {
                 .checked_body => |body| body,
                 .intrinsic_wrapper, .entry_wrapper, .unimplemented => return null,
             };
-            return .{ .here = .{ .template = template, .body = self.bodies.body(body_id).root_expr } };
+            const body = self.bodies.body(body_id).root_expr;
+            if (self.env.module_role == .builtin) {
+                return .{ .here_builtin = .{ .name = (providedName(self.names, template) orelse return null).text, .template = template, .body = body } };
+            }
+            return .{ .here = .{ .template = template, .body = body } };
         }
         const definition = self.walk.foreign.findExported(template_ref.artifact, def_idx) orelse return null;
         if (definition.module.env.module_role == .builtin) {
-            return .{ .provided = (providedName(definition.module.sources.names, definition.template) orelse return null).text };
+            return .{ .provided = .{
+                .name = (providedName(definition.module.sources.names, definition.template) orelse return null).text,
+                .definition = definition,
+            } };
         }
         return .{ .away = definition };
     }
@@ -7889,6 +8230,18 @@ pub const Walk = struct {
     definitions: std.AutoHashMapUnmanaged(DefinitionKey, Definition) = .empty,
     /// The rows the walk is inside, outermost first.
     rows: std.ArrayList(RowId) = .empty,
+    /// How many interpolated literals' first stage the walk is inside (see
+    /// `interpolationExpr`). Zero inside every row, so the rows a stage
+    /// builds are ordinary rows.
+    stage_one: u32 = 0,
+    /// Whether the call being resolved reaches the Roc definition of a
+    /// builtin, rather than naming it, which only a first stage does.
+    open_builtins: bool = false,
+    /// The lambdas a first stage wrote, by the row each is a closure of: what
+    /// the walk applies where it stands (`appliedInline`).
+    closure_targets: std.AutoHashMapUnmanaged(RowId, Reifier.CalleeTarget) = .empty,
+    /// The expressions that deliver a first stage's result unexamined.
+    stage_tail: std.AutoHashMapUnmanaged(struct { reader: *Reifier, expr: CheckedExprId }, void) = .empty,
     /// The root row of the site last emitted, which a test dumps.
     root: ?RowId = null,
     rejection: ?Rejection = null,
@@ -7967,6 +8320,9 @@ pub const Walk = struct {
         self.endSite();
         self.definitions.deinit(self.gpa);
         self.rows.deinit(self.gpa);
+        self.clearClosureTargets();
+        self.closure_targets.deinit(self.gpa);
+        self.stage_tail.deinit(self.gpa);
         var memo = self.normalized.valueIterator();
         while (memo.next()) |m| {
             m.origins.deinit(self.gpa);
@@ -8042,6 +8398,23 @@ pub const Walk = struct {
         return out;
     }
 
+    /// Forget the lambdas a first stage wrote, and free what each holds.
+    fn clearClosureTargets(self: *Walk) void {
+        var targets = self.closure_targets.valueIterator();
+        while (targets.next()) |target| freeTarget(self.gpa, target.*);
+        self.closure_targets.clearRetainingCapacity();
+    }
+
+    /// Free the instantiation and the bound callees a cloned target owns.
+    fn freeTarget(gpa: Allocator, target: Reifier.CalleeTarget) void {
+        if (target.instantiation) |fixed| {
+            var substitution = fixed.substitution;
+            substitution.deinit(gpa);
+        }
+        for (target.bound) |entry| freeTarget(gpa, entry.target);
+        gpa.free(target.bound);
+    }
+
     /// Give the site about to be walked a store, a type table and a builder
     /// of its own, and forget every row and type an earlier site built.
     pub fn startSite(self: *Walk) Allocator.Error!void {
@@ -8054,6 +8427,10 @@ pub const Walk = struct {
         self.site = site;
         self.definitions.clearRetainingCapacity();
         self.rows.clearRetainingCapacity();
+        self.clearClosureTargets();
+        self.stage_tail.clearRetainingCapacity();
+        self.stage_one = 0;
+        self.open_builtins = false;
         self.sources.clearRetainingCapacity();
         self.source_ids.clearRetainingCapacity();
         self.root = null;

@@ -102,20 +102,34 @@ of `roc-reify-normal-form.md`). The rules are in `src/reify/views.zig:1`. The no
       folds to the value. Pinned by the staging cases at
       `src/eval/test/eval_staging_tests.zig:2054` and `:2060`, and by
       `src/compile/test/code_reifier_test.zig:1686`, `:1749` and `:1815`.
-- [ ] A literal of a type of your own through `from_interpolation`. "a custom
+- [x] A literal of a type of your own through `from_interpolation`. "a custom
       string interpolation". The conversion runs in two stages (design.md,
       "An interpolated string literal converts in two stages"):
       `from_interpolation` reads the segments while the compiler runs and
       hands back an assembler, and the value is that assembler applied to the
-      interpolated values. The assembler is a function value the conversion
-      computes, and no node can apply a computed function: a call through
-      the `Try` payload of a row is an `Apply` that no simplification
-      resolves, and the assembler of `Str.from_interpolation` is a function
-      that a `Prim` returns. This box needs a decision on the normal form
-      (see the report options in `roc-reify-proposal.md` section 10). The
-      refusal is `src/check/code_reifier.zig` (`plannedDispatch`). Pinned by
-      the staging case "an interpolated literal of the author's own type is
-      refused" (`src/eval/test/eval_staging_tests.zig:2090`).
+      interpolated values. The walk runs the first stage by its definition
+      where the literal stands, with the segments as a literal list
+      (`src/check/code_reifier.zig` (`interpolationExpr`, `inlineCall`)),
+      the way it reads a top-level value that computes a function. A builtin
+      the stage calls that hands back a function, `Str.from_interpolation`
+      and `Try.map_ok`, is walked by its Roc definition too, and a lambda the
+      stage applies is walked where it is applied (`appliedInline`). The
+      lambda that the `Ok` holds is a closure of a row, so the literal is the
+      `Call` of that row over its captures, the segments among them, and the
+      list of the interpolated values. Until M17 a translator sees the fold
+      over that list that `Str.from_interpolation` writes. No node is new.
+      The program compiled, so the stage returned `Ok` for the segments:
+      an arm of an `if` in the tail of the stage that only delivers `Err` is
+      not described, and with it the test that would have chosen it
+      (`ifLevel`). Any other `Err` arm is the crash of the `from_numeral`
+      case, "this literal was rejected by its conversion". A conversion of
+      another package is one `Prim` named by its type's module and
+      `from_interpolation`, over the segments and the values. Pinned by the
+      staging cases at `src/eval/test/eval_staging_tests.zig:2452`, `:2458`
+      and `:2464`, and by `src/compile/test/code_reifier_test.zig:4799`,
+      `:4867`, `:4914`, `:4951` and `:5003`. A conversion that can leave its
+      body early, with a `?`, and one generic in the item type of its
+      assembler are still refused (`:5034`).
 - [x] A literal of a type of your own in a `match` pattern. The pattern binds
       the matched value, and the checker's own equality of that type against
       its conversion of the literal becomes a `Bool` `Switch`
@@ -1031,7 +1045,7 @@ auto-imported, so a user module may still be named `Ty` or `Node`.
 | No name whose value exists only at run time | a lambda cannot read a parameter, binder or `var` of the function it is written in; the value becomes a parameter of the lambda, or a template fixes it |
 | No computed function at a site | `main = Stage.describe(doubler)` where `doubler = make(2.0)` is refused, because the site's root needs a lambda; the author writes `\|x\| doubler(x)` at the site, or writes `doubler` as a lambda. A use of `doubler` inside a described body, and an exact alias, `same = add_one`, do describe |
 | No computed value of another package | `limit = xs.len()` in a package the app depends on is refused, because its body is that package's; a value written as data still folds |
-| No custom string interpolation | `from_interpolation` of a type of your own is refused at the literal, because its value is a function the conversion computes and no node applies one; a conversion of a builtin or of another package, and every `from_numeral` and `from_quote`, describes |
+| No custom string interpolation through a `?` | a `from_interpolation` of a type of your own whose body can leave early, with a `?`, or that is generic in the item type of its assembler, is refused at the literal; every other one describes (the box above) |
 
 A shader or a codec is written as one function calling others, over as many
 modules as its author split it into, and that describes whole: the compiler

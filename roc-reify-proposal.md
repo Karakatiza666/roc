@@ -79,7 +79,7 @@ unticked boxes cost"):
 | A site that names a top-level value computing a function | the site's root needs a lambda whose parameters it can list. A use of such a value inside a described body describes (section 13, "Naming a constant") |
 | A computed top-level value of another package | its body belongs to that package, and the description does not read it |
 | A tag union whose row nothing closed | it stands for many unions, and a description is monomorphic |
-| A custom `from_interpolation` literal | it needs an assembler function the compiler computes |
+| A custom `from_interpolation` that returns early with `?` or is generic in its item type | the walk runs the first stage where the literal stands, and a `?` can leave the row it is walked in |
 | `dbg`, and any effect | out of scope by design (sections 7.8 and 13) |
 
 The tests, in layers. The counts were taken at the time of writing.
@@ -87,7 +87,7 @@ The tests, in layers. The counts were taken at the time of writing.
 | Layer | Where | What it catches |
 |---|---|---|
 | Normal-form unit tests | `src/reify/` (160 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
-| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (162 tests) | a walk that describes a body wrongly |
+| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (176 tests) | a walk that describes a body wrongly |
 | Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (116 cases) | the same, for calls into other modules and builtins |
 | CLI fixtures | `test/cli/Staged*.roc` (48 files), run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
 | Fuzzers | `src/reify/fuzz_gen.zig`, `src/compile/reify_fuzz.zig`, `test/fuzzing/fuzz-reify.zig` | two spellings of one term that differ, or a normal form that computes what Roc does not |
@@ -1157,7 +1157,7 @@ further down the pipeline.
 
 | Kind | What is left |
 |---|---|
-| Needs a decision | a computed value of another package, whose body the description does not read; a custom `from_interpolation`, whose value is a function the conversion computes and no node applies. Derived `is_eq` on a function stays refused, because Roc has no equality on functions |
+| Needs a decision | a computed value of another package, whose body the description does not read; a custom `from_interpolation` that returns early with `?`, or is generic in the item type of its assembler. Derived `is_eq` on a function stays refused, because Roc has no equality on functions |
 
 The mechanical kind is empty. A tag union whose row the checker left open
 seals to the variants the definition names. An unset or omitted optional

@@ -1494,9 +1494,12 @@ const staged_interpolation = stage ++
     \\main = "${Stage.describe(parts)} | ${Stage.describe(only)}"
 ;
 
-// An interpolated literal of the author's own type applies the assembler its
-// `from_interpolation` hands back while the compiler runs. The segments it
-// takes are an operand the compiler generates, which the walk refuses.
+// An interpolated literal of the author's own type is converted in two
+// stages. The first runs while the compiler runs, over the literal's
+// segments, so the walk runs it by its definition where the literal stands;
+// the literal is the closure it hands back, applied to the list of the
+// interpolated values. A conversion that wraps the assembler of `Str` is
+// walked through `Str.from_interpolation`, so the translator sees its fold.
 const staged_custom_interpolation = stage ++
     \\Label := { text : Str }.{
     \\    from_interpolation : List(Str) -> Try((List(Str) -> Label), [InvalidInterpolation(Str)])
@@ -1507,6 +1510,49 @@ const staged_custom_interpolation = stage ++
     \\
     \\mark : F32 -> F32
     \\mark = |x| "a${x.to_str()}b".Label.width(x)
+    \\main = Stage.describe(mark)
+;
+
+// A conversion that rejects segments branches in its first stage. The program
+// compiled, so the stage returned `Ok` for these segments, and the arm that
+// only delivers `Err` is not described. A conversion that also transforms
+// the values has the transform on each value, inside the fold.
+const staged_escaping_interpolation = stage ++
+    \\Html := [Html(Str)].{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments|
+    \\        if segments.any(|segment| segment.contains("<script")) {
+    \\            Err(InvalidInterpolation("no scripts"))
+    \\        } else {
+    \\            Str.from_interpolation(segments).map_ok(|assemble|
+    \\                |values| Html(assemble(values.map(|value| value.replace_each("<", "&lt;")))))
+    \\        }
+    \\    width : Html, F32 -> F32
+    \\    width = |h, f| match h {
+    \\        Html(text) => if text.is_empty() 0.0.F32 else f
+    \\    }
+    \\}
+    \\
+    \\mark : F32 -> F32
+    \\mark = |x| "<p>${x.to_str()}!</p>".Html.width(x)
+    \\main = Stage.describe(mark)
+;
+
+// An interpolated literal is a value like any other, so it is described as an
+// argument of a call too.
+const staged_interpolation_argument = stage ++
+    \\Wrapped := { text : Str }.{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Wrapped), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| Wrapped.{ text: assemble(values) })
+    \\    size : Wrapped -> U64
+    \\    size = |w| w.text.count_utf8_bytes()
+    \\}
+    \\
+    \\measure : Wrapped, F32 -> F32
+    \\measure = |w, f| if Wrapped.size(w) > 3 f else 0.0.F32
+    \\
+    \\mark : F32 -> F32
+    \\mark = |x| measure("x${x.to_str()}y", x)
     \\main = Stage.describe(mark)
 ;
 
@@ -2403,10 +2449,22 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(Str.concat('p', Num.F32.to_str(p0), 'q')) { False => 0 | True => p0 } | r0 = |F32| -> F32 switch Str.is_empty(Num.F32.to_str(p0)) { False => 0 | True => p0 }\"" },
     },
     .{
-        .name = "staging - an interpolated literal of the author's own type is refused",
+        .name = "staging - an interpolated literal of the author's own type describes as the fold its conversion hands back",
         .source_kind = .module,
         .source = staged_custom_interpolation,
-        .expected = .{ .problem = {} },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n4 = ['a', 'b']; switch Str.is_empty(List.fold_with_index([Num.F32.to_str(p0)], Try.ok_or(List.first(n4), ''), closure r1(n4))) { False => p0 | True => 0 } } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
+    },
+    .{
+        .name = "staging - an interpolated literal of a type that escapes its values has the escape inside the fold",
+        .source_kind = .module,
+        .source = staged_escaping_interpolation,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n6 = ['<p>', '!</p>']; switch Str.is_empty(List.fold_with_index(List.map([Num.F32.to_str(p0)], closure r1()), Try.ok_or(List.first(n6), ''), closure r2(n6))) { False => p0 | True => 0 } } ; r1 = |Str| -> Str Str.replace_each(p0, '<', '&lt;') ; r2 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
+    },
+    .{
+        .name = "staging - an interpolated literal of the author's own type describes as an argument",
+        .source_kind = .module,
+        .source = staged_interpolation_argument,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n5 = ['x', 'y']; switch Num.U64.is_lt(3, Str.count_utf8_bytes(List.fold_with_index([Num.F32.to_str(p0)], Try.ok_or(List.first(n5), ''), closure r1(n5)))) { False => 0 | True => p0 } } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
     },
     .{
         .name = "staging - a top-level value folds at the wider union its use reads",

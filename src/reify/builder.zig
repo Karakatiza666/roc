@@ -1311,6 +1311,15 @@ pub const Builder = struct {
         return self.make(.{ .op = .apply, .args = all, .tys = &.{ty} });
     }
 
+    /// The row and captures of `ref` where it is a `Closure` node, and null
+    /// for any other value. The captures stay valid until the next node is
+    /// built.
+    pub fn knownClosure(self: *const Builder, ref: Ref) ?struct { row: RowId, captures: []const Ref } {
+        const n = self.nodeOf(ref) orelse return null;
+        if (n.op != .closure) return null;
+        return .{ .row = RowId.of(n.payload), .captures = self.store.refSlice(n.args) };
+    }
+
     // N8i: `Apply(Closure(r, captures), args)` is `Call(r, captures ++ args)`,
     // and `Apply` of a switch output that every arm gives as a known
     // `Closure` is a switch whose every arm applies its own closure. The

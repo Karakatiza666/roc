@@ -4789,3 +4789,284 @@ test "L3 M8: a recursive helper's call is named by its body" {
     defer gpa.free(b);
     try std.testing.expect(!std.mem.eql(u128, a, b));
 }
+
+// An interpolated literal of the author's own type is converted in two stages
+// (static-dispatch.md). The walk runs the first stage by its definition where
+// the literal stands, because the segments are literals, and the literal is
+// the closure that stage hands back, applied to the list of the interpolated
+// values.
+
+test "an interpolated literal of a type that escapes its values describes as the escaped fold" {
+    // The conversion rejects segments, so its first stage branches. The
+    // program compiled, so that stage returned `Ok` for these segments: the
+    // arm that only delivers `Err` is not taken, and nothing of the test it
+    // would have made is described. `Str.from_interpolation` is walked too,
+    // so the literal is its fold over the values, which this conversion
+    // escapes first.
+    const staged = try Staged.create(std.testing.allocator,
+        \\Html := [Html(Str)].{
+        \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
+        \\    from_interpolation = |segments|
+        \\        if segments.any(|segment| segment.contains("<script")) {
+        \\            Err(InvalidInterpolation("no scripts"))
+        \\        } else {
+        \\            Str.from_interpolation(segments).map_ok(|assemble|
+        \\                |values| Html(assemble(values.map(|value| value.replace_each("<", "&lt;")))))
+        \\        }
+        \\    width : Html, F32 -> F32
+        \\    width = |h, f| match h {
+        \\        Html(text) => if text.is_empty() 0.0.F32 else f
+        \\    }
+        \\}
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| "<p>${input.uv.to_str()}!</p>".Html.width(input.uv)
+    );
+    defer staged.destroy();
+
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = Num.F32.to_str(n0) : Str !spec
+        \\  n2 = list(n1) : List(Str)
+        \\  n3 = closure r1() : (Str -> Str)
+        \\  n4 = List.map(n2, n3) : List(Str) !spec
+        \\  n5 = "<p>" : Str
+        \\  n6 = "!</p>" : Str
+        \\  n7 = list(n5, n6) : List(Str)
+        \\  n8 = List.first(n7) : Builtin.Try !spec
+        \\  n9 = "" : Str
+        \\  n10 = Try.ok_or(n8, n9) : Str !spec
+        \\  n11 = closure r2(n7) : (Str, Str, U64 -> Str)
+        \\  n12 = List.fold_with_index(n4, n10, n11) : Str !spec
+        \\  n13 = Str.is_empty(n12) : Bool !spec
+        \\  n15 = switch n13 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      n14 = float 0x0 : F32
+        \\      value n14
+        \\  value n15
+        \\row r1 (Str) -> Str
+        \\  n0 = "<" : Str
+        \\  n1 = "&lt;" : Str
+        \\  n2 = Str.replace_each(p0, n0, n1) : Str !spec
+        \\  value n2
+        \\row r2 (List(Str), Str, Str, U64) -> Str
+        \\  n0 = 1 : U64
+        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
+        \\  n2 = List.get(p0, n1) : Builtin.Try
+        \\  n3 = "" : Str
+        \\  n4 = Try.ok_or(n2, n3) : Str !spec
+        \\  n5 = Str.concat(p1, p2, n4) : Str
+        \\  value n5
+        \\
+    );
+}
+
+test "an interpolated literal of a type that only wraps the assembler of Str describes as the fold of Str" {
+    const staged = try Staged.create(std.testing.allocator,
+        \\Label := { text : Str }.{
+        \\    from_interpolation : List(Str) -> Try((List(Str) -> Label), [InvalidInterpolation(Str)])
+        \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| { text: assemble(values) })
+        \\    width : Label, F32 -> F32
+        \\    width = |l, f| if l.text.is_empty() 0.0.F32 else f
+        \\}
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| "a${input.uv.to_str()}b".Label.width(input.uv)
+    );
+    defer staged.destroy();
+
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = field 1(p0) : F32
+        \\  n1 = Num.F32.to_str(n0) : Str !spec
+        \\  n2 = list(n1) : List(Str)
+        \\  n3 = "a" : Str
+        \\  n4 = "b" : Str
+        \\  n5 = list(n3, n4) : List(Str)
+        \\  n6 = List.first(n5) : Builtin.Try !spec
+        \\  n7 = "" : Str
+        \\  n8 = Try.ok_or(n6, n7) : Str !spec
+        \\  n9 = closure r1(n5) : (Str, Str, U64 -> Str)
+        \\  n10 = List.fold_with_index(n2, n8, n9) : Str !spec
+        \\  n11 = Str.is_empty(n10) : Bool !spec
+        \\  n13 = switch n11 : F32
+        \\    arm 0
+        \\      value n0
+        \\    arm 1
+        \\      n12 = float 0x0 : F32
+        \\      value n12
+        \\  value n13
+        \\row r1 (List(Str), Str, Str, U64) -> Str
+        \\  n0 = 1 : U64
+        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
+        \\  n2 = List.get(p0, n1) : Builtin.Try
+        \\  n3 = "" : Str
+        \\  n4 = Try.ok_or(n2, n3) : Str !spec
+        \\  n5 = Str.concat(p1, p2, n4) : Str
+        \\  value n5
+        \\
+    );
+}
+
+test "an interpolated literal of a conversion that reads its segments carries them as a list" {
+    const staged = try Staged.create(std.testing.allocator,
+        \\Joined := { text : Str }.{
+        \\    from_interpolation : List(Str) -> Try((List(Str) -> Joined), [InvalidInterpolation(Str)])
+        \\    from_interpolation = |segments| Ok(|values| { text: Str.join_with(segments.concat(values), "-") })
+        \\    width : Joined, F32 -> F32
+        \\    width = |j, f| if j.text.is_empty() 0.0.F32 else f
+        \\}
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| "a${input.uv.to_str()}b".Joined.width(input.uv)
+    );
+    defer staged.destroy();
+
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = "a" : Str
+        \\  n1 = "b" : Str
+        \\  n2 = list(n0, n1) : List(Str)
+        \\  n3 = field 1(p0) : F32
+        \\  n4 = Num.F32.to_str(n3) : Str !spec
+        \\  n5 = list(n4) : List(Str)
+        \\  n6 = List.concat(n2, n5) : List(Str)
+        \\  n7 = "-" : Str
+        \\  n8 = Str.join_with(n6, n7) : Str !spec
+        \\  n9 = Str.is_empty(n8) : Bool !spec
+        \\  n11 = switch n9 : F32
+        \\    arm 0
+        \\      value n3
+        \\    arm 1
+        \\      n10 = float 0x0 : F32
+        \\      value n10
+        \\  value n11
+        \\
+    );
+}
+
+test "an interpolated literal passed as an argument describes as the value it converts to" {
+    const staged = try Staged.create(std.testing.allocator,
+        \\Wrapped := { text : Str }.{
+        \\    from_interpolation : List(Str) -> Try((List(Str) -> Wrapped), [InvalidInterpolation(Str)])
+        \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| Wrapped.{ text: assemble(values) })
+        \\    size : Wrapped -> U64
+        \\    size = |w| w.text.count_utf8_bytes()
+        \\}
+        \\
+        \\measure : Wrapped, F32 -> F32
+        \\measure = |w, f| if Wrapped.size(w) > 3 f else 0.0.F32
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| measure("x${input.uv.to_str()}y", input.uv)
+    );
+    defer staged.destroy();
+
+    try staged.expectDump(
+        \\row r0 ({ time : F32, uv : F32 }) -> F32
+        \\  n0 = 3 : U64
+        \\  n1 = field 1(p0) : F32
+        \\  n2 = Num.F32.to_str(n1) : Str !spec
+        \\  n3 = list(n2) : List(Str)
+        \\  n4 = "x" : Str
+        \\  n5 = "y" : Str
+        \\  n6 = list(n4, n5) : List(Str)
+        \\  n7 = List.first(n6) : Builtin.Try !spec
+        \\  n8 = "" : Str
+        \\  n9 = Try.ok_or(n7, n8) : Str !spec
+        \\  n10 = closure r1(n6) : (Str, Str, U64 -> Str)
+        \\  n11 = List.fold_with_index(n3, n9, n10) : Str !spec
+        \\  n12 = Str.count_utf8_bytes(n11) : U64 !spec
+        \\  n13 = Num.U64.is_lt(n0, n12) : Bool
+        \\  n15 = switch n13 : F32
+        \\    arm 0
+        \\      n14 = float 0x0 : F32
+        \\      value n14
+        \\    arm 1
+        \\      value n1
+        \\  value n15
+        \\row r1 (List(Str), Str, Str, U64) -> Str
+        \\  n0 = 1 : U64
+        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
+        \\  n2 = List.get(p0, n1) : Builtin.Try
+        \\  n3 = "" : Str
+        \\  n4 = Try.ok_or(n2, n3) : Str !spec
+        \\  n5 = Str.concat(p1, p2, n4) : Str
+        \\  value n5
+        \\
+    );
+}
+
+test "an interpolated literal of a type of another package is a Prim over its segments and values" {
+    // N8h: the conversion is that package's body, which the walk does not
+    // read, so the literal is named by the type's module and `from_interpolation`.
+    const written = try Staged.createSite(std.testing.allocator,
+        \\wobble : { a : F32, b : F32 } -> F32
+        \\wobble = |input| Lib.size("x${input.a.to_str()}y")
+    , "", "input",
+        \\Lib := { text : Str }.{
+        \\    from_interpolation : List(Str) -> Try((List(Str) -> Lib), [InvalidInterpolation(Str)])
+        \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| { text: assemble(values) })
+        \\
+        \\    size : Lib -> F32
+        \\    size = |l| if l.text.is_empty() 0.0.F32 else 1.0.F32
+        \\}
+    );
+    defer written.destroy();
+    try written.expectDump(
+        \\row r0 ({ a : F32, b : F32 }) -> F32
+        \\  n0 = "x" : Str
+        \\  n1 = "y" : Str
+        \\  n2 = list(n0, n1) : List(Str)
+        \\  n3 = field 0(p0) : F32
+        \\  n4 = Num.F32.to_str(n3) : Str !spec
+        \\  n5 = list(n4) : List(Str)
+        \\  n6 = Lib.from_interpolation(n2, n5) : Lib !spec
+        \\  n7 = Lib.size(n6) : F32 !spec
+        \\  value n7
+        \\
+    );
+}
+
+test "an interpolated literal whose conversion can leave its body early is refused" {
+    const staged = try Staged.create(std.testing.allocator,
+        \\Early := { text : Str }.{
+        \\    from_interpolation : List(Str) -> Try((List(Str) -> Early), [InvalidInterpolation(Str)])
+        \\    from_interpolation = |segments| {
+        \\        assemble = Str.from_interpolation(segments)?
+        \\        Ok(|values| { text: assemble(values) })
+        \\    }
+        \\    width : Early, F32 -> F32
+        \\    width = |e, f| if e.text.is_empty() 0.0.F32 else f
+        \\}
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| "a${input.uv.to_str()}b".Early.width(input.uv)
+    );
+    defer staged.destroy();
+
+    try staged.expectRejected("a conversion that leaves its body early");
+}
+
+test "an interpolated literal whose conversion is generic in the item type of its assembler is refused" {
+    // The lambda's own type holds a variable that nothing fixes: the checker
+    // relates the item type to the values' types, which the lambda's type
+    // does not see.
+    const staged = try Staged.create(std.testing.allocator,
+        \\Count := { n : U64 }.{
+        \\    from_interpolation : List(Str) -> Try((List(item) -> Count), [InvalidInterpolation(Str)])
+        \\    from_interpolation = |_segments| Ok(|values| { n: List.len(values) })
+        \\    weigh : Count, F32 -> F32
+        \\    weigh = |c, f| if c.n > 1 f else 0.0.F32
+        \\}
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| "a${input.uv.to_str()}b${input.time.to_str()}".Count.weigh(input.uv)
+    );
+    defer staged.destroy();
+
+    try staged.expectRejected("a type variable");
+}
