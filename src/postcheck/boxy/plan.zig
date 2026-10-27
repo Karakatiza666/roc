@@ -21891,26 +21891,39 @@ const Builder = struct {
         };
     }
 
+    /// The stored function a procedure use names, on the chain
+    /// `resolveWorkerSource` follows: a pending callable-eval binding whose
+    /// root is a lookup names what that lookup names, so the use reads the
+    /// captures of the stored function its worker source came from.
     fn storedFnSourceForProcedureUse(
         self: *Builder,
         procedure: checked.ProcedureUseTemplate,
     ) ?StoredFnSource {
-        return switch (procedure.binding) {
-            .top_level => |binding| self.storedFnSourceForTopLevelBinding(binding),
-            .platform_required => |required| self.storedFnSourceForTopLevelBinding(.{
-                .artifact = required.app_value.artifact,
-                .binding = required.procedure_binding,
-            }),
+        const view, const body = switch (procedure.binding) {
+            .top_level => |binding| blk: {
+                const view = self.moduleForKey(binding.artifact);
+                break :blk .{ view, view.top_level_procedure_bindings.get(binding.binding).body };
+            },
+            .platform_required => |required| blk: {
+                const view = self.moduleForKey(required.app_value.artifact);
+                break :blk .{ view, view.top_level_procedure_bindings.get(required.procedure_binding).body };
+            },
             .imported => |imported| blk: {
                 const view = self.moduleForKey(imported.artifact);
-                const binding = importedProcedureBinding(view, imported);
-                break :blk switch (binding.body) {
-                    .checked_error => null,
-                    .callable_eval_template => |template| self.storedFnSourceForCallableEvalTemplate(view, template),
-                    .direct_template => null,
-                };
+                break :blk .{ view, importedProcedureBinding(view, imported).body };
             },
-            .hosted => null,
+            .hosted => return null,
+        };
+        const template_id = callableEvalTemplateOf(body) orelse return null;
+        const root = view.compile_time_roots.root(self.callableEvalTemplate(view, template_id).root);
+        return switch (root.payload) {
+            .fn_value => |fn_id| .{ .module = viewModule(view), .fn_id = fn_id },
+            .pending => switch (view.checked_bodies.expr(root.expr).data) {
+                .lookup_local => |lookup| self.storedFnSourceForProcedureValueRef(view, lookup.resolved orelse return null),
+                .lookup_external, .lookup_required => |resolved| self.storedFnSourceForProcedureValueRef(view, resolved orelse return null),
+                .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
+            },
+            .unevaluated, .const_node, .discarded, .expect, .runtime => null,
         };
     }
 

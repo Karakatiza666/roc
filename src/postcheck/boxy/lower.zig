@@ -22573,10 +22573,11 @@ const ProcBodyBuilder = struct {
         }
         // A `Code` description writes the backing of each transparent nominal
         // it holds without a `.nominal` node (`src/check/code_emit.zig`), as
-        // planning reads it (`stepStaticConstNode`).
+        // planning reads it (`stepStaticConstNode`). An alias of such a
+        // nominal is peeled first, as planning peels it.
         if (store_module.const_store.?.get(node) != .nominal and resolvedTypePayload(type_module, checked_ty) == .nominal) {
             const rep = self.parent.plan.representations.items[@backingInt(self.repForModuleType(type_module, checked_ty))];
-            if (rep.kind == .nominal and rep.kind.nominal == .transparent) {
+            if (rep.kind == .alias or (rep.kind == .nominal and rep.kind.nominal == .transparent)) {
                 return try self.beginRestoreConstNominal(target, store_module, type_module, node, checked_ty, next);
             }
         }
