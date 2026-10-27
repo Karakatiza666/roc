@@ -24282,6 +24282,49 @@ Builtin :: [].{
 			bound = |_, value| Bound.({ value, inputs: [] })
 		}
 
+		## A description whose site is declared `Code.Outlined(f)`: the
+		## `outline` view of the normal form. It starts from the `inline` view
+		## and makes a row of each computation that repeats: a tree of at least
+		## four operations, literals not counted, that occurs at two or more
+		## places becomes one row over the values it reads, and each place
+		## calls it. The rows come from the computation alone, so a refactor
+		## that keeps the computation keeps them, and extracting or inlining a
+		## helper changes nothing. A translator that emits functions, and whose
+		## output must not change when the author moves code into or out of a
+		## helper, reads this view. Recursive functions stay rows, as in
+		## `inline`.
+		Outlined(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+
+			## The rows the description reaches: the root, the recursive rows,
+			## and the rows the view made.
+			outline : Outlined(_fn) -> Graph
+			outline = |Outlined.(inner)| inner.graph
+
+			## The normal-form version the value was built under.
+			version : Outlined(_fn) -> U32
+			version = |Outlined.(inner)| inner.version
+
+			## Two values are equal when their normal forms are, wherever each
+			## was described.
+			is_eq : Outlined(fn), Outlined(fn) -> Bool
+			is_eq = |Outlined.(a), Outlined.(b)| a.version == b.version and a.graph == b.graph
+
+			## Hashes the normal form, and not the site key, to agree with `is_eq`.
+			to_hash : Outlined(_fn), Hasher -> Hasher
+			to_hash = |Outlined.(inner), hasher| inner.graph.to_hash(Hasher.write_u32(hasher, inner.version))
+
+			## Refuse node `at.node` of row `at.row` of the `outline` view, as
+			## [Code.refuse_at] refuses one of the `graph` view. A node of a row
+			## the view made reports every place the row stands for.
+			refuse_at : Outlined(_fn), { row : U32, node : U32 }, Str -> _a
+			refuse_at = |Outlined.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
+
+			## A translator's result, as [Code.bound] makes one for the `graph`
+			## view.
+			bound : Outlined(_fn), a -> Bound(a)
+			bound = |_, value| Bound.({ value, inputs: [] })
+		}
+
 		## The run-time value of one input slot, which follows the slot's
 		## [Code.Ty]: an integer that is not a `U128` is an `Int`, a record has
 		## one value per field in the order of its `Ty`, and a nominal value is a

@@ -1896,7 +1896,81 @@ const unbound_capture = stage ++
     \\main = scaled(7)
 ;
 
+// V3: the `outline` view. A stage reads `Code.Outlined(f)`, so each
+// computation of at least K nodes that repeats is one row every place calls.
+const outline_stage = stage ++
+    \\Outline :: {}.{
+    \\    describe : Code.Outlined(f) -> Str
+    \\    describe = |code| {
+    \\        graph = code.outline()
+    \\        first = graph.root_row()
+    \\        others = graph.rows().keep_if(|other| other.id != first.id)
+    \\        shown = [first].concat(others).map(|each| "r${each.id.to_str()} = ${Stage.row(graph, each)}")
+    \\        Str.join_with(shown, " ; ")
+    \\    }
+    \\
+    \\    same : Code.Outlined(f), Code.Outlined(f) -> Bool
+    \\    same = |a, b| a == b
+    \\}
+    \\
+;
+
+const outline_step =
+    \\step : U64 -> U64
+    \\step = |x| ((x * 3 + 1) * x + 5) * x
+    \\
+    \\twice : U64, U64 -> U64
+    \\twice = |a, b| step(a) + step(b)
+    \\
+    \\written : U64, U64 -> U64
+    \\written = |a, b| ((a * 3 + 1) * a + 5) * a + ((b * 3 + 1) * b + 5) * b
+    \\
+;
+
+const staged_outlined = outline_stage ++ outline_step ++
+    \\main = Outline.describe(twice)
+;
+
+const staged_outlined_same = outline_stage ++ outline_step ++
+    \\main = Outline.same(twice, written)
+;
+
+// A loop that repeats is one row too: its slots and index are bound inside
+// the cone, and the loop's bound is a hole.
+const staged_outlined_loop = outline_stage ++
+    \\squares : U64 -> U64
+    \\squares = |n| {
+    \\    var $total = 0
+    \\    for i in 0..<n {
+    \\        $total = $total + i * i + 1
+    \\    }
+    \\    $total
+    \\}
+    \\
+    \\both : U64, U64 -> U64
+    \\both = |a, b| squares(a) * squares(b)
+    \\main = Outline.describe(both)
+;
+
 pub const tests = [_]TestCase{
+    .{
+        .name = "staging - a Code.Outlined site makes one row of a helper called from two places",
+        .source_kind = .module,
+        .source = staged_outlined,
+        .expected = .{ .inspect_str = "\"r0 = |U64, U64| -> U64 Num.U64.plus(r1(p0), r1(p1)) ; r1 = |U64| -> U64 Num.U64.times(Num.U64.plus(Num.U64.times(Num.U64.plus(Num.U64.times(p0, 3), 1), p0), 5), p0)\"" },
+    },
+    .{
+        .name = "staging - a helper called twice and its body written twice are one Code.Outlined value",
+        .source_kind = .module,
+        .source = staged_outlined_same,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "staging - a loop that repeats is one row of the outline view",
+        .source_kind = .module,
+        .source = staged_outlined_loop,
+        .expected = .{ .inspect_str = "\"r0 = |U64, U64| -> U64 Num.U64.times(r1(p0), r1(p1)) ; r1 = |U64| -> U64 for_range<(0, p0, 0, continue(Num.U64.plus(Num.U64.plus(s5.1, Num.U64.times(s5.0, s5.0)), 1)))\"" },
+    },
     .{
         .name = "staging - a staged function's body becomes a description the stage reads",
         .source_kind = .module,

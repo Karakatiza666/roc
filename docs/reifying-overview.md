@@ -67,7 +67,7 @@ The full list of refusals is in [section 4](#4-status-and-limits).
 
 ## 2. How it works
 
-### Two views of a description
+### Three views of a description
 
 A description is a graph of functions. Each function is a _row_. The translator picks a view with the type of its parameter.
 
@@ -75,14 +75,15 @@ A description is a graph of functions. Each function is a _row_. The translator 
 | --- | --- | --- | --- |
 | graph | `Code(f)` | `code.graph()` | A helper called from one place is inlined. A helper called from two or more places, a recursive helper, or a helper that holds a `return` in a loop or an arm is a row. Each call is a `Call` node. |
 | inline | `Code.Inlined(f)` | `code.inline()` | Every call is inlined. A recursive helper, or a helper that holds a `return` in a loop or an arm, stays a row. |
+| outline | `Code.Outlined(f)` | `code.outline()` | The inline view, then each computation of at least four nodes that occurs at two or more places is one row, and each place calls it. The rows are the compiler's, not the author's. |
 
 A target with no function form, like one GLSL expression, reads the inline view. A target with functions, like SQL with common table expressions, reads the graph view.
 
-The rules for the two views are in [../src/reify/views.zig:1](../src/reify/views.zig).
+The rules for the three views are in [../src/reify/views.zig:1](../src/reify/views.zig).
 
 ### The shape of `Code.Graph`
 
-All the types are in the `Code` module of `Builtin.roc` (lines 23625 to 24212). `roc docs --builtins` lists them.
+All the types are in the `Code` module of `Builtin.roc` (lines 23625 to 24400). `roc docs --builtins` lists them.
 
 | Type | What it holds | Line in `Builtin.roc` |
 | --- | --- | --- |
@@ -202,8 +203,9 @@ Notes on accuracy:
 | --- | --- |
 | Where | The `reify` branch. Not merged into `main`. |
 | What works | Pure Roc as listed in [../roc-reify-design.md](../roc-reify-design.md): literals, operators, calls (helpers, generic, recursive, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods, and captured run-time values for a translator that returns a `Code.Bound`. |
-| Tests | 118 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 181 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 49 fixtures `test/cli/Staged*.roc`. 161 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
+| Tests | 130 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 186 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 59 fixtures `test/cli/Staged*.roc`. 168 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
 | Node identities | `Code.Inlined.inline_digest` names a node of the `inline` view by its content (milestone M8). |
+| Rows the compiler chooses | A `Code.Outlined(f)` site gets the `outline` view (milestone M9). No row is outlined in the four examples, because their repeated calls read different arguments ([../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 12). |
 | Not done | The translator cannot yet declare which functions of another package it reads (`code_primitives`, milestone M13 of [../roc-reify-normalization-plan.md](../roc-reify-normalization-plan.md)). |
 
 ### What is refused today
@@ -264,12 +266,12 @@ The `Code` module in [../src/build/roc/Builtin.roc](../src/build/roc/Builtin.roc
 | --- | --- |
 | The `Code` type and its docs | 23601 to 23625 |
 | `Ty` | 23632 |
-| `Val`, `Key`, `End`, `Region` | 23846, 23863, 23879, 23896 |
-| `Op` | 23959 |
-| `Node`, `Row`, `Graph` | 24019, 24055, 24078 |
-| `Graph.to_tree` and `Tree` | 24107, 24137 |
-| `Code.Inlined` | 24157 |
-| `Code.graph`, `version`, `is_eq`, `to_hash`, `refuse_at` | 24184, 24190, 24196, 24200, 24210 |
+| `Val`, `Key`, `End`, `Region` | 23847, 23865, 23881, 23898 |
+| `Op` | 23961 |
+| `Node`, `Row`, `Graph` | 24022, 24077, 24128 |
+| `Graph.to_tree` and `Tree` | 24163, 24193 |
+| `Code.Inlined`, `Code.Outlined` | 24229, 24296 |
+| `Code.graph`, `version`, `is_eq`, `to_hash`, `refuse_at` | 24367, 24373, 24379, 24383, 24398 |
 
 Key source files:
 
@@ -279,6 +281,6 @@ Key source files:
 | [../src/check/code_reifier.zig](../src/check/code_reifier.zig) | The walk that describes a function. |
 | [../src/check/checked_artifact.zig](../src/check/checked_artifact.zig) | `reifyStagedCode` (line 38310) and the provenance table. |
 | [../src/reify/mod.zig](../src/reify/mod.zig) | The normal-form version, line 36. |
-| [../src/reify/views.zig](../src/reify/views.zig) | The two views. |
+| [../src/reify/views.zig](../src/reify/views.zig) | The three views. |
 | [../src/reify/provenance.zig](../src/reify/provenance.zig) | The table from nodes to source places. |
 | [../src/check/report.zig](../src/check/report.zig) | The reports, including `translation refused`. |

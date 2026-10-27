@@ -145,29 +145,10 @@ pub fn ofSite(
     orders: []const []const NodeId,
 ) Allocator.Error![]const []const Digest {
     std.debug.assert(rows.len == orders.len);
-    const place = try gpa.alloc(Digest, store.rows.items.len);
-    defer gpa.free(place);
-    @memset(place, 0);
-    for (rows, 0..) |r, i| place[r.index()] = @as(Digest, i) | (@as(Digest, 1) << 64);
-    const ByPlace = struct {
-        fn name(ctx: *const anyopaque, row: ir.RowId) Digest {
-            const table: *const []Digest = @ptrCast(@alignCast(ctx));
-            return table.*[row.index()];
-        }
-    };
-    const place_slice: []Digest = place;
     var content: Content = .{ .gpa = gpa, .types = types };
     defer content.deinit();
-    const shallow: RowNamer = .{ .ctx = @ptrCast(&place_slice), .name = ByPlace.name };
-    const names = try gpa.alloc(Digest, store.rows.items.len);
+    const names = try siteRowNames(gpa, store, rows, &content);
     defer gpa.free(names);
-    @memset(names, 0);
-    for (rows) |r| {
-        var h: Hasher = .{};
-        h.digest(place[r.index()]);
-        h.digest(try ofRowContent(gpa, store, r, shallow, &content));
-        names[r.index()] = h.final();
-    }
     const names_slice: []Digest = names;
     const named: RowNamer = .{ .ctx = @ptrCast(&names_slice), .name = ByPlace.name };
     var memo: Memo = .{ .gpa = gpa, .store = store, .names = named, .content = &content };
@@ -187,6 +168,73 @@ pub fn ofSite(
     }
     return out;
 }
+
+/// Per row of the store, by index: the name a `Call` or `Closure` of it
+/// has in the digests of a site whose rows are `rows`, in the order the
+/// emitter numbers them (V5a). A row is named by its place in `rows` and the
+/// content of its own body, in which every row it reaches is named by its
+/// place alone, so a row that calls itself has a name. A row outside `rows`
+/// is named 0. The caller frees the result.
+pub fn siteRowNames(gpa: Allocator, store: *const ir.Store, rows: []const ir.RowId, content: *Content) Allocator.Error![]Digest {
+    const place = try gpa.alloc(Digest, store.rows.items.len);
+    defer gpa.free(place);
+    @memset(place, 0);
+    for (rows, 0..) |r, i| place[r.index()] = @as(Digest, i) | (@as(Digest, 1) << 64);
+    const place_slice: []Digest = place;
+    const shallow: RowNamer = .{ .ctx = @ptrCast(&place_slice), .name = ByPlace.name };
+    const names = try gpa.alloc(Digest, store.rows.items.len);
+    errdefer gpa.free(names);
+    @memset(names, 0);
+    for (rows) |r| {
+        var h: Hasher = .{};
+        h.digest(place[r.index()]);
+        h.digest(try ofRowContent(gpa, store, r, shallow, content));
+        names[r.index()] = h.final();
+    }
+    return names;
+}
+
+const ByPlace = struct {
+    fn name(ctx: *const anyopaque, row: ir.RowId) Digest {
+        const table: *const []Digest = @ptrCast(@alignCast(ctx));
+        return table.*[row.index()];
+    }
+};
+
+/// The digest of node `nd`'s own content, by what its ids name
+/// (`ofRowContent`): its op, payload, types and immediates, and not its
+/// arguments or regions. A `Call` or `Closure` names its row by `row_name`.
+pub fn localContent(store: *const ir.Store, content: *Content, nd: ir.Node, row_name: ?Digest) Allocator.Error!Digest {
+    var h: Hasher = .{};
+    const ctx: ContentOnly = .{ .content = content };
+    if (row_name) |d| {
+        h.words(&.{ @backingInt(nd.op), std.math.maxInt(u32) });
+        h.digest(d);
+        h.word(nd.tys.len);
+        for (store.tySlice(nd.tys)) |t| h.digest(try content.ty(t));
+        h.word(nd.aux.len);
+        h.words(store.wordSlice(nd.aux));
+    } else try immediates(store, ctx, &h, nd);
+    h.word(nd.args.len);
+    h.word(nd.regions.len);
+    return h.final();
+}
+
+/// The digest of literal `l`'s type and value.
+pub fn litContent(store: *const ir.Store, content: *Content, l: ir.LitId) Allocator.Error!Digest {
+    var h: Hasher = .{};
+    try content.lit(&h, store, l);
+    return h.final();
+}
+
+// Content read for `localContent`, which reads no child.
+const ContentOnly = struct {
+    content: *Content,
+
+    fn contentOf(self: ContentOnly) ?*Content {
+        return self.content;
+    }
+};
 
 /// Free what `ofSite` returned.
 pub fn freeSite(gpa: Allocator, digests: []const []const Digest) void {
@@ -215,7 +263,8 @@ pub const Content = struct {
         self.tys.deinit(self.gpa);
     }
 
-    fn ty(self: *Content, t: TyId) Allocator.Error!Digest {
+    /// The digest of type `t`'s structure, with names by their text.
+    pub fn ty(self: *Content, t: TyId) Allocator.Error!Digest {
         if (self.tys.get(t)) |d| return d;
         const types = self.types;
         const shape = types.get(t);

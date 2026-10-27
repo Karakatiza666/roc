@@ -45,6 +45,7 @@ Legend
 | --- | --- | --- |
 | `graph` | `Code(f)`, read with `Code.graph` | A recursive row, a row called from two or more places, a row a `Closure` names, and a row that holds a `Return` in a loop or in a switch arm. |
 | `inline` | `Code.Inlined(f)`, read with `Code.Inlined.inline` | A recursive row, and a row that holds a `Return` in a loop or in a switch arm. Every other row is inlined, and a `Closure` of any non-recursive row is a `Lambda` region. |
+| `outline` | `Code.Outlined(f)`, read with `Code.Outlined.outline` | The rows of `inline`, and one row for each computation of at least four nodes that occurs at two or more places (`roc-reify-normal-form.md` 5.3). A computation that holds a `Return`, or a `Continue`, `Break` or `Jump` to outside itself, is not made a row. |
 
 The `graph` view inlines a helper called from one place, unless the helper
 holds a `Return` in a loop or in a switch arm. The `inline` view keeps such a

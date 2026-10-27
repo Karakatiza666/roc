@@ -1515,6 +1515,19 @@ stood: every node runs in the same region as before, so nothing speculates. It n
 K, the selection order and the hole numbering are part of the language
 version, like R.
 
+`src/reify/views.zig` (`outlineSelect`) builds the rule (M9 of the plan). K
+is 4 (`views.outline_min_size`). The rule above leaves these points open, and
+the build reads them as the table says:
+
+| Point | Reading |
+|---|---|
+| literals | a literal is not a stopping point. It is copied into every cone that reads it, its value is part of the shape, and it does not count in the size. So `x * 3` and `x * 4` have two shapes |
+| which cones a row can be | a cone with one output, no `Return` to the row, no `Continue` or `Break` of a loop outside it, no `Jump` to a join outside it, and no `Call` or `Closure` of its own recursive component. Other cones are not candidates |
+| when two places are one shape | equal shape hashes, and then a walk of the two cones that compares them node by node. A collision of hashes is not a match |
+| overlap | a place overlaps a taken place when one cone holds the root of the other |
+| the end of a pass | the made rows and their callers are finalized again (3.8), and the next pass reads the result. The pass stops when it takes no shape. A debug check asserts that each pass makes the site smaller |
+| cost | O(m log m) per pass for m nodes, plus the hole lists of the places |
+
 ### 5.4 Rebuilding expression trees
 
 "All in defs" is the right shape for the normal form, and the wrong one for a
@@ -1978,12 +1991,29 @@ for all three.
 | Should layer L ship with the first version? | it is separable: N1 to N15 stand without it. Shipping it later is a versioned change of R, like any law added after |
 | Which laws belong in L? | the five of 3.16 are the ones a loop-to-builtin refactor needs, and N16f adds `len() > 0` and `len() == 0` against `is_empty()`. Further candidates are theorems about builtins that the library would have to state and test |
 | Commutative operators? | only leaf pairs, by N15c: a literal last, the root's parameters in order. The rest is left out (7.2). Revisit only if real translators show that authors reorder other operands |
-| What is K in `outline`? | a constant of the language version. Too small and `outline` makes a row of every repeated pair of operations; too large and it recovers little size. It needs measuring on real shaders |
+| What is K in `outline`? | decided for now: K = 4, measured on the examples (table below). K must be 3 or more, so that a pass makes the site smaller. The examples do not tell 3, 4 and 5 apart, and 4 keeps a repeated `a * b + c` inline. Measure again when a translator reads `outline`. The measurement found a larger question: a cone takes in every argument that only it reads, so `step(input.a)` and `step(input.b)` have two shapes, because each cone holds its own field read. `outline` recovers a repeated helper only when the places read the same kinds of computation. Options: keep maximal cones; cut each cone at the roots of other candidate cones; or match places by anti-unification, which makes the differing arguments holes |
 | Should `graph` inline single-use rows? | yes in this design, because it moves the most common helper extraction into tier A. The price is that a GLSL translator reading `graph` never emits a function the author called once |
 | Do translators need names for emitted identifiers? | no in this design: the dump and provenance cover debugging. A name exposed for emission becomes observable again |
 | Should the rules be derived rather than accumulated? | yes: the gate of `roc-reify-rule-derivation.md` section 6 passed on 2026-09-27. That document defines an offline tool, `zig build reify-rules`, that finds unjoined critical pairs and equal small terms that normalize apart, proves them in a most-defined semantics in which every rule is an equation, and writes the first-order rules as table rows. After the gate, a tier F rule enters the table through the tool, and a hand-written tier F row, such as N15a's rows over operand runs, states its reason |
 | How does a translator declare its cut? | decided: a well-known associated item `code_primitives` on the nominal type that owns the function with the `Code(f)` parameter, found through that type as `iter` and `to_inspect` are. It is public, like every well-known name, and it tells a translator's users which functions it reads by name. It is a direct reference to one top-level function, or a tuple of such references; anything else, and a function listed twice, is a compile error at the item. A type without it has an empty cut. The checker resolves it and records the cut in the checked artifact, as it records `IteratorProcedureId`; the reifier reads the checked expression, not an evaluated value. The cut is per type: two translators with different cuts are two types. Rejected: a private module constant read by name, which no Roc mechanism is like; a second `Code` type parameter with a `Code.prim` intrinsic (new surface), a package header entry (one cut per package, which `Glsl` and `Interp` in one package cannot share), and a cut passed to a `Code` function at run time (the normalizer would have to run in every backend, as plan 1.5 rejects for views) |
 | Where does the `graph` view stop being worth it? | if no translator ends up reading it, drop it and keep only `inline`; the normal form's definition does not change |
+
+K was measured with `ROC_REIFY_OUTLINE_STATS=3,4,5,6,8,12` (a Debug compiler
+only), which reifies each site in `outline` at each K and prints its size.
+"Nodes" counts the nodes of all rows of all sites. "Rows" counts the rows that
+`outline` made.
+
+| Source | Sites | Nodes in `inline` | K = 3 | K = 4 | K = 5 | K = 6, 8, 12 |
+|---|---|---|---|---|---|---|
+| `examples/reifying/glsl/` | 8 | 165 | 165, 0 rows | 165, 0 rows | 165, 0 rows | 165, 0 rows |
+| `examples/reifying/sql/` | 42 | 141 | 141, 0 rows | 141, 0 rows | 141, 0 rows | 141, 0 rows |
+| `examples/reifying/dbsp/` | 22 | 107 | 107, 0 rows | 107, 0 rows | 107, 0 rows | 107, 0 rows |
+| `examples/reifying/hello/` | 3 | 6 | 6, 0 rows | 6, 0 rows | 6, 0 rows | 6, 0 rows |
+| `test/cli/Staged*.roc` | 133 | 510 | 495, 5 rows | 495, 5 rows | 495, 5 rows | 510, 0 rows |
+
+The five rows of the fixtures are all in `test/cli/StagedOutlinedView.roc`.
+The GLSL shader calls `ripple` three times, but over different field reads,
+so no two cones have one shape (the open question on K above).
 
 ---
 

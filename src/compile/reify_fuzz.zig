@@ -387,10 +387,10 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
 
     // L4 for V5a: in the `inline` view, the prints meet and every node of
     // them has one digest.
+    var left_inline: Site = undefined;
+    try left_inline.describeIn(gpa, &lookup, env, case.left_param, .inline_);
+    defer left_inline.deinit();
     {
-        var left_inline: Site = undefined;
-        try left_inline.describeIn(gpa, &lookup, env, case.left_param, .inline_);
-        defer left_inline.deinit();
         var right_inline: Site = undefined;
         try right_inline.describeIn(gpa, &lookup, env, case.right_param, .inline_);
         defer right_inline.deinit();
@@ -419,6 +419,24 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
         }
     }
 
+    // L4 for V3: in the `outline` view, the prints meet.
+    var left_outline: Site = undefined;
+    try left_outline.describeIn(gpa, &lookup, env, case.left_param, .outline);
+    defer left_outline.deinit();
+    {
+        var right_outline: Site = undefined;
+        try right_outline.describeIn(gpa, &lookup, env, case.right_param, .outline);
+        defer right_outline.deinit();
+        if (left_outline.outcome == .reified and right_outline.outcome == .reified) {
+            if (!std.mem.eql(u8, left_outline.dump.items, right_outline.dump.items)) {
+                std.debug.print("the prints describe as two normal forms in the outline view:\n{s}\n{s}\n", .{ left_outline.dump.items, right_outline.dump.items });
+                return error.NormalFormsDiffer;
+            }
+        } else if ((left_outline.outcome == .reified) != (right_outline.outcome == .reified)) {
+            return error.RefusalsDiffer;
+        }
+    }
+
     // L5: the normal form's value is the one Roc computed at compile time.
     try coord.finishCheckedProgram(.executable_artifacts);
     if (errorsBesideCrashes(&coord)) {
@@ -439,12 +457,16 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
     for (items, case.input.items) |*item, value| item.* = .{ .int = value };
     const fields = [_]reify.eval.Value{ .{ .int = case.input.a }, .{ .int = case.input.b }, .{ .bool_ = case.input.flag }, .{ .list = items } };
     const args = [_]reify.eval.Value{.{ .agg = &fields }};
-    const site = left.walk.site.?;
-    var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
-    const computed = try evaluator.run(left.walk.root.?, &args);
-    if (!computed.eql(.{ .int = expected })) {
-        std.debug.print("the normal form computes {any}, and Roc computes {d}\n{s}\n", .{ computed, expected, left.dump.items });
-        return error.ValuesDiffer;
+    // Views agree: `graph`, `inline` and `outline` each compute Roc's answer.
+    for ([_]*const Site{ &left, &left_inline, &left_outline }) |each| {
+        if (each.outcome != .reified) continue;
+        const site = each.walk.site.?;
+        var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
+        const computed = try evaluator.run(each.walk.root.?, &args);
+        if (!computed.eql(.{ .int = expected })) {
+            std.debug.print("the normal form computes {any}, and Roc computes {d}\n{s}\n", .{ computed, expected, each.dump.items });
+            return error.ValuesDiffer;
+        }
     }
     return .agree;
 }

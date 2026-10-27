@@ -394,7 +394,9 @@ pub const Constants = struct {
     ///      tests of a literal's conversion that reach its rejection.
     /// 174: An interpolation of a type of the author's own has a conversion
     ///      root, and a `Code` site records the conversion roots its walk met.
-    pub const CACHE_VERSION = 174;
+    /// 175: Normal form 12: `Code.Outlined` is a builtin type, a site's view
+    ///      can be `outline` (V3), and its value holds that view.
+    pub const CACHE_VERSION = 175;
 };
 
 /// Configuration for the Roc cache system.

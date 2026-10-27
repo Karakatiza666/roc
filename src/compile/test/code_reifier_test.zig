@@ -152,11 +152,19 @@ const Staged = struct {
         return createWalked(gpa, wobble_source, "", "input", null, .inlined);
     }
 
+    /// `createRunning`, walked for a `Code.Outlined(f)` site: the `outline`
+    /// view (V3), which makes a row of each computation that repeats.
+    fn createOutlined(gpa: Allocator, wobble_source: []const u8) StagedError!*Staged {
+        return createWalked(gpa, wobble_source, "", "input", null, .outlined);
+    }
+
     const WalkedAs = union(enum) {
         /// A definition, at the scheme of its template.
         named,
         /// A definition, at the scheme of its template, in the `inline` view.
         inlined,
+        /// A definition, at the scheme of its template, in the `outline` view.
+        outlined,
         /// A lambda written at the site; true when it binds inputs.
         in_block: bool,
     };
@@ -188,6 +196,7 @@ const Staged = struct {
         switch (walked_as) {
             .named => {},
             .inlined => self.walk.view = .inline_,
+            .outlined => self.walk.view = .outline,
             .in_block => |binds_inputs| {
                 self.walk.beginSite(.graph, binds_inputs, self.reifier);
                 self.outcome = try self.reifier.reifyLambda(lambda, .{
@@ -409,6 +418,42 @@ const Staged = struct {
             }
         }
         try std.testing.expectEqualStrings(expected, out.items);
+    }
+
+    /// The dump of `wobble`'s `input` lambda walked again, at the scheme of
+    /// its template, for a site that declares `view`, or null where the
+    /// walk refused it. The caller frees the dump.
+    fn viewDump(self: *Staged, view: @TypeOf(@as(CodeReifier.Walk, undefined).view)) StagedError!?[]u8 {
+        const artifact = self.coord.appRootCheckedArtifact();
+        const lambda = stagedLambda(artifact, self.env, "input") orelse return error.StagedLambdaNotFound;
+        var store = ConstStore.init(self.gpa);
+        defer store.deinit();
+        var walk = CodeReifier.Walk.init(self.gpa, &store, self.foreign.lookup());
+        defer walk.deinit();
+        walk.view = view;
+        const reifier = try walk.reader(.{ .sources = CodeReifier.Reifier.artifactSources(artifact), .env = self.env });
+        const outcome = try reifier.reifyLambda(lambda, .{
+            .scheme = reifier.templateScheme(stagedTemplate(artifact, lambda) orelse return error.StagedLambdaNotFound),
+            .in_block = false,
+            .caller = reifier,
+            .fixed = null,
+            .region = base.Region.zero(),
+        });
+        if (outcome != .reified) return null;
+        const site = walk.site.?;
+        var report = try reify.verify.verifyAll(self.gpa, &site.store, &site.types);
+        defer report.deinit();
+        if (!report.ok()) {
+            for (report.messages.items) |message| std.debug.print("verifier: {s}\n", .{message});
+            return error.StagedSiteDoesNotVerify;
+        }
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        errdefer out.deinit();
+        reify.dump.dumpSite(&out.writer, self.gpa, &site.store, &site.types, walk.root.?) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.WriteFailed => return error.WriteFailed,
+        };
+        return try out.toOwnedSlice();
     }
 
     /// The site's dump, or a test failure naming what the walk refused.
@@ -2910,7 +2955,9 @@ test "a string pattern's capture keeps the name the author wrote in it" {
 // refactor in R (`roc-reify-normalization-plan.md` 5.10, M1), and the two
 // sides must describe as one normal form.
 
-/// Both sources describe `wobble` to the same dump.
+/// Both sources describe `wobble` to the same dump, and to the same dump in
+/// the `outline` view (M9: every L3 row holds in `outline`, which is a
+/// function of `inline` and so of the normal form).
 fn expectSameNormalForm(left: []const u8, right: []const u8) (StagedError || error{ TestUnexpectedResult, TestExpectedEqual })!void {
     const gpa = std.testing.allocator;
     const a = try Staged.createRunning(gpa, left, "");
@@ -2925,6 +2972,17 @@ fn expectSameNormalForm(left: []const u8, right: []const u8) (StagedError || err
         },
     };
     try std.testing.expectEqualStrings(a.dump.items, b.dump.items);
+    try expectSameView(a, b, .outline);
+}
+
+/// The two fixtures' sites describe to one dump in `view`.
+fn expectSameView(a: *Staged, b: *Staged, view: @TypeOf(@as(CodeReifier.Walk, undefined).view)) (StagedError || error{ TestUnexpectedResult, TestExpectedEqual })!void {
+    const gpa = std.testing.allocator;
+    const da = try a.viewDump(view) orelse return error.TestUnexpectedResult;
+    defer gpa.free(da);
+    const db = try b.viewDump(view) orelse return error.TestUnexpectedResult;
+    defer gpa.free(db);
+    try std.testing.expectEqualStrings(da, db);
 }
 
 test "L3: a literal's spelling does not reach the normal form" {
@@ -4788,6 +4846,184 @@ test "L3 M8: a recursive helper's call is named by its body" {
     const b = try inlineDigests(gpa, other);
     defer gpa.free(b);
     try std.testing.expect(!std.mem.eql(u128, a, b));
+}
+
+// M9, V3: the `outline` view. It is a function of `inline`, so the refactors
+// that keep `inline` keep it, and each computation of at least K nodes that
+// repeats becomes one row that every place calls.
+
+/// The `outline` dump of `source`'s `wobble`.
+fn expectOutlineDump(source: []const u8, expected: []const u8) !void {
+    const staged = try Staged.createOutlined(std.testing.allocator, source);
+    defer staged.destroy();
+    try staged.expectDump(expected);
+}
+
+/// The two sources describe to one dump in `outline`, and to two in `graph`.
+fn expectSameOutlineOnly(left: []const u8, right: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const a = try Staged.createRunning(gpa, left, "");
+    defer a.destroy();
+    const b = try Staged.createRunning(gpa, right, "");
+    defer b.destroy();
+    try std.testing.expect(a.outcome == .reified and b.outcome == .reified);
+    try std.testing.expect(!std.mem.eql(u8, a.dump.items, b.dump.items));
+    try expectSameView(a, b, .outline);
+}
+
+/// `source`'s `wobble` has one dump in `inline` and `outline`: nothing of it
+/// is outlined.
+fn expectNotOutlined(source: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const staged = try Staged.createRunning(gpa, source, "");
+    defer staged.destroy();
+    const inlined = try staged.viewDump(.inline_) orelse return error.TestUnexpectedResult;
+    defer gpa.free(inlined);
+    const outlined = try staged.viewDump(.outline) orelse return error.TestUnexpectedResult;
+    defer gpa.free(outlined);
+    try std.testing.expectEqualStrings(inlined, outlined);
+}
+
+const m9_helper =
+    \\step : U64 -> U64
+    \\step = |x| ((x * 3 + 1) * x + 5) * x
+    \\
+;
+
+// The inner `step(input)` is read by the outer `step` and by the sum, so it
+// is a computation of its own and the outer one reads it as a hole. Both
+// have the shape of `step`.
+const m9_twice =
+    \\wobble : U64 -> U64
+    \\wobble = |input| step(input) + step(step(input))
+;
+
+test "L3 M9: a helper called from two places is one row of the outline view" {
+    try expectOutlineDump(m9_helper ++ m9_twice,
+        \\row r0 (U64) -> U64
+        \\  n0 = call r1(p0) : U64 !spec
+        \\  n1 = call r1(n0) : U64 !spec
+        \\  n2 = Num.U64.plus(n0, n1) : U64 !spec
+        \\  value n2
+        \\row r1 (U64) -> U64
+        \\  n0 = 3 : U64
+        \\  n1 = Num.U64.times(p0, n0) : U64 !spec
+        \\  n2 = 1 : U64
+        \\  n3 = Num.U64.plus(n1, n2) : U64 !spec
+        \\  n4 = Num.U64.times(n3, p0) : U64 !spec
+        \\  n5 = 5 : U64
+        \\  n6 = Num.U64.plus(n4, n5) : U64 !spec
+        \\  n7 = Num.U64.times(n6, p0) : U64 !spec
+        \\  value n7
+        \\
+    );
+}
+
+test "L3 M9: a helper called twice and its body written out twice meet in outline, not in graph" {
+    try expectSameOutlineOnly(m9_helper ++ m9_twice,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    s = ((input * 3 + 1) * input + 5) * input
+        \\    s + ((s * 3 + 1) * s + 5) * s
+        \\}
+    );
+}
+
+test "L3 M9: extracting a helper over its parameters in another order keeps the outline view" {
+    try expectSameOutlineOnly(
+        \\scale : U64, U64 -> U64
+        \\scale = |k, x| ((x * k + 1) * x + 5) * x
+        \\
+        \\wobble : U64 -> U64
+        \\wobble = |input| scale(3, input) + scale(3, scale(3, input))
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    s = ((input * 3 + 1) * input + 5) * input
+        \\    s + ((s * 3 + 1) * s + 5) * s
+        \\}
+    );
+}
+
+test "L3 M9: a computation a third place also reads part of stays apart from the two that do not share it" {
+    // `input * 3 + 1` is read by the inner `step` and by the sum, so the
+    // inner `step` reads it as a hole and the outer one does not: the two
+    // have different shapes.
+    try expectNotOutlined(m9_helper ++
+        \\wobble : U64 -> U64
+        \\wobble = |input| step(input) + step(step(input)) + (input * 3 + 1)
+    );
+}
+
+test "L3 M9: a switch that returns from the function stays, and the computations in it are outlined" {
+    // The two loop bodies have one shape, and the `switch` of each is the
+    // largest cone. A row cannot return from its caller, so the `switch`
+    // stays, and its condition and its returned value are rows.
+    try expectOutlineDump(
+        \\wobble : { xs : List(U64), ys : List(U64) } -> U64
+        \\wobble = |input| {
+        \\    for x in input.xs {
+        \\        if ((x * 3 + 1) * x + 5) * x > 100 {
+        \\            return ((x * 7 + 2) * x + 1) * x
+        \\        }
+        \\    }
+        \\    for y in input.ys {
+        \\        if ((y * 3 + 1) * y + 5) * y > 100 {
+        \\            return ((y * 7 + 2) * y + 1) * y
+        \\        }
+        \\    }
+        \\    0
+        \\}
+    ,
+        \\row r0 ({ xs : List(U64), ys : List(U64) }) -> U64
+        \\  n0 = 0 : U64
+        \\  n1 = field 0(p0) : List(U64)
+        \\  n5 = for_list(n1) : !spec
+        \\    body (s5.0: U64, s5.1: U64)
+        \\      n2 = call r1(s5.1) : Bool !spec
+        \\      n4 = switch n2 : !spec
+        \\        arm 0
+        \\          continue
+        \\        arm 1
+        \\          n3 = call r2(s5.1) : U64 !spec
+        \\          return n3
+        \\      branch n4
+        \\  n6 = field 1(p0) : List(U64)
+        \\  n10 = for_list(n6) : !spec
+        \\    body (s10.0: U64, s10.1: U64)
+        \\      n7 = call r1(s10.1) : Bool !spec
+        \\      n9 = switch n7 : !spec
+        \\        arm 0
+        \\          continue
+        \\        arm 1
+        \\          n8 = call r2(s10.1) : U64 !spec
+        \\          return n8
+        \\      branch n9
+        \\  value n0
+        \\row r1 (U64) -> Bool
+        \\  n0 = 100 : U64
+        \\  n1 = 3 : U64
+        \\  n2 = Num.U64.times(p0, n1) : U64 !spec
+        \\  n3 = 1 : U64
+        \\  n4 = Num.U64.plus(n2, n3) : U64 !spec
+        \\  n5 = Num.U64.times(n4, p0) : U64 !spec
+        \\  n6 = 5 : U64
+        \\  n7 = Num.U64.plus(n5, n6) : U64 !spec
+        \\  n8 = Num.U64.times(n7, p0) : U64 !spec
+        \\  n9 = Num.U64.is_lt(n0, n8) : Bool
+        \\  value n9
+        \\row r2 (U64) -> U64
+        \\  n0 = 7 : U64
+        \\  n1 = Num.U64.times(p0, n0) : U64 !spec
+        \\  n2 = 2 : U64
+        \\  n3 = Num.U64.plus(n1, n2) : U64 !spec
+        \\  n4 = Num.U64.times(n3, p0) : U64 !spec
+        \\  n5 = 1 : U64
+        \\  n6 = Num.U64.plus(n4, n5) : U64 !spec
+        \\  n7 = Num.U64.times(n6, p0) : U64 !spec
+        \\  value n7
+        \\
+    );
 }
 
 // An interpolated literal of the author's own type is converted in two stages

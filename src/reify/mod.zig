@@ -33,7 +33,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 11;
+pub const normal_form_version: u32 = 12;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -55,6 +55,9 @@ pub fn fingerprint() u64 {
     for (scalar.steps) |step| h.update(step);
     // The conditions `speculatable` and `speculatable_rest` read the cone.
     h.update("speculatable reads the operand cone");
+    // V3: the `outline` view, its K, its selection order and its hole numbering.
+    h.update("outline: cones, shapes by first-occurrence holes, (occurrences x (size - 1)) then size then shape");
+    h.update(std.mem.asBytes(&views.outline_min_size));
     return h.final();
 }
 
@@ -108,6 +111,9 @@ const recorded = [_]Recorded{
     // rejected literal's crash switches on the one value. The rules that are
     // algorithms are in the fingerprint.
     .{ .version = 11, .fingerprint = 0xd2ffdfc061a21e95 },
+    // M9 of the plan: the `outline` view (V3), which makes a row of every
+    // computation of at least K nodes that repeats, and its K.
+    .{ .version = 12, .fingerprint = 0x111ad83eee8dde24 },
 };
 
 const std = @import("std");

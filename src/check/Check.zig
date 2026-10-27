@@ -27531,7 +27531,7 @@ const StagedCode = struct {
     view: CodeReificationSite.View,
 };
 
-/// The function type inside a `Code(f)` or `Code.Inlined(f)` expected type,
+/// The function type inside a `Code(f)`, `Code.Inlined(f)` or `Code.Outlined(f)` expected type,
 /// with the view that type selects (plan 1.5).
 ///
 /// Returns null for every other expected type, so an ordinary expression in an
@@ -27566,6 +27566,8 @@ fn stagedCode(self: *Self, expected_var: Var) ?StagedCode {
         .graph
     else if (nominal.ident.ident_idx.eql(self.cir.idents.builtin_code_inlined))
         .inline_
+    else if (nominal.ident.ident_idx.eql(self.cir.idents.builtin_code_outlined))
+        .outline
     else
         return null;
     const args = self.types.sliceNominalArgs(nominal);

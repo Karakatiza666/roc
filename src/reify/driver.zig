@@ -76,6 +76,13 @@ pub const Stats = struct {
     components: u32 = 0,
     rounds: u32 = 0,
     max_component_rounds: u32 = 0,
+    /// For the `outline` view: the size of `inline` and of the result
+    /// (`views.siteSize`), the rows the passes made, and the passes that
+    /// chose a shape.
+    inline_size: views.SiteSize = .{},
+    outline_size: views.SiteSize = .{},
+    outline_rows: u32 = 0,
+    outline_passes: u32 = 0,
 };
 
 /// The components of the graph of `Call` and `Closure` references, callee
@@ -90,9 +97,17 @@ pub fn components(gpa: Allocator, store: *const ir.Store) Allocator.Error![][]Ro
 }
 
 /// Which rows the run leaves: the finalized rows, the `graph` view of them
-/// (V1), which a `Code(f)` site holds, or the `inline` view (V2), which a
-/// `Code.Inlined(f)` site holds.
-pub const View = enum { finalized, graph, inline_ };
+/// (V1), which a `Code(f)` site holds, the `inline` view (V2), which a
+/// `Code.Inlined(f)` site holds, or the `outline` view (V3), which a
+/// `Code.Outlined(f)` site holds.
+pub const View = enum { finalized, graph, inline_, outline };
+
+/// How a run builds its view.
+pub const Options = struct {
+    /// K of the `outline` view. Only the measurement of K reads another
+    /// value (`ROC_REIFY_OUTLINE_STATS`); the language version fixes it.
+    outline_min_size: u32 = views.outline_min_size,
+};
 
 /// Run the simplify, finalize, view and number stages over every row of
 /// `b`'s store, whose site has the root `root`. `b` builds no row now.
@@ -102,6 +117,12 @@ pub fn run(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass) Error
 
 /// `run`, leaving the rows at `view`.
 pub fn runTo(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass, view: View) Error!Stats {
+    return runToWith(gpa, b, root, passes, view, .{});
+}
+
+/// `runTo`, with `options`.
+pub fn runToWith(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass, view: View, options: Options) Error!Stats {
+    std.debug.assert(options.outline_min_size >= 3);
     const store = b.store;
     store.rows.items[root.index()].fixed_params = true;
     var stats: Stats = .{};
@@ -127,11 +148,20 @@ pub fn runTo(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass, vie
             try viewTurns(gpa, b, passes, &fin, root, &stats, views.singleUse);
             try viewTurns(gpa, b, passes, &fin, root, &stats, views.everyHelper);
         },
+        .outline => {
+            try viewTurns(gpa, b, passes, &fin, root, &stats, views.singleUse);
+            try viewTurns(gpa, b, passes, &fin, root, &stats, views.everyHelper);
+        },
     }
     if (special.failed) |err| return err;
+    // V3 runs over the `inline` view and makes rows that no simplify round
+    // built, so the rule checks below do not read the calls of its rows.
+    var outlined: std.ArrayList(RowId) = .empty;
+    defer outlined.deinit(gpa);
+    if (view == .outline) try outlineTurns(gpa, b, &fin, root, &stats, options.outline_min_size, &outlined);
     try numberStage(gpa, b);
     if (checks) {
-        try checkInvariants(gpa, store, b.types, root);
+        try checkInvariants(gpa, store, b.types, root, outlined.items);
         try checkFlatTrees(gpa, store, b.types);
         if (try rows.check(gpa, store, root)) |_| return error.InvariantBroken;
     }
@@ -186,33 +216,83 @@ fn viewTurns(
             defer p.deinit();
             try rebuild.run(gpa, b, &p, .{ .inline_rows = &inline_rows, .lambda_rows = &lambda_rows });
         }
-        // The rows the site reaches, finalized again callee first.
-        var reached: std.ArrayList(RowId) = .empty;
-        defer reached.deinit(gpa);
-        {
-            var numberings: ir.RowTable(number.Numbering) = .empty;
-            defer {
-                for (numberings.values()) |*n| n.deinit(gpa);
-                numberings.deinit(gpa);
-            }
-            var after = try live.Returns.init(gpa, store);
-            defer after.deinit(gpa);
-            try number.siteRows(gpa, store, &after, root, &numberings);
-            try reached.appendSlice(gpa, numberings.keys());
-        }
-        fin.registry.clearRetainingCapacity();
-        for (reached.items) |r| store.rows.items[r.index()].digest = null;
-        const g = try rows.graph(gpa, store, .references);
-        defer rows.freeGraph(gpa, g);
-        const comps = try rows.components(gpa, g, reached.items);
-        defer rows.freeComponents(gpa, comps);
-        for (comps) |comp| {
-            const changed = for (comp) |r| {
-                if (std.mem.findScalar(RowId, turn.callers, r) != null) break true;
-            } else false;
-            if (changed) try component(gpa, b, passes, fin, comp, stats) else try fin.finalize(b, comp);
-        }
+        try refinalize(gpa, b, passes, fin, root, stats, turn.callers);
     }
+}
+
+// The rows the site of `root` reaches, finalized again callee first, from a
+// registry of their own, because a caller's digest names its callees'. A
+// component that holds one of `changed` is simplified first.
+fn refinalize(gpa: Allocator, b: *Builder, passes: []const Pass, fin: *rows.Finalizer, root: RowId, stats: *Stats, changed: []const RowId) Error!void {
+    const store = b.store;
+    var reached: std.ArrayList(RowId) = .empty;
+    defer reached.deinit(gpa);
+    {
+        var numberings: ir.RowTable(number.Numbering) = .empty;
+        defer {
+            for (numberings.values()) |*n| n.deinit(gpa);
+            numberings.deinit(gpa);
+        }
+        var after = try live.Returns.init(gpa, store);
+        defer after.deinit(gpa);
+        try number.siteRows(gpa, store, &after, root, &numberings);
+        try reached.appendSlice(gpa, numberings.keys());
+    }
+    fin.registry.clearRetainingCapacity();
+    for (reached.items) |r| store.rows.items[r.index()].digest = null;
+    const g = try rows.graph(gpa, store, .references);
+    defer rows.freeGraph(gpa, g);
+    const comps = try rows.components(gpa, g, reached.items);
+    defer rows.freeComponents(gpa, comps);
+    for (comps) |comp| {
+        const simplified = for (comp) |r| {
+            if (std.mem.findScalar(RowId, changed, r) != null) break true;
+        } else false;
+        if (simplified) try component(gpa, b, passes, fin, comp, stats) else try fin.finalize(b, comp);
+    }
+}
+
+// V3 (`views.zig`): each pass makes a row of every shape it chose, copied
+// from the shape's first occurrence, rewrites each occurrence as a call of
+// it, and finalizes the site's rows again without simplifying them, until a
+// pass chooses nothing. Every pass lowers the site's size, so the passes end.
+fn outlineTurns(gpa: Allocator, b: *Builder, fin: *rows.Finalizer, root: RowId, stats: *Stats, min_size: u32, made: *std.ArrayList(RowId)) Error!void {
+    const store = b.store;
+    stats.inline_size = try views.siteSize(gpa, store, root);
+    var size = stats.inline_size;
+    while (true) {
+        var sel = try views.outlineSelect(gpa, store, b.types, root, min_size);
+        defer sel.deinit();
+        if (sel.shapes.len == 0) break;
+        const shape_rows = try gpa.alloc(RowId, sel.shapes.len);
+        defer gpa.free(shape_rows);
+        for (sel.shapes, shape_rows) |*shape, *row| {
+            var returns = try live.Returns.init(gpa, store);
+            defer returns.deinit(gpa);
+            var p = try place.planWith(gpa, store, &returns, shape.rep.row, .simplify, ties(b));
+            defer p.deinit();
+            row.* = try rebuild.cone(gpa, b, &p, shape.rep.root, &shape.nodes, shape.rep.holes, shape.lits, &shape.also);
+            try made.append(gpa, row.*);
+        }
+        for (sel.edits) |edit| {
+            var o: rebuild.Outlined = .{};
+            defer o.deinit(gpa);
+            for (edit.calls) |c| try o.calls.put(gpa, c.root, .{ .row = shape_rows[c.shape], .args = c.holes });
+            for (edit.skip) |n| try o.skip.put(gpa, n, {});
+            var returns = try live.Returns.init(gpa, store);
+            defer returns.deinit(gpa);
+            var p = try place.planWith(gpa, store, &returns, edit.row, .simplify, ties(b));
+            defer p.deinit();
+            try rebuild.run(gpa, b, &p, .{ .raw = true, .outlined = &o });
+        }
+        try refinalize(gpa, b, &.{}, fin, root, stats, &.{});
+        stats.outline_passes += 1;
+        stats.outline_rows += @intCast(sel.shapes.len);
+        const now = try views.siteSize(gpa, store, root);
+        if (checks and now.nodes >= size.nodes) return error.InvariantBroken;
+        size = now;
+    }
+    stats.outline_size = size;
 }
 
 // The rows calls specialize to (N8i, N8d), each built from a finalized
@@ -615,7 +695,7 @@ fn checkFlatTrees(gpa: Allocator, store: *const ir.Store, types: *types_mod.Type
     if (!report.ok()) return error.InvariantBroken;
 }
 
-fn checkInvariants(gpa: Allocator, store: *const ir.Store, types: *types_mod.Types, root: RowId) Error!void {
+fn checkInvariants(gpa: Allocator, store: *const ir.Store, types: *types_mod.Types, root: RowId, outlined: []const RowId) Error!void {
     var report = try verify.verifyAll(gpa, store, types);
     defer report.deinit();
     if (!report.ok()) return error.InvariantBroken;
@@ -631,7 +711,18 @@ fn checkInvariants(gpa: Allocator, store: *const ir.Store, types: *types_mod.Typ
         try number.siteRows(gpa, store, &returns, root, &reached);
         var nodes: std.ArrayList(ir.NodeId) = .empty;
         defer nodes.deinit(gpa);
-        for (reached.values()) |numbering| try nodes.appendSlice(gpa, numbering.order.items);
+        for (reached.values()) |numbering| for (numbering.order.items) |n| {
+            // A row `outline` made is not simplified, so N14a's check does not read its calls.
+            const nd = store.node(n);
+            if (nd.op == .call) {
+                const callee = ir.RowId.of(nd.payload);
+                const made = for (outlined) |o| {
+                    if (canonical(store, o) == callee) break true;
+                } else false;
+                if (made) continue;
+            }
+            try nodes.append(gpa, n);
+        };
         if (!try scalar.noneRewritable(gpa, store, types, nodes.items)) return error.InvariantBroken;
     }
     // L2: no loop of a finished row matches a loop rule.

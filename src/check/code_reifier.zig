@@ -8209,6 +8209,10 @@ pub const Walk = struct {
     through: ?Reifier.TypeRef = null,
     /// The view the site being walked declares (plan 1.5, V6).
     view: View = .graph,
+    /// Where set, the walk measures K (`ROC_REIFY_OUTLINE_STATS`): `finish`
+    /// prints the size of the site's `outline` view at this K and emits
+    /// nothing.
+    measure_k: ?u32 = null,
     /// Per view, digest of the rows a site's walk built, and digest of
     /// their nodes' origins: the `Graph` their normal form wrote in that
     /// view, and the origins of its nodes (P1). The walk is deterministic,
@@ -8430,12 +8434,20 @@ pub const Walk = struct {
     /// that needs more simplify rounds than the language version allows is
     /// refused at `region`.
     pub fn normalize(self: *Walk, root: RowId, region: base.Region) error{ Rejected, OutOfMemory }!void {
-        const site = self.site.?;
-        const view: reify.driver.View = switch (self.view) {
+        _ = try self.normalizeWith(root, region, viewOf(self.view), .{});
+    }
+
+    fn viewOf(view: View) reify.driver.View {
+        return switch (view) {
             .graph => .graph,
             .inline_ => .inline_,
+            .outline => .outline,
         };
-        _ = reify.driver.runTo(self.gpa, &site.builder, root, &.{}, view) catch |err| switch (err) {
+    }
+
+    fn normalizeWith(self: *Walk, root: RowId, region: base.Region, view: reify.driver.View, options: reify.driver.Options) error{ Rejected, OutOfMemory }!reify.driver.Stats {
+        const site = self.site.?;
+        return reify.driver.runToWith(self.gpa, &site.builder, root, &.{}, view, options) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.RoundBoundExceeded => {
                 self.rejection = .{ .kind = .bound_exceeded, .region = region, .detail = "simplify rounds per component" };
@@ -8457,6 +8469,17 @@ pub const Walk = struct {
     /// rule resolves, is refused at `region`.
     pub fn finish(self: *Walk, root: RowId, site_key: u64, region: base.Region) error{ Rejected, OutOfMemory }!ConstNodeId {
         const site = self.site.?;
+        if (self.measure_k) |k| {
+            const stats = try self.normalizeWith(root, region, .outline, .{ .outline_min_size = k });
+            std.debug.print("reify outline: site {d}..{d} K={d}: inline {d} nodes in {d} rows, outline {d} nodes in {d} rows, {d} rows made in {d} passes\n", .{
+                region.start.offset, region.end.offset, k,
+                stats.inline_size.nodes, stats.inline_size.rows,
+                stats.outline_size.nodes, stats.outline_size.rows,
+                stats.outline_rows, stats.outline_passes,
+            });
+            self.rejection = .{ .kind = .bound_exceeded, .region = region, .detail = "measured, not emitted" };
+            return error.Rejected;
+        }
         const walked = try reify.rows.walkedDigest(self.gpa, &site.store, &site.types, root);
         const memo_key = .{ self.view, walked ^ slotsDigest(&site.store), reify.provenance.digest(&site.store) };
         if (self.normalized.get(memo_key)) |memo| {
@@ -8475,7 +8498,7 @@ pub const Walk = struct {
         self.root = root;
         const graph = try emitter.graph(root);
         const digests: ?ConstNodeId = switch (self.view) {
-            .graph => null,
+            .graph, .outline => null,
             .inline_ => try emitter.digests(root),
         };
         try self.bindSlots(emitter.slot_order, region);
@@ -8677,35 +8700,23 @@ pub fn reifyModuleSites(
         const site_expr = local.bodies.exprIdAtRawNode(site.node_idx) orelse continue;
         const region = env.store.getRegionAt(@fromBackingInt(@intCast(site.node_idx)));
         const bound_call: ?u32 = if (site.bound_call == @import("can").NodeStore.CodeReificationSite.no_bound_call) null else site.bound_call;
+        // `ROC_REIFY_OUTLINE_STATS`: the site walked once per K it lists,
+        // each walk measured and dropped, before the walk that counts.
+        if (base.dev_diagnostics.get(.reify_outline_stats)) |list| {
+            var ks = std.mem.tokenizeScalar(u8, list, ',');
+            while (ks.next()) |text| {
+                const k = std.fmt.parseInt(u32, text, 10) catch continue;
+                if (k < 3) continue;
+                walk.beginSite(site.view, bound_call != null, reifier);
+                walk.measure_k = k;
+                defer walk.measure_k = null;
+                _ = try walkSite(gpa, &walk, reifier, module, local, site, site_expr, region, &call_args, &call_values);
+                freeSlotSources(gpa, walk.takeSlots());
+                gpa.free(try walk.takeReads());
+            }
+        }
         walk.beginSite(site.view, bound_call != null, reifier);
-        const outcome: Outcome = switch (site.kind) {
-            .named_function => try reifyNamedSite(&walk, reifier, module, local, site.node_idx, site.fn_var, region),
-            // The lambda is the root, and the site is where it is written, so
-            // the checked expression the node copied to is what the walk
-            // reads, and the `f` beside it is the type to read it at.
-            .inline_lambda => try reifier.reifyLambda(site_expr, .{
-                .scheme = null,
-                .in_block = true,
-                .caller = reifier,
-                .fixed = local.site_types.rootForSourceVar(
-                    module,
-                    ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(site.fn_var)))),
-                ),
-                .region = region,
-            }),
-            .template_call => try reifyTemplateSite(
-                gpa,
-                &walk,
-                reifier,
-                module,
-                local,
-                site.node_idx,
-                region,
-                &call_args,
-                &call_values,
-            ),
-            .template, .template_callee => unreachable, // template and template_callee sites were skipped by the continue above
-        };
+        const outcome = try walkSite(gpa, &walk, reifier, module, local, site, site_expr, region, &call_args, &call_values);
         const slots = walk.takeSlots();
         errdefer freeSlotSources(gpa, slots);
         const reads = try walk.takeReads();
@@ -8716,6 +8727,49 @@ pub fn reifyModuleSites(
     const outcomes = try results.toOwnedSlice(gpa);
     errdefer gpa.free(outcomes);
     return .{ .outcomes = outcomes, .provenance = try walk.published.toOwnedSlice(gpa) };
+}
+
+// The walk of one site, by its kind.
+fn walkSite(
+    gpa: Allocator,
+    walk: *Walk,
+    reifier: *Reifier,
+    module: anytype,
+    local: LocalSources,
+    site: @import("can").NodeStore.CodeReificationSite,
+    site_expr: CheckedExprId,
+    region: base.Region,
+    call_args: *std.ArrayList(CheckedExprId),
+    call_values: *std.ArrayList(Reifier.TemplateArg),
+) Allocator.Error!Outcome {
+    return switch (site.kind) {
+        .named_function => try reifyNamedSite(walk, reifier, module, local, site.node_idx, site.fn_var, region),
+        // The lambda is the root, and the site is where it is written, so
+        // the checked expression the node copied to is what the walk
+        // reads, and the `f` beside it is the type to read it at.
+        .inline_lambda => try reifier.reifyLambda(site_expr, .{
+            .scheme = null,
+            .in_block = true,
+            .caller = reifier,
+            .fixed = local.site_types.rootForSourceVar(
+                module,
+                ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(site.fn_var)))),
+            ),
+            .region = region,
+        }),
+        .template_call => try reifyTemplateSite(
+            gpa,
+            walk,
+            reifier,
+            module,
+            local,
+            site.node_idx,
+            region,
+            call_args,
+            call_values,
+        ),
+        .template, .template_callee => unreachable, // the caller skips template and template_callee sites
+    };
 }
 
 fn freeSlotSources(gpa: Allocator, slots: []SlotSource) void {
