@@ -401,7 +401,9 @@ pub const Constants = struct {
     /// 177: Normal form 14: a region's digest and its structural comparison
     ///      read its loops that can return, and two merged rows pair their
     ///      nodes for provenance by the comparison.
-    pub const CACHE_VERSION = 177;
+    /// 178: Normal form 15: `outline` matches places by anti-unification
+    ///      (V3b), so the rows of a `Code.Outlined` site change.
+    pub const CACHE_VERSION = 178;
 };
 
 /// Configuration for the Roc cache system.

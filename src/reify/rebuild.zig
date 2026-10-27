@@ -69,24 +69,44 @@ pub const Options = struct {
     /// Per node being copied: the nodes whose origins its copy also takes,
     /// because the copy stands for them too (V3).
     also: ?*const collections.DenseMapUnmanaged(NodeId, []const NodeId) = null,
+    /// The places a generalization copied into a row of its own (`cone`)
+    /// reads its holes at, which read the row's parameters (V3).
+    slots: ?*const HoleSlots = null,
 };
+
+/// Where the copy of a generalization reads its holes (V3): per node
+/// argument and per region end value, by `slotKey` of the node or the
+/// region and the position, the parameter. Two places that read one value
+/// can read two holes, so a hole is named by where it is read, not by the
+/// value.
+pub const HoleSlots = struct {
+    args: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    ends: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+};
+
+/// The key `HoleSlots` names position `index` of node or region `owner` by.
+pub fn slotKey(owner: u32, index: u32) u64 {
+    return @as(u64, owner) << 32 | index;
+}
 
 /// The key `Options.holes` names a value by.
 pub fn refKey(ref: Ref) u64 {
     return @bitCast(ref);
 }
 
-/// What `outline` replaces in one row (V3): each chosen cone, by its root,
-/// becomes a `Call` of the row made of it, and the cone's other nodes are
-/// not built, because only the cone reads them.
+/// What `outline` replaces in one row (V3): each chosen occurrence, by its
+/// root, becomes a `Call` of the row made of its generalization, and the
+/// other nodes of its image are not built, because only the image reads
+/// them.
 pub const Outlined = struct {
-    /// Per cone root: the row it calls and the values it passes, as values
-    /// of the row being copied.
+    /// Per root: the row it calls, the values it passes, as values of the row
+    /// being copied, and the nodes those values read from the image's
+    /// regions, which are built just before the call, in their order.
     calls: collections.DenseMapUnmanaged(NodeId, Call) = .empty,
-    /// The nodes that only the replaced cones read.
+    /// The nodes that only the replaced images read.
     skip: std.AutoHashMapUnmanaged(NodeId, void) = .empty,
 
-    pub const Call = struct { row: RowId, args: []const Ref };
+    pub const Call = struct { row: RowId, args: []const Ref, moved: []const NodeId };
 
     pub fn deinit(self: *Outlined, gpa: Allocator) void {
         self.calls.deinit(gpa);
@@ -152,40 +172,41 @@ pub fn into(
     return row;
 }
 
-/// V3: a new row whose body is the cone of `root`, a node of `p`'s row:
-/// `cone` holds the cone's nodes, `root` among them, and `holes` its
-/// stopping points in hole order, which become the row's parameters. The
-/// literals in `lits`, which the cone reads from the root's region or a
-/// region around it, are built first, in the body. The row's value is the
-/// root's. Nothing is simplified: the copy is the cone as it is. `b` builds
-/// no other row now.
-pub fn cone(
-    gpa: Allocator,
-    b: *Builder,
-    p: *const place.Plan,
+/// What `cone` copies (V3): a generalization, as the image of its root in
+/// the row of the plan.
+pub const Cone = struct {
     root: NodeId,
+    /// The image's nodes, `root` among them.
     nodes: *const std.AutoHashMapUnmanaged(NodeId, void),
-    holes: []const Ref,
+    /// The nodes of the root's cone the row does not build.
+    skip: []const NodeId,
+    /// The holes' types, in hole order: the row's parameters.
+    params: []const TyId,
+    /// Where the image reads the holes.
+    slots: *const HoleSlots,
+    /// The literals the image reads from the root's region or a region
+    /// around it, built first, in the body.
     lits: []const NodeId,
+    /// Per node and literal copied: the nodes its copy also stands for (N10).
     also: ?*const collections.DenseMapUnmanaged(NodeId, []const NodeId),
-) Allocator.Error!RowId {
+};
+
+/// V3: a new row whose body is the generalization `c`, copied from its
+/// image in `p`'s row. The row's value is the root's. Nothing is
+/// simplified: the copy is the image as it is. `b` builds no other row now.
+pub fn cone(gpa: Allocator, b: *Builder, p: *const place.Plan, c: Cone) Allocator.Error!RowId {
     const store = b.store;
-    const params = try gpa.alloc(TyId, holes.len);
-    defer gpa.free(params);
-    for (holes, params) |h, *t| t.* = store.refTy(p.row, h);
-    var values: std.AutoHashMapUnmanaged(u64, Ref) = .empty;
-    defer values.deinit(gpa);
-    for (holes, 0..) |h, i| try values.put(gpa, refKey(h), Ref.rowParam(@intCast(i)));
-    const result = store.tySlice(store.node(root).tys)[0];
-    const row = try b.beginRow(params, result);
-    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = p, .opts = .{ .raw = true, .holes = &values, .also = also }, .row_body = store.row(p.row).body };
+    const result = store.tySlice(store.node(c.root).tys)[0];
+    const row = try b.beginRow(c.params, result);
+    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = p, .opts = .{ .raw = true, .slots = c.slots, .also = c.also }, .row_body = store.row(p.row).body };
     defer r.deinit();
-    for (lits) |l| try r.node(l);
-    const home = store.node(root).region;
+    for (c.skip) |n| try r.skipped.put(gpa, n, {});
+    for (c.lits) |l| try r.node(l);
+    const home = store.node(c.root).region;
     for (p.membersOf(home)) |m| {
-        if (nodes.contains(m) and !r.nodes.contains(m)) try r.node(m);
+        if (c.nodes.contains(m) and !r.nodes.contains(m)) try r.node(m);
     }
-    try b.endRow(.{ .value = &.{r.mapRef(Ref.of(root))} });
+    try b.endRow(.{ .value = &.{r.mapRef(Ref.of(c.root))} });
     return row;
 }
 
@@ -583,6 +604,18 @@ const Rebuild = struct {
         return self.frames.items[self.frames.items.len - 1];
     }
 
+    // V3: the parameter a generalization's copy reads at position `index`
+    // of node or region `owner`, where a hole stands.
+    fn holeAt(self: *const Rebuild, comptime which: enum { args, ends }, owner: u32, index: u32) ?Ref {
+        const slots = self.opts.slots orelse return null;
+        const table = switch (which) {
+            .args => &slots.args,
+            .ends => &slots.ends,
+        };
+        const hole = table.get(slotKey(owner, index)) orelse return null;
+        return Ref.rowParam(@intCast(hole));
+    }
+
     fn mapRefs(self: *const Rebuild, refs: []const Ref) Allocator.Error![]Ref {
         const out = try self.gpa.alloc(Ref, refs.len);
         for (refs, out) |r, *o| o.* = self.mapRef(r);
@@ -635,8 +668,12 @@ const Rebuild = struct {
             break :blk out;
         } else try self.gpa.dupe(Ref, old_refs);
         defer self.gpa.free(picked);
-        const refs = try self.mapRefs(picked);
+        const refs = try self.gpa.alloc(Ref, picked.len);
         defer self.gpa.free(refs);
+        for (picked, refs, 0..) |x, *o, i| {
+            const old: u32 = if (select) |sel| sel[i] else @intCast(i);
+            o.* = if (self.holeAt(.ends, r.index(), old)) |hole| hole else self.mapRef(x);
+        }
         const spec: EndSpec = switch (end.kind) {
             .open => unreachable, // ends of the old rows are closed
             .value => .{ .value = refs },
@@ -844,6 +881,8 @@ const Rebuild = struct {
         // V3: a cone `outline` chose is a call of the row made of it, which
         // reads the cone's holes and none of its own nodes.
         if (self.opts.outlined) |o| if (o.calls.get(n)) |c| {
+            // The values that move out of the image's regions come first.
+            for (c.moved) |m| if (!self.nodes.contains(m) and !self.skipped.contains(m)) try self.node(m);
             const origins = try self.originsOf(n);
             defer self.gpa.free(origins);
             const outer = self.here;
@@ -860,8 +899,9 @@ const Rebuild = struct {
         };
         const old_regions = try self.gpa.dupe(RegionId, s.regionSlice(nd.regions));
         defer self.gpa.free(old_regions);
-        const args = try self.mapRefs(old_args);
+        const args = try self.gpa.alloc(Ref, old_args.len);
         defer self.gpa.free(args);
+        for (old_args, args, 0..) |x, *o, j| o.* = if (self.holeAt(.args, n.index(), @intCast(j))) |hole| hole else self.mapRef(x);
         const origins = try self.originsOf(n);
         defer self.gpa.free(origins);
         const outer = self.here;

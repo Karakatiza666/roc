@@ -8472,10 +8472,10 @@ pub const Walk = struct {
         const site = self.site.?;
         if (self.measure_k) |k| {
             const stats = try self.normalizeWith(root, region, .outline, .{ .outline_min_size = k });
-            std.debug.print("reify outline: site {d}..{d} K={d}: inline {d} nodes in {d} rows, outline {d} nodes in {d} rows, {d} rows made in {d} passes\n", .{
+            std.debug.print("reify outline: site {d}..{d} K={d}: inline {d} nodes and {d} call arguments in {d} rows, outline {d} nodes and {d} call arguments in {d} rows, {d} rows made in {d} passes\n", .{
                 region.start.offset, region.end.offset, k,
-                stats.inline_size.nodes, stats.inline_size.rows,
-                stats.outline_size.nodes, stats.outline_size.rows,
+                stats.inline_size.nodes, stats.inline_size.args, stats.inline_size.rows,
+                stats.outline_size.nodes, stats.outline_size.args, stats.outline_size.rows,
                 stats.outline_rows, stats.outline_passes,
             });
             self.rejection = .{ .kind = .bound_exceeded, .region = region, .detail = "measured, not emitted" };

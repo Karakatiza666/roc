@@ -34,7 +34,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 14;
+pub const normal_form_version: u32 = 15;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -59,6 +59,10 @@ pub fn fingerprint() u64 {
     // V3: the `outline` view, its K, its selection order and its hole numbering.
     h.update("outline: cones, shapes by first-occurrence holes, (occurrences x (size - 1)) then size then shape");
     h.update(std.mem.asBytes(&views.outline_min_size));
+    // V3b: places grouped by keys to depth D and generalized by
+    // anti-unification, under the rules that keep meaning.
+    h.update("outline: keys to depth D, then at depth D with literal values, least general generalization, a hole moves only a speculatable value, literals that differ are a hole, c(s - 1) - ch then s then shape then place then depth");
+    h.update(std.mem.asBytes(&views.outline_key_depth));
     // M10: layer L, the laws a `Code.Lawful(f)` site opts into.
     for (laws.steps) |step| h.update(step);
     // A region's loops that can return, read or not, are in its digest and
@@ -130,6 +134,11 @@ const recorded = [_]Recorded{
     // such a loop keeps both arms, and two merged rows pair their nodes for
     // provenance by the comparison (N8g, N10).
     .{ .version = 14, .fingerprint = 0xcbb8426dfd39556b },
+    // V3b: `outline` matches places by anti-unification, so places that
+    // differ in a value, a differing literal among them, are one row whose
+    // parameter is that value, and a hole moves only a speculatable value
+    // out of an arm or a loop body. Places are grouped by keys to depth D.
+    .{ .version = 15, .fingerprint = 0xf9ae43f95561a55e },
 };
 
 const std = @import("std");

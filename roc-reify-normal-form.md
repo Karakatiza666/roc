@@ -1551,50 +1551,110 @@ The rule:
    in the same region or in regions it owns, stopping at parameters, slots, and
    nodes that something outside the cone also reads. A cone is a tree of work
    whose only inputs are its stopping points.
-2. **Shapes.** A cone's shape hash is computed bottom-up from ops, types and
-   argument shapes, with each stopping point replaced by a hole numbered in
-   the order of its first occurrence. So `a * a + b` and `c * c + d` share a
-   shape, and `a * b + c` does not.
-3. **Candidates.** A shape is a candidate if it occurs at two or more
-   non-overlapping places, anywhere in `inline`, and its cone has at least K
-   nodes.
-4. **Selection.** Candidates are taken in order of (occurrences × (size − 1))
-   descending, then size descending, then shape hash. A candidate is taken
-   unless one of its occurrences overlaps an occurrence already taken, in which
-   case only its non-overlapping occurrences count, and it is taken if two
-   remain.
-5. **Rows.** Each chosen shape becomes a row whose parameters are its holes in
-   hole order, and each occurrence becomes a `Call` with the stopping points as
-   arguments. Then the whole rule runs again on the result, so repetition
-   inside the new rows is found too. Each pass removes nodes, so it terminates.
-6. **Numbering.** N9 numbers the result, and rows are identified by digest as
+2. **Places and keys.** A place is a node whose cone has at least K nodes and
+   can be a row (the table below). The key of a place at depth d reads its
+   cone from the root down to depth d: the op, payload, types and immediates
+   of each node at depth d or less, a literal by its type alone, and every
+   other value (a stopping point, a node deeper than d, a region parameter) as
+   a leaf, by its type and its number in the order of first occurrence. One
+   more key, at depth D + 1, is the key at depth D that also reads each
+   literal's value. The places are sorted by their keys at depths 0 to D + 1,
+   then by site order. A group at depth d is a run of two or more places with
+   one key at every depth up to d. A run equal to the run at depth d - 1 that
+   holds it is that group. So groups at different depths hold one another,
+   and a group splits only in this way: selection takes the depth that gains
+   most. The last depth keeps places that differ only in their literals apart
+   from the ones that do not, so a literal hole never hides a row without
+   one. D is 3.
+3. **Generalization.** The generalization of a group is the least general
+   generalization (Plotkin) of its places. A walk visits the cones of all
+   places in step from their roots. It meets tuples of values, one value per
+   place, and gives each tuple one of these kinds:
+
+   | Tuple | Kind |
+   |---|---|
+   | nodes of the places' cones with one op, payload, types, immediates, output and region shape (region kinds, parameter types, end kind, counts) | a node of the generalization; the walk goes on into its arguments and regions |
+   | literals with one value | a literal, copied into the row |
+   | parameters at one place of regions of one node of the generalization | that parameter |
+   | anything else | a hole |
+
+   One tuple is one hole, so a hole that is the same value at every place is
+   one parameter: `a * a + b` and `c * c + d` give `h0 * h0 + h1`, and
+   `a * b + c` with `a * a + d` gives `h0 * h1 + h2`. The values of a hole
+   have one type. Holes are numbered in the order the walk first meets them:
+   depth first, a node's arguments in order, then per region its end and the
+   nodes nothing reads.
+4. **Holes that keep meaning.** A `Call` evaluates its arguments before its
+   body. So a hole moves its values out of the cone into the caller, ahead of
+   the call. These rules make a tuple a hole, or stop it from being one, and
+   the walk runs again until none applies:
+
+   | Rule | Why |
+   |---|---|
+   | a node of a place that the walk meets in two tuples of nodes, or in a tuple of nodes and a hole, is a hole wherever it is met | otherwise the row evaluates it twice where the place evaluated it once |
+   | a node that the value of a hole reads at a place, and that a tuple of nodes holds, is a hole | otherwise the caller and the row both evaluate it |
+   | no speculation: a value of a hole at a place is a stopping point, a literal, a node in the region of the place's root, or a node whose region is inside the cone and that moves: it, and every node it reads in such a region, is speculatable, owns no region, and reads no parameter of a region inside the cone. Otherwise the tuples of nodes that read the hole are holes | a stopping point and a node in the root's region run on every path where the root runs; a literal and a speculatable node cannot crash, so evaluating them where the place did not is allowed. This keeps the promise of this section: nothing that can fail runs where it did not |
+   | a tuple that is not a node at a place that cannot be a hole (a parameter of a region of the generalization, the target of a `Jump` or a `Branch`, a node nothing reads) makes the tuple of nodes that holds the place a hole | such a place is not a value the caller can pass |
+
+   The group has no generalization when its roots become a hole. A place whose
+   image (the nodes its tuples of nodes hold) meets the image of an earlier
+   place in site order, or of a taken occurrence, leaves the group, and the
+   generalization is computed again.
+5. **Candidates.** With c places, s nodes in the generalization (literals not
+   counted) and h holes, the gain is c × (s - 1) - c × h: each place saves its
+   s nodes but one, and passes h arguments. A group is a candidate when c ≥ 2,
+   s ≥ K and the gain is above 0.
+6. **Selection.** Candidates are taken in order of gain descending, then s
+   descending, then the hash of the generalization's shape, then the first
+   place in site order, then the depth. A candidate whose evaluation predates a
+   take is evaluated again against the occurrences taken since, and goes back
+   into the order; a candidate is taken when its evaluation is current.
+7. **Rows.** Each chosen generalization becomes a row whose parameters are its
+   holes in hole order, copied from its first place. Each place becomes a
+   `Call` with the values of its holes as arguments, and a value that moves is
+   built just before the call. Then the whole rule runs again on the result,
+   so repetition inside the new rows is found too.
+8. **Numbering.** N9 numbers the result, and rows are identified by digest as
    in 3.8.
 
 The rule preserves meaning because a `Call` evaluates its body where the cone
-stood: every node runs in the same region as before, so nothing speculates. It never outlines across a recursive component, because
-`inline` never breaks one.
+stood, and its arguments just before: every node of the generalization runs in
+the same region as before, and a value that moves is speculatable (rule 4), so
+nothing that can fail speculates. It never outlines across a recursive
+component, because `inline` never breaks one.
+
+Each pass terminates and the passes end. A take of c places of a
+generalization with s nodes and h holes removes c × s nodes and adds s nodes
+in the row and c calls, so the node count falls by (c - 1)(s - 1) - 1, at
+least 2. The size the debug check reads counts the arguments of calls too, as
+3 × nodes + arguments. A positive gain means h ≤ s - 2, so a take lowers it by
+at least 3(cs - s - c) - c(s - 2) = s(2c - 3) - c, which is above 0 for
+c ≥ 2 and s ≥ 3. A hole argument counts less than a node because it is a
+reference, not work: counted alike, two calls of `ripple` (`examples/reifying/glsl/`),
+4 nodes over 2 holes, would not lower the size.
 
 | Gain | Cost |
 |---|---|
 | functions in the output, identical under every refactor in R | the functions are not the author's, so emitted GLSL is harder to read; the dump maps them back |
 | bounded output size: inlining a call tree duplicates bodies, exponentially in the worst case, and outlining shares them again | stability is global: adding one use of a shape anywhere can change which rows are chosen everywhere, on a real edit, never on a refactor in R |
-| O(n log n) per pass over the size of `inline` | `inline` has to be materialized first, which is the expensive step |
+| a helper called over different arguments (`step(input.a)` and `step(input.b)`) is one row | per pass, O(D × m log m) for the keys of m nodes, plus the walks of the groups (below) |
 
-K, the selection order and the hole numbering are part of the language
-version, like R.
+K, D, the gain, the selection order and the hole numbering are part of the
+language version, like R.
 
-`src/reify/views.zig` (`outlineSelect`) builds the rule (M9 of the plan). K
-is 4 (`views.outline_min_size`). The rule above leaves these points open, and
-the build reads them as the table says:
+`src/reify/views.zig` (`outlineSelect`) builds the rule (M9 and V3b of the
+plan). K is 4 (`views.outline_min_size`) and D is 3 (`views.outline_key_depth`).
+The rule above leaves these points open, and the build reads them as the
+table says:
 
 | Point | Reading |
 |---|---|
-| literals | a literal is not a stopping point. It is copied into every cone that reads it, its value is part of the shape, and it does not count in the size. So `x * 3` and `x * 4` have two shapes |
-| which cones a row can be | a cone with one output, no `Return` to the row, no `Continue` or `Break` of a loop outside it, no `Jump` to a join outside it, and no `Call` or `Closure` of its own recursive component. Other cones are not candidates |
-| when two places are one shape | equal shape hashes, and then a walk of the two cones that compares them node by node. A collision of hashes is not a match |
-| overlap | a place overlaps a taken place when one cone holds the root of the other |
-| the end of a pass | the made rows and their callers are finalized again (3.8), and the next pass reads the result. The pass stops when it takes no shape. A debug check asserts that each pass makes the site smaller |
-| cost | O(m log m) per pass for m nodes, plus the hole lists of the places |
+| literals | a literal is not a stopping point, and it does not count in the size. Literals with one value at every place are copied into the row. Literals that differ are a hole, whose argument is the literal: a literal cannot crash, so the hole is always allowed, and the row keeps the node that reads it. Stopping above the literal would cost the same argument and lose that node. So `x * 3` and `x * 4` generalize to `x * h0` |
+| which cones a row can be | a cone with one output, no `Return` to the row, no `Continue` or `Break` of a loop outside it, no `Jump` to a join outside it, and no `Call` or `Closure` of its own recursive component. Other nodes are not places |
+| keys | a key is a hash, so two keys can collide. A collision only puts places in one group; the walk compares values, so it never treats two computations as one |
+| overlap | a place overlaps a taken occurrence when their images share a node. A place whose root is a value of a hole of another, or the other way round, does not overlap it: the outer call reads the inner one |
+| the end of a pass | the made rows and their callers are finalized again (3.8), and the next pass reads the result. The pass stops when it takes nothing. A debug check asserts that each pass lowers 3 × nodes + call arguments (`views.SiteSize`) |
+| cost | the keys are O(m × a^D) for nodes of at most a arguments, the sort O(D × m log m). A walk of a group of c places is O(c × w) for w tuples, run once per rule 4 round and once per change of the group's places; a round adds at least one hole. Selection evaluates a candidate again after each take that predates its evaluation |
 
 ### 5.4 Rebuilding expression trees
 
@@ -2059,7 +2119,7 @@ for all three.
 | Should layer L ship with the first version? | it is separable: N1 to N15 stand without it. Shipping it later is a versioned change of R, like any law added after |
 | Which laws belong in L? | the five of 3.16 are the ones a loop-to-builtin refactor needs, and N16f adds `len() > 0` and `len() == 0` against `is_empty()`. Further candidates are theorems about builtins that the library would have to state and test |
 | Commutative operators? | only leaf pairs, by N15c: a literal last, the root's parameters in order. The rest is left out (7.2). Revisit only if real translators show that authors reorder other operands |
-| What is K in `outline`? | decided for now: K = 4, measured on the examples (table below). K must be 3 or more, so that a pass makes the site smaller. The examples do not tell 3, 4 and 5 apart, and 4 keeps a repeated `a * b + c` inline. Measure again when a translator reads `outline`. The measurement found a larger question: a cone takes in every argument that only it reads, so `step(input.a)` and `step(input.b)` have two shapes, because each cone holds its own field read. `outline` recovers a repeated helper only when the places read the same kinds of computation. Options: keep maximal cones; cut each cone at the roots of other candidate cones; or match places by anti-unification, which makes the differing arguments holes |
+| What is K in `outline`? | decided for now: K = 4, measured on the examples (table below). K must be 3 or more, so that a pass lowers the site's measure. The examples do not tell 3 and 4 apart, and K = 5 loses the one row of the GLSL example. The measurement of M9 found that a cone takes in every argument only it reads, so `step(input.a)` and `step(input.b)` had two shapes. V3b answers it by anti-unification (5.3, rules 3 and 4): the differing arguments are holes, so both are one row, and the GLSL shader's two calls of `ripple` are one row. Measure again when a translator reads `outline` |
 | Should `graph` inline single-use rows? | yes in this design, because it moves the most common helper extraction into tier A. The price is that a GLSL translator reading `graph` never emits a function the author called once |
 | Do translators need names for emitted identifiers? | no in this design: the dump and provenance cover debugging. A name exposed for emission becomes observable again |
 | Should the rules be derived rather than accumulated? | yes: the gate of `roc-reify-rule-derivation.md` section 6 passed on 2026-09-27. That document defines an offline tool, `zig build reify-rules`, that finds unjoined critical pairs and equal small terms that normalize apart, proves them in a most-defined semantics in which every rule is an equation, and writes the first-order rules as table rows. After the gate, a tier F rule enters the table through the tool, and a hand-written tier F row, such as N15a's rows over operand runs, states its reason |
@@ -2067,21 +2127,29 @@ for all three.
 | Where does the `graph` view stop being worth it? | if no translator ends up reading it, drop it and keep only `inline`; the normal form's definition does not change |
 
 K was measured with `ROC_REIFY_OUTLINE_STATS=3,4,5,6,8,12` (a Debug compiler
-only), which reifies each site in `outline` at each K and prints its size.
-"Nodes" counts the nodes of all rows of all sites. "Rows" counts the rows that
-`outline` made.
+only), which reifies each site in `outline` at each K and prints its size,
+over `roc check` of each `main.roc` and of each fixture. "Nodes" counts the
+nodes of all rows of all sites, literals not counted. "Rows" counts the rows
+that `outline` made. The measurement is of normal form 15 (V3b).
 
 | Source | Sites | Nodes in `inline` | K = 3 | K = 4 | K = 5 | K = 6, 8, 12 |
 |---|---|---|---|---|---|---|
-| `examples/reifying/glsl/` | 8 | 165 | 165, 0 rows | 165, 0 rows | 165, 0 rows | 165, 0 rows |
+| `examples/reifying/glsl/` | 8 | 165 | 163, 1 row | 163, 1 row | 165, 0 rows | 165, 0 rows |
 | `examples/reifying/sql/` | 42 | 141 | 141, 0 rows | 141, 0 rows | 141, 0 rows | 141, 0 rows |
 | `examples/reifying/dbsp/` | 22 | 107 | 107, 0 rows | 107, 0 rows | 107, 0 rows | 107, 0 rows |
 | `examples/reifying/hello/` | 3 | 6 | 6, 0 rows | 6, 0 rows | 6, 0 rows | 6, 0 rows |
-| `test/cli/Staged*.roc` | 133 | 510 | 495, 5 rows | 495, 5 rows | 495, 5 rows | 510, 0 rows |
+| `test/cli/Staged*.roc` | 153 | 584 | 569, 5 rows | 569, 5 rows | 569, 5 rows | 584, 0 rows |
 
-The five rows of the fixtures are all in `test/cli/StagedOutlinedView.roc`.
-The GLSL shader calls `ripple` three times, but over different field reads,
-so no two cones have one shape (the open question on K above).
+The GLSL row is `ripple`: the shader `rippled` calls it twice over two field
+reads, `frag.fragTexCoord.y` and `frag.fragTexCoord.x`, and `settings.time * 2.0`
+is one value at both places. The row has 4 nodes and 2 holes, the field read
+and the shared product, and the site falls from 16 nodes to 14. No other site
+of the examples repeats a computation of 3 nodes or more. The five rows of the
+fixtures are all in `test/cli/StagedOutlinedView.roc`, as in M9. The
+`step(input.a)` and `step(input.b)` pair of the M9 measurement is not in an
+example (the DBSP example calls `step` at run time, not at a `Code` site);
+`L3 V3b` in `src/compile/test/code_reifier_test.zig` holds it, and it is one
+row.
 
 ---
 

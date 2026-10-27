@@ -257,10 +257,11 @@ fn refinalize(gpa: Allocator, b: *Builder, passes: []const Pass, fin: *rows.Fina
     }
 }
 
-// V3 (`views.zig`): each pass makes a row of every shape it chose, copied
-// from the shape's first occurrence, rewrites each occurrence as a call of
+// V3 (`views.zig`): each pass makes a row of every generalization it chose,
+// copied from its first occurrence, rewrites each occurrence as a call of
 // it, and finalizes the site's rows again without simplifying them, until a
-// pass chooses nothing. Every pass lowers the site's size, so the passes end.
+// pass chooses nothing. Every pass lowers the site's measure
+// (`views.SiteSize.measure`), so the passes end.
 fn outlineTurns(gpa: Allocator, b: *Builder, fin: *rows.Finalizer, root: RowId, stats: *Stats, min_size: u32, made: *std.ArrayList(RowId)) Error!void {
     const store = b.store;
     stats.inline_size = try views.siteSize(gpa, store, root);
@@ -276,13 +277,21 @@ fn outlineTurns(gpa: Allocator, b: *Builder, fin: *rows.Finalizer, root: RowId, 
             defer returns.deinit(gpa);
             var p = try place.planWith(gpa, store, &returns, shape.rep.row, .simplify, ties(b));
             defer p.deinit();
-            row.* = try rebuild.cone(gpa, b, &p, shape.rep.root, &shape.nodes, shape.rep.holes, shape.lits, &shape.also);
+            row.* = try rebuild.cone(gpa, b, &p, .{
+                .root = shape.rep.root,
+                .nodes = &shape.nodes,
+                .skip = shape.skip,
+                .params = shape.params,
+                .slots = &shape.slots,
+                .lits = shape.lits,
+                .also = &shape.also,
+            });
             try made.append(gpa, row.*);
         }
         for (sel.edits) |edit| {
             var o: rebuild.Outlined = .{};
             defer o.deinit(gpa);
-            for (edit.calls) |c| try o.calls.put(gpa, c.root, .{ .row = shape_rows[c.shape], .args = c.holes });
+            for (edit.calls) |c| try o.calls.put(gpa, c.root, .{ .row = shape_rows[c.shape], .args = c.holes, .moved = c.moved });
             for (edit.skip) |n| try o.skip.put(gpa, n, {});
             var returns = try live.Returns.init(gpa, store);
             defer returns.deinit(gpa);
@@ -294,7 +303,7 @@ fn outlineTurns(gpa: Allocator, b: *Builder, fin: *rows.Finalizer, root: RowId, 
         stats.outline_passes += 1;
         stats.outline_rows += @intCast(sel.shapes.len);
         const now = try views.siteSize(gpa, store, root);
-        if (checks and now.nodes >= size.nodes) return error.InvariantBroken;
+        if (checks and now.measure() >= size.measure()) return error.InvariantBroken;
         size = now;
     }
     stats.outline_size = size;

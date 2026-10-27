@@ -45,7 +45,7 @@ Legend
 | --- | --- | --- |
 | `graph` | `Code(f)`, read with `Code.graph` | A recursive row, a row called from two or more places, a row a `Closure` names, and a row that holds a `Return` in a loop or in a switch arm. |
 | `inline` | `Code.Inlined(f)`, read with `Code.Inlined.inline` | A recursive row, and a row that holds a `Return` in a loop or in a switch arm. Every other row is inlined, and a `Closure` of any non-recursive row is a `Lambda` region. |
-| `outline` | `Code.Outlined(f)`, read with `Code.Outlined.outline` | The rows of `inline`, and one row for each computation of at least four nodes that occurs at two or more places (`roc-reify-normal-form.md` 5.3). A computation that holds a `Return`, or a `Continue`, `Break` or `Jump` to outside itself, is not made a row. |
+| `outline` | `Code.Outlined(f)`, read with `Code.Outlined.outline` | The rows of `inline`, and one row for each computation of at least four nodes that occurs at two or more places (`roc-reify-normal-form.md` 5.3). The places are matched by anti-unification: where they differ in a value, the value is a parameter of the row, and only a speculatable value moves out of an arm or a loop body to be passed. A computation that holds a `Return`, or a `Continue`, `Break` or `Jump` to outside itself, is not made a row. |
 | `lawful` | `Code.Lawful(f)`, read with `Code.Lawful.graph` | The rows of `graph`, normalized with the laws of layer L as well (`roc-reify-normal-form.md` 3.16). A row a raised loop or a fused `map` calls is a row a `Closure` names. |
 
 The `graph` view inlines a helper called from one place, unless the helper

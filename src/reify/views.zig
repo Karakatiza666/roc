@@ -137,65 +137,82 @@ fn turnOf(gpa: Allocator, store: *const ir.Store, root: RowId, kind: Kind) Alloc
 // | Step | Here |
 // |---|---|
 // | cones | `Analysis.forest`: a node's cone is its subtree in a forest whose parent of a node is the nearest node that every reader of it lies under, at a region the node's region is in or inside |
-// | shapes | `Analysis.shapeOf`: per node, from its content and its children's shapes, with each stopping point a hole numbered by first occurrence |
-// | candidates | `outlineSelect`: a shape at two or more places whose cone has at least K nodes |
-// | selection | `outlineSelect`: (occurrences x (size - 1)) descending, then size descending, then shape ascending; a candidate keeps its occurrences that overlap none already taken |
-// | rows | `driver.zig`: each chosen shape becomes a row over its holes (`rebuild.cone`), each occurrence a `Call` of it, and the passes repeat until none is chosen |
+// | places and keys | `Analysis.keyOf`: per place and depth d, the cone read down to depth d, with every other value a leaf numbered by first occurrence |
+// | groups | `outlineSelect`: runs of one key at every depth up to d among the places sorted by their keys, for d from 0 to D |
+// | generalization | `Gen.evaluate`: the least general generalization of a group (`Gen.round`), with the rules that keep meaning (`Gen.rules`) run until none applies, and the places whose images overlap left out |
+// | selection | `outlineSelect`: gain c(s - 1) - ch descending, then s descending, then shape, first place and depth ascending; a candidate whose evaluation predates a take is evaluated again |
+// | rows | `driver.zig`: each chosen generalization becomes a row (`rebuild.cone`), each place a `Call` of it, and the passes repeat until none is chosen |
 //
 // A cone stops at row parameters, input slots, the parameters of a region
 // no node of the cone owns, and nodes something outside the cone reads. A
 // literal is part of every cone that reads it, as `to_tree` substitutes it
 // at every read (normal-form 5.4), and a cone's size does not count it. A
-// cone is a candidate only when outlining it keeps its meaning: its root has
+// cone is a place only when outlining it keeps its meaning: its root has
 // one output, no region in it ends by leaving it (a `Return` of the row, a
 // `Continue` or `Break` of a loop outside it, a `Jump` to a join outside
 // it), and, in a recursive row, it calls or names no row of that row's
 // component, so outlining never joins a new row to a recursive component.
 
-/// K: the least size of a cone `outline` makes a row of, literals not
-/// counted. A constant of the language version (normal-form 5.3). It is at
-/// least 3, so every pass removes nodes: c occurrences of a cone of size s
-/// leave c calls and one row of s nodes, and (c - 1)(s - 1) > 1.
+/// K: the least size of a generalization `outline` makes a row of, literals
+/// not counted. A constant of the language version (normal-form 5.3). It is
+/// at least 3, so every take lowers the site's measure (`SiteSize.measure`).
 pub const outline_min_size: u32 = 4;
+
+/// D: the deepest key places are grouped by (normal-form 5.3, rule 2). A
+/// constant of the language version.
+pub const outline_key_depth: u32 = 3;
 
 comptime {
     std.debug.assert(outline_min_size >= 3);
 }
 
-/// One pass of `outline`: the shapes it chose, in selection order, and per
-/// row that holds an occurrence, what the row's copy replaces.
+/// One pass of `outline`: the generalizations it chose, in selection order,
+/// and per row that holds an occurrence, what the row's copy replaces.
 pub const Selection = struct {
     arena: std.heap.ArenaAllocator,
     shapes: []const Chosen = &.{},
     edits: []const Edit = &.{},
 
-    /// One place a shape occurs at: its root, in its row, and the stopping
-    /// points of its cone in hole order.
-    pub const Occurrence = struct { row: RowId, root: NodeId, holes: []const Ref };
+    /// One place a generalization is taken at: its root, in its row, the
+    /// values of its holes in hole order, and the values that move out of
+    /// its cone, which the caller builds just before the call, in site order.
+    pub const Occurrence = struct { row: RowId, root: NodeId, holes: []const Ref, moved: []const NodeId };
 
-    /// A chosen shape. Its row is copied from `rep`, the first of its
-    /// occurrences in site order.
+    /// A chosen generalization. Its row is copied from `rep`, the first of
+    /// its occurrences in site order.
     pub const Chosen = struct {
         rep: Occurrence,
-        /// The nodes of `rep`'s cone, its root among them.
+        /// The nodes of `rep`'s image, which the row copies, its root among them.
         nodes: std.AutoHashMapUnmanaged(NodeId, void),
-        /// The literals `rep`'s cone reads from its root's region or a region
-        /// around it, in site order.
+        /// The nodes of `rep`'s cone the row does not build: those its
+        /// caller keeps, and the literals in the image's regions that only
+        /// they read.
+        skip: []const NodeId,
+        /// Per hole, in hole order: its type.
+        params: []const TyId,
+        /// Where `rep`'s image reads a hole.
+        slots: rebuild.HoleSlots,
+        /// The literals the image reads from its root's region or a region
+        /// around it, in site order, which the row builds in its body.
         lits: []const NodeId,
-        /// Per node of `rep`'s cone: the nodes of the other occurrences it
-        /// stands for, whose origins its copy takes too (N10).
+        /// Per node of `rep`'s image, and per literal it copies: the nodes
+        /// of the other occurrences it stands for, whose origins its copy
+        /// takes too (N10).
         also: collections.DenseMapUnmanaged(NodeId, []const NodeId),
         occurrences: []const Occurrence,
+        /// Per occurrence: the nodes of its image but its root, which its
+        /// caller does not build.
+        images: []const []const NodeId,
     };
 
     /// One row's occurrences: each root becomes a `Call` of shape `shape`'s
-    /// row over its holes, and `skip` holds the nodes only those cones read.
+    /// row over its holes, and `skip` holds the nodes only those images read.
     pub const Edit = struct {
         row: RowId,
         calls: []const Call,
         skip: []const NodeId,
 
-        pub const Call = struct { root: NodeId, shape: u32, holes: []const Ref };
+        pub const Call = struct { root: NodeId, shape: u32, holes: []const Ref, moved: []const NodeId };
     };
 
     pub fn deinit(self: *Selection) void {
@@ -203,9 +220,21 @@ pub const Selection = struct {
     }
 };
 
-/// The size of a site: the rows it reaches, and their nodes, literals not
-/// counted, which every pass of `outline` lowers.
-pub const SiteSize = struct { nodes: u32 = 0, rows: u32 = 0 };
+/// The size of a site: the rows it reaches, their nodes, literals not
+/// counted, and the arguments of their calls.
+pub const SiteSize = struct {
+    nodes: u32 = 0,
+    rows: u32 = 0,
+    args: u32 = 0,
+
+    /// What every pass of `outline` lowers (normal-form 5.3): a node weighs
+    /// three and an argument one. A take of c places of a generalization of
+    /// s nodes and h holes, with a positive gain, so h <= s - 2, lowers it
+    /// by at least s(2c - 3) - c, which is above 0 for c >= 2 and s >= 3.
+    pub fn measure(self: SiteSize) u64 {
+        return 3 * @as(u64, self.nodes) + self.args;
+    }
+};
 
 /// The size of the site of `root`.
 pub fn siteSize(gpa: Allocator, store: *const ir.Store, root: RowId) Allocator.Error!SiteSize {
@@ -217,15 +246,18 @@ pub fn siteSize(gpa: Allocator, store: *const ir.Store, root: RowId) Allocator.E
         reached.deinit(gpa);
     }
     try number.siteRows(gpa, store, &returns, root, &reached);
-    var total: u32 = 0;
+    var out: SiteSize = .{ .rows = @intCast(reached.count()) };
     for (reached.values()) |numbering| for (numbering.order.items) |n| {
-        if (store.nodes.items(.op)[n.index()] != .lit) total += 1;
+        const nd = store.node(n);
+        if (nd.op != .lit) out.nodes += 1;
+        if (nd.op == .call) out.args += nd.args.len;
     };
-    return .{ .nodes = total, .rows = @intCast(reached.count()) };
+    return out;
 }
 
-/// The shapes one pass of `outline` takes over the site of `root`, whose
-/// rows are at `inline` or at an earlier pass, with K = `min_size`.
+/// The generalizations one pass of `outline` takes over the site of
+/// `root`, whose rows are at `inline` or at an earlier pass, with K =
+/// `min_size`.
 pub fn outlineSelect(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, root: RowId, min_size: u32) Allocator.Error!Selection {
     var a: Analysis = .{ .gpa = gpa, .store = store, .content = .{ .gpa = gpa, .types = types }, .scratch = std.heap.ArenaAllocator.init(gpa) };
     defer a.deinit();
@@ -238,127 +270,132 @@ pub fn outlineSelect(gpa: Allocator, store: *const ir.Store, types: *const types
     errdefer out.deinit();
     const arena = out.arena.allocator();
 
-    // Candidates: groups of one shape, two or more strong, of size at least K.
-    const Cand = struct { shape: u128, at: u32 };
-    var cands: std.ArrayList(Cand) = .empty;
-    defer cands.deinit(gpa);
+    // Places, sorted by their keys at depths 0 to D, then by the key at
+    // depth D with literal values, then in site order.
+    const width = outline_key_depth + 2;
+    var places: std.ArrayList(u32) = .empty;
+    defer places.deinit(gpa);
     for (0..a.count()) |i| {
-        if (a.valid[i] and a.size[i] >= min_size) try cands.append(gpa, .{ .shape = a.shape[i], .at = @intCast(i) });
+        if (a.valid[i] and a.size[i] >= min_size) try places.append(gpa, @intCast(i));
     }
-    std.mem.sort(Cand, cands.items, {}, struct {
-        fn less(_: void, x: Cand, y: Cand) bool {
-            return if (x.shape != y.shape) x.shape < y.shape else x.at < y.at;
+    const keys = try gpa.alloc(u64, places.items.len * width);
+    defer gpa.free(keys);
+    for (places.items, 0..) |i, p| for (0..width) |d| {
+        a.key_values = d == width - 1;
+        keys[p * width + d] = try a.keyOf(i, @intCast(@min(d, outline_key_depth)));
+    };
+    a.key_values = false;
+    const order = try gpa.alloc(u32, places.items.len);
+    defer gpa.free(order);
+    for (order, 0..) |*o, p| o.* = @intCast(p);
+    const ByKey = struct {
+        keys: []const u64,
+        width: usize,
+        fn less(ctx: @This(), x: u32, y: u32) bool {
+            const kx = ctx.keys[x * ctx.width ..][0..ctx.width];
+            const ky = ctx.keys[y * ctx.width ..][0..ctx.width];
+            for (kx, ky) |p, q| if (p != q) return p < q;
+            return x < y;
         }
-    }.less);
-    const Group = struct { shape: u128, size: u32, start: u32, len: u32 };
+        // Whether sorted positions `x` and `y` have one key at every depth up to `d`.
+        fn same(ctx: @This(), sorted: []const u32, x: usize, y: usize, d: usize) bool {
+            const kx = ctx.keys[sorted[x] * ctx.width ..][0 .. d + 1];
+            const ky = ctx.keys[sorted[y] * ctx.width ..][0 .. d + 1];
+            return std.mem.eql(u64, kx, ky);
+        }
+    };
+    const by_key: ByKey = .{ .keys = keys, .width = width };
+    std.mem.sort(u32, order, by_key, ByKey.less);
+    const sorted = try gpa.alloc(u32, places.items.len);
+    defer gpa.free(sorted);
+    for (order, sorted) |p, *s| s.* = places.items[p];
+
+    // Groups: per depth, the runs of one key, each counted once.
+    const Group = struct { start: u32, len: u32, depth: u32 };
     var groups: std.ArrayList(Group) = .empty;
     defer groups.deinit(gpa);
-    var start: usize = 0;
-    while (start < cands.items.len) {
-        var end = start + 1;
-        while (end < cands.items.len and cands.items[end].shape == cands.items[start].shape) end += 1;
-        if (end - start >= 2) try groups.append(gpa, .{ .shape = cands.items[start].shape, .size = a.size[cands.items[start].at], .start = @intCast(start), .len = @intCast(end - start) });
-        start = end;
-    }
-    std.mem.sort(Group, groups.items, {}, struct {
-        fn less(_: void, x: Group, y: Group) bool {
-            const gx = @as(u64, x.len) * (x.size - 1);
-            const gy = @as(u64, y.len) * (y.size - 1);
-            if (gx != gy) return gx > gy;
-            if (x.size != y.size) return x.size > y.size;
-            return x.shape < y.shape;
+    for (0..width) |d| {
+        var start: usize = 0;
+        while (start < order.len) {
+            var end = start + 1;
+            while (end < order.len and by_key.same(order, start, end, d)) end += 1;
+            const inherited = d > 0 and
+                (start == 0 or !by_key.same(order, start - 1, start, d - 1)) and
+                (end == order.len or !by_key.same(order, end - 1, end, d - 1));
+            if (end - start >= 2 and !inherited) try groups.append(gpa, .{ .start = @intCast(start), .len = @intCast(end - start), .depth = @intCast(d) });
+            start = end;
         }
-    }.less);
+    }
 
-    // Selection: an occurrence inside or around one already taken is dropped.
-    var cover = try Fenwick.init(gpa, a.count());
-    defer cover.deinit(gpa);
-    var taken_roots = try Fenwick.init(gpa, a.count());
-    defer taken_roots.deinit(gpa);
-    var chosen: std.ArrayList(Selection.Chosen) = .empty;
-    var kept: std.ArrayList(u32) = .empty;
-    defer kept.deinit(gpa);
-    var confirmed: std.ArrayList(u32) = .empty;
-    defer confirmed.deinit(gpa);
-    var pairs: std.ArrayList([2]NodeId) = .empty;
-    defer pairs.deinit(gpa);
-    var also: collections.DenseMapUnmanaged(NodeId, std.ArrayList(NodeId)) = .empty;
-    defer {
-        var lists = also.valueIterator();
-        while (lists.next()) |l| l.deinit(gpa);
-        also.deinit(gpa);
+    // Selection: evaluate every group, then take the best whose evaluation
+    // is current, evaluating again the ones a take predates.
+    a.claimed = try a.scratch.allocator().alloc(bool, a.count());
+    @memset(a.claimed, false);
+    a.stamp = try a.scratch.allocator().alloc(u32, a.count());
+    @memset(a.stamp, 0);
+    var gen: Gen = .{ .an = &a };
+    defer gen.deinit();
+    const Live = struct { group: u32, score: Gen.Score, version: u32 };
+    var live: std.ArrayList(Live) = .empty;
+    defer live.deinit(gpa);
+    for (groups.items, 0..) |g, gi| {
+        if (try gen.evaluate(sorted[g.start..][0..g.len], min_size)) |score| try live.append(gpa, .{ .group = @intCast(gi), .score = score, .version = 0 });
     }
-    for (groups.items) |g| {
-        kept.clearRetainingCapacity();
-        for (cands.items[g.start..][0..g.len]) |c| {
-            const i = c.at;
-            if (cover.at(a.tin[i]) > 0) continue;
-            if (taken_roots.sum(a.tin[i], a.tout[i]) > 0) continue;
-            try kept.append(gpa, i);
+    const better = struct {
+        fn f(gs: []const Group, srt: []const u32, x: Live, y: Live) bool {
+            if (x.score.gain != y.score.gain) return x.score.gain > y.score.gain;
+            if (x.score.size != y.score.size) return x.score.size > y.score.size;
+            if (x.score.shape != y.score.shape) return x.score.shape < y.score.shape;
+            const gx = gs[x.group];
+            const gy = gs[y.group];
+            if (srt[gx.start] != srt[gy.start]) return srt[gx.start] < srt[gy.start];
+            return gx.depth < gy.depth;
         }
-        if (kept.items.len < 2) continue;
-        // Equal shapes are confirmed structurally, so a hash collision
-        // never outlines two computations as one.
-        const rep = kept.items[0];
-        confirmed.clearRetainingCapacity();
-        try confirmed.append(gpa, rep);
-        {
-            var lists = also.valueIterator();
-            while (lists.next()) |l| l.deinit(gpa);
-            also.clearRetainingCapacity();
+    }.f;
+    var chosen: std.ArrayList(Selection.Chosen) = .empty;
+    // Per local literal: whether a call passes it or a value that moves reads it.
+    const lit_used = try a.scratch.allocator().alloc(bool, a.count());
+    @memset(lit_used, false);
+    var takes: u32 = 0;
+    while (live.items.len > 0) {
+        var best: usize = 0;
+        for (live.items[1..], 1..) |c, ci| {
+            if (better(groups.items, sorted, c, live.items[best])) best = ci;
         }
-        for (kept.items[1..]) |other| {
-            pairs.clearRetainingCapacity();
-            if (!try a.sameCone(rep, other, &pairs)) continue;
-            try confirmed.append(gpa, other);
-            for (pairs.items) |pair| {
-                const gop = try also.getOrPut(gpa, pair[0]);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.append(gpa, pair[1]);
-            }
+        const c = live.items[best];
+        const g = groups.items[c.group];
+        const members = sorted[g.start..][0..g.len];
+        if (c.version != takes) {
+            if (try gen.evaluate(members, min_size)) |score| {
+                live.items[best] = .{ .group = c.group, .score = score, .version = takes };
+            } else _ = live.swapRemove(best);
+            continue;
         }
-        if (confirmed.items.len < 2) continue;
-        for (confirmed.items) |i| {
-            cover.addRange(a.tin[i], a.tout[i], 1);
-            taken_roots.addAt(a.tin[i], 1);
-        }
-        const occurrences = try arena.alloc(Selection.Occurrence, confirmed.items.len);
-        for (confirmed.items, occurrences) |i, *o| {
-            o.* = a.occurrence(i);
-            o.holes = try arena.dupe(Ref, o.holes);
-        }
-        var nodes: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
-        for (a.euler_order[a.tin[rep] .. a.tout[rep] + 1]) |m| try nodes.put(arena, a.nodes.items[m], {});
-        var also_out: collections.DenseMapUnmanaged(NodeId, []const NodeId) = .empty;
-        var it = also.iterator();
-        while (it.next()) |e| try also_out.put(arena, e.key_ptr.*, try arena.dupe(NodeId, e.value_ptr.items));
-        try chosen.append(arena, .{
-            .rep = occurrences[0],
-            .nodes = nodes,
-            .lits = try a.coneLits(arena, rep),
-            .also = also_out,
-            .occurrences = occurrences,
-        });
+        _ = live.swapRemove(best);
+        // The evaluation is current, so running it again reads its tuples.
+        const again = (try gen.evaluate(members, min_size)).?;
+        std.debug.assert(std.meta.eql(again, c.score));
+        try chosen.append(arena, try gen.take(arena, lit_used));
+        takes += 1;
     }
     out.shapes = try chosen.toOwnedSlice(arena);
 
-    // Per row, in site order: the calls, the nodes inside the cones, and
-    // the literals only the cones read.
+    // Per row, in site order: the calls, the nodes only the images read,
+    // and the literals nothing the caller keeps reads.
     var edits: std.ArrayList(Selection.Edit) = .empty;
     for (a.rows, 0..) |r, row_pos| {
         var calls: std.ArrayList(Selection.Edit.Call) = .empty;
         var skip: std.ArrayList(NodeId) = .empty;
-        for (out.shapes, 0..) |shape, s| for (shape.occurrences) |o| {
+        for (out.shapes, 0..) |shape, s| for (shape.occurrences, 0..) |o, k| {
             if (o.row != r) continue;
-            try calls.append(arena, .{ .root = o.root, .shape = @intCast(s), .holes = o.holes });
-            const i = a.local[o.root.index()];
-            for (a.euler_order[a.tin[i] + 1 .. a.tout[i] + 1]) |m| try skip.append(arena, a.nodes.items[m]);
+            try calls.append(arena, .{ .root = o.root, .shape = @intCast(s), .holes = o.holes, .moved = o.moved });
+            try skip.appendSlice(arena, shape.images[k]);
         };
         if (calls.items.len == 0) continue;
         for (a.row_start[row_pos]..a.row_start[row_pos + 1]) |l| {
-            if (!a.is_lit[l]) continue;
+            if (!a.is_lit[l] or lit_used[l]) continue;
             const read_outside = for (a.anchorsOf(@intCast(l))) |x| {
-                if (x == Analysis.top or cover.at(a.tin[x]) == 0) break true;
+                if (x == Analysis.top or !a.claimed[x]) break true;
             } else false;
             if (!read_outside) try skip.append(arena, a.nodes.items[l]);
         }
@@ -368,52 +405,7 @@ pub fn outlineSelect(gpa: Allocator, store: *const ir.Store, types: *const types
     return out;
 }
 
-// A Fenwick tree over positions 0..n, for the overlap test of selection.
-const Fenwick = struct {
-    tree: []i64,
-
-    fn init(gpa: Allocator, n: usize) Allocator.Error!Fenwick {
-        const tree = try gpa.alloc(i64, n + 2);
-        @memset(tree, 0);
-        return .{ .tree = tree };
-    }
-
-    fn deinit(self: *Fenwick, gpa: Allocator) void {
-        gpa.free(self.tree);
-    }
-
-    // Add `v` at position `i`.
-    fn addAt(self: *Fenwick, i: u32, v: i64) void {
-        var k: usize = @as(usize, i) + 1;
-        while (k < self.tree.len) : (k += k & (~k + 1)) self.tree[k] += v;
-    }
-
-    // The sum over positions 0..=i.
-    fn prefix(self: *const Fenwick, i: u32) i64 {
-        var k: usize = @as(usize, i) + 1;
-        var total: i64 = 0;
-        while (k > 0) : (k -= k & (~k + 1)) total += self.tree[k];
-        return total;
-    }
-
-    // The sum over positions lo..=hi.
-    fn sum(self: *const Fenwick, lo: u32, hi: u32) i64 {
-        return self.prefix(hi) - (if (lo == 0) 0 else self.prefix(lo - 1));
-    }
-
-    // Add `v` at every position lo..=hi, read back with `at`.
-    fn addRange(self: *Fenwick, lo: u32, hi: u32, v: i64) void {
-        self.addAt(lo, v);
-        self.addAt(hi + 1, -v);
-    }
-
-    // What `addRange` added at position `i`.
-    fn at(self: *const Fenwick, i: u32) i64 {
-        return self.prefix(i);
-    }
-};
-
-// The cones, shapes and validity of every node of a site's rows. Nodes are
+// The cones, keys and validity of every node of a site's rows. Nodes are
 // indexed locally, row by row in site order, each row's in its numbering
 // (N9), which is a post-order: a node's arguments and the nodes of the
 // regions it owns come before it.
@@ -453,19 +445,17 @@ const Analysis = struct {
     euler_order: []u32 = &.{},
     size: []u32 = &.{},
     valid: []bool = &.{},
-    shape: []u128 = &.{},
-    holes: [][]const Ref = &.{},
-    // Scratch of `shapeOf`.
+    /// Per node: whether an occurrence taken in this pass holds it in its image.
+    claimed: []bool = &.{},
+    /// Per node: the mark of the image being compared (`Gen`).
+    stamp: []u32 = &.{},
+    stamp_now: u32 = 0,
+    // Scratch of `keyOf`, and whether it reads literal values.
     points: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    hole_buf: std.ArrayList(Ref) = .empty,
-    frames: std.ArrayList(Frame) = .empty,
+    key_values: bool = false,
 
     const none: u32 = std.math.maxInt(u32);
     const top: u32 = std.math.maxInt(u32) - 1;
-    /// The output a join is named by where it stands among a cone's points.
-    const join_output: u30 = std.math.maxInt(u30);
-
-    const Frame = struct { refs: []const Ref, pos: u32 };
 
     fn deinit(self: *Analysis) void {
         const gpa = self.gpa;
@@ -478,8 +468,6 @@ const Analysis = struct {
         while (lists.next()) |l| l.deinit(gpa);
         self.unread.deinit(gpa);
         self.points.deinit(gpa);
-        self.hole_buf.deinit(gpa);
-        self.frames.deinit(gpa);
         self.scratch.deinit();
     }
 
@@ -499,6 +487,10 @@ const Analysis = struct {
         return self.child_list[self.child_start[i]..self.child_start[i + 1]];
     }
 
+    fn unreadOf(self: *const Analysis, r: RegionId) []const u32 {
+        return if (self.unread.get(r)) |l| l.items else &.{};
+    }
+
     fn regionDepth(self: *const Analysis, i: u32) u32 {
         return self.store.region(self.node(i).region).depth;
     }
@@ -507,6 +499,15 @@ const Analysis = struct {
         const l = self.local[n.index()];
         std.debug.assert(l != none);
         return l;
+    }
+
+    fn rowOf(self: *const Analysis, i: u32) RowId {
+        return self.rows[self.row_of[i]];
+    }
+
+    // The type of `x`, a value of the row of node `at`.
+    fn tyAt(self: *const Analysis, at: u32, x: Ref) TyId {
+        return self.store.refTy(self.rowOf(at), x);
     }
 
     // The site's rows, their components and names, and the local index of
@@ -728,15 +729,13 @@ const Analysis = struct {
         std.debug.assert(clock == total);
     }
 
-    // Sizes, validity and shapes, children before parents.
+    // Sizes and validity, children before parents.
     fn bottomUp(self: *Analysis) Allocator.Error!void {
         const arena = self.scratch.allocator();
         const store = self.store;
         const total = self.count();
         self.size = try arena.alloc(u32, total);
         self.valid = try arena.alloc(bool, total);
-        self.shape = try arena.alloc(u128, total);
-        self.holes = try arena.alloc([]const Ref, total);
         // Per node: the least depth a region end in its cone leaves to, and
         // whether its cone names a row of its own row's recursive component.
         const exit_depth = try self.gpa.alloc(i64, total);
@@ -748,7 +747,7 @@ const Analysis = struct {
             const nd = self.node(i);
             var size: u32 = if (self.is_lit[i]) 0 else 1;
             var least: i64 = std.math.maxInt(i64);
-            const row = self.rows[self.row_of[i]];
+            const row = self.rowOf(i);
             var named = switch (nd.op) {
                 .call, .closure => store.row(row).recursive and self.comp[nd.payload] == self.comp[row.index()],
                 .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => false,
@@ -764,7 +763,6 @@ const Analysis = struct {
             exit_depth[i] = least;
             names_comp[i] = named;
             self.valid[i] = !self.is_lit[i] and nd.tys.len == 1 and least >= self.depth[i] and !named;
-            try self.shapeOf(i);
         }
     }
 
@@ -796,321 +794,733 @@ const Analysis = struct {
         return self.depth[self.localOf(target)];
     }
 
-    fn occurrence(self: *const Analysis, i: u32) Selection.Occurrence {
-        return .{ .row = self.rows[self.row_of[i]], .root = self.nodes.items[i], .holes = self.holes[i] };
-    }
-
     // Whether `i` is a node of the cone of `root`.
     fn inCone(self: *const Analysis, root: u32, i: u32) bool {
         return !self.is_lit[i] and self.tin[root] <= self.tin[i] and self.tin[i] <= self.tout[root];
     }
 
-    // The literals the cone of `i` reads from `i`'s region or a region
-    // around it, which a copy of the cone builds in its body.
-    fn coneLits(self: *const Analysis, arena: Allocator, i: u32) Allocator.Error![]const NodeId {
+    // Whether `x` is a parameter of a region a node of the cone of `root` owns.
+    fn boundIn(self: *const Analysis, root: u32, x: Ref) bool {
+        if (x.kind != .region_param) return false;
+        const owner = self.store.region(x.regionId()).owner;
+        return owner != NodeId.none and self.inCone(root, self.localOf(owner));
+    }
+
+    // Whether nodes `x` and `y` have one op, payload, types, immediates and
+    // region shape, and as many arguments.
+    fn sameContent(self: *const Analysis, x: u32, y: u32) bool {
         const store = self.store;
-        const home = self.regionDepth(i);
-        var found: std.ArrayList(u32) = .empty;
-        defer found.deinit(self.gpa);
-        for (self.euler_order[self.tin[i] .. self.tout[i] + 1]) |m| {
-            const nd = self.node(m);
-            for (store.refSlice(nd.args)) |x| try self.noteLit(&found, x, home);
-            for (store.regionSlice(nd.regions)) |r| for (store.refSlice(store.region(r).end.refs)) |x| try self.noteLit(&found, x, home);
+        const nx = self.node(x);
+        const ny = self.node(y);
+        if (nx.op != ny.op or nx.payload != ny.payload or nx.args.len != ny.args.len) return false;
+        if (!std.mem.eql(TyId, store.tySlice(nx.tys), store.tySlice(ny.tys))) return false;
+        if (!std.mem.eql(u32, store.wordSlice(nx.aux), store.wordSlice(ny.aux))) return false;
+        const rx = store.regionSlice(nx.regions);
+        const ry = store.regionSlice(ny.regions);
+        if (rx.len != ry.len) return false;
+        for (rx, ry) |p, q| {
+            const gp = store.region(p);
+            const gq = store.region(q);
+            if (gp.kind != gq.kind or gp.end.kind != gq.end.kind or gp.end.refs.len != gq.end.refs.len) return false;
+            if (!std.mem.eql(TyId, store.tySlice(gp.params), store.tySlice(gq.params))) return false;
+            if (self.unreadOf(p).len != self.unreadOf(q).len) return false;
         }
-        std.mem.sort(u32, found.items, {}, std.sort.asc(u32));
-        const out = try arena.alloc(NodeId, found.items.len);
-        for (found.items, out) |l, *o| o.* = self.nodes.items[l];
-        return out;
+        return true;
     }
 
-    fn noteLit(self: *const Analysis, found: *std.ArrayList(u32), x: Ref, home: u32) Allocator.Error!void {
-        if (x.kind != .node) return;
-        const l = self.localOf(x.nodeId());
-        if (!self.is_lit[l] or self.regionDepth(l) > home) return;
-        if (std.mem.findScalar(u32, found.items, l) == null) try found.append(self.gpa, l);
-    }
-
-    const Tag = enum(u32) { lit, ref, child, param, join, hole };
-
-    // The shape of the cone of `i` and its holes. Every value the cone reads
-    // is one of its points, numbered in the order the walk first meets it:
-    // the node's arguments, then per region its end and the nodes nothing
-    // reads, and at the first meeting of a child, the child's holes in their
-    // order. A child is named by its own shape, so the shape of `i` reads
-    // each node of its cone once.
-    fn shapeOf(self: *Analysis, i: u32) Allocator.Error!void {
-        const store = self.store;
+    // The digest of node `i`'s own content, a row it calls or names by its
+    // name in the site (`digest.siteRowNames`), so no digest reads a row's id.
+    fn contentOf(self: *Analysis, i: u32) Allocator.Error!digest_mod.Digest {
         const nd = self.node(i);
-        self.points.clearRetainingCapacity();
-        self.hole_buf.clearRetainingCapacity();
-        var h = Sha256.init(.{});
         const name: ?digest_mod.Digest = switch (nd.op) {
             .call, .closure => self.names[nd.payload],
             .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => null,
         };
-        putDigest(&h, try digest_mod.localContent(store, &self.content, nd, name));
-        for (store.refSlice(nd.args)) |x| try self.token(&h, i, x);
+        return digest_mod.localContent(self.store, &self.content, nd, name);
+    }
+
+    const Tag = enum(u32) { lit, ref, child, leaf };
+
+    // The key of place `i` at depth `d` (normal-form 5.3, rule 2): the
+    // content of every node of its cone at depth `d` or less, a literal by
+    // its type (and its value too under `key_values`), and every other
+    // value a leaf by its type and its number in the order the walk first
+    // meets it.
+    fn keyOf(self: *Analysis, i: u32, d: u32) Allocator.Error!u64 {
+        self.points.clearRetainingCapacity();
+        var h = std.hash.Wyhash.init(0);
+        try self.keyNode(&h, i, i, 0, d);
+        return h.final();
+    }
+
+    fn keyNode(self: *Analysis, h: *std.hash.Wyhash, root: u32, i: u32, depth: u32, d: u32) Allocator.Error!void {
+        const store = self.store;
+        const nd = self.node(i);
+        putDigest(h, try self.contentOf(i));
+        for (store.refSlice(nd.args)) |x| try self.keyRef(h, root, x, depth + 1, d);
         for (store.regionSlice(nd.regions)) |r| {
             const reg = store.region(r);
-            putWords(&h, &.{ @backingInt(reg.kind), reg.params.len });
-            for (store.tySlice(reg.params)) |t| putDigest(&h, try self.content.ty(t));
-            putWords(&h, &.{ @backingInt(reg.end.kind), reg.end.refs.len });
-            switch (reg.end.kind) {
-                .jump => try self.token(&h, i, joinRef(RegionId.of(reg.end.target))),
-                .branch => try self.token(&h, i, Ref.of(NodeId.of(reg.end.target))),
-                .open, .value, .return_, .continue_, .break_ => {},
-            }
-            for (store.refSlice(reg.end.refs)) |x| try self.token(&h, i, x);
-            if (self.unread.get(r)) |list| {
-                putWords(&h, &.{@intCast(list.items.len)});
-                for (list.items) |m| try self.token(&h, i, Ref.of(self.nodes.items[m]));
-            }
-        }
-        var out: [32]u8 = undefined;
-        h.final(&out);
-        self.shape[i] = std.mem.readInt(u128, out[0..16], .little);
-        self.holes[i] = try self.scratch.allocator().dupe(Ref, self.hole_buf.items);
-    }
-
-    fn joinRef(j: RegionId) Ref {
-        return .{ .kind = .region_param, .output = join_output, .target = j.index() };
-    }
-
-    // One point read by the cone of `at`, and the holes of every child it
-    // meets for the first time, depth first.
-    fn token(self: *Analysis, h: *Sha256, at: u32, x: Ref) Allocator.Error!void {
-        self.frames.clearRetainingCapacity();
-        try self.emit(h, at, x);
-        while (self.frames.items.len > 0) {
-            const frame = &self.frames.items[self.frames.items.len - 1];
-            if (frame.pos == frame.refs.len) {
-                _ = self.frames.pop();
-                continue;
-            }
-            const next = frame.refs[frame.pos];
-            frame.pos += 1;
-            try self.emit(h, at, next);
+            putWords(h, &.{ @backingInt(reg.kind), reg.params.len, @backingInt(reg.end.kind), reg.end.refs.len, @intCast(self.unreadOf(r).len) });
+            for (store.tySlice(reg.params)) |t| putDigest(h, try self.content.ty(t));
+            for (store.refSlice(reg.end.refs)) |x| try self.keyRef(h, root, x, depth + 1, d);
         }
     }
 
-    fn emit(self: *Analysis, h: *Sha256, at: u32, x: Ref) Allocator.Error!void {
-        const store = self.store;
-        const Class = enum { child, param, join, hole };
-        var key = rebuild.refKey(x);
-        const class: Class = switch (x.kind) {
-            .node => blk: {
-                const m = self.localOf(x.nodeId());
-                if (self.is_lit[m]) {
-                    putWords(h, &.{ @intFromEnum(Tag.lit), x.output });
-                    putDigest(h, try digest_mod.litContent(store, &self.content, ir.LitId.of(self.node(m).payload)));
-                    return;
-                }
-                if (self.parent[m] == at) {
-                    key = rebuild.refKey(Ref.of(x.nodeId()));
-                    break :blk .child;
-                }
-                break :blk .hole;
-            },
-            .row_param, .input => .hole,
-            .region_param => blk: {
-                const owner = store.region(x.regionId()).owner;
-                const bound = owner != NodeId.none and self.localOf(owner) == at;
-                if (x.output == join_output) break :blk if (bound) .join else .hole;
-                break :blk if (bound) .param else .hole;
-            },
-        };
-        // Only a node's output is part of the shape: the index of a row
-        // parameter, a slot or a region parameter outside the cone is the
-        // hole's own, and a region parameter inside it is named by its place.
-        const output: u32 = if (x.kind == .node) x.output else 0;
-        if (self.points.get(key)) |seen| {
-            putWords(h, &.{ @intFromEnum(Tag.ref), seen, output });
-            return;
-        }
-        try self.points.put(self.gpa, key, self.points.count());
-        switch (class) {
-            .child => {
-                const m = self.localOf(x.nodeId());
+    fn keyRef(self: *Analysis, h: *std.hash.Wyhash, root: u32, x: Ref, depth: u32, d: u32) Allocator.Error!void {
+        if (x.kind == .node) {
+            const m = self.localOf(x.nodeId());
+            if (self.is_lit[m]) {
+                putWords(h, &.{ @intFromEnum(Tag.lit), x.output });
+                putDigest(h, try self.content.ty(self.tyAt(root, x)));
+                if (self.key_values) putDigest(h, try digest_mod.litContent(self.store, &self.content, ir.LitId.of(self.node(m).payload)));
+                return;
+            }
+            if (depth <= d and self.inCone(root, m)) {
+                const gop = try self.points.getOrPut(self.gpa, rebuild.refKey(Ref.of(x.nodeId())));
+                if (gop.found_existing) return putWords(h, &.{ @intFromEnum(Tag.ref), gop.value_ptr.*, x.output });
+                gop.value_ptr.* = self.points.count() - 1;
                 putWords(h, &.{ @intFromEnum(Tag.child), x.output });
-                putDigest(h, self.shape[m]);
-                try self.frames.append(self.gpa, .{ .refs = self.holes[m], .pos = 0 });
-            },
-            .param, .join => {
-                const r = x.regionId();
-                const owner = store.node(store.region(r).owner);
-                const pos = std.mem.findScalar(RegionId, store.regionSlice(owner.regions), r).?;
-                putWords(h, &.{ @intFromEnum(if (class == .param) Tag.param else Tag.join), @intCast(pos), x.output });
-                if (class == .param) putDigest(h, try self.content.ty(store.tySlice(store.region(r).params)[x.output]));
-            },
-            .hole => {
-                putWords(h, &.{ @intFromEnum(Tag.hole), output });
-                if (!(x.kind == .region_param and x.output == join_output)) {
-                    putDigest(h, try self.content.ty(store.refTy(self.rows[self.row_of[at]], x)));
-                }
-                try self.hole_buf.append(self.gpa, x);
-            },
+                return self.keyNode(h, root, m, depth, d);
+            }
         }
-    }
-
-    // Whether the cones of `a` and `b` are one computation: a walk of both
-    // in step that pairs their nodes, the regions they own and their holes
-    // one to one. `pairs` receives each pair of nodes, literals included.
-    fn sameCone(self: *Analysis, a: u32, b: u32, pairs: *std.ArrayList([2]NodeId)) Allocator.Error!bool {
-        const gpa = self.gpa;
-        var w: Pairing = .{ .an = self, .a = a, .b = b, .pairs = pairs };
-        defer w.deinit(gpa);
-        try w.nodes.put(gpa, self.nodes.items[a], self.nodes.items[b]);
-        try w.work.append(gpa, .{ self.nodes.items[a], self.nodes.items[b] });
-        try pairs.append(gpa, .{ self.nodes.items[a], self.nodes.items[b] });
-        while (w.work.pop()) |pair| {
-            if (!try w.compare(pair[0], pair[1])) return false;
-        }
-        // The holes pair in hole order, so a call passes the occurrence's
-        // holes where the row reads the representative's.
-        const ha = self.holes[a];
-        const hb = self.holes[b];
-        if (ha.len != hb.len) return false;
-        for (ha, hb) |x, y| if (w.holes_ab.get(rebuild.refKey(x)) != rebuild.refKey(y)) return false;
-        return true;
+        const gop = try self.points.getOrPut(self.gpa, rebuild.refKey(x));
+        if (gop.found_existing) return putWords(h, &.{ @intFromEnum(Tag.ref), gop.value_ptr.*, 0 });
+        gop.value_ptr.* = self.points.count() - 1;
+        putWords(h, &.{@intFromEnum(Tag.leaf)});
+        putDigest(h, try self.content.ty(self.tyAt(root, x)));
     }
 };
 
-// The walk of `Analysis.sameCone`.
-const Pairing = struct {
-    an: *const Analysis,
-    a: u32,
-    b: u32,
-    pairs: *std.ArrayList([2]NodeId),
-    nodes: std.AutoHashMapUnmanaged(NodeId, NodeId) = .empty,
-    regions: std.AutoHashMapUnmanaged(RegionId, RegionId) = .empty,
-    holes_ab: std.AutoHashMapUnmanaged(u64, u64) = .empty,
-    holes_ba: std.AutoHashMapUnmanaged(u64, u64) = .empty,
-    work: std.ArrayList([2]NodeId) = .empty,
+// The generalization of a group of places (normal-form 5.3, rules 3 and 4).
+// A round walks the places' cones in step and gives each tuple of values,
+// one per place, its kind; the rules then name the nodes that must be holes,
+// and the rounds repeat until they name none.
+const Gen = struct {
+    an: *Analysis,
+    /// The places, local roots in site order.
+    places: std.ArrayList(u32) = .empty,
+    /// Per (place position, local node): rule 4 made the node a hole at that place.
+    forced: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Per tuple: its kind, its values (`places.len` of them, at `values[t *
+    /// n ..]`; a tuple of nodes holds each node's first output), and the
+    /// number of a hole.
+    kinds: std.ArrayList(Class) = .empty,
+    values: std.ArrayList(Ref) = .empty,
+    numbers: std.ArrayList(u32) = .empty,
+    /// Per hash of a tuple's values: the last tuple with it; `chain` links the others.
+    memo: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    chain: std.ArrayList(u32) = .empty,
+    /// Where each tuple is read: a slot of a tuple of nodes.
+    edges: std.ArrayList(Edge) = .empty,
+    /// Per (place position, region): the tuple of nodes that owns it, and
+    /// the region's position among its owner's regions.
+    regions: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// The hole tuples, in hole order.
+    holes: std.ArrayList(u32) = .empty,
+    /// The tuples of nodes.
+    size: u32 = 0,
+    shape: u128 = 0,
+    // Scratch of a round.
+    stack: std.ArrayList(Item) = .empty,
+    pending: std.ArrayList(Ref) = .empty,
+    tuple: std.ArrayList(Ref) = .empty,
+    slots: std.ArrayList(Item) = .empty,
+    force: std.ArrayList(u64) = .empty,
+    owner: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    visited: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    work: std.ArrayList(u32) = .empty,
+    moves: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+    bad: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    keep: std.ArrayList(u32) = .empty,
 
-    fn deinit(self: *Pairing, allocator: Allocator) void {
-        self.nodes.deinit(allocator);
-        self.regions.deinit(allocator);
-        self.holes_ab.deinit(allocator);
-        self.holes_ba.deinit(allocator);
-        self.work.deinit(allocator);
+    const Class = enum(u8) { node, lit, param, hole };
+    const Slot = enum(u8) { arg, end, branch, unread };
+    /// Tuple `child` is read at slot `slot` (`region`, `index`) of tuple `parent`.
+    const Edge = struct { parent: u32, slot: Slot, region: u32, index: u32, child: u32 };
+    const Item = struct { parent: u32, slot: Slot, region: u32, index: u32, at: u32 };
+    const none: u32 = std.math.maxInt(u32);
+    const Outcome = enum { dead, again, settled };
+
+    /// What selection orders a candidate by.
+    pub const Score = struct { gain: i64, size: u32, holes: u32, shape: u128 };
+
+    fn deinit(self: *Gen) void {
+        const gpa = self.an.gpa;
+        self.places.deinit(gpa);
+        self.forced.deinit(gpa);
+        self.kinds.deinit(gpa);
+        self.values.deinit(gpa);
+        self.numbers.deinit(gpa);
+        self.memo.deinit(gpa);
+        self.chain.deinit(gpa);
+        self.edges.deinit(gpa);
+        self.regions.deinit(gpa);
+        self.holes.deinit(gpa);
+        self.stack.deinit(gpa);
+        self.pending.deinit(gpa);
+        self.tuple.deinit(gpa);
+        self.slots.deinit(gpa);
+        self.force.deinit(gpa);
+        self.owner.deinit(gpa);
+        self.visited.deinit(gpa);
+        self.work.deinit(gpa);
+        self.moves.deinit(gpa);
+        self.bad.deinit(gpa);
+        self.keep.deinit(gpa);
     }
 
-    fn gpa(self: *const Pairing) Allocator {
-        return self.an.gpa;
+    fn n(self: *const Gen) u32 {
+        return @intCast(self.places.items.len);
     }
 
-    fn compare(self: *Pairing, x: NodeId, y: NodeId) Allocator.Error!bool {
-        const store = self.an.store;
-        const nx = store.node(x);
-        const ny = store.node(y);
-        if (nx.op != ny.op or nx.payload != ny.payload) return false;
-        if (!std.mem.eql(TyId, store.tySlice(nx.tys), store.tySlice(ny.tys))) return false;
-        if (!std.mem.eql(u32, store.wordSlice(nx.aux), store.wordSlice(ny.aux))) return false;
-        const ax = store.refSlice(nx.args);
-        const ay = store.refSlice(ny.args);
-        if (ax.len != ay.len) return false;
-        const rx = store.regionSlice(nx.regions);
-        const ry = store.regionSlice(ny.regions);
-        if (rx.len != ry.len) return false;
-        for (rx, ry) |p, q| try self.regions.put(self.gpa(), p, q);
-        for (ax, ay) |p, q| if (!try self.ref(p, q)) return false;
-        for (rx, ry) |p, q| {
-            const gp = store.region(p);
-            const gq = store.region(q);
-            if (gp.kind != gq.kind or gp.end.kind != gq.end.kind) return false;
-            if (!std.mem.eql(TyId, store.tySlice(gp.params), store.tySlice(gq.params))) return false;
-            switch (gp.end.kind) {
-                .jump => if (!try self.ref(Analysis.joinRef(RegionId.of(gp.end.target)), Analysis.joinRef(RegionId.of(gq.end.target)))) return false,
-                .branch => if (!try self.ref(Ref.of(NodeId.of(gp.end.target)), Ref.of(NodeId.of(gq.end.target)))) return false,
+    fn valuesOf(self: *const Gen, t: u32) []const Ref {
+        const w = self.n();
+        return self.values.items[t * w ..][0..w];
+    }
+
+    // The local node tuple `t` of nodes holds at place `k`.
+    fn at(self: *const Gen, t: u32, k: u32) u32 {
+        return self.an.localOf(self.values.items[t * self.n() + k].nodeId());
+    }
+
+    fn key(k: u32, x: u32) u64 {
+        return @as(u64, k) << 32 | x;
+    }
+
+    /// The score of the generalization of `group`, or null where it is no
+    /// candidate. The tuples of the last round stay for `take`.
+    fn evaluate(self: *Gen, group: []const u32, min_size: u32) Allocator.Error!?Score {
+        const gpa = self.an.gpa;
+        const an = self.an;
+        self.places.clearRetainingCapacity();
+        try self.places.appendSlice(gpa, group);
+        while (true) {
+            if (self.n() < 2) return null;
+            self.forced.clearRetainingCapacity();
+            while (true) switch (try self.round()) {
+                .dead => return null,
+                .again => {},
+                .settled => break,
+            };
+            // A place whose image meets a taken one or an earlier place's leaves.
+            self.keep.clearRetainingCapacity();
+            an.stamp_now += 1;
+            for (0..self.n()) |kk| {
+                const k: u32 = @intCast(kk);
+                const meets = for (0..self.kinds.items.len) |t| {
+                    if (self.kinds.items[t] != .node) continue;
+                    const m = self.at(@intCast(t), k);
+                    if (an.claimed[m] or an.stamp[m] == an.stamp_now) break true;
+                } else false;
+                if (meets) continue;
+                for (0..self.kinds.items.len) |t| {
+                    if (self.kinds.items[t] == .node) an.stamp[self.at(@intCast(t), k)] = an.stamp_now;
+                }
+                try self.keep.append(gpa, self.places.items[k]);
+            }
+            if (self.keep.items.len == self.n()) break;
+            self.places.clearRetainingCapacity();
+            try self.places.appendSlice(gpa, self.keep.items);
+        }
+        const c: i64 = self.n();
+        const s: i64 = self.size;
+        const h: i64 = @intCast(self.holes.items.len);
+        const gain = c * (s - 1) - c * h;
+        if (self.size < min_size or gain <= 0) return null;
+        return .{ .gain = gain, .size = self.size, .holes = @intCast(self.holes.items.len), .shape = self.shape };
+    }
+
+    // One walk of the places' cones in step, then the rules of rule 4.
+    fn round(self: *Gen) Allocator.Error!Outcome {
+        const gpa = self.an.gpa;
+        const an = self.an;
+        const w = self.n();
+        self.kinds.clearRetainingCapacity();
+        self.values.clearRetainingCapacity();
+        self.numbers.clearRetainingCapacity();
+        self.memo.clearRetainingCapacity();
+        self.chain.clearRetainingCapacity();
+        self.edges.clearRetainingCapacity();
+        self.regions.clearRetainingCapacity();
+        self.holes.clearRetainingCapacity();
+        self.stack.clearRetainingCapacity();
+        self.pending.clearRetainingCapacity();
+        self.force.clearRetainingCapacity();
+        self.size = 0;
+        var h = Sha256.init(.{});
+
+        self.tuple.clearRetainingCapacity();
+        for (self.places.items) |p| try self.tuple.append(gpa, Ref.of(an.nodes.items[p]));
+        if (try self.classify(self.tuple.items) != .node) return .dead;
+        const root = (try self.intern(self.tuple.items, .node)).t;
+        putDigest(&h, try an.contentOf(self.places.items[0]));
+        try self.expand(root);
+        while (self.stack.pop()) |item| {
+            self.tuple.clearRetainingCapacity();
+            try self.tuple.appendSlice(gpa, self.pending.items[item.at..][0..w]);
+            self.pending.shrinkRetainingCapacity(item.at);
+            const refs = self.tuple.items;
+            putWords(&h, &.{ @intFromEnum(item.slot), item.region, item.index });
+            const kind = (try self.classify(refs)) orelse {
+                try self.forceTuple(item.parent);
+                continue;
+            };
+            if ((item.slot == .branch or item.slot == .unread) and kind != .node) {
+                try self.forceTuple(item.parent);
+                continue;
+            }
+            const output = refs[0].output;
+            if (kind == .node) for (refs) |*x| {
+                x.* = Ref.of(x.nodeId());
+            };
+            const got = try self.intern(refs, kind);
+            try self.edges.append(gpa, .{ .parent = item.parent, .slot = item.slot, .region = item.region, .index = item.index, .child = got.t });
+            putWords(&h, &.{ @intFromEnum(kind), output });
+            switch (kind) {
+                .node => if (got.new) {
+                    putDigest(&h, try an.contentOf(self.at(got.t, 0)));
+                    try self.expand(got.t);
+                } else putWords(&h, &.{got.t}),
+                .lit => putDigest(&h, try digest_mod.litContent(an.store, &an.content, ir.LitId.of(an.store.node(refs[0].nodeId()).payload))),
+                .param => {
+                    const owner = self.regions.get(key(0, refs[0].target)).?;
+                    putWords(&h, &.{ @truncate(owner >> 32), @truncate(owner) });
+                },
+                .hole => {
+                    putWords(&h, &.{self.numbers.items[got.t]});
+                    putDigest(&h, try an.content.ty(an.tyAt(self.places.items[0], refs[0])));
+                },
+            }
+        }
+        try self.rules();
+        var added: u32 = 0;
+        for (self.force.items) |f| {
+            const gop = try self.forced.getOrPut(gpa, f);
+            if (gop.found_existing) continue;
+            added += 1;
+            const k: u32 = @truncate(f >> 32);
+            if (@as(u32, @truncate(f)) == self.places.items[k]) return .dead;
+        }
+        if (added > 0) return .again;
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        self.shape = std.mem.readInt(u128, out[0..16], .little);
+        return .settled;
+    }
+
+    // The kind of a tuple (rule 3), or null where it is no node and cannot
+    // be a hole either.
+    fn classify(self: *const Gen, refs: []const Ref) Allocator.Error!?Class {
+        const an = self.an;
+        const store = an.store;
+        const places = self.places.items;
+        const all_nodes = for (refs) |x| {
+            if (x.kind != .node) break false;
+        } else true;
+        if (all_nodes) {
+            const m0 = an.localOf(refs[0].nodeId());
+            const all_lits = for (refs) |x| {
+                if (!an.is_lit[an.localOf(x.nodeId())]) break false;
+            } else true;
+            if (all_lits) {
+                const v0 = try digest_mod.litContent(store, &an.content, ir.LitId.of(store.node(refs[0].nodeId()).payload));
+                const same = for (refs[1..]) |x| {
+                    if (x.output != refs[0].output) break false;
+                    const v = try digest_mod.litContent(store, &an.content, ir.LitId.of(store.node(x.nodeId()).payload));
+                    if (v != v0) break false;
+                } else true;
+                if (same) return .lit;
+            } else {
+                const inside = for (refs, places, 0..) |x, p, k| {
+                    const m = an.localOf(x.nodeId());
+                    if (an.is_lit[m] or !an.inCone(p, m) or self.forced.contains(key(@intCast(k), m))) break false;
+                    if (x.output != refs[0].output or !an.sameContent(m0, m)) break false;
+                } else true;
+                if (inside) return .node;
+            }
+        }
+        // A parameter of a region of the generalization.
+        const any_bound = for (refs, places) |x, p| {
+            if (an.boundIn(p, x)) break true;
+        } else false;
+        if (any_bound) {
+            for (refs, places, 0..) |x, p, k| {
+                if (!an.boundIn(p, x) or x.output != refs[0].output) return null;
+                const owner = self.regions.get(key(@intCast(k), x.target)) orelse return null;
+                if (owner != self.regions.get(key(0, refs[0].target)).?) return null;
+            }
+            return .param;
+        }
+        // A hole: its values have one type.
+        const ty = an.tyAt(places[0], refs[0]);
+        for (refs[1..], places[1..]) |x, p| if (an.tyAt(p, x) != ty) return null;
+        return .hole;
+    }
+
+    const Interned = struct { t: u32, new: bool };
+
+    fn intern(self: *Gen, refs: []const Ref, kind: Class) Allocator.Error!Interned {
+        const gpa = self.an.gpa;
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(std.mem.sliceAsBytes(refs));
+        const hash = hasher.final();
+        const gop = try self.memo.getOrPut(gpa, hash);
+        if (gop.found_existing) {
+            var t = gop.value_ptr.*;
+            while (t != none) : (t = self.chain.items[t]) {
+                const vs = self.valuesOf(t);
+                const same = for (vs, refs) |p, q| {
+                    if (rebuild.refKey(p) != rebuild.refKey(q)) break false;
+                } else true;
+                if (same) {
+                    std.debug.assert(self.kinds.items[t] == kind);
+                    return .{ .t = t, .new = false };
+                }
+            }
+        }
+        const t: u32 = @intCast(self.kinds.items.len);
+        try self.kinds.append(gpa, kind);
+        try self.values.appendSlice(gpa, refs);
+        try self.numbers.append(gpa, if (kind == .hole) @intCast(self.holes.items.len) else 0);
+        try self.chain.append(gpa, if (gop.found_existing) gop.value_ptr.* else none);
+        gop.value_ptr.* = t;
+        switch (kind) {
+            .hole => try self.holes.append(gpa, t),
+            .node => self.size += 1,
+            .lit, .param => {},
+        }
+        return .{ .t = t, .new = true };
+    }
+
+    // The slots of tuple of nodes `t`, pushed so that they pop in order:
+    // its arguments, then per region the switch it branches to, its end's
+    // values and the nodes nothing reads. A `Jump` must reach one join of
+    // the generalization at every place.
+    fn expand(self: *Gen, t: u32) Allocator.Error!void {
+        const gpa = self.an.gpa;
+        const an = self.an;
+        const store = an.store;
+        const w = self.n();
+        const nd0 = an.node(self.at(t, 0));
+        const region_count = nd0.regions.len;
+        for (0..w) |kk| {
+            const k: u32 = @intCast(kk);
+            for (store.regionSlice(an.node(self.at(t, k)).regions), 0..) |r, q| try self.regions.put(gpa, key(k, r.index()), key(t, @intCast(q)));
+        }
+        self.slots.clearRetainingCapacity();
+        for (0..nd0.args.len) |j| try self.slots.append(gpa, .{ .parent = t, .slot = .arg, .region = 0, .index = @intCast(j), .at = 0 });
+        for (0..region_count) |qq| {
+            const q: u32 = @intCast(qq);
+            const r0 = store.regionSlice(nd0.regions)[q];
+            const end = store.region(r0).end;
+            switch (end.kind) {
+                .jump => if (self.regions.get(key(0, end.target))) |join| {
+                    for (1..w) |kk| {
+                        const rk = store.regionSlice(an.node(self.at(t, @intCast(kk))).regions)[q];
+                        const other = self.regions.get(key(@intCast(kk), store.region(rk).end.target));
+                        if (other == null or other.? != join) {
+                            try self.forceTuple(t);
+                            break;
+                        }
+                    }
+                } else try self.forceTuple(t),
+                .branch => try self.slots.append(gpa, .{ .parent = t, .slot = .branch, .region = q, .index = 0, .at = 0 }),
                 .open, .value, .return_, .continue_, .break_ => {},
             }
-            const ep = store.refSlice(gp.end.refs);
-            const eq = store.refSlice(gq.end.refs);
-            if (ep.len != eq.len) return false;
-            for (ep, eq) |s, t| if (!try self.ref(s, t)) return false;
-            const up: []const u32 = if (self.an.unread.get(p)) |l| l.items else &.{};
-            const uq: []const u32 = if (self.an.unread.get(q)) |l| l.items else &.{};
-            if (up.len != uq.len) return false;
-            for (up, uq) |s, t| if (!try self.ref(Ref.of(self.an.nodes.items[s]), Ref.of(self.an.nodes.items[t]))) return false;
+            for (0..end.refs.len) |j| try self.slots.append(gpa, .{ .parent = t, .slot = .end, .region = q, .index = @intCast(j), .at = 0 });
+            for (0..an.unreadOf(r0).len) |j| try self.slots.append(gpa, .{ .parent = t, .slot = .unread, .region = q, .index = @intCast(j), .at = 0 });
         }
-        return true;
+        var i = self.slots.items.len;
+        while (i > 0) {
+            i -= 1;
+            var item = self.slots.items[i];
+            item.at = @intCast(self.pending.items.len);
+            for (0..w) |kk| {
+                const nd = an.node(self.at(t, @intCast(kk)));
+                const x: Ref = switch (item.slot) {
+                    .arg => store.refSlice(nd.args)[item.index],
+                    .end => store.refSlice(store.region(store.regionSlice(nd.regions)[item.region]).end.refs)[item.index],
+                    .branch => Ref.of(NodeId.of(store.region(store.regionSlice(nd.regions)[item.region]).end.target)),
+                    .unread => Ref.of(an.nodes.items[an.unreadOf(store.regionSlice(nd.regions)[item.region])[item.index]]),
+                };
+                try self.pending.append(gpa, x);
+            }
+            try self.stack.append(gpa, item);
+        }
     }
 
-    // Where a value stands in a cone: inside it, a literal, or a hole.
-    const Place = enum { inside, lit, hole };
+    // Make tuple of nodes `t` a hole at every place.
+    fn forceTuple(self: *Gen, t: u32) Allocator.Error!void {
+        for (0..self.n()) |k| try self.force.append(self.an.gpa, key(@intCast(k), self.at(t, @intCast(k))));
+    }
 
-    fn placeOf(self: *const Pairing, root: u32, x: Ref) Place {
+    // Rule 4 over the tuples of a round: what it names goes to `force`.
+    fn rules(self: *Gen) Allocator.Error!void {
+        const gpa = self.an.gpa;
         const an = self.an;
-        return switch (x.kind) {
-            .node => blk: {
-                const l = an.localOf(x.nodeId());
-                if (an.is_lit[l]) break :blk .lit;
-                break :blk if (an.inCone(root, l)) .inside else .hole;
-            },
-            .row_param, .input => .hole,
-            .region_param => blk: {
-                const owner = an.store.region(x.regionId()).owner;
-                if (owner == NodeId.none) break :blk .hole;
-                break :blk if (an.inCone(root, an.localOf(owner))) .inside else .hole;
-            },
+        const store = an.store;
+        const w = self.n();
+        // A node of a place in two tuples of nodes.
+        self.owner.clearRetainingCapacity();
+        for (self.kinds.items, 0..) |kind, tt| {
+            if (kind != .node) continue;
+            const t: u32 = @intCast(tt);
+            for (0..w) |kk| {
+                const k: u32 = @intCast(kk);
+                const gop = try self.owner.getOrPut(gpa, key(k, self.at(t, k)));
+                if (gop.found_existing and gop.value_ptr.* != t) try self.force.append(gpa, key(k, self.at(t, k)));
+                if (!gop.found_existing) gop.value_ptr.* = t;
+            }
+        }
+        self.bad.clearRetainingCapacity();
+        for (self.places.items, 0..) |p, kk| {
+            const k: u32 = @intCast(kk);
+            // A node a hole's value reads, and a tuple of nodes holds.
+            self.visited.clearRetainingCapacity();
+            self.work.clearRetainingCapacity();
+            for (self.holes.items) |ht| try self.visit(p, self.values.items[ht * w + k]);
+            while (self.work.pop()) |m| {
+                if (self.owner.contains(key(k, m))) try self.force.append(gpa, key(k, m));
+                const nd = an.node(m);
+                for (store.refSlice(nd.args)) |x| try self.visit(p, x);
+                for (store.regionSlice(nd.regions)) |r| {
+                    const end = store.region(r).end;
+                    for (store.refSlice(end.refs)) |x| try self.visit(p, x);
+                    if (end.kind == .branch) try self.visit(p, Ref.of(NodeId.of(end.target)));
+                    for (an.unreadOf(r)) |u| try self.visit(p, Ref.of(an.nodes.items[u]));
+                }
+            }
+            // No speculation: a value outside the root's region must move.
+            self.moves.clearRetainingCapacity();
+            const home = an.node(p).region;
+            for (self.holes.items) |ht| {
+                const x = self.values.items[ht * w + k];
+                if (x.kind != .node) continue;
+                const m = an.localOf(x.nodeId());
+                if (an.is_lit[m] or !an.inCone(p, m) or an.node(m).region == home) continue;
+                if (!try self.movable(p, m)) try self.bad.put(gpa, ht, {});
+            }
+        }
+        for (self.edges.items) |e| if (self.bad.contains(e.child)) try self.forceTuple(e.parent);
+    }
+
+    fn visit(self: *Gen, p: u32, x: Ref) Allocator.Error!void {
+        if (x.kind != .node) return;
+        const m = self.an.localOf(x.nodeId());
+        if (!self.an.inCone(p, m)) return;
+        if ((try self.visited.getOrPut(self.an.gpa, m)).found_existing) return;
+        try self.work.append(self.an.gpa, m);
+    }
+
+    // Whether node `start` of the cone of `p`, outside the root's region,
+    // can move to the root's region: it, and every node it reads outside
+    // that region, is speculatable, owns no region, and reads no parameter
+    // of a region inside the cone.
+    fn movable(self: *Gen, p: u32, start: u32) Allocator.Error!bool {
+        const gpa = self.an.gpa;
+        const an = self.an;
+        const store = an.store;
+        const home = an.node(p).region;
+        if (self.moves.get(start)) |v| return v;
+        var stack: std.ArrayList(u32) = .empty;
+        defer stack.deinit(gpa);
+        try stack.append(gpa, start);
+        while (stack.items.len > 0) {
+            const m = stack.items[stack.items.len - 1];
+            if (self.moves.contains(m)) {
+                _ = stack.pop();
+                continue;
+            }
+            const nd = an.node(m);
+            var ok = nd.flags.speculatable and nd.regions.len == 0;
+            var waiting = false;
+            if (ok) for (store.refSlice(nd.args)) |x| {
+                if (an.boundIn(p, x)) {
+                    ok = false;
+                    break;
+                }
+                if (x.kind != .node) continue;
+                const u = an.localOf(x.nodeId());
+                if (an.is_lit[u] or !an.inCone(p, u) or an.node(u).region == home) continue;
+                if (self.moves.get(u)) |v| {
+                    if (!v) {
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    try stack.append(gpa, u);
+                    waiting = true;
+                }
+            };
+            if (waiting and ok) continue;
+            try self.moves.put(gpa, m, ok);
+            _ = stack.pop();
+        }
+        return self.moves.get(start).?;
+    }
+
+    // The chosen generalization of the last evaluation (normal-form 5.3,
+    // rule 7), with its images claimed and the literals its calls and the
+    // values that move read marked in `lit_used`.
+    fn take(self: *Gen, arena: Allocator, lit_used: []bool) Allocator.Error!Selection.Chosen {
+        const gpa = self.an.gpa;
+        const an = self.an;
+        const store = an.store;
+        const w = self.n();
+        const places = self.places.items;
+        const rep = places[0];
+
+        // The images, and per tuple of nodes the nodes it stands for.
+        const images = try arena.alloc([]const NodeId, w);
+        for (images, 0..) |*image, kk| {
+            const k: u32 = @intCast(kk);
+            var list: std.ArrayList(NodeId) = .empty;
+            for (self.kinds.items, 0..) |kind, t| {
+                if (kind != .node) continue;
+                const m = self.at(@intCast(t), k);
+                an.claimed[m] = true;
+                if (m != places[k]) try list.append(arena, an.nodes.items[m]);
+            }
+            image.* = try list.toOwnedSlice(arena);
+        }
+        var nodes: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
+        var also: collections.DenseMapUnmanaged(NodeId, []const NodeId) = .empty;
+        var needed: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer needed.deinit(gpa);
+        for (self.kinds.items, 0..) |kind, tt| {
+            const t: u32 = @intCast(tt);
+            const vs = self.valuesOf(t);
+            switch (kind) {
+                .node, .lit => {},
+                .param, .hole => continue,
+            }
+            const first = vs[0].nodeId();
+            if (kind == .node) try nodes.put(arena, first, {}) else try needed.put(gpa, an.localOf(first), {});
+            const others = try arena.alloc(NodeId, w - 1);
+            for (vs[1..], others) |x, *o| o.* = x.nodeId();
+            const gop = try also.getOrPut(arena, first);
+            gop.value_ptr.* = if (gop.found_existing) try std.mem.concat(arena, NodeId, &.{ gop.value_ptr.*, others }) else others;
+        }
+
+        // Where the representative's image reads each hole.
+        var slots: rebuild.HoleSlots = .{};
+        for (self.edges.items) |e| {
+            if (self.kinds.items[e.child] != .hole) continue;
+            const owner = self.at(e.parent, 0);
+            const hole = self.numbers.items[e.child];
+            switch (e.slot) {
+                .arg => try slots.args.put(arena, rebuild.slotKey(an.nodes.items[owner].index(), e.index), hole),
+                .end => try slots.ends.put(arena, rebuild.slotKey(store.regionSlice(an.node(owner).regions)[e.region].index(), e.index), hole),
+                .branch, .unread => unreachable, // these slots hold only tuples of nodes
+            }
+        }
+        const param_tys = try arena.alloc(TyId, self.holes.items.len);
+        for (self.holes.items, param_tys) |ht, *ty| ty.* = an.tyAt(rep, self.valuesOf(ht)[0]);
+
+        // What the row does not build: the cone's nodes outside the image,
+        // and the literals in the image's regions it copies no value of.
+        an.stamp_now += 1;
+        for (self.kinds.items, 0..) |kind, t| {
+            if (kind == .node) an.stamp[self.at(@intCast(t), 0)] = an.stamp_now;
+        }
+        var skip: std.ArrayList(NodeId) = .empty;
+        for (an.euler_order[an.tin[rep] .. an.tout[rep] + 1]) |m| {
+            if (an.stamp[m] != an.stamp_now) try skip.append(arena, an.nodes.items[m]);
+        }
+        const home_depth = an.regionDepth(rep);
+        var lits: std.ArrayList(NodeId) = .empty;
+        const row_pos = an.row_of[rep];
+        for (an.row_start[row_pos]..an.row_start[row_pos + 1]) |l| {
+            if (!an.is_lit[l]) continue;
+            if (needed.contains(@intCast(l))) {
+                if (an.regionDepth(@intCast(l)) <= home_depth) try lits.append(arena, an.nodes.items[l]);
+                continue;
+            }
+            const owner = store.region(an.node(@intCast(l)).region).owner;
+            if (owner != NodeId.none and an.stamp[an.localOf(owner)] == an.stamp_now) try skip.append(arena, an.nodes.items[l]);
+        }
+
+        // Per place: the values of its holes, and the values that move.
+        const occurrences = try arena.alloc(Selection.Occurrence, w);
+        for (occurrences, places, 0..) |*o, p, kk| {
+            const k: u32 = @intCast(kk);
+            const holes = try arena.alloc(Ref, self.holes.items.len);
+            for (self.holes.items, holes) |ht, *x| x.* = self.values.items[ht * w + k];
+            an.stamp_now += 1;
+            for (self.kinds.items, 0..) |kind, t| {
+                if (kind == .node) an.stamp[self.at(@intCast(t), k)] = an.stamp_now;
+            }
+            o.* = .{ .row = an.rowOf(p), .root = an.nodes.items[p], .holes = holes, .moved = try self.moved(arena, p, holes, lit_used) };
+        }
+        return .{
+            .rep = occurrences[0],
+            .nodes = nodes,
+            .skip = try skip.toOwnedSlice(arena),
+            .params = param_tys,
+            .slots = slots,
+            .lits = try lits.toOwnedSlice(arena),
+            .also = also,
+            .occurrences = occurrences,
+            .images = images,
         };
     }
 
-    fn ref(self: *Pairing, x: Ref, y: Ref) Allocator.Error!bool {
-        const store = self.an.store;
-        const px = self.placeOf(self.a, x);
-        if (px != self.placeOf(self.b, y)) return false;
-        switch (px) {
-            .lit => {
-                if (x.output != y.output or store.node(x.nodeId()).payload != store.node(y.nodeId()).payload) return false;
-                try self.pairs.append(self.gpa(), .{ x.nodeId(), y.nodeId() });
-                return true;
-            },
-            .inside => switch (x.kind) {
-                .node => {
-                    if (y.kind != .node or x.output != y.output) return false;
-                    const gop = try self.nodes.getOrPut(self.gpa(), x.nodeId());
-                    if (gop.found_existing) return gop.value_ptr.* == y.nodeId();
-                    gop.value_ptr.* = y.nodeId();
-                    try self.work.append(self.gpa(), .{ x.nodeId(), y.nodeId() });
-                    try self.pairs.append(self.gpa(), .{ x.nodeId(), y.nodeId() });
-                    return true;
-                },
-                .region_param => {
-                    if (y.kind != .region_param or x.output != y.output) return false;
-                    const paired = self.regions.get(x.regionId()) orelse return false;
-                    return paired == y.regionId();
-                },
-                .row_param, .input => unreachable, // a parameter or a slot is never inside a cone
-            },
-            .hole => {
-                const kx = rebuild.refKey(x);
-                const ky = rebuild.refKey(y);
-                if (self.holes_ab.get(kx)) |seen| return seen == ky;
-                if (self.holes_ba.contains(ky)) return false;
-                const join_x = x.kind == .region_param and x.output == Analysis.join_output;
-                const join_y = y.kind == .region_param and y.output == Analysis.join_output;
-                if (join_x != join_y) return false;
-                if (!join_x) {
-                    const ra = self.an.rows[self.an.row_of[self.a]];
-                    const rb = self.an.rows[self.an.row_of[self.b]];
-                    if (store.refTy(ra, x) != store.refTy(rb, y)) return false;
-                }
-                try self.holes_ab.put(self.gpa(), kx, ky);
-                try self.holes_ba.put(self.gpa(), ky, kx);
-                return true;
-            },
+    // The values the caller of place `p` builds just before the call, in
+    // site order: the nodes and literals the values of its holes read that
+    // stand in a region an image node owns (`stamp`). Every literal a hole
+    // passes or such a node reads is marked in `lit_used`.
+    fn moved(self: *Gen, arena: Allocator, p: u32, holes: []const Ref, lit_used: []bool) Allocator.Error![]const NodeId {
+        const gpa = self.an.gpa;
+        const an = self.an;
+        const store = an.store;
+        const home = an.node(p).region;
+        var found: std.ArrayList(u32) = .empty;
+        defer found.deinit(gpa);
+        self.visited.clearRetainingCapacity();
+        self.work.clearRetainingCapacity();
+        for (holes) |x| {
+            if (x.kind != .node) continue;
+            const m = an.localOf(x.nodeId());
+            if (an.is_lit[m]) lit_used[m] = true;
+            try self.reach(p, m, home);
         }
+        while (self.work.pop()) |m| {
+            try found.append(gpa, m);
+            if (an.is_lit[m]) continue;
+            for (store.refSlice(an.node(m).args)) |x| {
+                if (x.kind != .node) continue;
+                const u = an.localOf(x.nodeId());
+                if (an.is_lit[u]) lit_used[u] = true;
+                try self.reach(p, u, home);
+            }
+        }
+        std.mem.sort(u32, found.items, {}, std.sort.asc(u32));
+        const out = try arena.alloc(NodeId, found.items.len);
+        for (found.items, out) |m, *o| o.* = an.nodes.items[m];
+        return out;
+    }
+
+    // Note node or literal `m` for `moved` when it stands in a region an
+    // image node owns.
+    fn reach(self: *Gen, p: u32, m: u32, home: RegionId) Allocator.Error!void {
+        const an = self.an;
+        const region = an.node(m).region;
+        if (region == home) return;
+        if (!an.is_lit[m] and !an.inCone(p, m)) return;
+        const owner = an.store.region(region).owner;
+        if (owner == NodeId.none or an.stamp[an.localOf(owner)] != an.stamp_now) return;
+        if ((try self.visited.getOrPut(an.gpa, m)).found_existing) return;
+        try self.work.append(an.gpa, m);
     }
 };
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-fn putWords(h: *Sha256, ws: []const u32) void {
+fn putWords(h: anytype, ws: []const u32) void {
     h.update(std.mem.sliceAsBytes(ws));
 }
 
-fn putDigest(h: *Sha256, d: digest_mod.Digest) void {
+fn putDigest(h: anytype, d: digest_mod.Digest) void {
     h.update(std.mem.asBytes(&d));
 }
 
@@ -1984,4 +2394,319 @@ test "L6 V3: selection does not depend on the build order or on how placement br
         var prng = std.Random.DefaultPrng.init(seed);
         try expectOutline(nested, seed % 2 == 1, prng.random(), want.written());
     }
+}
+
+const prims = @import("prims.zig");
+
+// V3b: anti-unification. Places that differ in a value are one row when the
+// value can be a hole (normal-form 5.3, rules 3 and 4).
+
+// `(((x * x) + 7) * x) & x`, wrapping: four nodes over one value.
+fn square(f: *Fixture, x: Ref) Allocator.Error!Ref {
+    return pattern(f, x, x);
+}
+
+fn pairTy(f: *Fixture) Allocator.Error!TyId {
+    const i64_ty = try f.types.intTy(.i64);
+    return f.types.recordTy(&.{ .{ .name = "a", .ty = i64_ty }, .{ .name = "b", .ty = i64_ty } });
+}
+
+// `square(p0.a) - square(p0.b)`: the places read two fields, and the field
+// is a hole. With `reversed`, the places are built in the other order.
+fn twoFields(f: *Fixture, reversed: bool) Allocator.Error!RowId {
+    const root = try f.b.beginRow(&.{try pairTy(f)}, try f.types.intTy(.i64));
+    var parts: [2]Ref = undefined;
+    for (0..2) |k| {
+        const at = if (reversed) 1 - k else k;
+        parts[at] = try square(f, try f.b.field(Ref.rowParam(0), @intCast(at)));
+    }
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .minus, &.{ parts[0], parts[1] })} });
+    return root;
+}
+
+// `square(p0.a) - square(p0.b) - square(p1 - p2)`: three places, and the
+// third holes a difference where the others hold a field. (A product would
+// not do: N15 flattens `(p1 * p2) * (p1 * p2)` into one chain.)
+fn threeFields(f: *Fixture, _: bool) Allocator.Error!RowId {
+    const i64_ty = try f.types.intTy(.i64);
+    const root = try f.b.beginRow(&.{ try pairTy(f), i64_ty, i64_ty }, i64_ty);
+    const x = try square(f, try f.b.field(Ref.rowParam(0), 0));
+    const y = try square(f, try f.b.field(Ref.rowParam(0), 1));
+    const z = try square(f, try f.b.call(.i64, .minus, &.{ Ref.rowParam(1), Ref.rowParam(2) }));
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .minus, &.{ try f.b.call(.i64, .minus, &.{ x, y }), z })} });
+    return root;
+}
+
+// `pattern(p0.a, p1) - pattern(p0.b, p1)`: `p1` is one value at both places.
+fn oneSharedHole(f: *Fixture, _: bool) Allocator.Error!RowId {
+    const i64_ty = try f.types.intTy(.i64);
+    const root = try f.b.beginRow(&.{ try pairTy(f), i64_ty }, i64_ty);
+    const x = try pattern(f, try f.b.field(Ref.rowParam(0), 0), Ref.rowParam(1));
+    const y = try pattern(f, try f.b.field(Ref.rowParam(0), 1), Ref.rowParam(1));
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .minus, &.{ x, y })} });
+    return root;
+}
+
+// `pattern(p0, p0) - pattern(p1, p2)`: one place reads one value twice
+// where the other reads two.
+fn sharingDiffers(f: *Fixture, _: bool) Allocator.Error!RowId {
+    const root = try f.b.beginRow(&try params(f, 3), try f.types.intTy(.i64));
+    const x = try pattern(f, Ref.rowParam(0), Ref.rowParam(0));
+    const y = try pattern(f, Ref.rowParam(1), Ref.rowParam(2));
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .minus, &.{ x, y })} });
+    return root;
+}
+
+// `((((a * b) + lit) * a) & b) ^ a`, wrapping: five nodes and a literal.
+fn withLit(f: *Fixture, a: Ref, b: Ref, lit: i64) Allocator.Error!Ref {
+    const i64_ty = try f.types.intTy(.i64);
+    const ab = try f.b.call(.i64, .times_wrap, &.{ a, b });
+    const plus = try f.b.call(.i64, .plus_wrap, &.{ ab, try f.b.litInt(i64_ty, lit) });
+    const again = try f.b.call(.i64, .times_wrap, &.{ plus, a });
+    const both = try f.b.call(.i64, .bitwise_and, &.{ again, b });
+    return f.b.call(.i64, .bitwise_xor, &.{ both, a });
+}
+
+// `withLit(p0, p1, 7) - withLit(p2, p3, 9)`: the literals differ.
+fn twoLiterals(f: *Fixture, _: bool) Allocator.Error!RowId {
+    const root = try f.b.beginRow(&try params(f, 4), try f.types.intTy(.i64));
+    const x = try withLit(f, Ref.rowParam(0), Ref.rowParam(1), 7);
+    const y = try withLit(f, Ref.rowParam(2), Ref.rowParam(3), 9);
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .minus, &.{ x, y })} });
+    return root;
+}
+
+// `pattern(s, a)` over `s = if a == 0 { 0 } else { d(a, b) + 1 }`, where
+// `d` is `*` at the first place and `|` at the second when `speculatable`,
+// and the checked `*` and `-` otherwise. The places differ only in `d`,
+// which stands in an arm.
+fn armed(f: *Fixture, speculatable: bool) Allocator.Error!RowId {
+    const i64_ty = try f.types.intTy(.i64);
+    const root = try f.b.beginRow(&try params(f, 4), i64_ty);
+    var parts: [2]Ref = undefined;
+    for (&parts, 0..) |*part, k| {
+        const a = Ref.rowParam(@intCast(2 * k));
+        const b = Ref.rowParam(@intCast(2 * k + 1));
+        const zero = try f.b.litInt(i64_ty, 0);
+        const done = try f.b.call(.i64, .is_eq, &.{ a, zero });
+        const arm0 = try f.b.openArm(done, 0);
+        const method: prims.Method = if (speculatable) (if (k == 0) .times_wrap else .bitwise_or) else (if (k == 0) .times else .minus);
+        const d = try f.b.call(.i64, method, &.{ a, b });
+        try f.b.close(.{ .value = &.{try f.b.call(.i64, .plus_wrap, &.{ d, try f.b.litInt(i64_ty, 1) })} });
+        const arm1 = try f.b.openArm(done, 1);
+        try f.b.close(.{ .value = &.{zero} });
+        const s = try f.b.switchOn(done, &.{ arm0, arm1 }, &.{}, &.{i64_ty}, &.{});
+        part.* = try pattern(f, s, a);
+    }
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .minus, &.{ parts[0], parts[1] })} });
+    return root;
+}
+
+fn armedSpeculatable(f: *Fixture, _: bool) Allocator.Error!RowId {
+    return armed(f, true);
+}
+
+fn armedChecked(f: *Fixture, _: bool) Allocator.Error!RowId {
+    return armed(f, false);
+}
+
+test "V3b: two places that read different fields are one row, and each passes its field" {
+    try expectOutline(twoFields, false, null,
+        \\row r0 ({ a : I64, b : I64 }) -> I64
+        \\  n0 = field 0(p0) : I64
+        \\  n1 = call r1(n0) : I64
+        \\  n2 = field 1(p0) : I64
+        \\  n3 = call r1(n2) : I64
+        \\  n4 = Num.I64.minus(n1, n3) : I64 !spec
+        \\  value n4
+        \\row r1 (I64) -> I64
+        \\  n0 = Num.I64.times_wrap(p0, p0) : I64
+        \\  n1 = 7 : I64
+        \\  n2 = Num.I64.plus_wrap(n0, n1) : I64
+        \\  n3 = Num.I64.times_wrap(n2, p0) : I64
+        \\  n4 = Num.I64.bitwise_and(n3, p0) : I64
+        \\  value n4
+        \\
+    );
+}
+
+test "V3b: three places generalize together, a field at two and a difference at the third" {
+    try expectOutline(threeFields, false, null,
+        \\row r0 ({ a : I64, b : I64 }, I64, I64) -> I64
+        \\  n0 = field 0(p0) : I64
+        \\  n1 = call r1(n0) : I64
+        \\  n2 = field 1(p0) : I64
+        \\  n3 = call r1(n2) : I64
+        \\  n4 = Num.I64.minus(n1, n3) : I64 !spec
+        \\  n5 = Num.I64.minus(p1, p2) : I64 !spec
+        \\  n6 = call r1(n5) : I64
+        \\  n7 = Num.I64.minus(n4, n6) : I64 !spec
+        \\  value n7
+        \\row r1 (I64) -> I64
+        \\  n0 = Num.I64.times_wrap(p0, p0) : I64
+        \\  n1 = 7 : I64
+        \\  n2 = Num.I64.plus_wrap(n0, n1) : I64
+        \\  n3 = Num.I64.times_wrap(n2, p0) : I64
+        \\  n4 = Num.I64.bitwise_and(n3, p0) : I64
+        \\  value n4
+        \\
+    );
+}
+
+test "V3b: a hole that is one value at every place is one parameter" {
+    try expectOutline(oneSharedHole, false, null,
+        \\row r0 ({ a : I64, b : I64 }, I64) -> I64
+        \\  n0 = field 0(p0) : I64
+        \\  n1 = call r1(n0, p1) : I64
+        \\  n2 = field 1(p0) : I64
+        \\  n3 = call r1(n2, p1) : I64
+        \\  n4 = Num.I64.minus(n1, n3) : I64 !spec
+        \\  value n4
+        \\row r1 (I64, I64) -> I64
+        \\  n0 = Num.I64.times_wrap(p0, p1) : I64
+        \\  n1 = 7 : I64
+        \\  n2 = Num.I64.plus_wrap(n0, n1) : I64
+        \\  n3 = Num.I64.times_wrap(n2, p0) : I64
+        \\  n4 = Num.I64.bitwise_and(n3, p1) : I64
+        \\  value n4
+        \\
+    );
+}
+
+test "V3b: a place that reads one value twice passes it twice where the other passes two" {
+    try expectOutline(sharingDiffers, false, null,
+        \\row r0 (I64, I64, I64) -> I64
+        \\  n0 = call r1(p0, p0) : I64
+        \\  n1 = call r1(p1, p2) : I64
+        \\  n2 = Num.I64.minus(n0, n1) : I64 !spec
+        \\  value n2
+        \\row r1 (I64, I64) -> I64
+        \\  n0 = Num.I64.times_wrap(p0, p1) : I64
+        \\  n1 = 7 : I64
+        \\  n2 = Num.I64.plus_wrap(n0, n1) : I64
+        \\  n3 = Num.I64.times_wrap(n2, p0) : I64
+        \\  n4 = Num.I64.bitwise_and(n3, p1) : I64
+        \\  value n4
+        \\
+    );
+    try expectViewsAgree(sharingDiffers, &.{ &.{ 1, 2, 3 }, &.{ -5, 7, 0 }, &.{ 123456789, -987654321, 42 } });
+}
+
+test "V3b: literals that differ are a hole, and the node that reads them stays in the row" {
+    try expectOutline(twoLiterals, false, null,
+        \\row r0 (I64, I64, I64, I64) -> I64
+        \\  n0 = 7 : I64
+        \\  n1 = call r1(p0, p1, n0) : I64
+        \\  n2 = 9 : I64
+        \\  n3 = call r1(p2, p3, n2) : I64
+        \\  n4 = Num.I64.minus(n1, n3) : I64 !spec
+        \\  value n4
+        \\row r1 (I64, I64, I64) -> I64
+        \\  n0 = Num.I64.times_wrap(p0, p1) : I64
+        \\  n1 = Num.I64.plus_wrap(n0, p2) : I64
+        \\  n2 = Num.I64.times_wrap(n1, p0) : I64
+        \\  n3 = Num.I64.bitwise_and(n2, p1) : I64
+        \\  n4 = Num.I64.bitwise_xor(n3, p0) : I64
+        \\  value n4
+        \\
+    );
+    try expectViewsAgree(twoLiterals, &inputs4);
+}
+
+test "V3b: a speculatable value in an arm moves before the call, and the switch stays in the row" {
+    // `a == 0` is a switch on `a` (N7), so the row switches on its first parameter.
+    try expectOutline(armedSpeculatable, false, null,
+        \\row r0 (I64, I64, I64, I64) -> I64
+        \\  n0 = Num.I64.times_wrap(p0, p1) : I64
+        \\  n1 = call r1(p0, n0) : I64
+        \\  n2 = Num.I64.bitwise_or(p2, p3) : I64
+        \\  n3 = call r1(p2, n2) : I64
+        \\  n4 = Num.I64.minus(n1, n3) : I64 !spec
+        \\  value n4
+        \\row r1 (I64, I64) -> I64
+        \\  n3 = switch p0 : I64
+        \\    arm 0
+        \\      n0 = 0 : I64
+        \\      value n0
+        \\    default
+        \\      n1 = 1 : I64
+        \\      n2 = Num.I64.plus_wrap(p1, n1) : I64
+        \\      value n2
+        \\  n4 = Num.I64.times_wrap(n3, p0) : I64
+        \\  n5 = 7 : I64
+        \\  n6 = Num.I64.plus_wrap(n4, n5) : I64
+        \\  n7 = Num.I64.times_wrap(n6, n3) : I64
+        \\  n8 = Num.I64.bitwise_and(n7, p0) : I64
+        \\  value n8
+        \\
+    );
+    try expectViewsAgree(armedSpeculatable, &.{ &.{ 0, 2, 3, 4 }, &.{ -5, 7, 0, 11 }, &.{ 123456789, -987654321, 42, -1 } });
+}
+
+test "V3b: a value in an arm that can crash does not move, so the switch is a hole" {
+    try expectOutline(armedChecked, false, null,
+        \\row r0 (I64, I64, I64, I64) -> I64
+        \\  n0 = 0 : I64
+        \\  n4 = switch p0 : I64 !spec
+        \\    arm 0
+        \\      value n0
+        \\    default
+        \\      n1 = Num.I64.times(p0, p1) : I64 !spec
+        \\      n2 = 1 : I64
+        \\      n3 = Num.I64.plus_wrap(n1, n2) : I64
+        \\      value n3
+        \\  n5 = call r1(n4, p0) : I64
+        \\  n9 = switch p2 : I64 !spec
+        \\    arm 0
+        \\      value n0
+        \\    default
+        \\      n6 = Num.I64.minus(p2, p3) : I64 !spec
+        \\      n7 = 1 : I64
+        \\      n8 = Num.I64.plus_wrap(n6, n7) : I64
+        \\      value n8
+        \\  n10 = call r1(n9, p2) : I64
+        \\  n11 = Num.I64.minus(n5, n10) : I64 !spec
+        \\  value n11
+        \\row r1 (I64, I64) -> I64
+        \\  n0 = Num.I64.times_wrap(p0, p1) : I64
+        \\  n1 = 7 : I64
+        \\  n2 = Num.I64.plus_wrap(n0, n1) : I64
+        \\  n3 = Num.I64.times_wrap(n2, p0) : I64
+        \\  n4 = Num.I64.bitwise_and(n3, p1) : I64
+        \\  value n4
+        \\
+    );
+    try expectViewsAgree(armedChecked, &.{ &.{ 0, 2, 3, 4 }, &.{ -5, 7, 0, 11 }, &.{ 1234, -9876, 42, -1 } });
+}
+
+test "L6 V3b: the generalization does not depend on the build order or on how placement breaks ties" {
+    var want: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer want.deinit();
+    {
+        var f: Fixture = undefined;
+        f.init();
+        defer f.deinit();
+        const root = try twoFields(&f, false);
+        _ = try driver.runTo(testing.allocator, &f.b, root, &.{}, .outline);
+        try dump.dumpSite(&want.writer, testing.allocator, &f.store, &f.types, root);
+    }
+    for (0..16) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        try expectOutline(twoFields, seed % 2 == 1, prng.random(), want.written());
+    }
+}
+
+test "V3b: every pass lowers the site's measure, and the passes end" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const root = try nested(&f, false);
+    const stats = try driver.runTo(testing.allocator, &f.b, root, &.{}, .outline);
+    try testing.expectEqual(@as(u32, 2), stats.outline_passes);
+    try testing.expect(stats.outline_size.measure() < stats.inline_size.measure());
+    try testing.expect(stats.outline_size.nodes < stats.inline_size.nodes);
+    // A further pass takes nothing.
+    var again = try outlineSelect(testing.allocator, &f.store, &f.types, root, outline_min_size);
+    defer again.deinit();
+    try testing.expectEqual(@as(usize, 0), again.shapes.len);
 }

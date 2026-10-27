@@ -5026,6 +5026,111 @@ test "L3 M9: a switch that returns from the function stays, and the computations
     );
 }
 
+// V3b: anti-unification. Places that differ in a value are one row when the
+// value can be a hole (normal-form 5.3, rules 3 and 4).
+
+/// The `inline` and `outline` views of `source`'s `wobble`, over a record
+/// `{ a : U64, b : U64 }`, compute one value on each of `inputs`.
+fn expectOutlineAgrees(source: []const u8, inputs: []const [2]i128) !void {
+    const gpa = std.testing.allocator;
+    const inlined = try Staged.createInlined(gpa, source);
+    defer inlined.destroy();
+    const outlined = try Staged.createOutlined(gpa, source);
+    defer outlined.destroy();
+    try std.testing.expect(inlined.outcome == .reified and outlined.outcome == .reified);
+    var values_impl = std.heap.ArenaAllocator.init(gpa);
+    defer values_impl.deinit();
+    const values = values_impl.allocator();
+    for (inputs) |input| {
+        const fields = try values.alloc(reify.eval.Value, 2);
+        for (fields, input) |*field, v| field.* = .{ .int = v };
+        const args = [_]reify.eval.Value{.{ .agg = fields }};
+        var computed: [2]reify.eval.Value = undefined;
+        for ([_]*Staged{ inlined, outlined }, &computed) |staged, *value| {
+            const site = staged.walk.site.?;
+            var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
+            value.* = try evaluator.run(staged.walk.root.?, &args);
+        }
+        try std.testing.expect(computed[0].eql(computed[1]));
+    }
+}
+
+const v3b_step =
+    \\step : U64 -> U64
+    \\step = |x| ((x * 3 + 1) * x + 5) * x
+    \\
+;
+
+const v3b_fields =
+    \\wobble : { a : U64, b : U64 } -> U64
+    \\wobble = |input| step(input.a) + step(input.b)
+;
+
+test "L3 V3b: `step(input.a)` and `step(input.b)` are one row, and each place passes its field" {
+    try expectOutlineDump(v3b_step ++ v3b_fields,
+        \\row r0 ({ a : U64, b : U64 }) -> U64
+        \\  n0 = field 0(p0) : U64
+        \\  n1 = call r1(n0) : U64 !spec
+        \\  n2 = field 1(p0) : U64
+        \\  n3 = call r1(n2) : U64 !spec
+        \\  n4 = Num.U64.plus(n1, n3) : U64 !spec
+        \\  value n4
+        \\row r1 (U64) -> U64
+        \\  n0 = 3 : U64
+        \\  n1 = Num.U64.times(p0, n0) : U64 !spec
+        \\  n2 = 1 : U64
+        \\  n3 = Num.U64.plus(n1, n2) : U64 !spec
+        \\  n4 = Num.U64.times(n3, p0) : U64 !spec
+        \\  n5 = 5 : U64
+        \\  n6 = Num.U64.plus(n4, n5) : U64 !spec
+        \\  n7 = Num.U64.times(n6, p0) : U64 !spec
+        \\  value n7
+        \\
+    );
+    try expectOutlineAgrees(v3b_step ++ v3b_fields, &.{ .{ 1, 2 }, .{ 0, 7 }, .{ 300, 11 } });
+}
+
+test "L3 V3b: the body of `step` written out over two fields meets the helper in outline, not in graph" {
+    try expectSameOutlineOnly(v3b_step ++ v3b_fields,
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| ((input.a * 3 + 1) * input.a + 5) * input.a + ((input.b * 3 + 1) * input.b + 5) * input.b
+    );
+}
+
+// `scale(1, x)` folds `x * 1` to `x`, so the two places differ in that
+// node: the row takes it as a parameter and keeps the rest.
+const v3b_scaled =
+    \\scale : U64, U64 -> U64
+    \\scale = |k, x| ((x * k + 1) * x + 5) * x
+    \\
+    \\wobble : { a : U64, b : U64 } -> U64
+    \\wobble = |input| scale(1, input.a) + scale(2, input.b)
+;
+
+test "L3 V3b: a helper called with constants that fold differently shares only the common part" {
+    try expectOutlineDump(v3b_scaled,
+        \\row r0 ({ a : U64, b : U64 }) -> U64
+        \\  n0 = field 0(p0) : U64
+        \\  n1 = call r1(n0, n0) : U64 !spec
+        \\  n2 = field 1(p0) : U64
+        \\  n3 = 2 : U64
+        \\  n4 = Num.U64.times(n2, n3) : U64 !spec
+        \\  n5 = call r1(n4, n2) : U64 !spec
+        \\  n6 = Num.U64.plus(n1, n5) : U64 !spec
+        \\  value n6
+        \\row r1 (U64, U64) -> U64
+        \\  n0 = 1 : U64
+        \\  n1 = Num.U64.plus(p0, n0) : U64 !spec
+        \\  n2 = Num.U64.times(n1, p1) : U64 !spec
+        \\  n3 = 5 : U64
+        \\  n4 = Num.U64.plus(n2, n3) : U64 !spec
+        \\  n5 = Num.U64.times(n4, p1) : U64 !spec
+        \\  value n5
+        \\
+    );
+    try expectOutlineAgrees(v3b_scaled, &.{ .{ 1, 2 }, .{ 0, 7 }, .{ 300, 11 } });
+}
+
 // An interpolated literal of the author's own type is converted in two stages
 // (static-dispatch.md). The walk runs the first stage by its definition where
 // the literal stands, because the segments are literals, and the literal is
