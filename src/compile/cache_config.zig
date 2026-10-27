@@ -396,7 +396,9 @@ pub const Constants = struct {
     ///      root, and a `Code` site records the conversion roots its walk met.
     /// 175: Normal form 12: `Code.Outlined` is a builtin type, a site's view
     ///      can be `outline` (V3), and its value holds that view.
-    pub const CACHE_VERSION = 175;
+    /// 176: Normal form 13: `Code.Lawful` is a builtin type, and a site of
+    ///      it holds the `graph` view under the laws of layer L.
+    pub const CACHE_VERSION = 176;
 };
 
 /// Configuration for the Roc cache system.

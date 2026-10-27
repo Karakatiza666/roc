@@ -27,13 +27,14 @@ pub const rebuild = @import("rebuild.zig");
 pub const number = @import("number.zig");
 pub const loops = @import("loops.zig");
 pub const scalar = @import("scalar.zig");
+pub const laws = @import("laws.zig");
 pub const fuzz_gen = @import("fuzz_gen.zig");
 
 /// The normal-form version (I11). The rules, the speculatable lists and the
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 12;
+pub const normal_form_version: u32 = 13;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -58,6 +59,8 @@ pub fn fingerprint() u64 {
     // V3: the `outline` view, its K, its selection order and its hole numbering.
     h.update("outline: cones, shapes by first-occurrence holes, (occurrences x (size - 1)) then size then shape");
     h.update(std.mem.asBytes(&views.outline_min_size));
+    // M10: layer L, the laws a `Code.Lawful(f)` site opts into.
+    for (laws.steps) |step| h.update(step);
     return h.final();
 }
 
@@ -114,6 +117,10 @@ const recorded = [_]Recorded{
     // M9 of the plan: the `outline` view (V3), which makes a row of every
     // computation of at least K nodes that repeats, and its K.
     .{ .version = 12, .fingerprint = 0x111ad83eee8dde24 },
+    // M10 of the plan: layer L (N16a to N16f), which a `Code.Lawful(f)` site
+    // opts into, the builtins its laws read in the builtin table, with
+    // `List.is_empty` speculatable, and the `Iter.map` role.
+    .{ .version = 13, .fingerprint = 0x2fc706afc0671f11 },
 };
 
 const std = @import("std");
@@ -153,5 +160,6 @@ test "reify tests" {
     std.testing.refAllDecls(@import("number.zig"));
     std.testing.refAllDecls(@import("loops.zig"));
     std.testing.refAllDecls(@import("scalar.zig"));
+    std.testing.refAllDecls(@import("laws.zig"));
     std.testing.refAllDecls(@import("fuzz_gen.zig"));
 }

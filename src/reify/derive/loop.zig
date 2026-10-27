@@ -237,6 +237,7 @@ fn dupeValue(arena: Allocator, v: Value) Allocator.Error!Value {
         .agg => |xs| .{ .agg = try each.all(arena, xs) },
         .list => |xs| .{ .list = try each.all(arena, xs) },
         .tag => |t| .{ .tag = .{ .name = t.name, .payload = try each.all(arena, t.payload) } },
+        .closure => unreachable, // signature terms are built only from the enumerated symbols, which hold no closure
     };
 }
 

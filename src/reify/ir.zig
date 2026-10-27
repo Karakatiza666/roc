@@ -509,6 +509,10 @@ pub const IteratorRole = enum(u8) {
     /// `List.iter`: an iterator that yields every element of a list in index
     /// order, one per step, and never skips.
     list_iter,
+    /// `Iter.map`: an iterator that yields the function's value of each item
+    /// of the iterator it maps, in order, and skips where that one skips
+    /// (N16e).
+    map,
 };
 
 /// A primitive the builtin table does not hold, by the names its owner gives

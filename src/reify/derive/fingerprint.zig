@@ -119,6 +119,7 @@ fn hashValue(h: *std.hash.Wyhash, v: Value) void {
             h.update(std.mem.asBytes(&t.name));
             for (t.payload) |x| hashValue(h, x);
         },
+        .closure => unreachable, // signature terms are built only from the enumerated symbols, which hold no closure
     }
 }
 
@@ -159,7 +160,7 @@ pub fn writeValue(w: *std.Io.Writer, sort: Sort, v: Value) std.Io.Writer.Error!v
             try writeValue(w, .bool, xs[1]);
             try w.writeAll(if (sort == .tuple_ib) ")" else "}");
         },
-        .float, .str, .list => unreachable, // signature values are int, bool, tag, aggregate or bottom
+        .float, .str, .list, .closure => unreachable, // signature values are int, bool, tag, aggregate or bottom
     }
 }
 

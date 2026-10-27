@@ -353,11 +353,14 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
     const artifact = coord.appRootCheckedArtifact();
     const env = artifact.module_env.env();
     const lookup: Lookup = .{ .artifact = artifact, .builtins = &builtins.checked_artifact };
+    // A case with the constructs of M10 meets in the `lawful` view, where
+    // layer L applies (L4, loop to builtin).
+    const view: @TypeOf(@as(CodeReifier.Walk, undefined).view) = if (case.lawful) .lawful else .graph;
     var left: Site = undefined;
-    try left.describe(gpa, &lookup, env, case.left_param);
+    try left.describeIn(gpa, &lookup, env, case.left_param, view);
     defer left.deinit();
     var right: Site = undefined;
-    try right.describe(gpa, &lookup, env, case.right_param);
+    try right.describeIn(gpa, &lookup, env, case.right_param, view);
     defer right.deinit();
 
     // L4: one normal form, or one refusal.
@@ -385,14 +388,66 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
         },
     }
 
-    // L4 for V5a: in the `inline` view, the prints meet and every node of
-    // them has one digest.
+    // The other views are compared on cases without M10's constructs, whose
+    // spellings meet only under layer L.
     var left_inline: Site = undefined;
-    try left_inline.describeIn(gpa, &lookup, env, case.left_param, .inline_);
-    defer left_inline.deinit();
+    var left_outline: Site = undefined;
+    var left_graph: Site = undefined;
+    if (case.lawful) {
+        // L5 for laws: the graph the site describes without layer L.
+        try left_graph.describe(gpa, &lookup, env, case.left_param);
+    } else try compareViews(gpa, &lookup, env, case, &left_inline, &left_outline);
+    defer if (case.lawful) left_graph.deinit() else {
+        left_inline.deinit();
+        left_outline.deinit();
+    };
+
+    // L5: the normal form's value is the one Roc computed at compile time.
+    try coord.finishCheckedProgram(.executable_artifacts);
+    if (errorsBesideCrashes(&coord)) {
+        printReports(&coord);
+        return error.GeneratedCaseDidNotCheck;
+    }
+    const expected = try storedAnswer(&coord, case.answer) orelse return .reference_crashed;
+    // The answer is the only definition Roc evaluates, so no other crashed.
+    if (coord.hasUserErrors()) {
+        printReports(&coord);
+        return error.GeneratedCaseDidNotCheck;
+    }
+
+    var values_impl = std.heap.ArenaAllocator.init(gpa);
+    defer values_impl.deinit();
+    const values = values_impl.allocator();
+    const items = try values.alloc(reify.eval.Value, case.input.items.len);
+    for (items, case.input.items) |*item, value| item.* = .{ .int = value };
+    const fields = [_]reify.eval.Value{ .{ .int = case.input.a }, .{ .int = case.input.b }, .{ .bool_ = case.input.flag }, .{ .list = items } };
+    const args = [_]reify.eval.Value{.{ .agg = &fields }};
+    // Views agree: `graph`, `inline` and `outline` each compute Roc's
+    // answer, or `lawful` and `graph` for a case with M10's constructs.
+    const views: [3]?*const Site = if (case.lawful) .{ &left, &left_graph, null } else .{ &left, &left_inline, &left_outline };
+    for (views) |maybe| {
+        const each = maybe orelse continue;
+        if (each.outcome != .reified) continue;
+        const site = each.walk.site.?;
+        var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
+        const computed = try evaluator.run(each.walk.root.?, &args);
+        if (!computed.eql(.{ .int = expected })) {
+            std.debug.print("the normal form computes {any}, and Roc computes {d}\n{s}\n", .{ computed, expected, each.dump.items });
+            return error.ValuesDiffer;
+        }
+    }
+    return .agree;
+}
+
+// L4 for V5a and V3: the prints meet in the `inline` and `outline` views,
+// and in `inline` every node of them has one digest. The left print's sites
+// are left in `left_inline` and `left_outline`.
+fn compareViews(gpa: Allocator, lookup: *const Lookup, env: *const ModuleEnv, case: *const reify.fuzz_gen.Case, left_inline: *Site, left_outline: *Site) Error!void {
+    try left_inline.describeIn(gpa, lookup, env, case.left_param, .inline_);
+    errdefer left_inline.deinit();
     {
         var right_inline: Site = undefined;
-        try right_inline.describeIn(gpa, &lookup, env, case.right_param, .inline_);
+        try right_inline.describeIn(gpa, lookup, env, case.right_param, .inline_);
         defer right_inline.deinit();
         if (left_inline.outcome == .reified and right_inline.outcome == .reified) {
             if (!std.mem.eql(u8, left_inline.dump.items, right_inline.dump.items)) {
@@ -420,12 +475,11 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
     }
 
     // L4 for V3: in the `outline` view, the prints meet.
-    var left_outline: Site = undefined;
-    try left_outline.describeIn(gpa, &lookup, env, case.left_param, .outline);
-    defer left_outline.deinit();
+    try left_outline.describeIn(gpa, lookup, env, case.left_param, .outline);
+    errdefer left_outline.deinit();
     {
         var right_outline: Site = undefined;
-        try right_outline.describeIn(gpa, &lookup, env, case.right_param, .outline);
+        try right_outline.describeIn(gpa, lookup, env, case.right_param, .outline);
         defer right_outline.deinit();
         if (left_outline.outcome == .reified and right_outline.outcome == .reified) {
             if (!std.mem.eql(u8, left_outline.dump.items, right_outline.dump.items)) {
@@ -436,39 +490,6 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
             return error.RefusalsDiffer;
         }
     }
-
-    // L5: the normal form's value is the one Roc computed at compile time.
-    try coord.finishCheckedProgram(.executable_artifacts);
-    if (errorsBesideCrashes(&coord)) {
-        printReports(&coord);
-        return error.GeneratedCaseDidNotCheck;
-    }
-    const expected = try storedAnswer(&coord, case.answer) orelse return .reference_crashed;
-    // The answer is the only definition Roc evaluates, so no other crashed.
-    if (coord.hasUserErrors()) {
-        printReports(&coord);
-        return error.GeneratedCaseDidNotCheck;
-    }
-
-    var values_impl = std.heap.ArenaAllocator.init(gpa);
-    defer values_impl.deinit();
-    const values = values_impl.allocator();
-    const items = try values.alloc(reify.eval.Value, case.input.items.len);
-    for (items, case.input.items) |*item, value| item.* = .{ .int = value };
-    const fields = [_]reify.eval.Value{ .{ .int = case.input.a }, .{ .int = case.input.b }, .{ .bool_ = case.input.flag }, .{ .list = items } };
-    const args = [_]reify.eval.Value{.{ .agg = &fields }};
-    // Views agree: `graph`, `inline` and `outline` each compute Roc's answer.
-    for ([_]*const Site{ &left, &left_inline, &left_outline }) |each| {
-        if (each.outcome != .reified) continue;
-        const site = each.walk.site.?;
-        var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
-        const computed = try evaluator.run(each.walk.root.?, &args);
-        if (!computed.eql(.{ .int = expected })) {
-            std.debug.print("the normal form computes {any}, and Roc computes {d}\n{s}\n", .{ computed, expected, each.dump.items });
-            return error.ValuesDiffer;
-        }
-    }
-    return .agree;
 }
 
 // Whether a report other than a warning or a compile-time crash was made.

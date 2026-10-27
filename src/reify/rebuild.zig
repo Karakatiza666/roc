@@ -20,6 +20,7 @@ const place = @import("place.zig");
 const provenance = @import("provenance.zig");
 const loops = @import("loops.zig");
 const scalar = @import("scalar.zig");
+const laws = @import("laws.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -108,6 +109,26 @@ pub fn run(gpa: Allocator, b: *Builder, p: *const place.Plan, opts: Options) All
     try r.finish(old_body, .row, null);
 }
 
+/// The body of row `row` built in the builder's current region over `args`
+/// for its parameters, at the type `ty` of the call it stands for, as
+/// `Rebuild.inlined` builds an inlined callee. Layer L inlines the known
+/// function N16c and N16d call this way. The row's body ends in one value
+/// and no region in it ends in `Return`.
+pub fn inlineRow(gpa: Allocator, b: *Builder, returns: *live_mod.Returns, row: RowId, args: []const Ref, ty: TyId, ties: place.Ties) Allocator.Error!Ref {
+    var p = try place.planWith(gpa, b.store, returns, row, .simplify, ties);
+    defer p.deinit();
+    var wanted: ?Demand = if (ty == b.store.row(row).result) null else try DemandWalk.run(gpa, b.store, b.types, &p, ty);
+    defer if (wanted) |*w| w.deinit();
+    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = &p, .opts = .{ .param_values = args }, .demand = if (wanted) |*w| w else null, .inside = true };
+    defer r.deinit();
+    const body = b.store.row(row).body;
+    try r.regions.put(gpa, body, b.current());
+    try r.fill(body);
+    const end = b.store.region(body).end;
+    std.debug.assert(end.kind == .value and end.refs.len == 1);
+    return r.mapRef(b.store.refSlice(end.refs)[0]);
+}
+
 /// Build a new row over `params` with the body of `p`'s row copied into it,
 /// each old parameter read as the value `values` gives for it once the new
 /// row's body is open. Returns the new row. `b` builds no other row now.
@@ -165,6 +186,38 @@ pub fn cone(
         if (nodes.contains(m) and !r.nodes.contains(m)) try r.node(m);
     }
     try b.endRow(.{ .value = &.{r.mapRef(Ref.of(root))} });
+    return row;
+}
+
+/// N16a, N16b: a new row over the holes of `found`'s cone and then the
+/// element, whose body copies the nodes outside the loop the row takes, then
+/// the cone's nodes in the loop body, and gives the value the law names, or
+/// its negation. Nothing is simplified here; the driver simplifies the row.
+/// `b` builds no other row now.
+pub fn lawRow(gpa: Allocator, b: *Builder, p: *const place.Plan, found: *const laws.Raise) Allocator.Error!RowId {
+    const store = b.store;
+    const params = try gpa.alloc(TyId, found.holes.len + 1);
+    defer gpa.free(params);
+    for (found.holes, params[0..found.holes.len]) |h, *t| t.* = store.refTy(p.row, h);
+    params[found.holes.len] = found.elem_ty;
+    var values: std.AutoHashMapUnmanaged(u64, Ref) = .empty;
+    defer values.deinit(gpa);
+    for (found.holes, 0..) |h, i| try values.put(gpa, refKey(h), Ref.rowParam(@intCast(i)));
+    try values.put(gpa, refKey(found.elem), Ref.rowParam(@intCast(found.holes.len)));
+    const row = try b.beginRow(params, found.result_ty);
+    var r: Rebuild = .{ .gpa = gpa, .b = b, .p = p, .opts = .{ .raw = true, .holes = &values }, .row_body = store.row(p.row).body };
+    defer r.deinit();
+    for (found.pre) |m| try r.node(m);
+    const body = found.elem.regionId();
+    for (p.membersOf(body)) |m| {
+        if (found.cone.contains(m) and !r.nodes.contains(m)) try r.node(m);
+    }
+    const value = r.mapRef(found.value);
+    const result = if (found.negate)
+        try b.makeRaw(.{ .op = .prim, .payload = @import("prims.zig").find(.bool_, .not).?.index(), .args = &.{value}, .tys = &.{found.result_ty} })
+    else
+        value;
+    try b.endRow(.{ .value = &.{result} });
     return row;
 }
 
@@ -471,6 +524,14 @@ const Rebuild = struct {
 
     fn store(self: *const Rebuild) *ir.Store {
         return self.b.store;
+    }
+
+    // The type of `ref`, a ref of the row as it was. Under `row_params` the
+    // row's parameters are already in their new order (`rows.Finalizer.renumber`),
+    // and a parameter keeps its type at its new index.
+    fn oldRefTy(self: *const Rebuild, ref: Ref) TyId {
+        if (ref.kind == .row_param) if (self.opts.row_params) |map| return self.store().refTy(self.p.row, Ref.rowParam(@intCast(map[ref.output].?)));
+        return self.store().refTy(self.p.row, ref);
     }
 
     fn mapRef(self: *const Rebuild, ref: Ref) Ref {
@@ -831,6 +892,13 @@ const Rebuild = struct {
                         const rw = found;
                         break :blk try self.rewrittenLoop(nd, &rw, args);
                     }
+                    // Layer L: a loop the slot and exit rules leave as it is
+                    // can be a builtin call (N16a, N16b).
+                    if (self.b.laws != null and nd.op == .for_list) {
+                        if (try laws.raise(self.arena(), self.p, self.b.types, n)) |found| {
+                            if (try self.raised(&found)) |ref| break :blk .{ .ref = ref, .width = 1 };
+                        }
+                    }
                 }
                 // A loop copied as it is, and a lambda, are paths of their own.
                 try self.frames.append(self.gpa, null);
@@ -860,12 +928,68 @@ const Rebuild = struct {
                 .width = 1,
             },
             .call => .{ .ref = if (self.opts.inline_rows) |rows| (if (rows.get(RowId.of(nd.payload))) |callee| try self.inlined(callee, args, tys[0]) else try self.make(.{ .op = nd.op, .payload = nd.payload, .args = args, .tys = tys, .aux = aux })) else try self.make(.{ .op = nd.op, .payload = nd.payload, .args = args, .tys = tys, .aux = aux }), .width = 1 },
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .apply => .{
+            .prim => blk: {
+                // N16d reads whether the map is the only reader of the list it maps.
+                const sole = self.b.laws != null and laws.isMap(nd) and laws.soleFirst(self.p, n, nd);
+                const reader = self.b.sole_reader;
+                self.b.sole_reader = if (sole) args[0] else null;
+                defer self.b.sole_reader = reader;
+                break :blk .{ .ref = try self.make(.{ .op = nd.op, .payload = nd.payload, .args = args, .tys = tys, .aux = aux }), .width = 1 };
+            },
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .apply => .{
                 .ref = try self.make(.{ .op = nd.op, .payload = nd.payload, .args = args, .tys = tys, .aux = aux }),
                 .width = 1,
             },
         };
         try self.nodes.put(self.gpa, n, built);
+    }
+
+    // N16a, N16b: the loop `found` describes as a builtin call over a closure
+    // of a row made of the loop's cone. The row is built over the cone's
+    // holes and then the element, copied from the old row, and the driver
+    // simplifies and finalizes it before the closure names it. Null where
+    // the driver stopped with an error, which it keeps; the loop is then
+    // copied as it is and the run ends after the round.
+    fn raised(self: *Rebuild, found: *const laws.Raise) Allocator.Error!?Ref {
+        const b = self.b;
+        const law: @import("builder.zig").Algorithm = switch (found.law) {
+            .map => .law_map,
+            .keep_if => .law_keep_if,
+        };
+        if (!b.algorithmOn(law)) return null;
+        const hook = b.laws.?;
+        const captures = try self.mapRefs(found.holes);
+        defer self.gpa.free(captures);
+        const list = self.mapRef(found.list);
+        const outer_origins = b.origins;
+        const held = b.suspendRow();
+        const row = lawRow(self.gpa, b, self.p, found) catch |err| {
+            b.resumeRow(held);
+            return err;
+        };
+        const target = hook.close(hook.ctx, b, row, @intCast(found.holes.len)) catch |err| switch (err) {
+            error.OutOfMemory => |e| {
+                b.resumeRow(held);
+                return e;
+            },
+            // The driver keeps the reason and stops after the caller's round.
+            error.MeasureDidNotFall, error.RoundBoundExceeded, error.InvariantBroken => null,
+        };
+        b.resumeRow(held);
+        b.origins = outer_origins;
+        const made = target orelse return null;
+        b.algorithmFired(law);
+        const kept = try self.gpa.alloc(Ref, made.kept.len);
+        defer self.gpa.free(kept);
+        for (made.kept, kept) |k, *r| r.* = captures[k];
+        self.mark();
+        const clo = try b.closure(made.row, kept, found.fn_ty);
+        const method: @import("prims.zig").Method = switch (found.law) {
+            .map => .map,
+            .keep_if => .keep_if,
+        };
+        self.mark();
+        return try b.primOf(@import("prims.zig").find(.list, method).?, &.{ list, clo }, found.out_ty);
     }
 
     // N11: the loop `nd` copied as the rewrite `rw` says. What the header
@@ -1028,7 +1152,7 @@ const Rebuild = struct {
         // scrutinee can have fewer tags than the old one, because an inlined
         // argument conforms to a wider parameter: an arm for a tag it lacks is
         // dead and is not built (design.md "Row Coercion Primitive").
-        const old_ty = s.refTy(self.p.row, s.refSlice(nd.args)[0]);
+        const old_ty = self.oldRefTy(s.refSlice(nd.args)[0]);
         const old_names: ?[]NameId = switch (self.b.types.get(old_ty)) {
             .tag_union => |span| blk: {
                 const members = self.b.types.memberSlice(span);

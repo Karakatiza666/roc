@@ -929,9 +929,10 @@ pub const CodeReificationSite = extern struct {
     pub const no_bound_call: u32 = std.math.maxInt(u32);
 
     /// The view a site's declared type selects (plan 1.5): `Code(f)` holds
-    /// the `graph` view, `Code.Inlined(f)` the `inline` view and
-    /// `Code.Outlined(f)` the `outline` view.
-    pub const View = enum(u8) { graph, inline_, outline };
+    /// the `graph` view, `Code.Inlined(f)` the `inline` view,
+    /// `Code.Outlined(f)` the `outline` view, and `Code.Lawful(f)` the
+    /// `graph` view under layer L (normal-form 3.16).
+    pub const View = enum(u8) { graph, inline_, outline, lawful };
 
     /// What the site's node is, which decides where the description comes from.
     ///

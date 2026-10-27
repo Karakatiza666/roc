@@ -24325,6 +24325,48 @@ Builtin :: [].{
 			bound = |_, value| Bound.({ value, inputs: [] })
 		}
 
+		## A description whose site is declared `Code.Lawful(f)`: the `graph`
+		## view, normalized with the laws of the builtins as well (layer L).
+		## A loop that appends one value per element to an empty list is a
+		## `List.map`, and one that appends the element under a test is a
+		## `List.keep_if`; a `List.fold` of a known function is the loop that
+		## calls it; a `map` of a `map` is one `map`; `xs.iter().map(f).collect()`
+		## into a `List` is `List.map`; and `xs.len() == 0` and `xs.len() > 0`
+		## are `xs.is_empty()` and `!xs.is_empty()`. So a translator that
+		## reads this view sees one form where the author writes either, and
+		## matches the form after the laws. A translator that wants the forms
+		## as written reads `Code(f)`.
+		Lawful(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+
+			## The rows the description reaches, as [Code.graph] gives them.
+			graph : Lawful(_fn) -> Graph
+			graph = |Lawful.(inner)| inner.graph
+
+			## The normal-form version the value was built under.
+			version : Lawful(_fn) -> U32
+			version = |Lawful.(inner)| inner.version
+
+			## Two values are equal when their normal forms are, wherever each
+			## was described.
+			is_eq : Lawful(fn), Lawful(fn) -> Bool
+			is_eq = |Lawful.(a), Lawful.(b)| a.version == b.version and a.graph == b.graph
+
+			## Hashes the normal form, and not the site key, to agree with `is_eq`.
+			to_hash : Lawful(_fn), Hasher -> Hasher
+			to_hash = |Lawful.(inner), hasher| inner.graph.to_hash(Hasher.write_u32(hasher, inner.version))
+
+			## Refuse node `at.node` of row `at.row`, as [Code.refuse_at] refuses
+			## one of the `graph` view. A node a law made reports where the code
+			## it stands for was written.
+			refuse_at : Lawful(_fn), { row : U32, node : U32 }, Str -> _a
+			refuse_at = |Lawful.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
+
+			## A translator's result, as [Code.bound] makes one for the `graph`
+			## view.
+			bound : Lawful(_fn), a -> Bound(a)
+			bound = |_, value| Bound.({ value, inputs: [] })
+		}
+
 		## The run-time value of one input slot, which follows the slot's
 		## [Code.Ty]: an integer that is not a `U128` is an `Int`, a record has
 		## one value per field in the order of its `Ty`, and a nominal value is a

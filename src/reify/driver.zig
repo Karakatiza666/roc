@@ -40,6 +40,7 @@ const views = @import("views.zig");
 const match = @import("match.zig");
 const loops = @import("loops.zig");
 const scalar = @import("scalar.zig");
+const laws = @import("laws.zig");
 
 const Allocator = std.mem.Allocator;
 const RowId = ir.RowId;
@@ -107,6 +108,8 @@ pub const Options = struct {
     /// K of the `outline` view. Only the measurement of K reads another
     /// value (`ROC_REIFY_OUTLINE_STATS`); the language version fixes it.
     outline_min_size: u32 = views.outline_min_size,
+    /// Whether the site opts into layer L (`laws.zig`): a `Code.Lawful(f)` site.
+    laws: bool = false,
 };
 
 /// Run the simplify, finalize, view and number stages over every row of
@@ -136,6 +139,8 @@ pub fn runToWith(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass,
     defer b.specializer = null;
     b.scalarizer = .{ .ctx = &special, .run = Specialize.scalarize };
     defer b.scalarizer = null;
+    if (options.laws) b.laws = .{ .ctx = &special, .close = Specialize.lawClose, .inline_row = Specialize.lawInline };
+    defer b.laws = null;
     for (comps) |comp| {
         try component(gpa, b, passes, &fin, comp, &stats);
         if (special.failed) |err| return err;
@@ -161,7 +166,7 @@ pub fn runToWith(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass,
     if (view == .outline) try outlineTurns(gpa, b, &fin, root, &stats, options.outline_min_size, &outlined);
     try numberStage(gpa, b);
     if (checks) {
-        try checkInvariants(gpa, store, b.types, root, outlined.items);
+        try checkInvariants(gpa, b, root, outlined.items, options.laws);
         try checkFlatTrees(gpa, store, b.types);
         if (try rows.check(gpa, store, root)) |_| return error.InvariantBroken;
     }
@@ -500,6 +505,74 @@ const Specialize = struct {
         return self.specialized(store, made);
     }
 
+    // Layer L (`laws.zig`): the row a law built, simplified and finalized on
+    // the spot, and the row a closure of it names, with the captures that
+    // row reads. A closure's row takes the captures first and the
+    // function's own parameters after them, in their order; where finalize
+    // ordered `row`'s parameters otherwise, a row that keeps that convention
+    // calls it, as finalize makes one for a closure the walk built (N8f).
+    fn lawClose(ctx: *anyopaque, b: *Builder, row: RowId, captures: u32) builder_mod.SpecializeError!?builder_mod.LawClosure {
+        const self: *Specialize = @ptrCast(@alignCast(ctx));
+        const store = b.store;
+        const old = try self.arena.allocator().dupe(ir.TyId, store.tySlice(store.row(row).params));
+        const comp = [_]RowId{row};
+        component(self.gpa, b, self.passes, self.fin, &comp, self.stats) catch |err| return self.keep(err);
+        const at = self.specialized(store, row);
+        const order = at.order orelse {
+            const kept = try self.arena.allocator().alloc(u32, captures);
+            for (kept, 0..) |*k, i| k.* = @intCast(i);
+            return .{ .row = at.row, .kept = kept };
+        };
+        var kept: std.ArrayList(u32) = .empty;
+        for (order) |k| if (k < captures) try kept.append(self.arena.allocator(), k);
+        const direct = order.len == old.len and for (order[kept.items.len..], captures..) |k, want| {
+            if (k != want) break false;
+        } else true;
+        if (direct) return .{ .row = at.row, .kept = kept.items };
+        const w = self.fin.conventionRow(b, at.row, order, old, captures, kept.items) catch |err| return self.keep(err);
+        const wrapper = [_]RowId{w};
+        component(self.gpa, b, self.passes, self.fin, &wrapper, self.stats) catch |err| return self.keep(err);
+        return .{ .row = canonical(store, w), .kept = kept.items };
+    }
+
+    // `Builder.Laws.inline_row`: a row that only forwards to another, as a
+    // closure's convention row does, is inlined as that row over the
+    // arguments it passes.
+    fn lawInline(ctx: *anyopaque, b: *Builder, row: RowId, args: []const ir.Ref, ty: ir.TyId) Allocator.Error!?ir.Ref {
+        const self: *Specialize = @ptrCast(@alignCast(ctx));
+        const store = b.store;
+        var at = canonical(store, row);
+        var with = try self.gpa.dupe(ir.Ref, args);
+        defer self.gpa.free(with);
+        while (store.forwardingCall(at)) |n| {
+            const nd = store.node(n);
+            const passed = try self.gpa.alloc(ir.Ref, nd.args.len);
+            for (store.refSlice(nd.args), passed) |a, *p| p.* = with[a.output];
+            self.gpa.free(with);
+            with = passed;
+            at = canonical(store, RowId.of(nd.payload));
+        }
+        const info = store.row(at);
+        if (info.recursive) return null;
+        var returns = try live.Returns.init(self.gpa, store);
+        defer returns.deinit(self.gpa);
+        const end = store.region(info.body).end;
+        if (end.kind != .value or end.refs.len != 1 or returns.regionHolds(store, info.body)) return null;
+        return try rebuild.inlineRow(self.gpa, b, &returns, at, with, ty, ties(b));
+    }
+
+    // The error a driver step a specialization runs stopped with, kept for
+    // the end of the caller's round.
+    fn keep(self: *Specialize, err: Error) builder_mod.SpecializeError {
+        if (self.failed == null) self.failed = err;
+        return switch (err) {
+            error.OutOfMemory => |e| e,
+            error.MeasureDidNotFall => error.MeasureDidNotFall,
+            error.RoundBoundExceeded => error.RoundBoundExceeded,
+            error.InvariantBroken, error.UnresolvedApply => error.InvariantBroken,
+        };
+    }
+
     // The row `made` is now, with the order finalize gave its parameters.
     // A row that merged took the parameters of the row it merged into, in
     // the order `made` had them, and the merge follows the renumbering.
@@ -568,7 +641,7 @@ const State = struct {
     }
 };
 
-fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, comp: []const RowId) Allocator.Error!State {
+fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, comp: []const RowId, with_laws: bool) Allocator.Error!State {
     var returns = try live.Returns.init(gpa, store);
     defer returns.deinit(gpa);
     var reached = try live.ofStore(gpa, store);
@@ -585,7 +658,7 @@ fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types
         defer numbering.deinit(gpa);
         p.* = number.fingerprint(store, &returns, &numbering, r);
         f.* = store.row(r).speculatable;
-        const m = try measure.ofRow(gpa, store, types, reached, &calls, r);
+        const m = try measure.ofRow(gpa, store, types, reached, &calls, r, with_laws);
         for (&total.counts, m.counts) |*t, c| t.* +|= c;
     }
     return .{ .prints = prints, .flags = flags, .measure = total };
@@ -594,7 +667,7 @@ fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types
 fn simplify(gpa: Allocator, b: *Builder, passes: []const Pass, comp: []const RowId) Error!u32 {
     const store = b.store;
     var rounds: u32 = 0;
-    var before = try stateOf(gpa, store, b.types, comp);
+    var before = try stateOf(gpa, store, b.types, comp, b.laws != null);
     defer before.deinit(gpa);
     while (true) {
         {
@@ -618,7 +691,7 @@ fn simplify(gpa: Allocator, b: *Builder, passes: []const Pass, comp: []const Row
         for (passes) |p| {
             if (try p.run(p.ctx, store, b.types, comp)) passed = true;
         }
-        var after = try stateOf(gpa, store, b.types, comp);
+        var after = try stateOf(gpa, store, b.types, comp, b.laws != null);
         const content = passed or !std.mem.eql(u128, before.prints, after.prints);
         const flags = !std.mem.eql(bool, before.flags, after.flags);
         if (!content and !flags) {
@@ -695,7 +768,9 @@ fn checkFlatTrees(gpa: Allocator, store: *const ir.Store, types: *types_mod.Type
     if (!report.ok()) return error.InvariantBroken;
 }
 
-fn checkInvariants(gpa: Allocator, store: *const ir.Store, types: *types_mod.Types, root: RowId, outlined: []const RowId) Error!void {
+fn checkInvariants(gpa: Allocator, b: *const Builder, root: RowId, outlined: []const RowId, with_laws: bool) Error!void {
+    const store = b.store;
+    const types = b.types;
     var report = try verify.verifyAll(gpa, store, types);
     defer report.deinit();
     if (!report.ok()) return error.InvariantBroken;
@@ -734,7 +809,15 @@ fn checkInvariants(gpa: Allocator, store: *const ir.Store, types: *types_mod.Typ
         var p = try place.plan(gpa, store, &returns, r, .simplify);
         defer p.deinit();
         if (!try loops.noneRewritable(gpa, store, types, &p)) return error.InvariantBroken;
+        // L2: at a site that opts into layer L, no law applies to a finished row.
+        if (with_laws and !try lawsNoneRewritable(gpa, b, &p)) return error.InvariantBroken;
     }
+}
+
+fn lawsNoneRewritable(gpa: Allocator, b: *const Builder, p: *const place.Plan) Allocator.Error!bool {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    return laws.noneRewritable(arena.allocator(), p, b);
 }
 
 const testing = std.testing;

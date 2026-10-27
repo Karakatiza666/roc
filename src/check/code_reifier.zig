@@ -5133,7 +5133,8 @@ pub const Reifier = struct {
             .identity => .identity,
             .next => .next,
             .list_iter => .list_iter,
-            .custom, .single, .list_iter_rev, .str_iter_utf8, .map, .keep_if, .drop_if, .take_first, .drop_first, .concat, .append, .with_index, .step_by, .from_iter, .range_iter, .numeric_range_iter, .numeric_to, .numeric_until, .from_step, .range_done => .none,
+            .map => .map,
+            .custom, .single, .list_iter_rev, .str_iter_utf8, .keep_if, .drop_if, .take_first, .drop_first, .concat, .append, .with_index, .step_by, .from_iter, .range_iter, .numeric_range_iter, .numeric_to, .numeric_until, .from_step, .range_done => .none,
         };
     }
 
@@ -8434,12 +8435,12 @@ pub const Walk = struct {
     /// that needs more simplify rounds than the language version allows is
     /// refused at `region`.
     pub fn normalize(self: *Walk, root: RowId, region: base.Region) error{ Rejected, OutOfMemory }!void {
-        _ = try self.normalizeWith(root, region, viewOf(self.view), .{});
+        _ = try self.normalizeWith(root, region, viewOf(self.view), .{ .laws = self.view == .lawful });
     }
 
     fn viewOf(view: View) reify.driver.View {
         return switch (view) {
-            .graph => .graph,
+            .graph, .lawful => .graph,
             .inline_ => .inline_,
             .outline => .outline,
         };
@@ -8498,7 +8499,7 @@ pub const Walk = struct {
         self.root = root;
         const graph = try emitter.graph(root);
         const digests: ?ConstNodeId = switch (self.view) {
-            .graph, .outline => null,
+            .graph, .outline, .lawful => null,
             .inline_ => try emitter.digests(root),
         };
         try self.bindSlots(emitter.slot_order, region);

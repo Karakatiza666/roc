@@ -3293,12 +3293,12 @@ pub const ReportBuilder = struct {
         return null;
     }
 
-    /// Whether `var_` is a `Code`, a `Code.Inlined` or a `Code.Outlined`.
+    /// Whether `var_` is a `Code`, a `Code.Inlined`, a `Code.Outlined` or a `Code.Lawful`.
     fn isCodeType(self: *Self, var_: Var) bool {
         const nominal = self.module_env.types.resolveVar(var_).desc.content.unwrapNominalType() orelse return false;
         if (!nominal.originIsBuiltin()) return false;
         const ident = nominal.ident.ident_idx;
-        return ident.eql(self.module_env.idents.builtin_code) or ident.eql(self.module_env.idents.builtin_code_inlined) or ident.eql(self.module_env.idents.builtin_code_outlined);
+        return ident.eql(self.module_env.idents.builtin_code) or ident.eql(self.module_env.idents.builtin_code_inlined) or ident.eql(self.module_env.idents.builtin_code_outlined) or ident.eql(self.module_env.idents.builtin_code_lawful);
     }
 
     fn buildInvalidNumericLiteralReport(
@@ -5823,7 +5823,7 @@ pub const ReportBuilder = struct {
     }
 
     /// Whether an argument mismatch is a function named where a `Code` was
-    /// expected. The expected side is the builtin `Code`, `Code.Inlined` or `Code.Outlined` and the actual side is
+    /// expected. The expected side is the builtin `Code`, `Code.Inlined`, `Code.Outlined` or `Code.Lawful` and the actual side is
     /// a function: the checker looked for a description and was handed the
     /// function itself, which is what a staging site that did not trigger
     /// leaves behind.
@@ -5850,7 +5850,8 @@ pub const ReportBuilder = struct {
         };
         if (!nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code) and
             !nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code_inlined) and
-            !nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code_outlined)) return false;
+            !nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code_outlined) and
+            !nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code_lawful)) return false;
 
         return switch (self.snapshots.?.getContentUnwrapAlias(actual)) {
             .structure => |structure| switch (structure) {

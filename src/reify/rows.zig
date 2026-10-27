@@ -347,7 +347,7 @@ pub const Finalizer = struct {
     // The row a closure of `r` calls through: the captures `r` reads, in
     // `r`'s order, then the function's own parameters in their order, and a
     // body that calls `r` over them.
-    fn conventionRow(self: *Finalizer, b: *Builder, r: RowId, order: []const u32, old: []const TyId, captures: u32, kept: []const u32) Error!RowId {
+    pub fn conventionRow(self: *Finalizer, b: *Builder, r: RowId, order: []const u32, old: []const TyId, captures: u32, kept: []const u32) Error!RowId {
         const gpa = self.gpa;
         const own = old.len - captures;
         const tys = try gpa.alloc(TyId, kept.len + own);

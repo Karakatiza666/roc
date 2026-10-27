@@ -32,6 +32,10 @@ pub const Options = struct {
     /// helper that takes its arguments in several shapes). With it off, a
     /// case is the one the generator made before M7 for the same bytes.
     m7: bool = true,
+    /// The constructs of M10 (a sum written as `List.fold`, a test of the
+    /// list being empty). A case with them is compared in the `lawful` view,
+    /// where layer L makes the spellings meet.
+    m10: bool = false,
 };
 
 /// Bytes the generator reads its choices from. Past the end it reads zeros,
@@ -84,6 +88,8 @@ const Node = union(enum) {
     sum: struct { start: *const Node, step: *const Node, slot: u16 },
     /// A private helper `|p, q| p + q * k` called twice, as `h(x1, y1) + h(x2, y2)`.
     twice: struct { args: [4]*const Node, k: u64 },
+    /// Whether the list field is empty, or with `negated` whether it is not.
+    empty: struct { negated: bool },
 };
 
 /// One generated case: the module text and the input it is run on.
@@ -97,6 +103,8 @@ pub const Case = struct {
     right_param: []u8,
     answer: []u8,
     input: Input,
+    /// Set where the case may hold the constructs of M10.
+    lawful: bool,
 
     pub fn deinit(self: *Case, gpa: Allocator) void {
         gpa.free(self.source);
@@ -205,6 +213,8 @@ const Builder = struct {
 
     fn boolTerm(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
         const d = depth + 1;
+        // M10: a test of the list being empty, from the extra stream.
+        if (self.options.m10 and self.extra.pick(8) == 0) return self.node(.{ .empty = .{ .negated = self.extra.pick(2) == 1 } });
         return switch (self.reader.pick(8)) {
             0 => self.leaf(.bool_, &scope),
             1 => self.node(.{ .is_lt = .{ try self.term(.u64_, scope, d), try self.term(.u64_, scope, d) } }),
@@ -279,6 +289,7 @@ fn reads(n: *const Node, slot: u16) bool {
         .default => |d| reads(d.cond, slot) or reads(d.ok, slot) or reads(d.fallback, slot),
         .sum => |x| reads(x.start, slot) or reads(x.step, slot),
         .twice => |t| reads(t.args[0], slot) or reads(t.args[1], slot) or reads(t.args[2], slot) or reads(t.args[3], slot),
+        .empty => false,
     };
 }
 
@@ -516,6 +527,19 @@ const Printer = struct {
                 const shape = if (self.options.m7) self.extra.pick(3) else 0;
                 const f1 = try self.symbols.fresh("fo");
                 const f2 = try self.symbols.fresh("fo");
+                // M10: a scalar sum as `List.fold` over a lambda (N16c).
+                if (self.options.m10 and shape == 0 and self.extra.pick(2) == 0) {
+                    const state = try self.symbols.fresh("lc");
+                    try self.print("{s}.{s}.fold(", .{ self.names.param, self.names.fields[3] });
+                    try self.expr(s.start);
+                    // The start may bind this slot in a block of its own.
+                    self.names.locals[s.slot] = item;
+                    self.names.twins[s.slot] = null;
+                    try self.print(", |{s}, {s}| {s} + ", .{ state, item, state });
+                    try self.expr(s.step);
+                    try self.write(")");
+                    return;
+                }
                 try self.print("{{\nvar {s} = ", .{acc});
                 switch (shape) {
                     0 => try self.expr(s.start),
@@ -555,6 +579,21 @@ const Printer = struct {
                 try self.write("\n}");
             },
             .twice => |t| try self.twice(t.args, t.k),
+            .empty => |e| {
+                const list = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ self.names.param, self.names.fields[3] });
+                defer self.gpa.free(list);
+                // N16f: each spelling is `List.is_empty` or its negation.
+                if (e.negated) switch (self.extra.pick(4)) {
+                    0 => try self.print("({s}.len() > 0.U64)", .{list}),
+                    1 => try self.print("!({s}.is_empty())", .{list}),
+                    2 => try self.print("({s}.len() != 0.U64)", .{list}),
+                    else => try self.print("(0.U64 < {s}.len())", .{list}),
+                } else switch (self.extra.pick(3)) {
+                    0 => try self.print("({s}.len() == 0.U64)", .{list}),
+                    1 => try self.print("{s}.is_empty()", .{list}),
+                    else => try self.print("(0.U64 == {s}.len())", .{list}),
+                }
+            },
         }
     }
 
@@ -758,7 +797,7 @@ const Printer = struct {
                 try self.write(" })");
                 return;
             },
-            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice => {},
+            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice, .empty => {},
         }
         try self.write("{\n");
         try self.bind(value, slot);
@@ -905,6 +944,7 @@ pub fn generateWith(gpa: Allocator, bytes: []const u8, options: Options) Allocat
         .left_param = try gpa.dupe(u8, left_names.param),
         .right_param = try gpa.dupe(u8, right_names.param),
         .answer = try gpa.dupe(u8, answer),
+        .lawful = options.m10,
         .input = input,
     };
 }

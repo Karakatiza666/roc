@@ -5411,3 +5411,182 @@ test "a crash the author wrote in a conversion is not a rejected literal" {
 
     try staged.expectRejected("a call to a function value that no simplification resolves");
 }
+
+// L3 M10: layer L (normal-form 3.16). The laws apply only at a site that
+// opts in with `Code.Lawful(f)`, so each pair meets in the `lawful` view and
+// stays apart in the `graph` view.
+
+/// The two sources describe `wobble` to one dump in the `lawful` view and to
+/// two dumps in the `graph` view.
+fn expectSameLawfulOnly(left: []const u8, right: []const u8) (StagedError || error{ TestUnexpectedResult, TestExpectedEqual })!void {
+    const gpa = std.testing.allocator;
+    const a = try Staged.createRunning(gpa, left, "");
+    defer a.destroy();
+    const b = try Staged.createRunning(gpa, right, "");
+    defer b.destroy();
+    inline for (.{ a, b }) |side| switch (side.outcome) {
+        .reified => {},
+        .rejected => |rejection| {
+            std.debug.print("reification rejected: {t} {s} at '{s}'\n", .{ rejection.kind, rejection.detail, side.env.getSource(rejection.region) });
+            return error.TestUnexpectedResult;
+        },
+    };
+    try expectSameView(a, b, .lawful);
+    // Without the opt-in, no law applies.
+    try std.testing.expect(!std.mem.eql(u8, a.dump.items, b.dump.items));
+}
+
+test "L3 M10: a loop that appends each mapped element is List.map" {
+    try expectSameLawfulOnly(
+        \\wobble : List(U64) -> List(U64)
+        \\wobble = |input| {
+        \\    var $out = []
+        \\    for x in input {
+        \\        $out = $out.append(x * 3 + 1)
+        \\    }
+        \\    $out
+        \\}
+    ,
+        \\wobble : List(U64) -> List(U64)
+        \\wobble = |input| input.map(|x| x * 3 + 1)
+    );
+}
+
+test "L3 M10: a loop that appends each element under a test is List.keep_if" {
+    try expectSameLawfulOnly(
+        \\wobble : List(U64) -> List(U64)
+        \\wobble = |input| {
+        \\    var $out = []
+        \\    for x in input {
+        \\        if x > 3 {
+        \\            $out = $out.append(x)
+        \\        }
+        \\    }
+        \\    $out
+        \\}
+    ,
+        \\wobble : List(U64) -> List(U64)
+        \\wobble = |input| input.keep_if(|x| x > 3)
+    );
+}
+
+test "L3 M10: a fold of a known function is the loop written by hand" {
+    try expectSameLawfulOnly(
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| {
+        \\    var $s = 0
+        \\    for x in input {
+        \\        $s = $s + x * 2
+        \\    }
+        \\    $s
+        \\}
+    ,
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| input.fold(0, |s, x| s + x * 2)
+    );
+}
+
+test "L3 M10: a fold whose function reads two fields of a captured record is the loop written by hand" {
+    // The capture splits into its fields (N14a) when N16c calls the row, and
+    // the row that takes them is renumbered with a switch on a parameter.
+    try expectSameLawfulOnly(
+        \\wobble : { b : U64, c : Bool, xs : List(U64) } -> U64
+        \\wobble = |input| input.xs.fold(11, |s, _y| s + (if input.c 14 else input.b))
+    ,
+        \\wobble : { b : U64, c : Bool, xs : List(U64) } -> U64
+        \\wobble = |input| {
+        \\    var $s = 11
+        \\    for _y in input.xs {
+        \\        $s = $s + (if input.c 14 else input.b)
+        \\    }
+        \\    $s
+        \\}
+    );
+}
+
+test "L3 M10: a fold whose function has the body of a helper called twice is the loop written by hand" {
+    // The lambda's row and the helper's row merge (N8g), so the row has
+    // three callers; N16c inlines it at the loop all the same.
+    const helper =
+        \\add : U64, U64 -> U64
+        \\add = |p, q| p + q
+        \\
+        \\
+    ;
+    try expectSameLawfulOnly(helper ++
+        \\wobble : { a : U64, b : U64, xs : List(U64) } -> U64
+        \\wobble = |input| input.xs.fold(0, |s, x| s + x) + add(input.a, 1) + add(input.b, 2)
+    , helper ++
+        \\wobble : { a : U64, b : U64, xs : List(U64) } -> U64
+        \\wobble = |input| {
+        \\    var $s = 0
+        \\    for x in input.xs {
+        \\        $s = $s + x
+        \\    }
+        \\    $s + add(input.a, 1) + add(input.b, 2)
+        \\}
+    );
+}
+
+test "L3 M10: a map of a map is one map" {
+    try expectSameLawfulOnly(
+        \\wobble : List(U64) -> List(U64)
+        \\wobble = |input| input.map(|x| x + 1).map(|y| y * 3)
+    ,
+        \\wobble : List(U64) -> List(U64)
+        \\wobble = |input| input.map(|x| (x + 1) * 3)
+    );
+}
+
+test "L3 M10: a length above 0 is not is_empty" {
+    try expectSameLawfulOnly(
+        \\wobble : List(U64) -> Bool
+        \\wobble = |input| input.len() > 0
+    ,
+        \\wobble : List(U64) -> Bool
+        \\wobble = |input| !input.is_empty()
+    );
+}
+
+test "L3 M10: a length equal to 0 is is_empty" {
+    try expectSameLawfulOnly(
+        \\wobble : List(U64) -> Bool
+        \\wobble = |input| 0 == input.len()
+    ,
+        \\wobble : List(U64) -> Bool
+        \\wobble = |input| input.is_empty()
+    );
+}
+
+test "L3 M10: an `if` on a length not equal to 0 is an `if` on not is_empty" {
+    // The `if` makes the comparison a literal switch on the length (N13n),
+    // which N16f makes a switch on `List.is_empty`.
+    try expectSameLawfulOnly(
+        \\wobble : { a : U64, b : U64, xs : List(U64) } -> U64
+        \\wobble = |input| if input.xs.len() != 0 input.b else input.a
+    ,
+        \\wobble : { a : U64, b : U64, xs : List(U64) } -> U64
+        \\wobble = |input| if !input.xs.is_empty() input.b else input.a
+    );
+}
+
+test "L3 M10: a loop whose body reads the index stays a loop" {
+    // `map` gives the function no index (N16a), so the two stay apart.
+    const gpa = std.testing.allocator;
+    const a = try Staged.createRunning(gpa,
+        \\wobble : List(U64) -> List(U64)
+        \\wobble = |input| {
+        \\    var $out = []
+        \\    var $i = 0
+        \\    for x in input {
+        \\        $out = $out.append(x + $i)
+        \\        $i = $i + 1
+        \\    }
+        \\    $out
+        \\}
+    , "");
+    defer a.destroy();
+    const lawful = try a.viewDump(.lawful) orelse return error.TestUnexpectedResult;
+    defer gpa.free(lawful);
+    try std.testing.expect(std.mem.find(u8, lawful, "List.map") == null);
+}

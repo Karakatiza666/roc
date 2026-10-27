@@ -405,6 +405,7 @@ const Materializer = struct {
             .str => self.types.strTy(),
             .list => self.types.listTy(try self.types.intTy(.i64)),
             .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => unreachable, // int and float owners are handled by the branches above
+            .iter => unreachable, // the table's rows name no `Iter` builtin
         };
     }
 
@@ -470,6 +471,7 @@ const Materializer = struct {
                             .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not => self.types.boolTy(),
                             .len => self.types.intTy(.u64),
                             .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .get => operand,
+                            .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // the table's rows name no builtin of layer L
                         };
                     },
                     .field, .index, .payload => {

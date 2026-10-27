@@ -1952,7 +1952,82 @@ const staged_outlined_loop = outline_stage ++
     \\main = Outline.describe(both)
 ;
 
+// M10: layer L. A stage reads `Code.Lawful(f)`, so a loop that appends to
+// an empty list is `List.map`, and a length compared with 0 is
+// `List.is_empty`. A `Code(f)` stage reads the forms as written.
+const lawful_stage = stage ++
+    \\Lawful :: {}.{
+    \\    describe : Code.Lawful(f) -> Str
+    \\    describe = |code| {
+    \\        graph = code.graph()
+    \\        first = graph.root_row()
+    \\        others = graph.rows().keep_if(|other| other.id != first.id)
+    \\        shown = [first].concat(others).map(|each| "r${each.id.to_str()} = ${Stage.row(graph, each)}")
+    \\        Str.join_with(shown, " ; ")
+    \\    }
+    \\
+    \\    same : Code.Lawful(f), Code.Lawful(f) -> Bool
+    \\    same = |a, b| a == b
+    \\}
+    \\
+    \\looped : List(U64) -> List(U64)
+    \\looped = |xs| {
+    \\    var $out = []
+    \\    for x in xs {
+    \\        $out = $out.append(x + 1)
+    \\    }
+    \\    $out
+    \\}
+    \\
+    \\mapped : List(U64) -> List(U64)
+    \\mapped = |xs| xs.map(|x| x + 1)
+    \\
+;
+
+const staged_lawful_loop = lawful_stage ++
+    \\main = Lawful.describe(looped)
+;
+
+const staged_lawful_same = lawful_stage ++
+    \\main = Lawful.same(looped, mapped)
+;
+
+const staged_lawful_not_opted = lawful_stage ++
+    \\main = Stage.describe(looped)
+;
+
+const staged_lawful_empty = lawful_stage ++
+    \\nonempty : List(U64) -> Bool
+    \\nonempty = |xs| xs.len() > 0
+    \\
+    \\main = Lawful.describe(nonempty)
+;
+
 pub const tests = [_]TestCase{
+    .{
+        .name = "staging - a Code.Lawful site describes a loop that appends to an empty list as List.map",
+        .source_kind = .module,
+        .source = staged_lawful_loop,
+        .expected = .{ .inspect_str = "\"r0 = |List(U64)| -> List(U64) List.map(p0, closure r1()) ; r1 = |U64| -> U64 Num.U64.plus(p0, 1)\"" },
+    },
+    .{
+        .name = "staging - the loop and the List.map it means are one Code.Lawful value",
+        .source_kind = .module,
+        .source = staged_lawful_same,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "staging - a Code site keeps the loop as written, without layer L",
+        .source_kind = .module,
+        .source = staged_lawful_not_opted,
+        .expected = .{ .inspect_str = "\"r0 = |List(U64)| -> List(U64) for_list(p0, [], continue(List.append(s4.2, Num.U64.plus(s4.1, 1))))\"" },
+    },
+    .{
+        .name = "staging - a Code.Lawful site describes a length above 0 as not is_empty",
+        .source_kind = .module,
+        .source = staged_lawful_empty,
+        .expected = .{ .inspect_str = "\"r0 = |List(U64)| -> Bool Bool.not(List.is_empty(p0))\"" },
+    },
     .{
         .name = "staging - a Code.Outlined site makes one row of a helper called from two places",
         .source_kind = .module,

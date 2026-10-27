@@ -40,6 +40,9 @@ pub const Value = union(enum) {
     /// value is the same tag at every union that has it.
     tag: struct { name: types_mod.NameId, payload: []const Value },
     list: []const Value,
+    /// A `Closure`: the row it calls and the values it captured, which are
+    /// the row's first parameters.
+    closure: struct { row: RowId, captures: []const Value },
 
     /// Structural equality; floats compare by bits, and ⊥ equals only ⊥.
     pub fn eql(a: Value, b: Value) bool {
@@ -52,6 +55,7 @@ pub const Value = union(enum) {
             .agg => |xs| b == .agg and eqlSlice(xs, b.agg),
             .tag => |t| b == .tag and b.tag.name == t.name and eqlSlice(t.payload, b.tag.payload),
             .list => |xs| b == .list and eqlSlice(xs, b.list),
+            .closure => |c| b == .closure and b.closure.row == c.row and eqlSlice(c.captures, b.closure.captures),
         };
     }
 
@@ -61,6 +65,9 @@ pub const Value = union(enum) {
             .bottom => true,
             .int, .float, .bool_, .str => false,
             .agg, .list => |xs| for (xs) |x| {
+                if (x.hasBottom()) break true;
+            } else false,
+            .closure => |c| for (c.captures) |x| {
                 if (x.hasBottom()) break true;
             } else false,
             .tag => |t| for (t.payload) |x| {
@@ -243,7 +250,7 @@ pub const Evaluator = struct {
                 }
                 break :blk node.payload - 1;
             },
-            .bottom, .agg, .list => unreachable, // evalSwitch handles a bottom scrutinee before armFor; aggs and lists are never switched on
+            .bottom, .agg, .list, .closure => unreachable, // evalSwitch handles a bottom scrutinee before armFor; aggs, lists and closures are never switched on
         };
         return regions[arm];
     }
@@ -272,7 +279,8 @@ pub const Evaluator = struct {
         switch (node.op) {
             .lit => return litValue(self, ir.LitId.of(node.payload)),
             .crash => return self.crash(),
-            .derived, .closure, .lambda, .apply, .opt_field => return error.Unsupported,
+            .derived, .lambda, .apply, .opt_field => return error.Unsupported,
+            .closure => return .{ .closure = .{ .row = RowId.of(node.payload), .captures = try self.evalRefs(frame, node.args) } },
             .list => return .{ .list = try self.evalRefs(frame, node.args) },
             // A bound the normalizer proved dominates an `Elem`; where it does not hold, the body is not normal.
             .elem => {
@@ -297,7 +305,7 @@ pub const Evaluator = struct {
                 return switch (x) {
                     .bottom => .bottom,
                     .agg => |xs| xs[node.payload],
-                    .int, .float, .bool_, .str, .tag, .list => unreachable, // field and index read an aggregate by the typing of the body
+                    .int, .float, .bool_, .str, .tag, .list, .closure => unreachable, // field and index read an aggregate by the typing of the body
                 };
             },
             .payload => {
@@ -307,20 +315,13 @@ pub const Evaluator = struct {
                     // Reading a payload of another tag is a compiler bug in a
                     // well-formed body, and ⊥ in a candidate the derivation built.
                     .tag => |t| if (t.name.index() == node.payload) t.payload[self.store.wordSlice(node.aux)[0]] else self.crash(),
-                    .int, .float, .bool_, .str, .agg, .list => unreachable, // payload reads a tag by the typing of the body
+                    .int, .float, .bool_, .str, .agg, .list, .closure => unreachable, // payload reads a tag by the typing of the body
                 };
             },
             .call => {
                 const args = try self.evalRefs(frame, node.args);
                 for (args) |a| if (a == .bottom) return .bottom;
-                var callee = try self.newFrame(RowId.of(node.payload), args);
-                const out = try self.evalRegion(&callee, self.store.row(RowId.of(node.payload)).body);
-                return switch (out) {
-                    .value => |vs| vs[0],
-                    .ret => |v| v,
-                    .bottom => .bottom,
-                    .jump, .cont, .brk => unreachable, // a called row body ends in a value, ret or bottom
-                };
+                return self.callRow(RowId.of(node.payload), args);
             },
             .prim => {
                 const args = try self.evalRefs(frame, node.args);
@@ -376,7 +377,7 @@ pub const Evaluator = struct {
         switch (first) {
             .bool_ => |b| if (b == decisive) return first,
             .bottom => saw_bottom = true,
-            .int, .float, .str, .agg, .tag, .list => unreachable, // And and Or operands are Bool or bottom by the typing of the body
+            .int, .float, .str, .agg, .tag, .list, .closure => unreachable, // And and Or operands are Bool or bottom by the typing of the body
         }
         for (self.store.regionSlice(node.regions)) |r| {
             const v: Value = switch (try self.evalRegion(frame, r)) {
@@ -391,7 +392,7 @@ pub const Evaluator = struct {
                     // looking for an operand that decides the result.
                     saw_bottom = true;
                 },
-                .int, .float, .str, .agg, .tag, .list => unreachable, // And and Or operands are Bool or bottom by the typing of the body
+                .int, .float, .str, .agg, .tag, .list, .closure => unreachable, // And and Or operands are Bool or bottom by the typing of the body
             }
         }
         if (saw_bottom) return .bottom;
@@ -455,7 +456,7 @@ pub const Evaluator = struct {
                     for (args) |a| try out.appendSlice(self.arena, a.list);
                     break :blk .{ .list = out.items };
                 },
-                .bottom, .int, .float, .bool_, .agg, .tag => unreachable, // concat's operands are strs or lists by the typing of the body
+                .bottom, .int, .float, .bool_, .agg, .tag, .closure => unreachable, // concat's operands are strs or lists by the typing of the body
             },
             .len => .{ .int = args[0].list.len },
             // `Try(elem, [OutOfBounds])`: the tags are found by name.
@@ -473,8 +474,70 @@ pub const Evaluator = struct {
                 payload[0] = .{ .tag = .{ .name = out_of_bounds, .payload = &.{} } };
                 break :blk .{ .tag = .{ .name = err, .payload = payload } };
             },
+            .is_empty => .{ .bool_ = args[0].list.len == 0 },
+            .append => blk: {
+                const out = try self.arena.alloc(Value, args[0].list.len + 1);
+                @memcpy(out[0..args[0].list.len], args[0].list);
+                out[args[0].list.len] = args[1];
+                break :blk .{ .list = out };
+            },
+            // The function is called on every element, first to last, as the
+            // builtins' loops call it (`Builtin.roc`).
+            .map => blk: {
+                const out = try self.arena.alloc(Value, args[0].list.len);
+                for (args[0].list, out) |x, *o| {
+                    o.* = try self.apply(args[1], &.{x});
+                    if (o.* == .bottom) break :blk .bottom;
+                }
+                break :blk .{ .list = out };
+            },
+            .keep_if => blk: {
+                var out: std.ArrayList(Value) = .empty;
+                for (args[0].list) |x| switch (try self.apply(args[1], &.{x})) {
+                    .bool_ => |keep| if (keep) try out.append(self.arena, x),
+                    .bottom => break :blk .bottom,
+                    .int, .float, .str, .agg, .tag, .list, .closure => unreachable, // a predicate gives a Bool by the typing of the body
+                };
+                break :blk .{ .list = out.items };
+            },
+            .fold => blk: {
+                var state = args[1];
+                for (args[0].list) |x| {
+                    state = try self.apply(args[2], &.{ state, x });
+                    if (state == .bottom) break :blk .bottom;
+                }
+                break :blk state;
+            },
+            // An iterator has no value here.
+            .collect => error.Unsupported,
             .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => error.Unsupported,
         };
+    }
+
+    /// The value of row `row` over `args`, none of them ⊥.
+    fn callRow(self: *Evaluator, row: RowId, args: []const Value) Error!Value {
+        var callee = try self.newFrame(row, args);
+        const out = try self.evalRegion(&callee, self.store.row(row).body);
+        return switch (out) {
+            .value => |vs| vs[0],
+            .ret => |v| v,
+            .bottom => .bottom,
+            .jump, .cont, .brk => unreachable, // a called row body ends in a value, ret or bottom
+        };
+    }
+
+    /// The value of the function `f` over `args`: a closure calls its row
+    /// with its captures first.
+    fn apply(self: *Evaluator, f: Value, args: []const Value) Error!Value {
+        for (args) |a| if (a == .bottom) return .bottom;
+        const c = switch (f) {
+            .closure => |c| c,
+            .bottom => return .bottom,
+            .int, .float, .bool_, .str, .agg, .tag, .list => unreachable, // a function argument is a closure by the typing of the body
+        };
+        for (c.captures) |a| if (a == .bottom) return .bottom;
+        const all = try std.mem.concat(self.arena, Value, &.{ c.captures, args });
+        return self.callRow(c.row, all);
     }
 
     fn evalInt(self: *Evaluator, int: types_mod.IntTy, method: prims.Method, args: []const Value) Error!Value {
@@ -519,7 +582,7 @@ fn floatResult(comptime F: type, method: prims.Method, a: F, b: F) Error!Value {
         .plus => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a + b))) },
         .minus => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a - b))) },
         .times => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a * b))) },
-        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable, // float prims admit no other methods (prims.admits)
+        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // float prims admit no other methods (prims.admits)
     };
 }
 

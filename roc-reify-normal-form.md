@@ -121,6 +121,10 @@ which is exact rather than a guess: the only effect of leaving a builtin off
 is that it is not hoisted out of a loop. It answers the proposal's open
 question on crash semantics (`roc-reify-proposal.md:1107-1112`) with one flag
 instead of a crash model.
+The list is the `speculatable` column of `src/reify/prims.zig`. M10 adds
+`List.is_empty`, which reads the length and cannot crash, and leaves
+`List.append`, `List.map`, `List.keep_if`, `List.fold` and `Iter.collect` off
+it, because each one calls a function or allocates.
 
 `crash` written in a body stays a node where it was written, because the
 author put it there. C2 would allow deciding a branch that always crashes as
@@ -1259,7 +1263,7 @@ structured form a rule can recognize exactly:
 | `List.fold(xs, init, f)` with a known `f` | down, to `ForList(xs)` with `f` inlined | a fold has no structure beyond its loop, and `ForList` keeps the scan visible |
 | `List.map(List.map(xs, f), g)` | to `List.map(xs, g ∘ f)`, where `g ∘ f` is a row built from both bodies | the inner list is read nowhere else |
 | `xs.iter().map(f).collect()` into a `List` | to `List.map(xs, f)` | the iterator adapters carry declared lowering contracts (`design.md:5914-5918`) |
-| `is_eq(List.len(xs), 0)`, `is_lt(0, List.len(xs))` (N16f) | to `List.is_empty(xs)` and `Bool.not(List.is_empty(xs))` | `List.len` is a `U64`, so a length above 0 is one that is not 0 |
+| `is_eq(List.len(xs), 0)`, `is_lte(List.len(xs), 0)`, `is_lt(0, List.len(xs))`, and a literal switch on `List.len(xs)` with the one key 0 (N16f) | to `List.is_empty(xs)`, `Bool.not(List.is_empty(xs))`, and the `Bool` switch on `List.is_empty(xs)` | `List.len` is a `U64`, so a length above 0 is one that is not 0 |
 
 Map fusion interleaves the calls to `f` and `g`, which changes which one fails
 first when both can. C2 does not constrain it: every call still runs on every
@@ -1273,6 +1277,48 @@ form after L, and `iteration` (3.11) is what tells it the loop is a scan.
 The raising laws are recognizers, but not heuristics: each one is a pattern
 over the normal form with an exact condition. A loop that matches is rewritten
 every time, and a loop that does not match is never rewritten.
+
+How a site opts in (M10). "Opt-in per language version" does not say who
+opts in, so the reading here is the one 1.5 of the plan gives every other
+choice of what a site gets: the site's declared type selects it. A site of
+type `Code.Lawful(f)` holds the `graph` view normalized with layer L, and a
+site of type `Code(f)`, `Code.Inlined(f)` or `Code.Outlined(f)` holds its
+view without it. The checker stamps the choice on the site
+(`src/canonicalize/NodeStore.zig`, `View.lawful`), the walk passes it to the
+driver as explicit data (`src/check/code_reifier.zig`, `Options.laws`), and
+the per-site memo key holds the view, so one function reified at two site
+types gives two values. The laws are part of the language version: normal
+form 13 adds them to the fingerprint (`src/reify/mod.zig`), so a change to a
+law moves the version, as a change to any other rule does.
+
+| Law | Side conditions it relies on | Exact, or by C2 |
+|---|---|---|
+| N16a | the loop is a `ForList` over `[]` with one slot; every turn ends in `Continue(List.append(slot, v))`; the slot is read once, by that append; the index is read nowhere; no `Break` or `Return` | exact: `List.map` in `Builtin.roc` calls the function on each element, first to last, and appends what it gives |
+| N16b | as N16a, but the turn ends in `Continue` of a `Bool` switch whose one arm gives `List.append(slot, element)` and computes nothing else, and whose other arm gives the slot and computes nothing; the slot is read twice, by these arms | exact: `List.keep_if` tests each element, first to last |
+| N16a, N16b row | the row the law makes holds the nodes of the loop body that the value reads (the cone); a constant outside the loop is copied; a speculatable node outside the loop that only the cone reads is copied; every other outside value is a capture. A cone that reads the index or the slot is no match | exact: a copied node outside the loop is speculatable, so to compute it once per element, or not at all on `[]`, changes no result and no crash; a capture is computed once, before the loop, as before |
+| N16c | the function is a `Closure` of a known row; the row's body is inlined in the loop unless the row is recursive or can end in `Return` in a nested region, where the loop calls it | exact: `List.fold` in `Builtin.roc` is that loop, one call per element over the state so far |
+| N16d | both functions are `Closure`s of known rows; the outer `map` is the only reader of the inner one; the new row holds `g`'s body over `f`'s body, each inlined as in N16c | by C2: each element now calls `f` and then `g` before the next element, so when two calls can crash, a different one can crash first. The IR has no effect operation, so the crash order is the only change |
+| N16e | the `Iter.map` and the `List.iter` are known by the checker's `IteratorRole`, never by name; the result is a `List` | exact: `Iter.map` then `Iter.collect` calls the function on each element, first to last |
+| N16f | the length is `List.len`, a `U64`, compared with the literal 0 by `is_eq` (either order), `is_lte(len, 0)` or `is_lt(0, len)`, or tested by a literal switch whose one key is 0. N13 writes `!(0 < len)` as `len <= 0`, and N13n writes `if len == 0` as the literal switch, so each of these is a critical pair that N16f joins | exact: `List.is_empty` is `len == 0`, and a `U64` above 0 is one that is not 0. `List.is_empty` cannot crash, so it is on the speculatable list (1.1) |
+
+A row a law makes is simplified and finalized before the closure that names
+it, as a specialization is (N8i). A `Closure` takes its captures first, so
+where finalize orders the parameters otherwise, the closure names a
+wrapper row that keeps that order (`src/reify/rows.zig`, `conventionRow`).
+The measure counts the folds of a closure that N16c can still lower and the
+literal switches on a length that N16f can still rewrite (`law_redexes`,
+after `self_tail_calls`): N16a and N16b remove a loop, N16c removes a fold,
+N16f over a switch removes a literal switch, and N16d, N16e and N16f over a
+comparison remove nodes.
+
+Limits of M10:
+
+| Limit | Why |
+|---|---|
+| layer L applies to the `graph` view only; no `Code.Lawful` form of `inline` or `outline` exists | no translator needs one yet; a type for each pair is a later change of the builtin library |
+| N16a and N16b raise only a loop whose function reads the element and outside values; a loop that reads the index, or a counter of its own, stays a loop | `List.map` and `List.keep_if` give the function no index |
+| a value bound outside the loop that is not speculatable, `k // m` for example, is a capture of the closure, not part of the row | the loop computes it once, before its first turn; the row would compute it once per element |
+| N16c lowers `List.fold` only; `Iter.fold` and folds of other owners stay calls | the laws of 3.16 name `List.fold` only |
 
 ### 3.17 N17: known lists
 

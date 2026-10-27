@@ -93,6 +93,7 @@ A description is a graph of functions, called _rows_. The translator says which 
 | `graph` | `Code(f)` | `code.graph()` | A helper called from one place is inlined there. A helper called from two or more places is a row of its own, and each call is a `Call` node. A helper that holds a `return` inside a loop or inside an arm is a row of its own too. |
 | `inline` | `Code.Inlined(f)` | `code.inline()` | Inlined at every call, however many there are. A function that calls itself stays a row. A helper that holds a `return` inside a loop or inside a `match` or `if` arm also stays a row, and each call is a `Call` node. |
 | `outline` | `Code.Outlined(f)` | `code.outline()` | As in `inline`. Then each computation of at least four operations that occurs at two or more places becomes one row, and each place is a `Call` node. The compiler chooses these rows, so a refactor of the source does not change them. |
+| `lawful` | `Code.Lawful(f)` | `code.graph()` | As in `graph`. The compiler also uses the laws of the builtins: a loop that appends to an empty list is `List.map` or `List.keep_if`, a `List.fold` with a known function is its loop, a `map` of a `map` is one `map`, `iter().map(f).collect()` is `List.map`, and `len() > 0` is `!is_empty()`. Only this view uses these laws. |
 | `to_tree` | any | `graph.to_tree(row.id)` | Not a view of the graph. It turns one row into nested expressions. |
 
 For a helper `helper` that `twice = |x| helper(x) + helper(x + 1)` calls two times:
@@ -219,7 +220,7 @@ The translator gave this reason:
     `sqrt` has no operator here
 ```
 
-`Code.Inlined` has its own `refuse_at` for nodes of the `inline` view, and `Code.Outlined` has one for nodes of the `outline` view.
+`Code.Inlined` has its own `refuse_at` for nodes of the `inline` view, `Code.Outlined` has one for nodes of the `outline` view, and `Code.Lawful` has one for nodes of the `lawful` view.
 
 Use an `Err` when you want a test, or when the caller can recover. Use `refuse_at` when the user must fix the source.
 

@@ -22,6 +22,7 @@ const polarity = @import("polarity.zig");
 const match = @import("match.zig");
 const provenance = @import("provenance.zig");
 const scalar = @import("scalar.zig");
+const laws_mod = @import("laws.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -86,7 +87,21 @@ const Link = struct {
 /// rejected literal, N13m over the facts of a bound, and N13d over
 /// `Bool.not`, and N14a over a call. A test turns one off to see its rule
 /// stop.
-pub const Algorithm = enum { interchange, case_of_case, rejected_arm, bounded_get, decided_not, scalar_call };
+pub const Algorithm = enum {
+    interchange,
+    case_of_case,
+    rejected_arm,
+    bounded_get,
+    decided_not,
+    scalar_call,
+    /// The laws of layer L (`laws.zig`), N16a to N16f.
+    law_map,
+    law_keep_if,
+    law_fold,
+    law_fusion,
+    law_iter_map,
+    law_is_empty,
+};
 
 /// The rules on exits and joins (normal-form 3.11), which run when an
 /// exiting switch's region closes. T1 is how the walk builds them.
@@ -192,6 +207,26 @@ pub const Scalarizer = struct {
     run: *const fn (ctx: *anyopaque, b: *Builder, row: RowId) SpecializeError!?Scalarized,
 };
 
+/// The row a closure of a row that a law of layer L built names (`laws.zig`):
+/// the row itself, or a row that keeps the closure's convention, and the
+/// captures that row still reads, by their index among the built row's.
+pub const LawClosure = struct { row: RowId, kept: []const u32 };
+
+/// Simplifies and finalizes `row`, a row a law just built whose first
+/// `captures` parameters are the values a closure of it captures, and gives
+/// the row a closure of it names. Returns null where it stopped with an
+/// error, which the driver keeps.
+///
+/// `inline_row` builds the body of `row` in the current region over `args`
+/// for its parameters: the known function a law calls, inlined (N16c, N16d).
+/// It returns null for a row that cannot be inlined, a recursive one or one
+/// whose body can end in `Return` in a nested region (V1).
+pub const Laws = struct {
+    ctx: *anyopaque,
+    close: *const fn (ctx: *anyopaque, b: *Builder, row: RowId, captures: u32) SpecializeError!?LawClosure,
+    inline_row: *const fn (ctx: *anyopaque, b: *Builder, row: RowId, args: []const Ref, ty: TyId) Allocator.Error!?Ref,
+};
+
 /// Why a specialization stopped: the driver's errors, which the builder
 /// hands back through the call it was building.
 pub const SpecializeError = error{ MeasureDidNotFall, RoundBoundExceeded, InvariantBroken } || Allocator.Error;
@@ -232,6 +267,10 @@ pub const Builder = struct {
     /// the row only reads by field or index calls the row with the parameter
     /// split (N14a). The driver sets it.
     scalarizer: ?Scalarizer = null,
+    /// Where set, the site opts into layer L (`laws.zig`, normal-form 3.16),
+    /// and a row a law builds is simplified and finalized through it. The
+    /// driver sets it for a `Code.Lawful(f)` site only.
+    laws: ?Laws = null,
     /// The value switch output that the switch being built is the only reader
     /// of, which the rebuild knows from the placement's uses: N13r moves the
     /// switch into the arms of the value switch only then, so the value switch
@@ -274,12 +313,12 @@ pub const Builder = struct {
         self.hooks.algorithm_steps += 1;
     }
 
-    fn algorithmOn(self: *Builder, a: Algorithm) bool {
+    pub fn algorithmOn(self: *const Builder, a: Algorithm) bool {
         if (!hooks_enabled) return true;
         return !self.hooks.rules_off and !self.hooks.algorithms_off.contains(a);
     }
 
-    fn algorithmFired(self: *Builder, a: Algorithm) void {
+    pub fn algorithmFired(self: *Builder, a: Algorithm) void {
         if (!hooks_enabled) return;
         self.hooks.algorithms_fired.getPtr(a).* += 1;
         self.hooks.algorithm_steps += 1;
@@ -1269,13 +1308,17 @@ pub const Builder = struct {
             }
         }
         if (self.rulesActive() and spec.op == .switch_) {
-            if (spec.aux.len > 0) return self.litSwitch(spec);
+            if (spec.aux.len > 0) {
+                if (self.laws != null) if (try laws_mod.lenSwitchToEmpty(self, spec)) |r| return r;
+                return self.litSwitch(spec);
+            }
             if (try self.decidedSwitch(spec)) |r| return r;
         }
         if (self.rulesActive() and (spec.op == .and_ or spec.op == .or_)) {
             if (try self.decidedOperands(spec)) |r| return r;
         }
         if (self.rulesActive() and spec.op == .prim) {
+            if (self.laws != null) if (try laws_mod.prim(self, spec)) |r| return r;
             if (try self.decidedNot(spec)) |r| return r;
             if (try self.boundedGet(spec)) |r| return r;
         }
@@ -2236,7 +2279,10 @@ pub const Builder = struct {
             .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not => self.types.boolTy(),
             .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat => self.store.refTy(self.row, args[0]),
             .len => self.types.intTy(.u64),
-            .get => unreachable, // `get` has no result type derivable from its arguments and is never built through `prim`
+            .is_empty => self.types.boolTy(),
+            .append, .keep_if => self.store.refTy(self.row, args[0]),
+            .fold => self.store.refTy(self.row, args[1]),
+            .get, .map, .collect => unreachable, // their result types are not derivable from their arguments, and they are never built through `call`
         };
     }
 
@@ -2569,7 +2615,7 @@ pub const Builder = struct {
                         .str => |text| text.len == 0,
                         .int, .float, .bool_, .dec, .bytes => false,
                     },
-                    .bool_, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => false,
+                    .bool_, .iter, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => false,
                 };
                 if (n.op != .lit) return false;
                 const want = prims.identityInt(p.owner.int() orelse return false, p.method) orelse return false;
@@ -2753,7 +2799,7 @@ pub const Builder = struct {
             .bool_ => switch (p.method) {
                 .not => .{ .bool_ = !lits[0].value.bool_ },
                 .is_eq => .{ .bool_ = lits[0].value.bool_ == lits[1].value.bool_ },
-                .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get => unreachable, // bool owners only have the not and is_eq folds
+                .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // bool owners only have the not and is_eq folds
             },
             .str => switch (p.method) {
                 .is_eq => .{ .bool_ = std.mem.eql(u8, self.store.byteSlice(lits[0].value.str), self.store.byteSlice(lits[1].value.str)) },
@@ -2764,10 +2810,11 @@ pub const Builder = struct {
                     for (lits) |l| try out.appendSlice(self.gpa, self.store.byteSlice(l.value.str));
                     break :blk .{ .str = try out.toOwnedSlice(self.gpa) };
                 },
-                .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .len, .get => unreachable, // str owners only have the is_eq and concat folds
+                .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // str owners only have the is_eq and concat folds
             },
-            // A list literal is the embedded bytes of a file, whose elements the rules do not read.
-            .list => null,
+            // A list literal is the embedded bytes of a file, whose elements
+            // the rules do not read, and an iterator is never a literal.
+            .list, .iter => null,
             .f32, .f64, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => unreachable, // number owners fold above
         };
     }
