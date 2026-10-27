@@ -13836,6 +13836,30 @@ position; the runtime appends them to the method's requirement descriptors,
 and a worker that needs one reads it from its own dictionary on entry instead of
 receiving it as a hidden parameter.
 
+A call that binds input slots (`CheckedCodeBinding`, see "Code
+Reification") is lowered as any call: boxy runs the translator where the
+program reads the call, and `Code.bound` gives the result no inputs. Lowering
+then builds the call's `Code.Bound` again around the result's `value`, with
+`inputs` set to one `Code.Value` per recorded slot, in slot order
+(`beginBoundCodeCall` in `src/postcheck/boxy/lower.zig`). It reads the slots,
+their projections and their shapes from the checked binding and nothing else:
+
+| Step | What lowering does |
+|---|---|
+| Slot | Reads the slot's binder local through its recorded projections. A field or item read follows the representation's ordered roles, an unwrap enters the nominal's formal scope, and a formal's value crosses the planned boundary to the actual its scope binds |
+| Value | Calls the generated procedure of the slot value's representation (`codeValueProc`) |
+| Procedure | Builds one layer of the `Code.Value` from the representation, and calls the procedure of each component. One procedure exists per representation and formal environment, so a recursive type reaches its own procedure again |
+| Check | In debug builds, asserts that the slot's representation has the shape the walk recorded (`codeValueShapeMatches`) |
+
+The procedures are shape-specialized LIR keyed by planned representations,
+like the recursive helpers of derived equality and hashing. They read no
+descriptor, and no runtime interpreter walks a value to build a `Code.Value`.
+A slot type is closed, so each type variable a representation reaches is a
+nominal formal that an enclosing nominal binds, or a variable with a sealed
+default. Planning adds nothing for a binding: the binder's representation,
+the call's `Code.Bound` representation and their children are already in the
+representation table.
+
 ### Boxy `TypeDesc`
 
 A boxy `TypeDesc` is primarily runtime data for representation. It describes
@@ -23714,6 +23738,12 @@ Invariants:
   helper per Monotype type, so a recursive type reaches its own helper. In
   debug builds lowering asserts that each slot's Monotype type has the shape
   the walk recorded.
+- `.boxy` reads the same recorded slots. It runs the call where the program
+  reads it, and builds the call's `Code.Bound` again around the result's
+  `value` with one `Code.Value` per slot. A value is built by one generated
+  procedure per representation and formal environment, and in debug builds
+  lowering asserts each slot's representation against the recorded shape (see
+  "`.boxy` Runtime Lowering").
 
 ## Test Root Ownership
 

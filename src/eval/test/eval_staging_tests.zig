@@ -1845,6 +1845,17 @@ const bound_recursive = bind ++
     \\main = paired(Chain.Link(1, Chain.Link(2, Chain.End)))
 ;
 
+// A slot whose type is a nominal with type parameters: the backing's value
+// is read at the type the slot fixes for each parameter.
+const bound_generic_nominal = bind ++
+    \\Tree(a) := [Leaf(a), Node(Tree(a), Tree(a))]
+    \\
+    \\shown_tree : Tree(Str), Try(I64, Str) -> Str
+    \\shown_tree = |tree, result| Bind.shown(Bind.render(|x| (1.I64 + x, tree, result)))
+    \\
+    \\main = shown_tree(Tree.Node(Tree.Leaf("l"), Tree.Leaf("r")), Err("bad"))
+;
+
 // A `var` can be written again before the call, so it is no slot.
 const bound_var = bind ++
     \\counted : U16 -> Str
@@ -2591,6 +2602,48 @@ pub const tests = [_]TestCase{
         .source_kind = .module,
         .source = bound_recursive,
         .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0) / 1 slots / Wrap(Link(Int(1), Wrap(Link(Int(2), Wrap(End())))))\"" },
+    },
+    .{
+        .name = "staging - a captured value of a generic nominal type is read at the type the slot fixes",
+        .source_kind = .module,
+        .source = bound_generic_nominal,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0, in1) / 2 slots / Wrap(Node(Wrap(Leaf('l')), Wrap(Leaf('r')))), Wrap(Err('bad'))\"" },
+    },
+    .{
+        .name = "staging - boxy: a translator that returns a Code.Bound receives a captured parameter as an input slot",
+        .source_kind = .module,
+        .source = bound_parameter,
+        .expected = .{ .inspect_str = "\"Num.U16.plus(in0, p0) / 1 slots / Int(7) | Num.U16.plus(in0, p0) / 1 slots / Int(9)\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - boxy: each field a lambda reads from a captured record is one input slot with the value of its type",
+        .source_kind = .module,
+        .source = bound_projections,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(in0, p0), in1, in2, in3, in4) / 5 slots / Int(5), ['a', 'b'], Closed(Int(3)), Wrap({Int(250)}), Frac(0.5)\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - boxy: a captured value of a recursive type is built by a procedure that reaches itself",
+        .source_kind = .module,
+        .source = bound_recursive,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0) / 1 slots / Wrap(Link(Int(1), Wrap(Link(Int(2), Wrap(End())))))\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - boxy: a captured value of a generic nominal type is read at the type the slot fixes",
+        .source_kind = .module,
+        .source = bound_generic_nominal,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0, in1) / 2 slots / Wrap(Node(Wrap(Leaf('l')), Wrap(Leaf('r')))), Wrap(Err('bad'))\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
     },
     .{
         .name = "staging - a captured var is refused as an input slot",

@@ -437,6 +437,18 @@ const DerivedFrameShape = struct {
 
 /// A procedure performing a derived method over a recursive tag union, which
 /// calls itself where the union recurs.
+/// A generated procedure `value -> Code.Value` over one representation of an
+/// input slot's type, under the formal bindings of the nominal backings
+/// around it (design.md "Code Reification").
+const CodeValueHelper = struct {
+    rep: Plan.TypeRepId,
+    /// The representation of `Code.Value`.
+    value_rep: Plan.TypeRepId,
+    /// The formal environment, as `Plan.orderedDerivedEnv` orders it.
+    bindings: []const Plan.DerivedBinding,
+    proc: LIR.LirProcSpecId,
+};
+
 const DerivedHelper = struct {
     method: Plan.DerivedMethod,
     rep: Plan.TypeRepId,
@@ -893,6 +905,9 @@ const ProcedureBuilder = struct {
     descriptor_hash_proc: ?LIR.LirProcSpecId = null,
     descriptor_dicts: std.ArrayList(DescriptorDictCacheEntry) = .empty,
     derived_helpers: std.ArrayList(DerivedHelper) = .empty,
+    /// The procedures that build the `Code.Value` of an input slot's value,
+    /// one per representation and formal environment (`codeValueProc`).
+    code_value_helpers: std.ArrayList(CodeValueHelper) = .empty,
     descriptor_method_slot_cache: std.ArrayList(DescriptorMethodSlotCacheEntry),
     callable_adapter_cache: std.ArrayList(CallableAdapterCacheEntry),
     pending_direct_call_descriptor_abis: std.ArrayList(PendingDirectCallDescriptorAbi),
@@ -1080,6 +1095,8 @@ const ProcedureBuilder = struct {
         self.descriptor_dicts.deinit(self.allocator);
         for (self.derived_helpers.items) |helper| helper.shape.deinit(self.allocator);
         self.derived_helpers.deinit(self.allocator);
+        for (self.code_value_helpers.items) |helper| self.allocator.free(helper.bindings);
+        self.code_value_helpers.deinit(self.allocator);
         self.allocator.free(self.hosted_catalog);
         self.allocator.free(self.type_desc_ids);
         self.allocator.free(self.rep_holds_callable);
@@ -5580,6 +5597,82 @@ const ProcedureBuilder = struct {
         proc_spec.stack_probe = self.stackProbeForProc(job.args_span, frame_span, job.ret_layout);
     }
 
+    // Captured run-time inputs (design.md "Code Reification").
+    //
+    // The `Code.Value` of an input slot's value is built by one generated
+    // procedure per representation of the slot's type and formal
+    // environment. A procedure builds one layer and calls the procedure of
+    // each component, so a recursive type reaches its own procedure again.
+
+    /// The procedure that builds the `Code.Value` of a value of `rep_id`
+    /// under `bindings`, reserved with its body queued at the first use.
+    fn codeValueProc(
+        self: *ProcedureBuilder,
+        rep_id: Plan.TypeRepId,
+        value_rep: Plan.TypeRepId,
+        bindings: []const Plan.DerivedBinding,
+        value_layout: layout.Idx,
+    ) Allocator.Error!LIR.LirProcSpecId {
+        for (self.code_value_helpers.items) |helper| {
+            if (helper.rep != rep_id or helper.value_rep != value_rep or helper.bindings.len != bindings.len) continue;
+            for (helper.bindings, bindings) |a, b| {
+                if (!std.meta.eql(a, b)) break;
+            } else return helper.proc;
+        }
+        const owned = try self.allocator.dupe(Plan.DerivedBinding, bindings);
+        errdefer self.allocator.free(owned);
+        const proc_symbol = self.symbols.fresh();
+        const proc_id = try self.result.store.addProcSpec(.{
+            .name = lirSymbol(proc_symbol),
+            .identity = LIR.ProcIdentity.programLocal("boxy", @backingInt(proc_symbol)),
+            .args = LIR.LocalSpan.empty(),
+            .body = null,
+            .ret_layout = value_layout,
+        }, constructlessOrigin(.derived).loc);
+        const index: u32 = @intCast(self.code_value_helpers.items.len);
+        try self.code_value_helpers.append(self.allocator, .{
+            .rep = rep_id,
+            .value_rep = value_rep,
+            .bindings = owned,
+            .proc = proc_id,
+        });
+        try self.appendProcJob(.{ .code_value = index });
+        return proc_id;
+    }
+
+    fn buildCodeValueBody(self: *ProcedureBuilder, index: u32) Allocator.Error!void {
+        const helper = self.code_value_helpers.items[index];
+        const rep = self.plan.representations.items[@backingInt(helper.rep)];
+        const saved_tail_builder = self.result.store.tail_call_builder;
+        self.result.store.tail_call_builder = null;
+        defer self.result.store.tail_call_builder = saved_tail_builder;
+        var proc = ProcBodyBuilder.initSyntheticAdapter(
+            self,
+            self.plan.moduleView(rep.source_type.module),
+            self.layout_plan.worker_layouts[0],
+            constructlessOrigin(.derived),
+        );
+        defer proc.deinit();
+        const arg = try proc.addArgLocalForRep(helper.rep);
+        const result = try proc.addFrameLocalForRep(helper.value_rep);
+        const args_span = try self.result.store.addLocalSpan(proc.arg_locals.items);
+        const ret_stmt = try self.result.store.addCFStmt(.{ .ret = .{ .value = result } }, proc.derivedOrigin());
+        const scope = proc.beginNominalBackingFormalScope();
+        errdefer proc.dropNominalBackingFormalScope(scope);
+        try proc.nominal_formal_bindings.appendSlice(self.allocator, helper.bindings);
+        const layer = try proc.lowerCodeValueLayerInto(result, arg, helper.rep, helper.value_rep, ret_stmt);
+        const scoped = try proc.leaveNominalBackingFormalScope(scope, layer);
+        const body = try proc.prependStaticDescriptorMaterializationsForScopedSlots(null, scoped);
+        const frame_span = try self.result.store.addLocalSpan(proc.frame_locals.items);
+        const ret_layout = self.result.store.getLocal(result).layout_idx;
+        const proc_spec = self.result.store.getProcSpecPtr(helper.proc);
+        proc_spec.args = args_span;
+        proc_spec.body = body;
+        proc_spec.shapes = proc_spec.shapes.merged(self.result.store.shapes);
+        proc_spec.frame_locals = frame_span;
+        proc_spec.stack_probe = self.stackProbeForProc(args_span, frame_span, ret_layout);
+    }
+
     /// The recursive helper for a derived method over `rep_id` in `frame`
     /// under `env`, emitted on first use.
     fn derivedHelperIndex(
@@ -6990,6 +7083,8 @@ const ProcedureBuilder = struct {
         body: ?union(enum) {
             worker: *WorkerJob,
             derived: *DerivedJob,
+            /// The procedure of `code_value_helpers` at this index.
+            code_value: u32,
             callable_adapter: *CallableAdapterJob,
             static_method_adapter: *StaticMethodAdapterJob,
             /// A literal conversion's procedures, filling its reserved
@@ -7041,7 +7136,7 @@ const ProcedureBuilder = struct {
                 adapter_job.deinit(self.allocator);
                 self.allocator.destroy(adapter_job);
             },
-            .literal, .crashing_method => {},
+            .literal, .crashing_method, .code_value => {},
         }
     }
 
@@ -7133,7 +7228,7 @@ const ProcedureBuilder = struct {
                 try self.pushWorkerJob(adapter_job.worker_id);
             },
             .derived => |derived_job| try self.buildDerivedHeader(derived_job),
-            .callable_adapter, .literal, .crashing_method => {},
+            .callable_adapter, .literal, .crashing_method, .code_value => {},
         }
     }
 
@@ -7155,6 +7250,7 @@ const ProcedureBuilder = struct {
             else
                 try self.buildWorkerBody(worker_job),
             .derived => |derived_job| try self.buildDerivedBody(derived_job),
+            .code_value => |index| try self.buildCodeValueBody(index),
             .callable_adapter => |adapter_job| try self.buildCallableAdapterBody(adapter_job),
             .static_method_adapter => |adapter_job| try self.buildStaticMethodAdapterBody(adapter_job),
             .literal => |literal| try self.buildLiteralAccessor(literal.index, literal.method_slot),
@@ -17647,6 +17743,9 @@ const ProcBodyBuilder = struct {
             .normal => {},
             .operand => |operand| return try self.beginDivergentOperand(target, expr_id, operand),
         }
+        if (self.module.checked_bodies.codeBinding(expr_id)) |slots| {
+            return try self.beginBoundCodeCall(target, expr_id, slots, next);
+        }
 
         return switch (expr.data) {
             .numeral => |numeral| if (numeral.plan) |plan|
@@ -17890,9 +17989,12 @@ const ProcBodyBuilder = struct {
                     next,
                 );
             }
+            // A call that binds input slots is lowered by `beginExpr`, at its
+            // own type.
+            const binds_inputs = self.module.checked_bodies.codeBinding(expr_id) != null;
             switch (expr.data) {
-                .call => |call| if (target_uses_expected_layout) return try self.beginDirectCall(target, expr_id, call, expected_ty, next),
-                .dispatch_call, .type_dispatch_call => |maybe_plan| if (target_uses_expected_layout) return try self.beginDispatchCall(target, expr_id, maybe_plan, expected_ty, next),
+                .call => |call| if (target_uses_expected_layout and !binds_inputs) return try self.beginDirectCall(target, expr_id, call, expected_ty, next),
+                .dispatch_call, .type_dispatch_call => |maybe_plan| if (target_uses_expected_layout and !binds_inputs) return try self.beginDispatchCall(target, expr_id, maybe_plan, expected_ty, next),
                 .lambda,
                 .closure,
                 => return try self.beginCallableExprTypeRef(target, .{ .module = Plan.viewModule(self.module), .ty = expected_ty }, expr_id, next),
@@ -37284,6 +37386,708 @@ const ProcBodyBuilder = struct {
         next: LIR.CFStmtId,
     ) Allocator.Error!LIR.CFStmtId {
         return try HashWalk.lower(.{ .builder = self }, .{ .target = target, .value = value, .hasher = hasher, .ty = rep_id, .next = next });
+    }
+
+    // Captured run-time inputs (design.md "Code Reification").
+    //
+    // A call that binds input slots runs as any call does, and `Code.bound`
+    // gives it no inputs. Its value is then built again with `inputs` set to
+    // one `Code.Value` per slot, in slot order. A slot is its binder's local
+    // read through the projections publication recorded, and its value is
+    // built by the procedure of its representation (`codeValueProc`).
+
+    /// A call that binds input slots, run into a local of its own, with
+    /// `target` its `Code.Bound` with the slots' values as `inputs`.
+    fn beginBoundCodeCall(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        expr_id: checked.CheckedExprId,
+        slots: []const checked.CheckedCodeSlot,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!ExprStep {
+        const expr = self.module.checked_bodies.expr(expr_id);
+        const bound_rep = self.repForType(expr.ty);
+        const raw = try self.addFrameLocalForRep(bound_rep);
+        const bound = try self.lowerBoundCodeInto(target, raw, bound_rep, slots, next);
+        return switch (expr.data) {
+            .call => |call| try self.beginDirectCall(raw, expr_id, call, expr.ty, bound),
+            .dispatch_call, .type_dispatch_call => |maybe_plan| try self.beginDispatchCall(raw, expr_id, maybe_plan, expr.ty, bound),
+            .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .interpolation, .structural_eq, .structural_hash, .method_eq, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => boxyLowerInvariant("a code binding named an expression that is not a call"),
+        };
+    }
+
+    /// Into `target`, the `Code.Bound` `raw` with `inputs` set to the values
+    /// of `slots`.
+    fn lowerBoundCodeInto(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        raw: LIR.LocalId,
+        bound_rep: Plan.TypeRepId,
+        slots: []const checked.CheckedCodeSlot,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        const allocator = self.parent.allocator;
+        const plan = self.parent.plan;
+        const bound = plan.representations.items[@backingInt(bound_rep)];
+        if (bound.kind != .nominal) boxyLowerInvariant("a call that binds input slots did not return a nominal Code.Bound");
+        const scope = try self.enterNominalBackingFormalScope(bound_rep);
+        errdefer self.dropNominalBackingFormalScope(scope);
+        const backing_rep = self.parent.repQuery().requiredSingleChild(bound_rep, .nominal_backing).rep;
+        const backing = plan.representations.items[@backingInt(backing_rep)];
+        if (backing.kind != .record) boxyLowerInvariant("Code.Bound's backing was not a record");
+        const children = plan.childSlice(backing.children);
+        var inputs_field: ?u32 = null;
+        var value_field: ?u32 = null;
+        for (children, 0..) |child, index| {
+            const label = switch (child.role) {
+                .record_field => |label| label,
+                .alias_backing, .alias_arg, .nominal_backing, .nominal_arg, .nominal_padding_field, .record_ext, .tuple_elem, .function_arg, .function_ret, .tag_payload, .tag_ext, .list_elem, .box_payload => boxyLowerInvariant("Code.Bound's backing had a child that is not a field"),
+            };
+            const text = plan.moduleView(plan.childLabelModule(child)).canonical_names.?.recordFieldLabelText(label);
+            if (std.mem.eql(u8, text, "inputs")) {
+                inputs_field = @intCast(index);
+            } else if (std.mem.eql(u8, text, "value")) {
+                value_field = @intCast(index);
+            } else boxyLowerInvariant("Code.Bound had a field other than value and inputs");
+        }
+        const inputs_index = inputs_field orelse boxyLowerInvariant("Code.Bound has no field inputs");
+        const value_index = value_field orelse boxyLowerInvariant("Code.Bound has no field value");
+        const inputs_rep = children[inputs_index].rep;
+        const value_rep = self.parent.repQuery().requiredSingleChild(inputs_rep, .list_elem).rep;
+
+        // The backing of `raw`, its `value`, and the backing built with the
+        // slots' values.
+        const raw_backing = if (bound.declared_fields.len == 0) raw else try self.addFrameLocalForRep(backing_rep);
+        const fields = try allocator.alloc(LIR.LocalId, children.len);
+        defer allocator.free(fields);
+        const inputs = try self.addFrameLocalForRep(inputs_rep);
+        const value = try self.addFrameLocalForRep(children[value_index].rep);
+        fields[inputs_index] = inputs;
+        fields[value_index] = value;
+        const built = try self.addFrameLocalForRep(backing_rep);
+
+        const descriptor_fields = try allocator.alloc(AggregateDescriptorField, children.len);
+        defer allocator.free(descriptor_fields);
+        for (children, fields, descriptor_fields) |child, field, *descriptor_field| {
+            descriptor_field.* = .{ .local = field, .target_rep = child.rep, .source_rep = child.rep };
+        }
+        const aggregate_desc = try self.constructedAggregateDescriptorForFields(built, backing_rep, descriptor_fields);
+        defer aggregate_desc.deinit(allocator);
+        var continuation = try self.assignRepresentationBoundaryWithSourceMode(target, built, bound_rep, backing_rep, .move, next);
+        continuation = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
+            .target = built,
+            .fields = try self.parent.result.store.addLocalSpan(fields),
+            .contents_desc = try self.parent.result.store.addStmtRowIfPresent(LIR.BoxyDescRef, aggregate_desc.contents_desc),
+            .next = continuation,
+        } }, self.derivedOrigin());
+        continuation = try self.readCodeValueField(value, raw_backing, value_index, children[value_index].rep, continuation);
+        continuation = try self.prependOptionalDescriptorMaterialization(aggregate_desc.materialize, continuation);
+        continuation = try self.prependDescriptorArgMaterializations(aggregate_desc.field_initializers, continuation);
+        if (raw_backing != raw) {
+            continuation = try self.assignRepresentationBoundary(raw_backing, raw, backing_rep, bound_rep, continuation);
+        }
+        continuation = try self.leaveNominalBackingFormalScope(scope, continuation);
+
+        // The slots' values, in slot order, ahead of the backing.
+        const values = try allocator.alloc(LIR.LocalId, slots.len);
+        defer allocator.free(values);
+        for (values) |*local| local.* = try self.addFrameLocalForRep(value_rep);
+        continuation = try self.assignCodeValueList(inputs, inputs_rep, values, continuation);
+        var index = slots.len;
+        while (index > 0) {
+            index -= 1;
+            continuation = try self.lowerBoundSlotInto(values[index], slots[index], value_rep, continuation);
+        }
+        return continuation;
+    }
+
+    /// One projection of an input slot, read from `source` into `dest`.
+    const SlotRead = struct {
+        dest: LIR.LocalId,
+        source: LIR.LocalId,
+        dest_rep: Plan.TypeRepId,
+        source_rep: Plan.TypeRepId,
+        kind: union(enum) {
+            field: u32,
+            /// A boundary into `dest_rep`: a formal's value converted to its
+            /// actual, or a nominal value to its backing.
+            boundary,
+            /// The formal scope of a nominal whose backing the next reads
+            /// see; left once those reads are built.
+            scope: NominalBackingFormalScope,
+        },
+    };
+
+    /// Into `target`, the `Code.Value` of `slot`: its binder's local read
+    /// through its projections.
+    fn lowerBoundSlotInto(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        slot: checked.CheckedCodeSlot,
+        value_rep: Plan.TypeRepId,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        const allocator = self.parent.allocator;
+        const plan = self.parent.plan;
+        const bindings_start = self.nominal_formal_bindings.items.len;
+        var reads = std.ArrayList(SlotRead).empty;
+        defer {
+            var index = reads.items.len;
+            while (index > 0) {
+                index -= 1;
+                switch (reads.items[index].kind) {
+                    .scope => |scope| self.dropNominalBackingFormalScope(scope),
+                    .field, .boundary => {},
+                }
+            }
+            reads.deinit(allocator);
+        }
+        var local = self.localForBinder(slot.leaf);
+        var rep_id = self.binderStorageRep(slot.leaf);
+        for (self.module.checked_bodies.codeSlotSteps(slot)) |step| {
+            const resolved = self.codeValueResolvedRep(rep_id, bindings_start);
+            if (resolved.converts) {
+                const converted = try self.addFrameLocalForRep(resolved.rep);
+                try reads.append(allocator, .{ .dest = converted, .source = local, .dest_rep = resolved.rep, .source_rep = rep_id, .kind = .boundary });
+                local = converted;
+            }
+            rep_id = resolved.rep;
+            const rep = plan.representations.items[@backingInt(rep_id)];
+            switch (step.kind) {
+                .field, .index => {
+                    const want_text = if (step.kind == .field) self.module.canonical_names.?.recordFieldLabelText(@fromBackingInt(step.value)) else "";
+                    if ((step.kind == .field and rep.kind != .record) or (step.kind == .index and rep.kind != .tuple)) {
+                        boxyLowerInvariant("an input slot's projection read a value that is not a record or tuple");
+                    }
+                    var field_index: u32 = 0;
+                    const child = for (plan.childSlice(rep.children)) |child| {
+                        switch (child.role) {
+                            .record_field => |label| {
+                                if (step.kind == .field and std.mem.eql(u8, plan.moduleView(plan.childLabelModule(child)).canonical_names.?.recordFieldLabelText(label), want_text)) break child;
+                                field_index += 1;
+                            },
+                            .tuple_elem => |elem_index| {
+                                if (step.kind == .index and elem_index == step.value) break child;
+                                field_index += 1;
+                            },
+                            .alias_backing, .alias_arg, .nominal_backing, .nominal_arg, .nominal_padding_field, .record_ext, .function_arg, .function_ret, .tag_payload, .tag_ext, .list_elem, .box_payload => {},
+                        }
+                    } else boxyLowerInvariant("an input slot read a component its type does not have");
+                    const dest = try self.addFrameLocalForRep(child.rep);
+                    try reads.append(allocator, .{ .dest = dest, .source = local, .dest_rep = child.rep, .source_rep = rep_id, .kind = .{ .field = field_index } });
+                    local = dest;
+                    rep_id = child.rep;
+                },
+                .unwrap => {
+                    if (rep.kind != .nominal) boxyLowerInvariant("an input slot unwrapped a value that is not nominal");
+                    try reads.append(allocator, .{ .dest = local, .source = local, .dest_rep = rep_id, .source_rep = rep_id, .kind = .{ .scope = try self.enterNominalBackingFormalScope(rep_id) } });
+                    const backing_rep = self.parent.repQuery().requiredSingleChild(rep_id, .nominal_backing).rep;
+                    if (rep.declared_fields.len != 0) {
+                        const backing = try self.addFrameLocalForRep(backing_rep);
+                        try reads.append(allocator, .{ .dest = backing, .source = local, .dest_rep = backing_rep, .source_rep = rep_id, .kind = .boundary });
+                        local = backing;
+                    }
+                    rep_id = backing_rep;
+                },
+            }
+        }
+        if (std.debug.runtime_safety) {
+            if (!try self.codeValueShapeMatches(rep_id, self.module.checked_bodies.codeSlotShape(slot), bindings_start)) {
+                boxyLowerInvariant("an input slot's representation differs from the shape of its slot type");
+            }
+        }
+        var continuation = try self.lowerCodeValueCallInto(target, local, rep_id, value_rep, bindings_start, next);
+        while (reads.pop()) |read| {
+            continuation = switch (read.kind) {
+                .field => |field_index| try self.readCodeValueField(read.dest, read.source, field_index, read.dest_rep, continuation),
+                .boundary => try self.assignRepresentationBoundary(read.dest, read.source, read.dest_rep, read.source_rep, continuation),
+                .scope => |scope| try self.leaveNominalBackingFormalScope(scope, continuation),
+            };
+        }
+        return continuation;
+    }
+
+    /// The representation a `Code.Value` follows for a value of `rep_id`:
+    /// its alias backings read through, and a formal or sealed variable read
+    /// as what binds it, which `converts` the value.
+    fn codeValueResolvedRep(self: *const ProcBodyBuilder, rep_id: Plan.TypeRepId, bindings_start: usize) struct { rep: Plan.TypeRepId, converts: bool } {
+        var current = rep_id;
+        var converts = false;
+        while (true) {
+            const rep = self.parent.plan.representations.items[@backingInt(current)];
+            switch (rep.kind) {
+                .alias => current = self.parent.repQuery().requiredSingleChild(current, .alias_backing).rep,
+                .dynamic => {
+                    current = self.nominalFormalActualAbove(bindings_start, current) orelse rep.sealed_default.get() orelse
+                        boxyLowerInvariant("an input slot's type reached a type variable nothing binds");
+                    converts = true;
+                },
+                else => return .{ .rep = current, .converts = converts },
+            }
+        }
+    }
+
+    /// Read field `field_index` of the struct `source` into `dest`, through
+    /// the box its layout stores it in when the field is on a recursive
+    /// type's cycle.
+    fn readCodeValueField(
+        self: *ProcBodyBuilder,
+        dest: LIR.LocalId,
+        source: LIR.LocalId,
+        field_index: u32,
+        dest_rep: Plan.TypeRepId,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        if (self.isZstLocal(dest)) return next;
+        const stored_layout = try self.aggregateFieldLayout(self.parent.result.store.getLocal(source).layout_idx, field_index);
+        if (stored_layout == self.parent.result.store.getLocal(dest).layout_idx) {
+            return try self.derivedFieldRead(dest, source, field_index, next);
+        }
+        const stored = try self.addFrameLocal(stored_layout);
+        const unboxed = try self.assignWorkerValueToTagPayloadStorage(dest, stored, dest_rep, next);
+        return try self.derivedFieldRead(stored, source, field_index, unboxed);
+    }
+
+    /// Into `target`, the `Code.Value` of `source`, a value of `rep_id`: a
+    /// call of the procedure of the representation it resolves to.
+    fn lowerCodeValueCallInto(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        source: LIR.LocalId,
+        rep_id: Plan.TypeRepId,
+        value_rep: Plan.TypeRepId,
+        bindings_start: usize,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        const allocator = self.parent.allocator;
+        const resolved = self.codeValueResolvedRep(rep_id, bindings_start);
+        const value = if (resolved.converts) try self.addFrameLocalForRep(resolved.rep) else source;
+        const bindings = try Plan.orderedDerivedEnv(allocator, self.nominal_formal_bindings.items[bindings_start..]);
+        defer allocator.free(bindings);
+        const proc = try self.parent.codeValueProc(resolved.rep, value_rep, bindings, self.parent.result.store.getLocal(target).layout_idx);
+        const call = try self.parent.result.store.addCFStmt(.{ .assign_call = .{
+            .target = target,
+            .proc = proc,
+            .args = try self.parent.result.store.addLocalSpan(&.{value}),
+            .next = next,
+        } }, self.derivedOrigin());
+        if (!resolved.converts) return call;
+        return try self.assignRepresentationBoundary(value, source, resolved.rep, rep_id, call);
+    }
+
+    /// Into `target`, one layer of the `Code.Value` of `source`, a value of
+    /// `rep_id`: each component's value is a call of its procedure.
+    fn lowerCodeValueLayerInto(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        source: LIR.LocalId,
+        rep_id: Plan.TypeRepId,
+        value_rep: Plan.TypeRepId,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        const plan = self.parent.plan;
+        const rep = plan.representations.items[@backingInt(rep_id)];
+        switch (rep.kind) {
+            .primitive => |primitive| {
+                const widened: ?struct { op: LIR.LowLevel, layout: layout.Idx } = switch (primitive) {
+                    .u8 => .{ .op = .u8_to_i128, .layout = .i128 },
+                    .i8 => .{ .op = .i8_to_i128, .layout = .i128 },
+                    .u16 => .{ .op = .u16_to_i128, .layout = .i128 },
+                    .i16 => .{ .op = .i16_to_i128, .layout = .i128 },
+                    .u32 => .{ .op = .u32_to_i128, .layout = .i128 },
+                    .i32 => .{ .op = .i32_to_i128, .layout = .i128 },
+                    .u64 => .{ .op = .u64_to_i128, .layout = .i128 },
+                    .i64 => .{ .op = .i64_to_i128, .layout = .i128 },
+                    .f32 => .{ .op = .f32_to_f64, .layout = .f64 },
+                    .bool, .str, .u128, .i128, .f64, .dec => null,
+                    .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => boxyLowerInvariant("a slot type held a vector, which the walk refuses"),
+                };
+                const tag: []const u8 = switch (primitive) {
+                    .bool => "Bool",
+                    .str => "Str",
+                    .u128 => "U128",
+                    .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .i128 => "Int",
+                    .f32, .f64 => "Frac",
+                    .dec => "Dec",
+                    .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => unreachable,
+                };
+                const widen = widened orelse return try self.assignCodeValueVariant(target, value_rep, tag, &.{source}, next);
+                const wide = try self.addFrameLocal(widen.layout);
+                const variant = try self.assignCodeValueVariant(target, value_rep, tag, &.{wide}, next);
+                return try self.assignUnaryLowLevel(wide, widen.op, source, variant);
+            },
+            .bool_tag_union => return try self.assignCodeValueVariant(target, value_rep, "Bool", &.{source}, next),
+            .empty_record => return try self.assignCodeValueComponents(target, value_rep, "Record", &.{}, next),
+            .record, .tuple => {
+                var components = std.ArrayList(LIR.LocalId).empty;
+                defer components.deinit(self.parent.allocator);
+                var reads = std.ArrayList(struct { field: LIR.LocalId, index: u32, rep: Plan.TypeRepId }).empty;
+                defer reads.deinit(self.parent.allocator);
+                var field_index: u32 = 0;
+                for (plan.childSlice(rep.children)) |child| {
+                    switch (child.role) {
+                        .record_field, .tuple_elem => {},
+                        .record_ext => {
+                            self.requireEmptyRecordExtension(child.rep);
+                            continue;
+                        },
+                        .alias_backing, .alias_arg, .nominal_backing, .nominal_arg, .nominal_padding_field, .function_arg, .function_ret, .tag_payload, .tag_ext, .list_elem, .box_payload => boxyLowerInvariant("a record or tuple representation had a child that is not a component"),
+                    }
+                    try components.append(self.parent.allocator, try self.addFrameLocalForRep(value_rep));
+                    try reads.append(self.parent.allocator, .{ .field = try self.addFrameLocalForRep(child.rep), .index = field_index, .rep = child.rep });
+                    field_index += 1;
+                }
+                var continuation = try self.assignCodeValueComponents(target, value_rep, if (rep.kind == .record) "Record" else "Tuple", components.items, next);
+                var index = reads.items.len;
+                while (index > 0) {
+                    index -= 1;
+                    const read = reads.items[index];
+                    continuation = try self.lowerCodeValueCallInto(components.items[index], read.field, read.rep, value_rep, 0, continuation);
+                    continuation = try self.readCodeValueField(read.field, source, read.index, read.rep, continuation);
+                }
+                return continuation;
+            },
+            .tag_union => {
+                for (plan.childSlice(rep.children)) |child| {
+                    if (child.role == .tag_ext) self.requireClosedCodeValueTagExtension(child.rep);
+                }
+                const variants = self.repTagVariants(rep_id);
+                if (variants.len == 0) return try self.parent.result.store.addCFStmt(.runtime_error, self.derivedOrigin());
+                const done = self.freshJoinPointId();
+                const branches = try self.parent.allocator.alloc(LIR.CFSwitchBranch, variants.len);
+                defer self.parent.allocator.free(branches);
+                for (variants, branches, 0..) |variant, *branch, variant_index| {
+                    const payloads = plan.childSlice(variant.payloads);
+                    const values = try self.parent.allocator.alloc(LIR.LocalId, payloads.len);
+                    defer self.parent.allocator.free(values);
+                    for (values) |*local| local.* = try self.addFrameLocalForRep(value_rep);
+                    const name = try self.addFrameLocal(.str);
+                    const list = try self.addFrameLocalForRep(self.codeValuePayloadRep(value_rep, "Tag", 1));
+                    var continuation = try self.assignCodeValueVariant(target, value_rep, "Tag", &.{ name, list }, try self.joinJump(done));
+                    continuation = try self.assignCodeValueList(list, self.codeValuePayloadRep(value_rep, "Tag", 1), values, continuation);
+                    continuation = try self.assignStringBytesLiteral(name, self.parent.tagVariantNameText(variant), continuation);
+                    const source_has_payload_desc = rep.descriptor.get() != null or self.parent.result.store.getLocal(source).boxy_desc != null;
+                    var payload_index = payloads.len;
+                    while (payload_index > 0) {
+                        payload_index -= 1;
+                        const payload_child = self.variantPayloadChild(rep_id, @intCast(variant_index), @intCast(payload_index));
+                        const payload = try self.addExtractedTagPayloadLocal(payload_child.rep, source_has_payload_desc);
+                        continuation = try self.lowerCodeValueCallInto(values[payload_index], payload.local, payload_child.rep, value_rep, 0, continuation);
+                        if (!self.isZstLocal(payload.local)) {
+                            continuation = try self.readVariantPayload(payload, payload_child.rep, source, rep_id, @intCast(variant_index), @intCast(payload_index), continuation);
+                        }
+                    }
+                    branch.* = .{ .value = @intCast(variant_index), .body = continuation };
+                }
+                const dispatch = if (variants.len == 1 and self.isZstLocal(source))
+                    branches[0].body
+                else blk: {
+                    const discriminant = try self.addFrameLocal(.u32);
+                    const switch_stmt = try self.derivedDiscriminantSwitch(
+                        discriminant,
+                        branches,
+                        try self.parent.result.store.addCFStmt(.runtime_error, self.derivedOrigin()),
+                    );
+                    break :blk try self.derivedDiscriminantRead(discriminant, source, switch_stmt);
+                };
+                return try self.derivedResultJoin(done, target, next, dispatch);
+            },
+            .list => {
+                // len = list_len(source)
+                // loop (index = 0, out = with_capacity(len))
+                //   if index == len then out
+                //   else continue (index + 1, append_unsafe(out, value_of(get_unsafe(source, index))))
+                const elem_rep = self.parent.repQuery().requiredSingleChild(rep_id, .list_elem).rep;
+                const out_rep = self.codeValuePayloadRep(value_rep, "List", 0);
+                const len = try self.addFrameLocal(.u64);
+                const index = try self.addFrameLocal(.u64);
+                const out = try self.addFrameLocalForRep(out_rep);
+                const zero_index = try self.addFrameLocal(.u64);
+                const initial_out = try self.addFrameLocalForRep(out_rep);
+                const done = try self.addFrameLocal(.bool);
+                const elem = try self.addFrameLocalForRep(elem_rep);
+                const elem_value = try self.addFrameLocalForRep(value_rep);
+                const next_out = try self.addFrameLocalForRep(out_rep);
+                const one = try self.addFrameLocal(.u64);
+                const next_index = try self.addFrameLocal(.u64);
+                const join_id = self.freshJoinPointId();
+
+                const finish = try self.assignCodeValueVariant(target, value_rep, "List", &.{out}, next);
+                var step = try self.joinJump(join_id);
+                step = try self.setLocalInitializeJoinParam(out, next_out, step);
+                step = try self.setLocalInitializeJoinParam(index, next_index, step);
+                step = try self.assignBinaryLowLevel(next_index, .num_int_add_crash_on_overflow, index, one, step);
+                step = try self.assignIntLiteral(one, 1, step);
+                step = try self.assignBinaryLowLevel(next_out, .list_append_unsafe, out, elem_value, step);
+                step = try self.lowerCodeValueCallInto(elem_value, elem, elem_rep, value_rep, 0, step);
+                if (!self.isZstLocal(elem)) step = try self.assignBinaryLowLevel(elem, .list_get_unsafe, source, index, step);
+                const body = try self.assignBinaryLowLevel(done, .num_is_eq, index, len, try self.boolSwitchNoContinuation(done, finish, step));
+
+                var initial = try self.joinJump(join_id);
+                initial = try self.setLocalInitializeJoinParam(out, initial_out, initial);
+                initial = try self.setLocalInitializeJoinParam(index, zero_index, initial);
+                initial = try self.assignUnaryLowLevel(initial_out, .list_with_capacity, len, initial);
+                initial = try self.assignIntLiteral(zero_index, 0, initial);
+                initial = try self.assignUnaryLowLevel(len, .list_len, source, initial);
+                return try self.parent.result.store.addCFStmt(.{ .join = .{
+                    .id = join_id,
+                    .params = try self.joinParamSpan(&[_]LIR.LocalId{ index, out }),
+                    .body = body,
+                    .remainder = initial,
+                } }, self.derivedOrigin());
+            },
+            .nominal => {
+                // `Wrap` of the backing's value, read under the nominal's
+                // formal bindings.
+                const scope = try self.enterNominalBackingFormalScope(rep_id);
+                errdefer self.dropNominalBackingFormalScope(scope);
+                const backing_rep = self.parent.repQuery().requiredSingleChild(rep_id, .nominal_backing).rep;
+                const backing = if (rep.declared_fields.len == 0) source else try self.addFrameLocalForRep(backing_rep);
+                const inner = try self.addFrameLocalForRep(value_rep);
+                var continuation = try self.assignCodeValueVariant(target, value_rep, "Wrap", &.{inner}, next);
+                continuation = try self.lowerCodeValueCallInto(inner, backing, backing_rep, value_rep, 0, continuation);
+                if (backing != source) {
+                    continuation = try self.assignRepresentationBoundary(backing, source, backing_rep, rep_id, continuation);
+                }
+                return try self.leaveNominalBackingFormalScope(scope, continuation);
+            },
+            .alias, .dynamic => boxyLowerInvariant("a Code.Value procedure was reserved for a representation it reads through"),
+            .in_progress,
+            .erased_callable,
+            .box,
+            .empty_tag_union,
+            .generated_field,
+            .generated_field_names,
+            .generated_tag_union_spec,
+            => boxyLowerInvariant("a slot type held a shape no Code.Value expresses, which publication refuses"),
+        }
+    }
+
+    /// A slot type's tag row is closed: its extension reads through to the
+    /// empty tag union, as the walk seals it.
+    fn requireClosedCodeValueTagExtension(self: *const ProcBodyBuilder, rep_id: Plan.TypeRepId) void {
+        var current = rep_id;
+        while (true) {
+            const rep = self.parent.plan.representations.items[@backingInt(current)];
+            switch (rep.kind) {
+                .empty_tag_union => return,
+                .alias => current = self.parent.repQuery().requiredSingleChild(current, .alias_backing).rep,
+                .dynamic => current = rep.sealed_default.get() orelse
+                    boxyLowerInvariant("a slot type's tag row extension was a variable nothing seals"),
+                else => boxyLowerInvariant("a slot type held an open tag union, which the walk seals"),
+            }
+        }
+    }
+
+    /// The representation of payload `index` of `Code.Value`'s variant `text`.
+    fn codeValuePayloadRep(self: *const ProcBodyBuilder, value_rep: Plan.TypeRepId, text: []const u8, index: usize) Plan.TypeRepId {
+        const variant = self.generatedParserTagVariant(value_rep, text);
+        return self.parent.plan.childSlice(variant.variant.payloads)[index].rep;
+    }
+
+    /// Into `target`, `Code.Value`'s variant `text` holding `payloads`.
+    fn assignCodeValueVariant(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        value_rep: Plan.TypeRepId,
+        text: []const u8,
+        payloads: []const LIR.LocalId,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        const variant = self.generatedParserTagVariant(value_rep, text);
+        const children = self.parent.plan.childSlice(variant.variant.payloads);
+        if (children.len != payloads.len) boxyLowerInvariant("a Code.Value variant had another payload count");
+        var items: [2]ProcedureBuilder.GeneratedParserTupleItem = undefined;
+        for (payloads, children, 0..) |payload, child, index| {
+            items[index] = .{ .source_type = child.source_type, .rep = child.rep, .value = payload };
+        }
+        return try self.parent.lowerGeneratedParserTagConstruction(self, value_rep, variant, target, items[0..payloads.len], next);
+    }
+
+    /// Into `target`, `Code.Value`'s variant `text` holding the list of
+    /// `components`.
+    fn assignCodeValueComponents(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        value_rep: Plan.TypeRepId,
+        text: []const u8,
+        components: []const LIR.LocalId,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        const list_rep = self.codeValuePayloadRep(value_rep, text, 0);
+        const list = try self.addFrameLocalForRep(list_rep);
+        const variant = try self.assignCodeValueVariant(target, value_rep, text, &.{list}, next);
+        return try self.assignCodeValueList(list, list_rep, components, variant);
+    }
+
+    /// A `List(Code.Value)` of `elems` into `target`, a local of `list_rep`.
+    fn assignCodeValueList(
+        self: *ProcBodyBuilder,
+        target: LIR.LocalId,
+        list_rep: Plan.TypeRepId,
+        elems: []const LIR.LocalId,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        const desc_info = try self.stableDescriptorForConstructedValue(target, list_rep);
+        if (desc_info.desc) |desc| try self.parent.result.store.setLocalBoxyDesc(target, desc);
+        const assign = try self.assignList(target, elems, next);
+        return try self.prependOptionalDescriptorMaterialization(desc_info.materialize, assign);
+    }
+
+    /// Whether `rep_id`, under the formal bindings from `bindings_start` on,
+    /// has the shape `words` (`checked.CodeValueShape`) say, which the walk
+    /// wrote from the slot's type. Debug builds only.
+    fn codeValueShapeMatches(self: *ProcBodyBuilder, rep_id: Plan.TypeRepId, words: []const u32, bindings_start: usize) Allocator.Error!bool {
+        const allocator = self.parent.allocator;
+        const plan = self.parent.plan;
+        const names_store = self.module.canonical_names.?;
+        const S = checked.CodeValueShape;
+        const none = std.math.maxInt(u32);
+        // The formal bindings of the nominals around a position, a chain
+        // from the innermost.
+        const Env = struct { parent: u32, formal: Plan.TypeRepId, actual: Plan.TypeRepId };
+        var envs = std.ArrayList(Env).empty;
+        defer envs.deinit(allocator);
+        var outer: u32 = none;
+        for (self.nominal_formal_bindings.items[bindings_start..]) |binding| {
+            try envs.append(allocator, .{ .parent = outer, .formal = binding.formal, .actual = binding.actual });
+            outer = @intCast(envs.items.len - 1);
+        }
+        const Item = union(enum) {
+            rep: struct { rep: Plan.TypeRepId, env: u32 },
+            field: []const u8,
+            tag: struct { name: []const u8, payloads: usize },
+        };
+        var pending = std.ArrayList(Item).empty;
+        defer pending.deinit(allocator);
+        try pending.append(allocator, .{ .rep = .{ .rep = rep_id, .env = outer } });
+        var at: usize = 0;
+        while (pending.pop()) |item| {
+            if (at >= words.len) return false;
+            const word = words[at];
+            at += 1;
+            const position = switch (item) {
+                .field => |text| {
+                    if (!std.mem.eql(u8, names_store.recordFieldLabelText(@fromBackingInt(word)), text)) return false;
+                    continue;
+                },
+                .tag => |tag| {
+                    if (!std.mem.eql(u8, names_store.tagLabelText(@fromBackingInt(word)), tag.name)) return false;
+                    if (at >= words.len or words[at] != tag.payloads) return false;
+                    at += 1;
+                    continue;
+                },
+                .rep => |position| position,
+            };
+            var current = position.rep;
+            while (true) {
+                const rep = plan.representations.items[@backingInt(current)];
+                switch (rep.kind) {
+                    .alias => current = self.parent.repQuery().requiredSingleChild(current, .alias_backing).rep,
+                    .dynamic => {
+                        var env = position.env;
+                        const bound = while (env != none) : (env = envs.items[env].parent) {
+                            if (envs.items[env].formal == current) break envs.items[env].actual;
+                        } else null;
+                        current = bound orelse rep.sealed_default.get() orelse return false;
+                    },
+                    else => break,
+                }
+            }
+            const rep = plan.representations.items[@backingInt(current)];
+            const shape = std.enums.fromInt(S, word) orelse return false;
+            switch (shape) {
+                .int => {
+                    if (at >= words.len) return false;
+                    const want = words[at];
+                    at += 1;
+                    const primitive = switch (rep.kind) {
+                        .primitive => |primitive| primitive,
+                        else => return false,
+                    };
+                    switch (primitive) {
+                        .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => {},
+                        else => return false,
+                    }
+                    if (@intFromEnum(primitive) - @intFromEnum(checked.CheckedPrimitive.u8) != want) return false;
+                },
+                .frac => {
+                    if (at >= words.len) return false;
+                    const want: checked.CheckedPrimitive = if (words[at] == 1) .f64 else .f32;
+                    at += 1;
+                    if (rep.kind != .primitive or rep.kind.primitive != want) return false;
+                },
+                .dec => if (rep.kind != .primitive or rep.kind.primitive != .dec) return false,
+                .str => if (rep.kind != .primitive or rep.kind.primitive != .str) return false,
+                .bool_ => if (rep.kind != .bool_tag_union and (rep.kind != .primitive or rep.kind.primitive != .bool)) return false,
+                .list => {
+                    if (rep.kind != .list) return false;
+                    try pending.append(allocator, .{ .rep = .{ .rep = self.parent.repQuery().requiredSingleChild(current, .list_elem).rep, .env = position.env } });
+                },
+                .wrap => {
+                    if (rep.kind != .nominal) return false;
+                    var env = position.env;
+                    var substitutions = plan.nominalBackingSubstitutions(rep.nominal_backing_arg_substitutions);
+                    while (substitutions.next()) |substitution| {
+                        const formal = substitution.formal_rep orelse continue;
+                        var search = position.env;
+                        const actual = while (search != none) : (search = envs.items[search].parent) {
+                            if (envs.items[search].formal == substitution.actual_rep) break envs.items[search].actual;
+                        } else substitution.actual_rep;
+                        if (formal == actual) continue;
+                        try envs.append(allocator, .{ .parent = env, .formal = formal, .actual = actual });
+                        env = @intCast(envs.items.len - 1);
+                    }
+                    try pending.append(allocator, .{ .rep = .{ .rep = self.parent.repQuery().requiredSingleChild(current, .nominal_backing).rep, .env = env } });
+                },
+                .recursive => if (rep.kind != .nominal) return false,
+                .tuple, .record => {
+                    if (at >= words.len) return false;
+                    const count = words[at];
+                    at += 1;
+                    if (shape == .tuple and rep.kind != .tuple) return false;
+                    if (shape == .record and rep.kind != .record and rep.kind != .empty_record) return false;
+                    const children = plan.childSlice(rep.children);
+                    var components: u32 = 0;
+                    for (children) |child| switch (child.role) {
+                        .record_field, .tuple_elem => components += 1,
+                        else => {},
+                    };
+                    if (components != count) return false;
+                    var index = children.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const child = children[index];
+                        switch (child.role) {
+                            .tuple_elem => try pending.append(allocator, .{ .rep = .{ .rep = child.rep, .env = position.env } }),
+                            .record_field => |label| {
+                                try pending.append(allocator, .{ .rep = .{ .rep = child.rep, .env = position.env } });
+                                try pending.append(allocator, .{ .field = plan.moduleView(plan.childLabelModule(child)).canonical_names.?.recordFieldLabelText(label) });
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                .tag_union => {
+                    if (at >= words.len or rep.kind != .tag_union) return false;
+                    const variants = plan.tagVariantSlice(rep.tag_variants);
+                    if (variants.len != words[at]) return false;
+                    at += 1;
+                    var index = variants.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const payloads = plan.childSlice(variants[index].payloads);
+                        var payload = payloads.len;
+                        while (payload > 0) {
+                            payload -= 1;
+                            try pending.append(allocator, .{ .rep = .{ .rep = payloads[payload].rep, .env = position.env } });
+                        }
+                        try pending.append(allocator, .{ .tag = .{ .name = self.parent.tagVariantNameText(variants[index]), .payloads = payloads.len } });
+                    }
+                },
+            }
+        }
+        return at == words.len;
     }
 
     fn lowerPrimitiveHashLocalsInto(
