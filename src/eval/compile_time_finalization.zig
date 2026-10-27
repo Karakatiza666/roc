@@ -3590,7 +3590,7 @@ fn reportEmbeddedFailure(
     // Code checking rejected owns its diagnostic; reaching it discards the
     // root's result without reporting the problem a second time.
     if (failedAtCheckedError(failed_at.meaning)) return .reported_elsewhere;
-    const Embedded = struct { kind: ?lir.LIR.LiteralRejectionKind, message: []const u8, region: ?base.Region, loc: ?base.SourceLoc };
+    const Embedded = struct { kind: ?lir.LIR.LiteralRejectionKind, message: []const u8, region: ?base.Region, loc: ?base.SourceLoc, literal: ?lir.LIR.LiteralRejectionSite = null };
     const embedded: Embedded = if (guardProducerSlot(lir_result, failed_at.meaning)) |producer| switch (producer.root) {
         .checked => |producer_root| {
             if (checkedProducerReportedFailure(owners, producer.module, producer_root)) return .reported_elsewhere;
@@ -3611,11 +3611,18 @@ fn reportEmbeddedFailure(
             };
         },
     } else if (failedLiteralRejection(lir_result, failed_at.meaning)) |site|
-        .{ .kind = site.kind, .message = message, .region = failed_at.region, .loc = failed_at.loc }
+        .{ .kind = site.kind, .message = message, .region = failed_at.region, .loc = failed_at.loc, .literal = site }
     else
         return .none;
     const store = maybe_problem_store orelse return .reported_elsewhere;
-    const site = comptimeFailureSiteFromLoc(module, &lir_result.store, root_region, embedded.region, embedded.loc);
+    // A rejected literal of this module is reported at the literal itself, not
+    // at the statement of the conversion that rejected it: that statement's
+    // position depends on how the program was lowered.
+    const site = if (embedded.literal) |literal| blk: {
+        if (!moduleKeyBytesEqual(failed_at.meaning.?.literal_rejection.module, module.key.bytes)) break :blk comptimeFailureSiteFromLoc(module, &lir_result.store, root_region, embedded.region, embedded.loc);
+        const literal_region = module.checked_bodies.expr(@fromBackingInt(@intCast(literal.checked_expr))).source_region;
+        break :blk comptimeFailureSiteFrom(module, literal_region, null, null, null);
+    } else comptimeFailureSiteFromLoc(module, &lir_result.store, root_region, embedded.region, embedded.loc);
     if (embedded.kind) |kind| {
         if (literalRejectionReported(store, kind, site.region)) return .reported;
         const message_idx = try store.putExtraString(embedded.message);
