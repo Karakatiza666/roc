@@ -398,7 +398,10 @@ pub const Constants = struct {
     ///      can be `outline` (V3), and its value holds that view.
     /// 176: Normal form 13: `Code.Lawful` is a builtin type, and a site of
     ///      it holds the `graph` view under the laws of layer L.
-    pub const CACHE_VERSION = 176;
+    /// 177: Normal form 14: a region's digest and its structural comparison
+    ///      read its loops that can return, and two merged rows pair their
+    ///      nodes for provenance by the comparison.
+    pub const CACHE_VERSION = 177;
 };
 
 /// Configuration for the Roc cache system.

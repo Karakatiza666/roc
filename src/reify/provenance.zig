@@ -12,7 +12,7 @@
 //! | hash-consing finds it again (N5a) | its origins and the new ones |
 //! | a rebuild copies it | the old node's |
 //! | a view inlines a call or a closure (V1, V2) | the callee node's, each reached through the call's or closure's |
-//! | two rows merge (N8g) | each node's and its partner's |
+//! | two rows merge (N8g) | its own, and those of every node of the dropped row the row comparison paired with it (`rows.zig` `mergeInto`) |
 
 const std = @import("std");
 const ir = @import("ir.zig");

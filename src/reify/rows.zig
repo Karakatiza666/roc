@@ -389,8 +389,10 @@ pub const Finalizer = struct {
             }
             for (part[i..], digests[i..]) |q, e| {
                 if (e != d or q == rep) continue;
-                if (!try sameRow(gpa, store, rep, q, classes.pairing())) return error.InvariantBroken;
-                try mergeInto(gpa, store, q, rep);
+                var matched: Correspondence = .empty;
+                defer matched.deinit(gpa);
+                if (!try sameRow(gpa, store, q, rep, classes.pairing(), &matched)) return error.InvariantBroken;
+                try mergeInto(gpa, store, q, rep, matched.items);
             }
             try reps.append(gpa, rep);
         }
@@ -409,10 +411,16 @@ pub const Finalizer = struct {
         } else true;
         if (all_hit) {
             const pairing: MapPairing = .{ .from = reps.items, .to = hits };
-            for (reps.items, hits) |r, h| {
-                if (!try sameRow(gpa, store, r, h.?, pairing.pairing())) return error.InvariantBroken;
+            const matched = try gpa.alloc(Correspondence, reps.items.len);
+            @memset(matched, .empty);
+            defer {
+                for (matched) |*m| m.deinit(gpa);
+                gpa.free(matched);
             }
-            for (reps.items, hits) |r, h| if (r != self.root) try mergeInto(gpa, store, r, h.?);
+            for (reps.items, hits, matched) |r, h, *m| {
+                if (!try sameRow(gpa, store, r, h.?, pairing.pairing(), m)) return error.InvariantBroken;
+            }
+            for (reps.items, hits, matched) |r, h, m| if (r != self.root) try mergeInto(gpa, store, r, h.?, m.items);
             if (std.mem.findScalar(RowId, reps.items, self.root) == null) return;
             // The root now calls the finalized part, so its digest is its own.
             var d: [1]Digest = undefined;
@@ -525,38 +533,45 @@ const MapPairing = struct {
     }
 };
 
+// The nodes a comparison of two rows found equal, the first row's first.
+const Correspondence = std.ArrayList([2]NodeId);
+
 // Whether rows `a` and `b` compute one thing: equal parameter and result
 // types, and bodies that end alike over equal values, with a row that
 // `pairing` pairs taken as one. A digest collision never merges two rows.
-fn sameRow(gpa: Allocator, store: *const ir.Store, a: RowId, b: RowId, pairing: equal.RowPairing) Allocator.Error!bool {
+// Where it holds, `matched` holds the correspondence it found.
+fn sameRow(gpa: Allocator, store: *const ir.Store, a: RowId, b: RowId, pairing: equal.RowPairing, matched: *Correspondence) Allocator.Error!bool {
     const x = store.row(a);
     const y = store.row(b);
     if (x.result != y.result) return false;
     if (!std.mem.eql(TyId, store.tySlice(x.params), store.tySlice(y.params))) return false;
-    var cmp: equal.Comparison = .{ .gpa = gpa, .store = store, .rows = pairing };
+    var cmp: equal.Comparison = .{ .gpa = gpa, .store = store, .rows = pairing, .matched = matched };
     defer cmp.deinit();
     return cmp.regions(x.body, y.body);
 }
 
-// Row `from` merges into `into`: every `Call` and `Closure` that names it
-// names `into`.
 // Row `from` merges into `into`, which `sameRow` found equal to it: every
 // call and closure of `from` names `into`, and each node of `into` takes the
-// origins of the node of `from` its numbering pairs it with (N10).
-fn mergeInto(gpa: Allocator, store: *ir.Store, from: RowId, into: RowId) Error!void {
-    {
+// origins of every node of `from` that `matched` pairs it with (N10). The
+// pairs come from the comparison, not from the two numberings: equal rows
+// can share an equal node differently until the number stage (N5d), so
+// their numberings need not pair position by position.
+fn mergeInto(gpa: Allocator, store: *ir.Store, from: RowId, into: RowId, matched: []const [2]NodeId) Error!void {
+    if (std.debug.runtime_safety) {
+        // Equality was just found, so every node of `from` has a partner.
         var returns = try live_mod.Returns.init(gpa, store);
         defer returns.deinit(gpa);
         var a = try number.ofRow(gpa, store, &returns, from);
         defer a.deinit(gpa);
-        var b = try number.ofRow(gpa, store, &returns, into);
-        defer b.deinit(gpa);
-        if (a.order.items.len != b.order.items.len) return error.InvariantBroken;
-        for (a.order.items, b.order.items) |x, y| {
-            const origins = try gpa.dupe(provenance.OriginId, store.provenance.of(x));
-            defer gpa.free(origins);
-            try store.provenance.add(gpa, y, origins);
-        }
+        var partnered: collections.DenseMapUnmanaged(NodeId, void) = .empty;
+        defer partnered.deinit(gpa);
+        for (matched) |m| try partnered.put(gpa, m[0], {});
+        for (a.order.items) |n| std.debug.assert(partnered.contains(n));
+    }
+    for (matched) |m| {
+        const origins = try gpa.dupe(provenance.OriginId, store.provenance.of(m[0]));
+        defer gpa.free(origins);
+        try store.provenance.add(gpa, m[1], origins);
     }
     for (store.nodes.items(.op), store.nodes.items(.payload)) |op, *payload| {
         switch (op) {
@@ -1189,4 +1204,153 @@ test "N8g: a forced digest collision merges nothing, and finalize reports it" {
     try fin.registry.put(testing.allocator, d[0], doubled);
     try testing.expectError(error.InvariantBroken, fin.finalize(&f.b, &.{bumped}));
     try testing.expectEqual(@as(?RowId, null), f.store.row(bumped).merged_into);
+}
+
+// `for _ in 0..<n { t = t + b * 3 }` from `t = k`, in the open region.
+fn tripleLoop(f: *Fixture, k: Ref, b: Ref, n: Ref) Allocator.Error!Ref {
+    const i64_ty = try f.i64Ty();
+    const body = try f.b.openRegion(.loop_body, &.{ i64_ty, i64_ty });
+    const step = try f.b.call(.i64, .times_wrap, &.{ b, try f.b.litInt(i64_ty, 3) });
+    try f.b.close(.{ .continue_ = &.{try f.b.call(.i64, .plus_wrap, &.{ ir.Ref.regionParam(body, 1), step })} });
+    return f.b.loopOf(.for_range, &.{ try f.b.litInt(i64_ty, 0), n, k }, body, &.{i64_ty});
+}
+
+// `|c, a, b, n| if c a * 3 else { t = 36; for _ in 0..<n { t = t + b * 3 }; t }`.
+// Where `hoisted`, the row first builds `12 * 3`, which folds to 36 and
+// leaves the literal 3 at the body, where both arms read it; otherwise each
+// arm builds its own 3, as an inlined helper does (N5d).
+fn tripleRow(f: *Fixture, hoisted: bool) Allocator.Error!RowId {
+    const i64_ty = try f.i64Ty();
+    const r = try f.b.beginRow(&.{ try f.types.boolTy(), i64_ty, i64_ty, i64_ty }, i64_ty);
+    const c = Ref.rowParam(0);
+    if (hoisted) _ = try f.b.call(.i64, .times_wrap, &.{ try f.b.litInt(i64_ty, 12), try f.b.litInt(i64_ty, 3) });
+    const arm0 = try f.b.openArm(c, 0);
+    try f.b.close(.{ .value = &.{try tripleLoop(f, try f.b.litInt(i64_ty, 36), Ref.rowParam(2), Ref.rowParam(3))} });
+    const arm1 = try f.b.openArm(c, 1);
+    try f.b.close(.{ .value = &.{try f.b.call(.i64, .times_wrap, &.{ Ref.rowParam(1), try f.b.litInt(i64_ty, 3) })} });
+    try f.b.endRow(.{ .value = &.{try f.b.switchOn(c, &.{ arm0, arm1 }, &.{}, &.{i64_ty}, &.{})} });
+    return r;
+}
+
+// Two `tripleRow`s, the first `hoisted`, each built at a source of its own
+// (1 and 2), called from a root built at source 0.
+fn tripleSite(f: *Fixture, sources: *[3]provenance.OriginId) Allocator.Error![3]RowId {
+    for (sources, 0..) |*o, k| o.* = try f.store.provenance.intern(testing.allocator, .{ .source = provenance.SourceId.of(@intCast(k)), .via = .none });
+    const i64_ty = try f.i64Ty();
+    f.b.origins = sources[1..2];
+    const h1 = try tripleRow(f, true);
+    f.b.origins = sources[2..3];
+    const h2 = try tripleRow(f, false);
+    f.b.origins = sources[0..1];
+    const root = try f.b.beginRow(&.{ try f.types.boolTy(), i64_ty, i64_ty, i64_ty }, i64_ty);
+    const params: [4]Ref = .{ Ref.rowParam(0), Ref.rowParam(1), Ref.rowParam(2), Ref.rowParam(3) };
+    const c1 = try f.b.callRow(h1, &params);
+    const c2 = try f.b.callRow(h2, &params);
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .times_wrap, &.{ c1, c2 })} });
+    f.b.origins = &.{};
+    return .{ h1, h2, root };
+}
+
+test "N8g: two rows that compute one value but share a literal differently merge into one row" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    var sources: [3]provenance.OriginId = undefined;
+    const h1, const h2, const root = try tripleSite(&f, &sources);
+    // The first row reads one 3 from both arms and the second one 3 per
+    // arm, so their numberings do not pair position by position, but the
+    // rows are equal and merge (N5d is not built).
+    const got = try f.site(root);
+    defer testing.allocator.free(got);
+    try testing.expect(try check(testing.allocator, &f.store, root) == null);
+    try testing.expectEqual(@as(?RowId, null), f.store.row(h1).merged_into);
+    try testing.expectEqual(@as(?RowId, h1), f.store.row(h2).merged_into);
+    try testing.expect(std.mem.find(u8, got, "row r2") == null);
+}
+
+test "N10: a node of a row that another row merged into has the origins of every node the comparison paired with it" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    var sources: [3]provenance.OriginId = undefined;
+    _, _, const root = try tripleSite(&f, &sources);
+    const got = try f.site(root);
+    defer testing.allocator.free(got);
+    var emitted = try provenance.emitted(testing.allocator, &f.store, root);
+    defer emitted.deinit(testing.allocator);
+    // Row 1 is the helper both rows became: each of its nodes, the one 3
+    // that both arms read among them, came from source 1 and from source 2.
+    try testing.expectEqual(@as(usize, 2), emitted.rows.items.len);
+    const helper = emitted.rows.items[1];
+    try testing.expect(helper.len > 0);
+    for (0..helper.len) |k| {
+        var seen: [3]bool = @splat(false);
+        for (emitted.of(1, @intCast(k)).?) |chain| {
+            for (emitted.links.items[chain.start..][0..chain.len]) |s| seen[s.index()] = true;
+        }
+        try testing.expect(!seen[0] and seen[1] and seen[2]);
+    }
+}
+
+// `|n, k| { for i in 0..<n { if i == k { return i } }; n + k }` where
+// `looped`, and `|n, k| n + k` otherwise. Nothing reads the loop.
+fn exitRow(f: *Fixture, looped: bool) Allocator.Error!RowId {
+    const i64_ty = try f.i64Ty();
+    const r = try f.b.beginRow(&.{ i64_ty, i64_ty }, i64_ty);
+    if (looped) {
+        const zero = try f.b.litInt(i64_ty, 0);
+        const body = try f.b.openRegion(.loop_body, &.{i64_ty});
+        const i = Ref.regionParam(body, 0);
+        const c = try f.b.call(.i64, .is_eq, &.{ i, Ref.rowParam(1) });
+        const arm0 = try f.b.openArm(c, 0);
+        try f.b.close(.{ .continue_ = &.{} });
+        const arm1 = try f.b.openArm(c, 1);
+        try f.b.close(.{ .return_ = i });
+        const sw = try f.b.exitingSwitch(c, &.{ arm0, arm1 }, &.{}, &.{});
+        try f.b.close(.{ .branch = sw });
+        _ = try f.b.forRange(false, &.{ zero, Ref.rowParam(0) }, body, &.{});
+    }
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .plus_wrap, &.{ Ref.rowParam(0), Ref.rowParam(1) })} });
+    return r;
+}
+
+// A root that multiplies the calls of `first` and `second` over its two parameters.
+fn exitSite(f: *Fixture, first: RowId, second: RowId) Allocator.Error!RowId {
+    const i64_ty = try f.i64Ty();
+    const root = try f.b.beginRow(&.{ i64_ty, i64_ty }, i64_ty);
+    const c1 = try f.b.callRow(first, &.{ Ref.rowParam(0), Ref.rowParam(1) });
+    const c2 = try f.b.callRow(second, &.{ Ref.rowParam(0), Ref.rowParam(1) });
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .times_wrap, &.{ c1, c2 })} });
+    return root;
+}
+
+test "N8g: two helpers alike with a loop that can return and that nothing reads are one row" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const h1 = try exitRow(&f, true);
+    const h2 = try exitRow(&f, true);
+    const root = try exitSite(&f, h1, h2);
+    const got = try f.site(root);
+    defer testing.allocator.free(got);
+    try testing.expect(try check(testing.allocator, &f.store, root) == null);
+    try testing.expectEqual(@as(?RowId, h1), f.store.row(h2).merged_into);
+}
+
+test "N8g: a loop that can return and that nothing reads keeps a helper apart from one without it, in either call order" {
+    for ([_]bool{ false, true }) |swapped| {
+        var f: Fixture = undefined;
+        f.init();
+        defer f.deinit();
+        const looped = try exitRow(&f, true);
+        const plain = try exitRow(&f, false);
+        const root = if (swapped) try exitSite(&f, plain, looped) else try exitSite(&f, looped, plain);
+        const got = try f.site(root);
+        defer testing.allocator.free(got);
+        try testing.expect(try check(testing.allocator, &f.store, root) == null);
+        try testing.expectEqual(@as(?RowId, null), f.store.row(looped).merged_into);
+        try testing.expectEqual(@as(?RowId, null), f.store.row(plain).merged_into);
+        try testing.expect(f.store.row(looped).digest.? != f.store.row(plain).digest.?);
+        try testing.expect(std.mem.find(u8, got, "row r2") != null);
+    }
 }

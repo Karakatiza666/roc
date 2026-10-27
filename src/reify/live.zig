@@ -80,7 +80,7 @@ pub const Returns = struct {
     const State = enum(u8) { unknown, visiting, no, yes };
 
     state: []State,
-    /// Per region: its nodes, in id order.
+    /// Per region: its nodes, in id order, as `Store.members` gave them at `init`.
     members: [][]NodeId,
 
     /// Index the regions of `store`. Build it again after adding nodes.
@@ -88,25 +88,15 @@ pub const Returns = struct {
         const state = try gpa.alloc(State, store.nodeCount());
         errdefer gpa.free(state);
         @memset(state, .unknown);
-        const counts = try gpa.alloc(u32, store.regionCount());
-        defer gpa.free(counts);
-        @memset(counts, 0);
-        const regions = store.nodes.items(.region);
-        for (regions) |r| counts[r.index()] += 1;
         const members = try gpa.alloc([]NodeId, store.regionCount());
         var filled: usize = 0;
         errdefer {
             for (members[0..filled]) |m| gpa.free(m);
             gpa.free(members);
         }
-        for (members, counts) |*m, c| {
-            m.* = try gpa.alloc(NodeId, c);
+        for (members, 0..) |*m, i| {
+            m.* = try gpa.dupe(NodeId, store.members(RegionId.of(@intCast(i))));
             filled += 1;
-        }
-        @memset(counts, 0);
-        for (regions, 0..) |r, i| {
-            members[r.index()][counts[r.index()]] = NodeId.of(@intCast(i));
-            counts[r.index()] += 1;
         }
         return .{ .state = state, .members = members };
     }
@@ -117,38 +107,99 @@ pub const Returns = struct {
         gpa.free(self.state);
     }
 
-    /// Whether node `n` can end the row in `Return`. A `Return` in a lambda
-    /// body ends the lambda, so a `Lambda` never does.
+    /// Whether node `n` can end the row in `Return` (`canReturn`).
     pub fn holds(self: *Returns, store: *const ir.Store, n: NodeId) bool {
-        if (store.nodes.items(.op)[n.index()] == .lambda) return false;
         switch (self.state[n.index()]) {
             .yes => return true,
             .no, .visiting => return false,
             .unknown => {},
         }
         self.state[n.index()] = .visiting;
-        const found = for (store.regionSlice(store.node(n).regions)) |r| {
-            if (self.regionHolds(store, r)) break true;
-        } else false;
+        const found = nodeReturns(store, n, self);
         self.state[n.index()] = if (found) .yes else .no;
         return found;
     }
 
-    /// Whether node `n` is a loop whose body can end the row in `Return`.
-    /// Such a loop stays in the region it was built in, whether a value
-    /// reads it or not, and two of them in one region keep their order,
-    /// because the first to return decides the row's value.
+    /// Whether node `n` is a loop whose body can end the row in `Return`
+    /// (`exits`).
     pub fn exits(self: *Returns, store: *const ir.Store, n: NodeId) bool {
         return store.nodes.items(.op)[n.index()].isLoop() and self.holds(store, n);
     }
 
     /// Whether region `r` ends in `Return`, or holds a node that can.
     pub fn regionHolds(self: *Returns, store: *const ir.Store, r: RegionId) bool {
-        if (store.region(r).end.kind == .return_) return true;
-        for (self.members[r.index()]) |m| if (self.holds(store, m)) return true;
-        return false;
+        return regionReturns(store, r, self);
+    }
+
+    fn membersOf(self: *const Returns, _: *const ir.Store, r: RegionId) []const NodeId {
+        return self.members[r.index()];
     }
 };
+
+/// Whether node `n` can end the row in `Return`: a region it lists ends in
+/// `Return` or holds a node that can. A `Return` in a lambda body ends the
+/// lambda, so a `Lambda` never does. Only the regions a node lists count, so
+/// a join an exit rule dropped from its switch does not. It reads the store
+/// as it is, so it holds at every point of a build; `Returns` caches it for
+/// a store that no longer changes.
+pub fn canReturn(store: *const ir.Store, n: NodeId) bool {
+    return nodeReturns(store, n, Direct{});
+}
+
+/// Whether node `n` is a loop whose body can end the row in `Return`. Such a
+/// loop stays in the region it was built in, whether a value reads it or
+/// not, and two of them in one region keep their order, because the first
+/// to return decides the row's value. The numbering (`number.zig`), the
+/// structural comparison (`equal.zig`) and the digests (`digest.zig`) read a
+/// region's such loops, in id order, through this one definition.
+pub fn exits(store: *const ir.Store, n: NodeId) bool {
+    return store.nodes.items(.op)[n.index()].isLoop() and canReturn(store, n);
+}
+
+/// The loops of region `r` that can end the row in `Return` (`exits`), in id order.
+pub const ExitLoops = struct {
+    store: *const ir.Store,
+    members: []const NodeId,
+    at: usize = 0,
+
+    pub fn of(store: *const ir.Store, r: RegionId) ExitLoops {
+        return .{ .store = store, .members = store.members(r) };
+    }
+
+    pub fn next(self: *ExitLoops) ?NodeId {
+        while (self.at < self.members.len) {
+            const m = self.members[self.at];
+            self.at += 1;
+            if (exits(self.store, m)) return m;
+        }
+        return null;
+    }
+};
+
+// Reads `canReturn` of a member with no cache.
+const Direct = struct {
+    fn holds(_: Direct, store: *const ir.Store, n: NodeId) bool {
+        return canReturn(store, n);
+    }
+
+    fn membersOf(_: Direct, store: *const ir.Store, r: RegionId) []const NodeId {
+        return store.members(r);
+    }
+};
+
+fn nodeReturns(store: *const ir.Store, n: NodeId, cx: anytype) bool {
+    if (store.nodes.items(.op)[n.index()] == .lambda) return false;
+    for (store.regionSlice(store.node(n).regions)) |r| {
+        if (regionReturns(store, r, cx)) return true;
+    }
+    return false;
+}
+
+fn regionReturns(store: *const ir.Store, r: RegionId, cx: anytype) bool {
+    if (store.region(r).end.kind == .return_) return true;
+    for (cx.membersOf(store, r)) |m| if (cx.holds(store, m)) return true;
+    return false;
+}
 
 fn reachRegion(gpa: Allocator, store: *const ir.Store, live: *Live, pending: *std.ArrayList(NodeId), r: RegionId) Allocator.Error!void {
     if (live.regions[r.index()]) return;

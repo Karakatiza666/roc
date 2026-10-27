@@ -5590,3 +5590,158 @@ test "L3 M10: a loop whose body reads the index stays a loop" {
     defer gpa.free(lawful);
     try std.testing.expect(std.mem.find(u8, lawful, "List.map") == null);
 }
+
+// N5d gap (M10 fuzz seed 0x1010): an equal literal that two sibling regions
+// read is one node where it was built before the switch, and one node per
+// arm where an inlined helper built it, so the two spellings below have two
+// normal forms until N5d gives such a literal one place.
+
+const triple_helpers =
+    \\triple : U64, U64, List(U64) -> U64
+    \\triple = |k, b, xs| {
+    \\    var $t = k
+    \\    for _z in xs {
+    \\        $t = $t + b * 3
+    \\    }
+    \\    $t
+    \\}
+    \\
+;
+
+test "L3 N5d gap: a literal two arms read is one node, or one per arm after inlining" {
+    try expectOtherNormalForm(triple_helpers ++
+        \\wobble : { a : U64, b : U64, c : Bool, xs : List(U64) } -> U64
+        \\wobble = |input| if input.c input.a * 3 else {
+        \\    k = 12.U64 * 3
+        \\    var $t = k
+        \\    for _z in input.xs {
+        \\        $t = $t + input.b * 3
+        \\    }
+        \\    $t
+        \\}
+    , triple_helpers ++
+        \\wobble : { a : U64, b : U64, c : Bool, xs : List(U64) } -> U64
+        \\wobble = |input| if input.c input.a * 3 else {
+        \\    k = 12.U64 * 3
+        \\    triple(k, input.b, input.xs)
+        \\}
+    );
+}
+
+test "L3 M10: two helpers that differ only in where they share a literal merge into one row" {
+    // Both helpers have one value but share the literal 3 differently until
+    // N5d, so their numberings do not pair position by position. They merge
+    // by the pairs the row comparison found (N8g, N10); pairing by position
+    // crashed the compiler (M10 fuzz seed 0x1010, case 4).
+    const staged = try Staged.createRunning(std.testing.allocator, triple_helpers ++
+        \\inlined : Bool, U64, U64, List(U64) -> U64
+        \\inlined = |c, a, b, xs| if c a * 3 else {
+        \\    k = 12.U64 * 3
+        \\    triple(k, b, xs)
+        \\}
+        \\
+        \\written : Bool, U64, U64, List(U64) -> U64
+        \\written = |c, a, b, xs| if c a * 3 else {
+        \\    k = 12.U64 * 3
+        \\    var $t = k
+        \\    for _z in xs {
+        \\        $t = $t + b * 3
+        \\    }
+        \\    $t
+        \\}
+        \\
+        \\wobble : { a : U64, b : U64, c : Bool, xs : List(U64) } -> U64
+        \\wobble = |input| inlined(input.c, input.a, input.b, input.xs) + inlined(input.c, input.b, input.a, input.xs) + written(input.c, input.a, input.b, input.xs) + written(input.c, input.b, input.a, input.xs)
+    , "");
+    defer staged.destroy();
+    try std.testing.expect(staged.outcome == .reified);
+    try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "row r1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "row r2") == null);
+}
+
+// A loop that can return and that nothing reads decides the row's value, so
+// the digest and the structural comparison read it (N8g, N7).
+
+const find_looped =
+    \\looped : List(U64), U64 -> U64
+    \\looped = |xs, k| {
+    \\    for x in xs {
+    \\        if x == k {
+    \\            return x
+    \\        }
+    \\    }
+    \\    xs.len() + k
+    \\}
+    \\
+;
+
+test "L3 N8g: two helpers alike with a loop that can return and that nothing reads are one row" {
+    const staged = try Staged.createRunning(std.testing.allocator, find_looped ++
+        \\again : List(U64), U64 -> U64
+        \\again = |xs, k| {
+        \\    for x in xs {
+        \\        if x == k {
+        \\            return x
+        \\        }
+        \\    }
+        \\    xs.len() + k
+        \\}
+        \\
+        \\wobble : { xs : List(U64), k : U64 } -> U64
+        \\wobble = |input| looped(input.xs, input.k) * again(input.xs, input.k)
+    , "");
+    defer staged.destroy();
+    try std.testing.expect(staged.outcome == .reified);
+    try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "row r1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "row r2") == null);
+}
+
+test "L3 N8g: a helper with a loop that can return stays apart from one without it, in either call order" {
+    for ([_][]const u8{
+        \\wobble : { xs : List(U64), k : U64 } -> U64
+        \\wobble = |input| looped(input.xs, input.k) * plain(input.xs, input.k)
+        ,
+        \\wobble : { xs : List(U64), k : U64 } -> U64
+        \\wobble = |input| plain(input.xs, input.k) * looped(input.xs, input.k)
+    }) |site| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ find_looped,
+            \\plain : List(U64), U64 -> U64
+            \\plain = |xs, k| xs.len() + k
+            \\
+            \\
+        , site });
+        defer std.testing.allocator.free(source);
+        const staged = try Staged.createRunning(std.testing.allocator, source, "");
+        defer staged.destroy();
+        try std.testing.expect(staged.outcome == .reified);
+        // `plain` is inlined into the root and `looped` is the one helper;
+        // a merge of the two made the root call `looped` twice.
+        const dump = staged.dump.items;
+        const helper = std.mem.indexOf(u8, dump, "row r1") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, dump, "row r2") == null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, dump, "call r1"));
+        try std.testing.expect(std.mem.indexOf(u8, dump[0..helper], "List.len") != null);
+        try std.testing.expect(std.mem.indexOf(u8, dump[helper..], "for_list") != null);
+        try std.testing.expect(std.mem.indexOf(u8, dump[helper..], "return") != null);
+    }
+}
+
+test "L3 N7: an if whose arms differ only in a loop that can return keeps the loop and its return" {
+    const staged = try Staged.createRunning(std.testing.allocator,
+        \\wobble : { xs : List(U64), k : U64, c : Bool } -> U64
+        \\wobble = |input| if input.c {
+        \\    for x in input.xs {
+        \\        if x == input.k {
+        \\            return x
+        \\        }
+        \\    }
+        \\    input.k
+        \\} else {
+        \\    input.k
+        \\}
+    , "");
+    defer staged.destroy();
+    try std.testing.expect(staged.outcome == .reified);
+    try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "for_list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "return") != null);
+}

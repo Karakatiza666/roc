@@ -556,6 +556,9 @@ pub const Store = struct {
     slots: std.ArrayList(Slot) = .empty,
     /// Per node, where it came from (N10). Nothing in the normal form reads it.
     provenance: provenance.Provenance = .{},
+    /// Per region, by id: the nodes built in it, in id order. A node never
+    /// moves to another region, so this is true at every point of a build.
+    region_members: std.ArrayList(std.ArrayList(NodeId)) = .empty,
 
     pub fn init(gpa: Allocator) Store {
         return .{ .gpa = gpa };
@@ -574,6 +577,8 @@ pub const Store = struct {
         self.named_prims.deinit(self.gpa);
         self.slots.deinit(self.gpa);
         self.provenance.deinit(self.gpa);
+        for (self.region_members.items) |*m| m.deinit(self.gpa);
+        self.region_members.deinit(self.gpa);
     }
 
     /// Append `items` to the ref pool.
@@ -676,6 +681,8 @@ pub const Store = struct {
     /// Append a node and return its id.
     pub fn appendNode(self: *Store, n: Node) Allocator.Error!NodeId {
         const id = NodeId.of(@intCast(self.nodes.len));
+        try self.region_members.items[n.region.index()].append(self.gpa, id);
+        errdefer _ = self.region_members.items[n.region.index()].pop();
         try self.nodes.append(self.gpa, n);
         return id;
     }
@@ -683,8 +690,16 @@ pub const Store = struct {
     /// Append a region and return its id.
     pub fn appendRegion(self: *Store, r: Region) Allocator.Error!RegionId {
         const id = RegionId.of(@intCast(self.regions.len));
+        try self.region_members.append(self.gpa, .empty);
+        errdefer _ = self.region_members.pop();
         try self.regions.append(self.gpa, r);
         return id;
+    }
+
+    /// The nodes built in region `r`, in id order. The slice is valid until
+    /// the next node is built.
+    pub fn members(self: *const Store, r: RegionId) []const NodeId {
+        return self.region_members.items[r.index()].items;
     }
 
     /// Set the terminator of region `r`.

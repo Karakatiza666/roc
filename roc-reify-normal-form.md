@@ -269,7 +269,12 @@ number phase then only hoists speculatable nodes out of loops (3.5), which
 changes no region's contents and so enables no rule. Rules that compare
 regions, such as N7's merge into `And` and `Or`, compare each region's end and
 what it depends on structurally, pairing the parameters of the regions bound
-inside the two. A content digest cannot stand in for that comparison, because
+inside the two. They also compare, one by one in the order they were built,
+each region's loops that can end the row in `Return`, whether a value reads
+them or not, because such a loop decides the row's value
+(`src/reify/live.zig`, `exits`; `src/reify/equal.zig`, `Comparison.regions`).
+So `if c { for x in xs { if x == k { return x } }; k } else k` keeps both
+arms. A content digest cannot stand in for that comparison, because
 it names a parameter by the region that binds it, so two arms that bind equal
 regions of their own digest apart.
 
@@ -627,7 +632,10 @@ needed. The rule is exact and near linear, with no search over permutations.
 Unison hashes mutually recursive definitions by position in the same way.
 
 A digest is computed from content, not from N9's numbering or from placement,
-so it exists as soon as a component's fixpoint ends (3.0). Two rows are merged
+so it exists as soon as a component's fixpoint ends (3.0). A region's digest
+reads its end and its loops that can return, read or not, as the structural
+comparison does (`src/reify/digest.zig`, `regionDigest`), so a helper with such
+a loop and one without it have two digests. Two rows are merged
 only when their digests are equal and a structural comparison confirms it: a
 hash collision must never merge two computations. The same holds for every
 comparison by region digest.
@@ -720,7 +728,21 @@ reads the table, and a translator has no accessor for it. Section 6 uses it.
 | hash-consing finds it again (N5a) | its origins and the new ones |
 | a rebuild copies it | the old node's |
 | a view inlines a call or a closure (V1, V2) | the callee node's, each reached through the call or closure |
-| two rows merge (N8g) | each node's and its partner's |
+| two rows merge (N8g) | its own, and those of every node of the dropped row that the row comparison found equal to it |
+
+When two rows merge (N8g), the nodes are paired by the comparison that
+found the rows equal (`src/reify/equal.zig`, `Comparison.matched`), not by
+their positions in the two numberings. Rows merge before the number stage, so
+two equal rows can share an equal node differently: one literal `3` that two
+arms read, against one `3` in each arm (N5d is not built). The pairing is then
+not one to one.
+
+| What N10 guarantees after a merge | Why |
+|---|---|
+| every node of the dropped row is paired with at least one node of the kept row | the comparison visits every node the numbering reaches: what the region ends read, and its loops that can return, read or not; a debug build asserts it (`src/reify/rows.zig`, `mergeInto`) |
+| a kept node holds the union of the origins of every dropped node paired with it | a shared `3` takes the origins of both per-arm `3`s |
+| a dropped node gives its origins to every kept node paired with it | each per-arm `3` takes the origins of the shared `3` |
+| no origin of the dropped row is lost | it lands on a kept node that computes the same value |
 
 ### 3.11 N11: three loop forms
 

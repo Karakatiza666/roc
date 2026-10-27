@@ -34,7 +34,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 13;
+pub const normal_form_version: u32 = 14;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -61,6 +61,9 @@ pub fn fingerprint() u64 {
     h.update(std.mem.asBytes(&views.outline_min_size));
     // M10: layer L, the laws a `Code.Lawful(f)` site opts into.
     for (laws.steps) |step| h.update(step);
+    // A region's loops that can return, read or not, are in its digest and
+    // its structural comparison (`live.exits`).
+    h.update("a region's digest and comparison read its loops that can return");
     return h.final();
 }
 
@@ -121,6 +124,12 @@ const recorded = [_]Recorded{
     // opts into, the builtins its laws read in the builtin table, with
     // `List.is_empty` speculatable, and the `Iter.map` role.
     .{ .version = 13, .fingerprint = 0x2fc706afc0671f11 },
+    // Fix: a region's digest and its structural comparison read the loops
+    // in it that can return, read or not, so a helper with such a loop no
+    // longer merges with one without it, an `if` whose arms differ only in
+    // such a loop keeps both arms, and two merged rows pair their nodes for
+    // provenance by the comparison (N8g, N10).
+    .{ .version = 14, .fingerprint = 0xcbb8426dfd39556b },
 };
 
 const std = @import("std");

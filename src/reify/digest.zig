@@ -2,7 +2,8 @@
 //!
 //! Merkle style: a node's digest comes from its op, payload, types,
 //! immediates, its arguments' digests and its regions' digests; a region's
-//! from its kind, parameter types and its end. A region parameter is named by
+//! from its kind, parameter types, its end and its loops that can end the
+//! row in `Return` (`live.exits`), read or not. A region parameter is named by
 //! its position and by the region that binds it: the owner's op, payload,
 //! types, immediates and arguments, and the region's place among the owner's
 //! regions. So two loops over one start computing one thing have equal body
@@ -13,6 +14,7 @@
 const std = @import("std");
 const collections = @import("collections");
 const ir = @import("ir.zig");
+const live = @import("live.zig");
 const types_mod = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -497,6 +499,10 @@ fn regionDigest(store: *const ir.Store, ctx: anytype, r: RegionId) Allocator.Err
         .open, .value, .return_, .continue_, .break_ => {},
     }
     for (store.refSlice(reg.end.refs)) |ref| h.digest(try refDigest(store, ctx, ref));
+    // Its loops that can return, read or not, in the order they run, as the
+    // structural comparison reads them (`equal.zig`).
+    var loops = live.ExitLoops.of(store, r);
+    while (loops.next()) |m| h.digest(try ctx.nodeD(m));
     return h.final();
 }
 
