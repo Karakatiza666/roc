@@ -22571,6 +22571,15 @@ const ProcBodyBuilder = struct {
         if (@backingInt(node) >= store_module.const_store.?.values.items.len) {
             boxyLowerInvariant("ConstStore node id was outside the store");
         }
+        // A `Code` description writes the backing of each transparent nominal
+        // it holds without a `.nominal` node (`src/check/code_emit.zig`), as
+        // planning reads it (`stepStaticConstNode`).
+        if (store_module.const_store.?.get(node) != .nominal and resolvedTypePayload(type_module, checked_ty) == .nominal) {
+            const rep = self.parent.plan.representations.items[@backingInt(self.repForModuleType(type_module, checked_ty))];
+            if (rep.kind == .nominal and rep.kind.nominal == .transparent) {
+                return try self.beginRestoreConstNominal(target, store_module, type_module, node, checked_ty, next);
+            }
+        }
         return switch (store_module.const_store.?.get(node)) {
             .pending => boxyLowerInvariant("pending ConstStore node reached runtime boxy lowering"),
             .zst => exprDone(try self.assignZst(target, next)),
@@ -22933,7 +22942,7 @@ const ProcBodyBuilder = struct {
         defer self.parent.allocator.free(elem_locals);
         const source_locals = try self.parent.allocator.alloc(?LIR.LocalId, list_len);
         defer self.parent.allocator.free(source_locals);
-        const source_layout = self.workerRuntimeLayoutForType(elem_ty).layoutIdx();
+        const source_layout = self.workerRuntimeLayoutForRep(source_elem_rep).layoutIdx();
 
         for (elem_locals, source_locals) |*local, *source_local| {
             local.* = try self.addFrameLocal(elem_layout);

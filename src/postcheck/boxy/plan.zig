@@ -6633,7 +6633,7 @@ const Builder = struct {
             => {},
             .empty_record => try actions.append(self.allocator, .{ .omitted_defaults = site }),
             .str_from_quote => |quote| try actions.append(self.allocator, .{ .string_literal_conversion = .{ .view = view, .expr = expr_id, .plan = quote.plan } }),
-            .code_from_lambda => |staged| try self.pushCodeConversion(actions, view, expr_id, staged.node),
+            .code_from_lambda => |staged| try self.pushCodeConversion(actions, view, expr_id, staged),
             .lookup_local,
             .lookup_external,
             .lookup_required,
@@ -6852,20 +6852,42 @@ const Builder = struct {
 
     /// A staged function's description is a constant the reifier already
     /// wrote, so planning walks the stored node for representations and has no
-    /// dispatch target to resolve.
+    /// dispatch target to resolve. The site also demands the conversion root
+    /// of each custom literal its walk met, so a rejected literal is planned,
+    /// evaluated, and reported though nothing runs the function it is in.
+    /// Runs inside the caller's action sequence, so actions are appended in
+    /// the order they run.
     fn pushCodeConversion(
         self: *Builder,
         actions: *std.ArrayList(PlanAction),
         view: ModuleView,
         expr_id: checked.CheckedExprId,
-        maybe_node: ?checked.ConstNodeId,
+        site: checked.CheckedCodeSite,
     ) Allocator.Error!void {
-        const node = maybe_node orelse unreachable; // the description walk wrote every staged site
+        const node = site.node orelse unreachable; // the description walk wrote every staged site
         const store = view.const_store orelse
             boxyPlanInvariant("staged code module had no ConstStore");
         if (store.get(node) == .crash) return;
         const rep = try self.analyzeType(view, view.checked_bodies.expr(expr_id).ty);
-        try self.pushStaticConstRoot(actions, view, node, rep, null);
+        const visited = try self.newStaticConstVisited();
+        errdefer self.freeStaticConstVisited(visited);
+        try actions.ensureUnusedCapacity(self.allocator, 2);
+        actions.appendAssumeCapacity(.{ .static_const_node = .{ .store_view = view, .node = node, .rep_id = rep, .const_type = null, .visited = visited } });
+        actions.appendAssumeCapacity(.{ .free_visited = visited });
+        for (site.reads) |read| try self.pushCodeRead(actions, read);
+    }
+
+    /// The conversion of the literal a `Code` site's walk met, planned as the
+    /// literal's own body would plan it.
+    fn pushCodeRead(self: *Builder, actions: *std.ArrayList(PlanAction), read: checked.CheckedCodeRead) Allocator.Error!void {
+        const view = self.moduleForKey(.{ .bytes = read.module });
+        const root = view.compile_time_roots.root(@fromBackingInt(read.root));
+        switch (view.checked_bodies.expr(root.expr).data) {
+            .numeral => |numeral| try actions.append(self.allocator, .{ .numeral_conversion = .{ .view = view, .expr = root.expr, .plan = numeral.plan } }),
+            .str_from_quote => |quote| try actions.append(self.allocator, .{ .string_literal_conversion = .{ .view = view, .expr = root.expr, .plan = quote.plan } }),
+            .interpolation => try actions.append(self.allocator, .{ .interpolation_after_parts = .{ .view = view, .expr = root.expr } }),
+            .pending, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => boxyPlanInvariant("a Code site read a root that was not a literal conversion"),
+        }
     }
 
     /// Analyze a stored constant's nodes under a visited set of their own.
