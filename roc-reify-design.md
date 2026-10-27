@@ -118,16 +118,23 @@ of `roc-reify-normal-form.md`). The rules are in `src/reify/views.zig:1`. The no
       `Call` of that row over its captures, the segments among them, and the
       list of the interpolated values. Until M17 a translator sees the fold
       over that list that `Str.from_interpolation` writes. No node is new.
-      The program compiled, so the stage returned `Ok` for the segments:
-      an arm of an `if` in the tail of the stage that only delivers `Err` is
-      not described, and with it the test that would have chosen it
-      (`ifLevel`). Any other `Err` arm is the crash of the `from_numeral`
-      case, "this literal was rejected by its conversion". A conversion of
+      The `Err` of the stage is the crash of the `from_numeral` case, "this
+      literal was rejected by its conversion". The compiler wrote that crash,
+      not the author, so it is a `Crash` of kind `rejected_literal`
+      (`src/reify/ir.zig` (`CrashKind`)). Rule N13w of the normal form
+      (`roc-reify-normal-form.md` 3.13) drops every test of the stage that
+      only leads to it, so a rejection written as an `if`, a `match`, a chain
+      of tests or a test in a helper describes as the conversion that never
+      rejects. A rejection whose path stays behind a call that is not
+      inlined stays a crash. A conversion of
       another package is one `Prim` named by its type's module and
       `from_interpolation`, over the segments and the values. Pinned by the
       staging cases at `src/eval/test/eval_staging_tests.zig:2452`, `:2458`
       and `:2464`, and by `src/compile/test/code_reifier_test.zig:4799`,
-      `:4867`, `:4914`, `:4951` and `:5003`. A conversion that can leave its
+      `:4867`, `:4914`, `:4951` and `:5003`, and the spellings of a
+      rejection by the L3 pairs at `:5108` to `:5146`. A `crash` that the
+      author wrote in the stage stays, so the stage keeps its branch and the
+      literal is refused (`:5160`). A conversion that can leave its
       body early, with a `?`, and one generic in the item type of its
       assembler are still refused (`:5034`).
 - [x] A literal of a type of your own in a `match` pattern. The pattern binds

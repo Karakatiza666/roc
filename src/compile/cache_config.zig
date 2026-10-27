@@ -390,7 +390,9 @@ pub const Constants = struct {
     ///      the call of the row its conversion's first stage hands back, and a
     ///      lambda read at a function of the nominal over its result delivers
     ///      the nominal.
-    pub const CACHE_VERSION = 172;
+    /// 173: Normal form 11: a crash records who wrote it, and N13w drops the
+    ///      tests of a literal's conversion that reach its rejection.
+    pub const CACHE_VERSION = 173;
 };
 
 /// Configuration for the Roc cache system.

@@ -290,6 +290,20 @@ pub const Slot = struct {
     };
 };
 
+/// Who wrote a `crash` node, its payload. A translator sees both kinds as one
+/// `Crash`; only the rules tell them apart.
+pub const CrashKind = enum(u32) {
+    /// A `crash` the author wrote, which stays where it was written
+    /// (normal-form 1.1).
+    written = 0,
+    /// The `Err` arm of a literal's conversion (`T.from_numeral`,
+    /// `T.from_quote`, `T.from_interpolation`): the crash the program reaches
+    /// where the conversion rejected the literal. The compiler wrote it, and
+    /// the conversion runs while the compiler runs, so the rejection is a
+    /// compile-time error. C2 lets N13w drop the branches that reach it.
+    rejected_literal = 1,
+};
+
 /// The operation of a node. The declaration order is the op precedence the
 /// orientation check of `roc-reify-rule-derivation.md` 2.2 breaks ties with.
 pub const Op = enum(u8) {
@@ -407,6 +421,7 @@ pub const Node = struct {
     /// | `switch_` | number of arms; the remaining regions are joins. A tag switch has one arm per member of its scrutinee's own type, in name order. |
     /// | `derived` | the method's name (`types.NameId`); the subject type is `aux[0]` |
     /// | `for_range` | 1 when the range includes its end, else 0 |
+    /// | `crash` | who wrote the crash (`CrashKind`) |
     /// | every other op | 0 |
     ///
     /// A `crash` reads its message as its one argument, a `closure` its

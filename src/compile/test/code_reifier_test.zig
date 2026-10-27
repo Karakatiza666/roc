@@ -5070,3 +5070,108 @@ test "an interpolated literal whose conversion is generic in the item type of it
 
     try staged.expectRejected("a type variable");
 }
+
+// N13w: the `Err` of a literal's conversion is the crash of a rejected
+// literal, which the compiler wrote, so a path to it computes no result and
+// C2 lets it go. However the conversion spells the rejection, as an `if`, a
+// `match`, a test in a helper or a chain of tests, the literal describes as
+// the conversion that never rejects.
+
+/// `Html` with `from_interpolation` defined as `body`, and `wobble` over one
+/// literal of it.
+fn htmlSource(comptime body: []const u8) []const u8 {
+    return
+        \\Html := [Html(Str)].{
+        \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
+        \\    from_interpolation = |segments|
+        \\
+    ++ body ++
+        \\
+        \\    check : List(Str) -> Try({}, [InvalidInterpolation(Str)])
+        \\    check = |segments| if segments.any(|segment| segment.contains("<script")) Err(InvalidInterpolation("no scripts")) else Ok({})
+        \\    width : Html, F32 -> F32
+        \\    width = |h, f| match h {
+        \\        Html(text) => if text.is_empty() 0.0.F32 else f
+        \\    }
+        \\}
+        \\
+        \\wobble : { time : F32, uv : F32 } -> F32
+        \\wobble = |input| "<p>${input.uv.to_str()}!</p>".Html.width(input.uv)
+    ;
+}
+
+const html_accepts =
+    \\        Str.from_interpolation(segments).map_ok(|assemble|
+    \\            |values| Html(assemble(values.map(|value| value.replace_each("<", "&lt;")))))
+;
+
+test "L3 N13w: a rejection written as an `if` is the conversion that never rejects" {
+    try expectSameNormalForm(htmlSource(
+        \\        if segments.any(|segment| segment.contains("<script")) {
+        \\            Err(InvalidInterpolation("no scripts"))
+        \\        } else {
+        \\
+    ++ html_accepts ++
+        \\
+        \\        }
+    ), htmlSource(html_accepts));
+}
+
+test "L3 N13w: a rejection written as a `match` is the conversion that never rejects" {
+    try expectSameNormalForm(htmlSource(
+        \\        match segments.find_first(|segment| segment.contains("<script")) {
+        \\            Ok(_) => Err(InvalidInterpolation("no scripts"))
+        \\            Err(NotFound) => {
+        \\
+    ++ html_accepts ++
+        \\
+        \\            }
+        \\        }
+    ), htmlSource(html_accepts));
+}
+
+test "L3 N13w: a rejection tested in a helper is the conversion that never rejects" {
+    try expectSameNormalForm(htmlSource(
+        \\        match Html.check(segments) {
+        \\            Ok({}) => {
+        \\
+    ++ html_accepts ++
+        \\
+        \\            }
+        \\            Err(e) => Err(e)
+        \\        }
+    ), htmlSource(html_accepts));
+}
+
+test "L3 N13w: a chain of rejections is the conversion that never rejects" {
+    try expectSameNormalForm(htmlSource(
+        \\        if segments.any(|segment| segment.contains("<script")) {
+        \\            Err(InvalidInterpolation("no scripts"))
+        \\        } else if segments.len() > 9 {
+        \\            Err(InvalidInterpolation("too long"))
+        \\        } else {
+        \\
+    ++ html_accepts ++
+        \\
+        \\        }
+    ), htmlSource(html_accepts));
+}
+
+test "a crash the author wrote in a conversion is not a rejected literal" {
+    // Only the crash of a rejected literal is the compiler's. The author's
+    // `crash` stays where it was written (normal-form 1.1), with the test
+    // that reaches it, so the first stage keeps its branch, and the function
+    // its `Ok` holds is chosen at run time, which no node applies.
+    const staged = try Staged.create(std.testing.allocator, htmlSource(
+        \\        if segments.any(|segment| segment.contains("<script")) {
+        \\            crash "no scripts"
+        \\        } else {
+        \\
+    ++ html_accepts ++
+        \\
+        \\        }
+    ));
+    defer staged.destroy();
+
+    try staged.expectRejected("a call to a function value that no simplification resolves");
+}

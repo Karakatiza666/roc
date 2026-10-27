@@ -1524,31 +1524,6 @@ pub const Reifier = struct {
 
     // First stage //
 
-    /// Mark `expr_id` as delivering the result of the first stage being
-    /// walked, unexamined.
-    fn markTail(self: *Reifier, expr_id: CheckedExprId) Allocator.Error!void {
-        try self.walk.stage_tail.put(self.gpa, .{ .reader = self, .expr = expr_id }, {});
-    }
-
-    fn inTail(self: *Reifier, expr_id: CheckedExprId) bool {
-        return self.walk.stage_tail.contains(.{ .reader = self, .expr = expr_id });
-    }
-
-    /// Whether an expression delivers an `Err` and nothing else.
-    fn deliversErr(self: *Reifier, expr_id: CheckedExprId) bool {
-        var current = expr_id;
-        while (true) switch (self.bodies.expr(current).data) {
-            .tag => |tag| return std.mem.eql(u8, self.names.tagLabelText(tag.name), "Err"),
-            .row_coerce => |coerce| current = coerce.value,
-            .nominal => |nominal| current = nominal.backing_expr,
-            .block => |block| {
-                if (block.statements.len != 0) return false;
-                current = block.final_expr;
-            },
-            else => return false,
-        };
-    }
-
     /// Whether this reader's walk is inside the first stage of an
     /// interpolated literal, at a call whose result holds a function. Such a
     /// call is walked where it stands, because a node named for it would give
@@ -1976,10 +1951,7 @@ pub const Reifier = struct {
         defer self.bld().origins = outer;
         return switch (expr_data.data) {
             .tag, .zero_argument_tag, .nominal => self.exprAs(expr_id, at),
-            .row_coerce => |coerce| blk: {
-                if (self.inTail(expr_id)) try self.markTail(coerce.value);
-                break :blk self.exprAt(coerce.value, at);
-            },
+            .row_coerce => |coerce| self.exprAt(coerce.value, at),
             // A call whose result is read at a wider union has that union as its type.
             .call => |call| self.callExpr(call.func, call.args, expr_data.ty, at, region),
             // A constant a name folds to is built at `at`.
@@ -1989,11 +1961,8 @@ pub const Reifier = struct {
                 break :blk self.exprRef(expr_id);
             },
             .match_ => |match_expr| (try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .{ .at = at }, region)).?,
-            .block => |block| blk: {
-                if (self.inTail(expr_id)) try self.markTail(block.final_expr);
-                break :blk (try self.blockExpr(block.statements, block.final_expr, .{ .at = at })).?;
-            },
-            .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .{ .at = at }, self.inTail(expr_id), region)).?,
+            .block => |block| (try self.blockExpr(block.statements, block.final_expr, .{ .at = at })).?,
+            .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .{ .at = at }, region)).?,
             // A transfer delivers nothing here, and a crash has every type.
             .return_, .break_ => self.exprRef(expr_id),
             .crash => |literal| self.bld().crash(at, try self.bld().litStr(self.bodies.stringLiteral(literal))),
@@ -2034,11 +2003,8 @@ pub const Reifier = struct {
             .str => |segments| try self.interpolatedExpr(segments),
             .lookup_local => |lookup| try self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, expr_id, null, region),
             .match_ => |match_expr| (try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .value, region)).?,
-            .block => |block| blk: {
-                if (self.inTail(expr_id)) try self.markTail(block.final_expr);
-                break :blk (try self.blockExpr(block.statements, block.final_expr, .value)).?;
-            },
-            .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .value, self.inTail(expr_id), region)).?,
+            .block => |block| (try self.blockExpr(block.statements, block.final_expr, .value)).?,
+            .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .value, region)).?,
             .binop => |binop| try self.binopExpr(binop.op, binop.lhs, binop.rhs, expr_data.ty, region),
             .unary_minus => |operand| blk: {
                 const value = try self.exprRef(operand);
@@ -2080,10 +2046,7 @@ pub const Reifier = struct {
             .hosted_lambda => self.rejectError(.effect, region, "a hosted function"),
             .nominal => |nominal| try self.nominalExpr(nominal.backing_expr, expr_data.ty, as, region),
             // The value at the wider tag union this node's type is.
-            .row_coerce => |coerce| blk: {
-                if (self.inTail(expr_id)) try self.markTail(coerce.value);
-                break :blk try self.exprAt(coerce.value, as orelse try self.tyOf(expr_data.ty, region));
-            },
+            .row_coerce => |coerce| try self.exprAt(coerce.value, as orelse try self.tyOf(expr_data.ty, region)),
             .tag => |tag_expr| try self.tagExpr(tag_expr.name, tag_expr.args, expr_data.ty, as, region),
             .zero_argument_tag => |tag_expr| try self.tagExpr(tag_expr.name, &.{}, expr_data.ty, as, region),
             .call => |call| try self.callExpr(call.func, call.args, expr_data.ty, null, region),
@@ -2146,7 +2109,7 @@ pub const Reifier = struct {
         const expr_data = self.bodies.expr(expr_id);
         const region = expr_data.source_region;
         switch (expr_data.data) {
-            .if_ => |if_expr| _ = try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .none, false, region),
+            .if_ => |if_expr| _ = try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .none, region),
             .match_ => |match_expr| _ = try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .none, region),
             .block => |block| _ = try self.blockExpr(block.statements, block.final_expr, .none),
             .for_ => |loop| try self.forLoop(loop.pattern, loop.expr, loop.body, loop.plan, loop.mutations, region),
@@ -2206,9 +2169,11 @@ pub const Reifier = struct {
     /// so is every lambda it applies, until the lambda it hands back in its
     /// `Ok` is a closure of a row. The second stage is that closure applied
     /// to the list of the interpolated values, a `Call` of the row over its
-    /// captures and the list. A rejecting branch is a crash, as the `Err` of
-    /// a `from_numeral` is. A conversion of another package is one `Prim`
-    /// over the segments and the values.
+    /// captures and the list. The `Err` of the first stage is the crash of a
+    /// rejected literal, as the `Err` of a `from_numeral` is
+    /// (`convertedWith`), and the rule N13w drops the branches that reach it.
+    /// A conversion of another package is one `Prim` over the segments and
+    /// the values.
     fn interpolationExpr(self: *Reifier, interpolation: checked.CheckedInterpolation, checked_ty: CheckedTypeId, region: base.Region) Error!Ref {
         const id = interpolation.plan orelse return self.rejectError(.unresolved_reference, region, "this literal");
         const plan = self.plans.plans[@backingInt(id)];
@@ -2232,12 +2197,7 @@ pub const Reifier = struct {
         switch (try self.dispatchTarget(DispatchSpec.ofPlan(plan), region)) {
             .definition => |target| {
                 self.walk.stage_one += 1;
-                defer {
-                    self.walk.stage_one -= 1;
-                    if (self.walk.stage_one == 0) self.walk.stage_tail.clearRetainingCapacity();
-                }
-                const lambda = try target.reader.lambdaData(target.key.body);
-                try target.reader.markTail(lambda.body);
+                defer self.walk.stage_one -= 1;
                 const converted = try self.inlineCall(target, &.{segment_list}, null, region);
                 return self.convertedWith(converted, value_list, checked_ty, region);
             },
@@ -3418,40 +3378,29 @@ pub const Reifier = struct {
         final_else: CheckedExprId,
         checked_ty: CheckedTypeId,
         want: Want,
-        tail: bool,
         region: base.Region,
     ) Error!?Ref {
         var roots = std.ArrayList(CheckedExprId).empty;
         defer roots.deinit(self.gpa);
         for (branches) |branch| try roots.appendSlice(self.gpa, &.{ branch.cond, branch.body });
         try roots.append(self.gpa, final_else);
-        if (tail) for (branches) |branch| try self.markTail(branch.body);
-        if (tail) try self.markTail(final_else);
         var plan = try self.branchPlan(roots.items, want, try self.valueTy(want, checked_ty, region));
         defer plan.deinit(self.gpa);
         var br = Branching.begin(self, &plan);
-        return self.ifLevel(&br, branches, final_else, true, tail);
+        return self.ifLevel(&br, branches, final_else, true);
     }
 
-    /// `prune` says the `if` delivers the result of a literal's first stage.
-    /// The program compiled, so that stage returned `Ok` for the literal, and
-    /// an arm that only delivers `Err` is not taken: it is no arm, and the
-    /// test that would have chosen it is never made.
-    fn ifLevel(self: *Reifier, br: *Branching, branches: []const checked.CheckedIfBranch, final_else: CheckedExprId, top: bool, prune: bool) Error!?Ref {
+    fn ifLevel(self: *Reifier, br: *Branching, branches: []const checked.CheckedIfBranch, final_else: CheckedExprId, top: bool) Error!?Ref {
         const b = self.bld();
-        if (prune and branches.len != 0) {
-            if (self.deliversErr(branches[0].body)) return self.ifLevel(br, branches[1..], final_else, top, prune);
-            if (branches.len == 1 and self.deliversErr(final_else)) return self.armBody(br, branches[0].body, top);
-        }
         if (branches.len == 0) return self.armBody(br, final_else, top);
         const cond = try self.exprRef(branches[0].cond);
         if (b.knownKey(cond)) |key| {
-            return if (key == 1) self.armBody(br, branches[0].body, top) else self.ifLevel(br, branches[1..], final_else, top, prune);
+            return if (key == 1) self.armBody(br, branches[0].body, top) else self.ifLevel(br, branches[1..], final_else, top);
         }
         const scope_base = self.scope.items.len;
         var arms: [2]RegionId = undefined;
         arms[0] = try br.openArm(cond, 0);
-        try closedArm(self.ifLevel(br, branches[1..], final_else, false, prune));
+        try closedArm(self.ifLevel(br, branches[1..], final_else, false));
         self.scope.shrinkRetainingCapacity(scope_base);
         arms[1] = try br.openArm(cond, 1);
         try br.leaf(self.armCode(branches[0].body, br.plan.want), scope_base);
@@ -5305,7 +5254,8 @@ pub const Reifier = struct {
 
     /// The value a conversion's `Try` holds: its `Ok` payload, or, where the
     /// conversion rejected the literal, the crash that rejection is when the
-    /// program runs.
+    /// program runs. That crash is the compiler's, not the author's, so it is
+    /// a rejected literal's crash (`ir.CrashKind`), which N13w may drop.
     fn convertedLiteral(self: *Reifier, converted: Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
         return self.convertedWith(converted, null, result_ty, region);
     }
@@ -5326,7 +5276,7 @@ pub const Reifier = struct {
             const delivered = if (name == ok)
                 if (values) |list| try b.apply(try b.payload(found, ok, 0), &.{list}, ty) else try b.payload(found, ok, 0)
             else
-                try b.crash(ty, try b.litStr("this literal was rejected by its conversion"));
+                try b.rejectedLiteral(ty, try b.litStr("this literal was rejected by its conversion"));
             try b.close(.{ .value = &.{delivered} });
         }
         return b.switchOn(found, arms, &.{}, &.{ty}, &.{});
@@ -8240,8 +8190,6 @@ pub const Walk = struct {
     /// The lambdas a first stage wrote, by the row each is a closure of: what
     /// the walk applies where it stands (`appliedInline`).
     closure_targets: std.AutoHashMapUnmanaged(RowId, Reifier.CalleeTarget) = .empty,
-    /// The expressions that deliver a first stage's result unexamined.
-    stage_tail: std.AutoHashMapUnmanaged(struct { reader: *Reifier, expr: CheckedExprId }, void) = .empty,
     /// The root row of the site last emitted, which a test dumps.
     root: ?RowId = null,
     rejection: ?Rejection = null,
@@ -8322,7 +8270,6 @@ pub const Walk = struct {
         self.rows.deinit(self.gpa);
         self.clearClosureTargets();
         self.closure_targets.deinit(self.gpa);
-        self.stage_tail.deinit(self.gpa);
         var memo = self.normalized.valueIterator();
         while (memo.next()) |m| {
             m.origins.deinit(self.gpa);
@@ -8428,7 +8375,6 @@ pub const Walk = struct {
         self.definitions.clearRetainingCapacity();
         self.rows.clearRetainingCapacity();
         self.clearClosureTargets();
-        self.stage_tail.clearRetainingCapacity();
         self.stage_one = 0;
         self.open_builtins = false;
         self.sources.clearRetainingCapacity();

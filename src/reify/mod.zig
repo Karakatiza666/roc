@@ -33,11 +33,12 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 10;
+pub const normal_form_version: u32 = 11;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
-/// the ops, and the kinds of value a node reads.
+/// the ops, the kinds of value a node reads, the kinds of crash, and the
+/// rules that are algorithms.
 pub fn fingerprint() u64 {
     var h = std.hash.Wyhash.init(0);
     h.update(std.mem.asBytes(&rules.fingerprint()));
@@ -48,6 +49,8 @@ pub fn fingerprint() u64 {
     }
     for (std.enums.values(ir.Ref.Kind)) |kind| h.update(@tagName(kind));
     for (std.enums.values(ir.RecordForm)) |form| h.update(@tagName(form));
+    for (std.enums.values(ir.CrashKind)) |kind| h.update(@tagName(kind));
+    for (std.enums.values(builder.Algorithm)) |a| h.update(@tagName(a));
     for (loops.steps) |step| h.update(step);
     for (scalar.steps) |step| h.update(step);
     // The conditions `speculatable` and `speculatable_rest` read the cone.
@@ -100,6 +103,11 @@ const recorded = [_]Recorded{
     // the operand and every node it reads are speculatable, so `x - x` over
     // a field of a loop output keeps the loop.
     .{ .version = 10, .fingerprint = 0xb436a740a244c612 },
+    // N13w: a crash records who wrote it (`ir.CrashKind`), and a switch on
+    // the output of a value switch whose every value but one reaches a
+    // rejected literal's crash switches on the one value. The rules that are
+    // algorithms are in the fingerprint.
+    .{ .version = 11, .fingerprint = 0xd2ffdfc061a21e95 },
 };
 
 const std = @import("std");

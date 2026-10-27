@@ -166,6 +166,10 @@ pub const Kind = enum {
     /// tag or literal, and that nothing else reads, which N13r would move into
     /// the arms.
     not_case_of_case,
+    /// A switch with an arm that ends in a rejected literal's crash, on the
+    /// output of a value switch that gives one other value, which N13w would
+    /// switch on instead.
+    not_rejected_arm,
 
     fn text(self: Kind) []const u8 {
         return switch (self) {
@@ -175,6 +179,7 @@ pub const Kind = enum {
             .too_large => "a decision tree is larger than the multiplier bound",
             .not_hoisted => "an arm ends in a switch on a position that comes before this switch's own",
             .not_case_of_case => "a switch tests a known tag or literal that only a value switch's arms give",
+            .not_rejected_arm => "a switch tests a value switch whose every value but one reaches a rejected literal",
         };
     }
 };
@@ -195,6 +200,7 @@ pub fn check(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Typ
         try c.flat(id);
         try c.hoisted(id);
         try c.caseOfCase(id);
+        try c.rejectedArm(id);
         if (!c.continues(id)) try c.bound(id);
     }
     return report;
@@ -495,6 +501,20 @@ const Checker = struct {
         try self.fail(n, .not_case_of_case);
     }
 
+    // N13w: no switch on the output of a value switch in its region, which
+    // only it and its arms read, has a rejected literal's arm that all but
+    // one of the values the value switch gives select (`rejectedKept`).
+    fn rejectedArm(self: *Checker, n: NodeId) Allocator.Error!void {
+        const node = self.store.node(n);
+        const regions = self.store.regionSlice(node.regions);
+        if (node.tys.len == 0 or regions.len != node.payload) return;
+        const outer_t = self.store.refSlice(node.args)[0];
+        const row = self.store.region(node.region).row;
+        _ = try rejectedKept(self.gpa, self.store, self.types, row, node.region, outer_t, regions, self.store.wordSlice(node.aux)) orelse return;
+        if (!try self.soleReader(n, outer_t)) return;
+        try self.fail(n, .not_rejected_arm);
+    }
+
     // Whether every live reader of the chain of `Unwrap`s that leads from
     // `outer_t` to a switch output is `n`, a node inside `n`'s regions, or the
     // next `Unwrap` of the chain.
@@ -723,4 +743,149 @@ test "N7a: the tree bound passes a small tree and fails a subtree copied into ev
         try f.b.endRow(.{ .value = &.{tree} });
         try testing.expectEqual(c.bad, try f.violations());
     }
+}
+
+/// The value N13w switches on (normal-form 3.13), and the `Unwrap`s between
+/// it and the scrutinee.
+pub const Kept = struct { value: Ref, depth: u32 };
+
+/// N13w over a switch in `region` on `outer_t`, with value arms `arms` and
+/// literal keys `keys`: where an arm ends in a rejected literal's crash and
+/// `outer_t` is, through `Unwrap`s, the output of a value switch `s` in
+/// `region`, follow each arm of `s`, and of each value switch such an arm
+/// ends in, to the value it gives. When every value but one is a known `Tag`
+/// or `Lit` that selects a rejected literal's arm, and the work the one
+/// other value needs from inside `s` is speculatable, that value; otherwise
+/// null.
+pub fn rejectedKept(
+    gpa: Allocator,
+    store: *const ir.Store,
+    types: *const types_mod.Types,
+    row: ir.RowId,
+    region: RegionId,
+    outer_t: Ref,
+    arms: []const RegionId,
+    keys: []const u32,
+) Allocator.Error!?Kept {
+    const rejected = for (arms) |r| {
+        if (rejects(store, r)) break true;
+    } else false;
+    if (!rejected) return null;
+    // The output may be read through the `Unwrap`s of a nominal, which the
+    // arms built with `Wrap`s.
+    var t = outer_t;
+    var depth: u32 = 0;
+    while (t.kind == .node) {
+        const n = store.node(t.nodeId());
+        if (n.op != .unwrap) break;
+        t = store.refSlice(n.args)[0];
+        depth += 1;
+    }
+    if (t.kind != .node or t.output != 0) return null;
+    const inner = store.node(t.nodeId());
+    if (inner.op != .switch_ or inner.region != region or inner.tys.len != 1) return null;
+    const leaves: Leaves = .{ .store = store, .types = types, .t_ty = store.refTy(row, outer_t), .arms = arms, .keys = keys, .depth = depth };
+    var kept: ?Ref = null;
+    if (!leaves.keep(t.nodeId(), &kept)) return null;
+    const value = kept orelse return null;
+    if (!try speculatableWithin(gpa, store, value, store.regionSlice(inner.regions))) return null;
+    return .{ .value = value, .depth = depth };
+}
+
+/// Whether region `r` ends in the crash of a rejected literal (`ir.CrashKind`).
+fn rejects(store: *const ir.Store, r: RegionId) bool {
+    const v = polarity.armValue(store, r) orelse return false;
+    if (v.kind != .node) return false;
+    const n = store.node(v.nodeId());
+    return n.op == .crash and n.payload == @backingInt(ir.CrashKind.rejected_literal);
+}
+
+const Leaves = struct {
+    store: *const ir.Store,
+    types: *const types_mod.Types,
+    /// The scrutinee's type, whose members the arms follow.
+    t_ty: ir.TyId,
+    arms: []const RegionId,
+    keys: []const u32,
+    depth: u32,
+
+    // Over the value switch `sw`: false where a second value selects no
+    // rejected arm, and true otherwise, with `kept` set to the one that does
+    // not, if any.
+    fn keep(self: Leaves, sw: NodeId, kept: *?Ref) bool {
+        const nd = self.store.node(sw);
+        const regions = self.store.regionSlice(nd.regions);
+        if (regions.len != nd.payload or nd.tys.len != 1) return false;
+        for (regions) |arm| {
+            const given = polarity.armValue(self.store, arm) orelse return false;
+            // An arm that ends in a value switch built in it gives that switch's value.
+            if (given.kind == .node and given.output == 0) {
+                const n = self.store.node(given.nodeId());
+                if (n.op == .switch_ and n.region == arm and n.tys.len == 1) {
+                    if (!self.keep(given.nodeId(), kept)) return false;
+                    continue;
+                }
+            }
+            if (self.selectsRejected(given)) continue;
+            if (kept.* != null) return false;
+            kept.* = given;
+        }
+        return true;
+    }
+
+    // Whether `given`, read through the `Unwrap`s, is a known `Tag` or `Lit`
+    // that selects a rejected literal's arm.
+    fn selectsRejected(self: Leaves, given: Ref) bool {
+        var v = given;
+        for (0..self.depth) |_| {
+            if (v.kind != .node) return false;
+            const w = self.store.node(v.nodeId());
+            if (w.op != .wrap) return false;
+            v = self.store.refSlice(w.args)[0];
+        }
+        if (v.kind != .node) return false;
+        const n = self.store.node(v.nodeId());
+        const sel: usize = switch (n.op) {
+            .tag => self.types.memberIndex(self.t_ty, types_mod.NameId.of(n.payload)) orelse return false,
+            .lit => switch (self.store.lit(LitId.of(n.payload)).value) {
+                .bool_ => |b| @intFromBool(b),
+                .int, .str => std.mem.findScalar(u32, self.keys, n.payload) orelse self.keys.len,
+                .float, .dec, .bytes => return false,
+            },
+            .crash, .derived, .record, .tuple, .list, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => return false,
+        };
+        return rejects(self.store, self.arms[sel]);
+    }
+};
+
+/// Whether every live node that `ref` reads from inside `regions`, through
+/// its operands and the ends of the regions it owns, is speculatable. A node
+/// outside them is computed where it is whatever N13w does.
+fn speculatableWithin(gpa: Allocator, store: *const ir.Store, ref: Ref, regions: []const RegionId) Allocator.Error!bool {
+    var seen: std.AutoHashMapUnmanaged(NodeId, void) = .empty;
+    defer seen.deinit(gpa);
+    var stack: std.ArrayList(Ref) = .empty;
+    defer stack.deinit(gpa);
+    try stack.append(gpa, ref);
+    while (stack.pop()) |r| switch (r.kind) {
+        .row_param, .region_param, .input => {},
+        .node => {
+            const n = r.nodeId();
+            const at = store.nodes.items(.region)[n.index()];
+            const inside = for (regions) |reg| {
+                if (store.encloses(reg, at)) break true;
+            } else false;
+            if (!inside) continue;
+            if ((try seen.getOrPut(gpa, n)).found_existing) continue;
+            const nd = store.node(n);
+            if (!nd.flags.speculatable) return false;
+            try stack.appendSlice(gpa, store.refSlice(nd.args));
+            for (store.regionSlice(nd.regions)) |sub| {
+                const end = store.region(sub).end;
+                try stack.appendSlice(gpa, store.refSlice(end.refs));
+                if (end.kind == .branch) try stack.append(gpa, Ref.of(NodeId.of(end.target)));
+            }
+        },
+    };
+    return true;
 }

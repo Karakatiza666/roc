@@ -82,10 +82,11 @@ const Link = struct {
 };
 
 /// The context rules that are algorithms, not rows (plan 3.3): N7b over
-/// positions, N13r over a switch's arms, N13m over the facts of a bound, and
-/// N13d over `Bool.not`, and N14a over a call. A test turns one off to see
-/// its rule stop.
-pub const Algorithm = enum { interchange, case_of_case, bounded_get, decided_not, scalar_call };
+/// positions, N13r over a switch's arms, N13w over the arms that reach a
+/// rejected literal, N13m over the facts of a bound, and N13d over
+/// `Bool.not`, and N14a over a call. A test turns one off to see its rule
+/// stop.
+pub const Algorithm = enum { interchange, case_of_case, rejected_arm, bounded_get, decided_not, scalar_call };
 
 /// The rules on exits and joins (normal-form 3.11), which run when an
 /// exiting switch's region closes. T1 is how the walk builds them.
@@ -1043,7 +1044,13 @@ pub const Builder = struct {
 
     /// `Crash` of type `ty`, with its message.
     pub fn crash(self: *Builder, ty: TyId, message: Ref) Allocator.Error!Ref {
-        return self.make(.{ .op = .crash, .args = &.{message}, .tys = &.{ty} });
+        return self.make(.{ .op = .crash, .payload = @backingInt(ir.CrashKind.written), .args = &.{message}, .tys = &.{ty} });
+    }
+
+    /// The crash of a literal that its conversion rejected, a `Crash` the
+    /// compiler wrote rather than the author (`ir.CrashKind`).
+    pub fn rejectedLiteral(self: *Builder, ty: TyId, message: Ref) Allocator.Error!Ref {
+        return self.make(.{ .op = .crash, .payload = @backingInt(ir.CrashKind.rejected_literal), .args = &.{message}, .tys = &.{ty} });
     }
 
     /// The primitive `owner.method`: the table's entry when it holds one, and
@@ -1613,6 +1620,7 @@ pub const Builder = struct {
                 return self.instantiate(rule.result, &b, spec.tys);
             }
             if (spec.op == .switch_) {
+                if (try self.rejectedArm(spec)) |r| return r;
                 if (try self.caseOfCase(spec)) |r| return r;
                 if (try self.interchange(spec)) |r| return r;
             }
@@ -1844,6 +1852,70 @@ pub const Builder = struct {
         self.algorithmFired(.case_of_case);
         if (spec.tys.len == 0) return Ref.of(try self.exitingSwitch(scrutinee, new_arms, joins, keys));
         return try self.switchOn(scrutinee, new_arms, &.{}, out_tys, keys);
+    }
+
+    // N13w, a rejected literal's arm (normal-form 3.13): a switch `o` on the
+    // output of a value switch `s` that stands in this region, one of whose
+    // arms ends in the crash of a rejected literal. Follow each arm of `s`,
+    // and of each value switch such an arm ends in, to the value it gives
+    // for the output. When every such value but one is a known `Tag` or
+    // `Lit` that selects an arm of `o` ending in a rejected literal's crash,
+    // and the work the one other value needs from inside `s` is
+    // speculatable, `o` switches on that value, and `s` and its tests go.
+    // C2 allows it: a path to a rejected literal crashes, so only the one
+    // other path computes a result, and the work moved out of `s` cannot
+    // fail. Unlike N13r, several values may select one rejected arm,
+    // because `o` keeps its own arms and nothing is copied into `s`. `o` is
+    // the only reader of the output, as for N13r, so nothing is computed
+    // twice.
+    fn rejectedArm(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        const outer_t = spec.args[0];
+        if (self.sole_reader != outer_t or !self.algorithmOn(.rejected_arm)) return null;
+        if (spec.tys.len == 0 or spec.regions.len != spec.payload) return null;
+        const found = try match.rejectedKept(self.gpa, self.store, self.types, self.row, self.current(), outer_t, spec.regions, spec.aux) orelse return null;
+
+        // `o` rebuilt over the kept value, its arms reading it for the output.
+        const outer = try self.gpa.dupe(RegionId, spec.regions);
+        defer self.gpa.free(outer);
+        const keys = try self.gpa.dupe(u32, spec.aux);
+        defer self.gpa.free(keys);
+        const out_tys = try self.gpa.dupe(TyId, spec.tys);
+        defer self.gpa.free(out_tys);
+        const t_ty = self.store.refTy(self.row, outer_t);
+        var scrutinee = try self.available(found.value);
+        for (0..found.depth) |_| scrutinee = try self.unwrap(scrutinee);
+        const saved = self.case_subst;
+        self.case_subst = .{ .from = outer_t, .to = scrutinee };
+        defer self.case_subst = saved;
+        self.algorithmFired(.rejected_arm);
+        switch (self.types.get(t_ty)) {
+            .tag_union => |span| {
+                const members = self.types.memberSlice(span);
+                const names = try self.gpa.alloc(NameId, members.len);
+                defer self.gpa.free(names);
+                for (members, names) |m, *name| name.* = m.name;
+                var live_names: std.ArrayList(NameId) = .empty;
+                defer live_names.deinit(self.gpa);
+                var live_arms: std.ArrayList(RegionId) = .empty;
+                defer live_arms.deinit(self.gpa);
+                for (names, outer) |name, old| {
+                    if (!self.tagLive(scrutinee, name)) continue;
+                    try live_names.append(self.gpa, name);
+                    try live_arms.append(self.gpa, try self.openTagArm(scrutinee, name));
+                    try self.fillFrom(old);
+                }
+                return try self.tagSwitchOn(scrutinee, live_names.items, live_arms.items, &.{}, out_tys);
+            },
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .list, .nominal, .func, .opaque_, .recursive => {
+                const new_arms = try self.gpa.alloc(RegionId, outer.len);
+                defer self.gpa.free(new_arms);
+                for (new_arms, outer, 0..) |*arm, old, i| {
+                    arm.* = try self.openArmAt(scrutinee, keys, @intCast(i));
+                    try self.fillFrom(old);
+                }
+                return try self.switchOn(scrutinee, new_arms, &.{}, out_tys, keys);
+            },
+        }
     }
 
     // The switch an arm ends in, when the arm ends in exactly its one
@@ -4624,6 +4696,66 @@ test "N13d on Bool.not: a negation of a Bool an earlier And operand decided is t
     try testing.expect(g.store.node(kept.nodeId()).op == .prim);
     try g.b.close(.{ .value = &.{kept} });
     try g.b.endRow(.{ .value = &.{Ref.rowParam(0)} });
+}
+
+// `switch s { Err => crash, Ok(v) => v }` over the `Try` that the chain
+// `if p0 Err else if p1 Err else Ok(p2)` gives: N13w's case, with the crash
+// built by `crashOf`. The rebuild sets `sole_reader`; the test does it here.
+fn rejectedChain(f: *Fixture, comptime crashOf: fn (*Builder, TyId, Ref) Allocator.Error!Ref) Allocator.Error!Ref {
+    const i64_ty = try f.types.intTy(.i64);
+    const try_ty = try f.types.tagUnionTy(&.{ .{ .name = "Err", .payload = &.{} }, .{ .name = "Ok", .payload = &.{i64_ty} } });
+    const err = try f.types.name("Err");
+    const ok = try f.types.name("Ok");
+    const p = Ref.rowParam;
+    var outer: [2]RegionId = undefined;
+    outer[0] = try f.b.openArm(p(0), 0);
+    var inner: [2]RegionId = undefined;
+    inner[0] = try f.b.openArm(p(1), 0);
+    try f.b.close(.{ .value = &.{try f.b.tag(try_ty, ok, &.{p(2)})} });
+    inner[1] = try f.b.openArm(p(1), 1);
+    try f.b.close(.{ .value = &.{try f.b.tag(try_ty, err, &.{})} });
+    try f.b.close(.{ .value = &.{try f.b.switchOn(p(1), &inner, &.{}, &.{try_ty}, &.{})} });
+    outer[1] = try f.b.openArm(p(0), 1);
+    try f.b.close(.{ .value = &.{try f.b.tag(try_ty, err, &.{})} });
+    const s = try f.b.switchOn(p(0), &outer, &.{}, &.{try_ty}, &.{});
+    var arms: [2]RegionId = undefined;
+    arms[0] = try f.b.openTagArm(s, err);
+    try f.b.close(.{ .value = &.{try crashOf(&f.b, i64_ty, try f.b.litStr("rejected"))} });
+    arms[1] = try f.b.openTagArm(s, ok);
+    try f.b.close(.{ .value = &.{try f.b.payload(s, ok, 0)} });
+    f.b.sole_reader = s;
+    defer f.b.sole_reader = null;
+    return f.b.tagSwitchOn(s, &.{ err, ok }, &arms, &.{}, &.{i64_ty});
+}
+
+test "N13w: a switch on a chain of tests whose every other value reaches a rejected literal is the one value, and the knockout and an author's crash stop it" {
+    const Case = enum { fires, knocked, written };
+    inline for (comptime std.enums.values(Case)) |case| {
+        var f: Fixture = undefined;
+        f.init();
+        defer f.deinit();
+        if (case == .knocked) f.b.hooks.algorithms_off.insert(.rejected_arm);
+        const bool_ty = try f.types.boolTy();
+        const i64_ty = try f.types.intTy(.i64);
+        const row = try f.b.beginRow(&.{ bool_ty, bool_ty, i64_ty }, i64_ty);
+        const out = try rejectedChain(&f, if (case == .written) Builder.crash else Builder.rejectedLiteral);
+        try f.b.endRow(.{ .value = &.{out} });
+        try verifyOk(&f);
+        switch (case) {
+            // Both tests go: the value is the `Ok` payload.
+            .fires => {
+                try testing.expectEqual(Ref.rowParam(2), out);
+                try testing.expectEqual(@as(u32, 1), f.b.hooks.algorithms_fired.get(.rejected_arm));
+            },
+            .knocked, .written => try testing.expectEqual(Op.switch_, f.store.node(out.nodeId()).op),
+        }
+        // Where the chain reaches no crash, the result is the payload.
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const eval = @import("eval.zig");
+        var e = try eval.Evaluator.init(arena.allocator(), &f.store, &f.types, .strict);
+        try testing.expect((try e.run(row, &.{ .{ .bool_ = false }, .{ .bool_ = false }, .{ .int = 7 } })).eql(.{ .int = 7 }));
+    }
 }
 
 test "N13n mirrors: a match on x == k meets the And an if on x == k is, and the nested if N7d merges, and their knockout stops them" {

@@ -125,7 +125,9 @@ instead of a crash model.
 `crash` written in a body stays a node where it was written, because the
 author put it there. C2 would allow deciding a branch that always crashes as
 unreachable; the normal form does not, so an interpreter target can still
-report it (7.2).
+report it (7.2). The one crash the author did not write is the rejection of
+a literal by its conversion, which the language makes a compile-time error.
+N13w (3.13) decides the branches that reach it, as C2 allows.
 
 ---
 
@@ -1004,6 +1006,7 @@ already known from the graph:
 | `Switch` on `Tag(t, ...)` or on `Lit` | the arm for `t`, or for the literal | none |
 | `Switch` at a position a dominating arm already decided | that arm | the dominating arm tested the same node at the same position |
 | `Switch` on an output of another switch `s`, where every arm of `s` gives that output as a known `Tag` or `Lit` (case-of-case) | `s`, with each of its arms continuing into the outer arm its value selects: an outer arm that one arm of `s` selects is inlined there, and one that several select becomes a join of `s` they jump to, with the tag's payload and `s`'s other outputs as its parameters | none: every test runs in the order it ran, each outer arm runs in exactly the cases it ran, and nothing is copied. The build holds this for a switch `s` with one output, no other reader (the rebuild tells the builder), and arms that select different outer arms. An outer arm that two arms select needs a second join, which an exiting switch cannot carry (3.11), so that case stays a switch on `s`'s output |
+| `Switch` `o` on an output of a value switch `s`, where an arm of `o` ends in the crash of a rejected literal, and every value that `s` gives for the output, through its arms and the value switches they end in, is a known `Tag` or `Lit` that selects such an arm, except one value `v` (N13w) | `o` on `v`; `s` and its tests are dropped | the work `v` needs from inside `s` is speculatable, and `o` is the only reader of the output, as for case-of-case. C2 allows it: a path to a rejected literal crashes, so `v` is the result wherever the body has one, and nothing that can fail is evaluated where it was not |
 | `Switch` on a `Bool` whose arms are `Lit(False)` and `Lit(True)` | the scrutinee | none |
 | `Switch` on a `Bool` whose arms are `Lit(True)` and `Lit(False)` | `Prim("Bool.not")` of the scrutinee | none |
 | `Bool.not(Bool.not(x))` | `x` | none |
@@ -1030,6 +1033,25 @@ already known from the graph:
 | `Bool.not(And(x1, ..., xn))`, `Bool.not(Or(x1, ..., xn))` (N13t) | `Or` and `And` of the negations of `x1` to `xn` | none |
 | `Bool.not` of a `Bool` switch (N13t) | the switch with each arm's value negated | none |
 | `Switch` on a `Bool` `c` with two arms (N13s) | `Switch` on the negation of `c` with the two arms swapped | the negation has fewer `Bool.not` leaves; on a tie, fewer integer `is_lte` leaves; on a tie, `c` is an `Or`, or, when `c` is neither an `And` nor an `Or`, its first leaf is a `Bool.not` or an integer `is_lte` |
+
+N13w is what makes a literal's conversion meet the conversion without its
+rejection. The `Err` of `T.from_numeral`, `T.from_quote` or
+`T.from_interpolation` is a crash that the compiler writes where the literal
+stands (`src/check/code_reifier.zig`, `convertedWith`). The author did not
+write it, so it is a `Crash` of kind `rejected_literal`
+(`src/reify/ir.zig`, `CrashKind`), and a translator sees it as the `Crash`
+it is. The tests of an interpolated literal's first stage run over the
+literal's segments, so a stage that rejects in an `if`, in a `match`, in a
+chain of tests or in a helper that returns a `Try` is a switch, or a tree
+of switches, whose every value but one is the `Err` tag. N13w drops the tree,
+and N13c then takes the `Ok` arm of the conversion's own switch, so every
+spelling of the rejection describes as the conversion that never rejects. A
+rejection whose path stays behind a call that is not inlined stays the
+crash. A crash that the author wrote stays where it was written, and so do
+the tests that reach it. N13w copies nothing: an arm of `o` that several
+values select is a crash, and it is not copied, because `o` keeps its arms.
+The normal-form check fails where N13w still applies
+(`src/reify/match.zig`, `rejectedKept`).
 
 Case-of-case is what makes a helper that returns a tag meet the code it
 replaced. `parse(s)?`, with `parse` an `if ok Ok(v) else Err(e)`, is a switch on
@@ -1609,6 +1631,7 @@ Every row is an edit that preserves meaning in Roc under C2. "A" means the norma
 | a tail-recursive helper or a loop | A | A | N12, N11 |
 | `return x` as the last statement, or `x` | A | A | T6 |
 | a helper that returns a tag or a `Try`, matched or unwrapped with `?` by its caller, or the helper's tests written in place | A for a helper with one call site, B otherwise | A | 5.1, case-of-case (3.13) |
+| reject a literal in its conversion with an `if`, a `match`, a chain of tests or a helper's `Try`, at any depth | A | A | N13w (3.13), C2 |
 | call a function chosen by an `if` or read from a record literal, or call each function directly | A | A | `Apply` (3.8) |
 | drop a loop variable nothing reads, or one that never changes | A | A | N11 |
 | build a record, tuple or tag and read it back, or use the parts directly | A | A | N13 |
@@ -1660,7 +1683,7 @@ absorbing them costs more than the refactor they would absorb:
 | equal operands of a chain merged or cancelled, `x & x` and `x`, `x ^ x` and `0` | with operand order kept, it is not confluent with N15a's flattening (3.15); a canonical operand order would make it so, which the first row leaves out |
 | a canonical form for boolean formulas, such as a reduced BDD | canonical only for a fixed variable order, which would have to come from the walk, so it adds no invariance N7 and N13 lack |
 | merging identical work in some sibling branches but not all | it places work where some branch did not evaluate it, which is speculation. Work in every arm is merged (3.5), because binding it once before the switch is a refactor in R |
-| a branch that always crashes, treated as unreachable | C2 would allow it, but the author wrote the `crash`, and an interpreter target reports it |
+| a branch that always crashes, treated as unreachable | C2 would allow it, but the author wrote the `crash`, and an interpreter target reports it. The crash of a rejected literal is the compiler's, and N13w decides it (3.13) |
 | inlining a builtin's body | a builtin is a primitive; its body is not API, and a translator recognizes it by identity |
 | loop unrolling, loop fusion outside layer L | optimizations, not refactors anyone makes to reified code. The exception is a loop over a list of known length, which N17g unrolls, because a loop over `[r, g, b]` and three statements is a refactor authors make |
 | outlining in the `graph` view | it would replace the author's shared helpers, which is what `outline` is for |

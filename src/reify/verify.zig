@@ -319,7 +319,8 @@ const Verifier = struct {
                 if (!std.mem.eql(TyId, self.store.tySlice(reg.params), self.types.tySlice(f.func.params))) break :blk true;
                 break :blk !try self.endGives(body[0], &.{f.func.ret});
             },
-            .crash, .derived, .list, .closure, .elem, .opt_field => !single,
+            .crash => !single or std.enums.fromInt(ir.CrashKind, nd.payload) == null,
+            .derived, .list, .closure, .elem, .opt_field => !single,
         };
         if (bad) try self.report.add("node {d}: types disagree with op {s}", .{ n.index(), @tagName(nd.op) });
     }
