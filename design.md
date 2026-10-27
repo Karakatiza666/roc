@@ -19135,7 +19135,14 @@ continuation.
 A Boxy concrete tag payload read takes its field layout from the committed
 tag-union layout of its source. When that field is the boxed storage of a
 recursive position, the read targets the stored box and unboxes it to the
-payload's own layout, mirroring construction, which boxes it.
+payload's own layout, mirroring construction, which boxes it. A record or
+tuple representation boundary follows the same rule for each field: it reads a
+field whose source struct layout stores it boxed into that stored box and
+unboxes it, and it boxes a converted field whose target struct layout stores it
+boxed. A restored `ConstStore` record, tuple, or multi-payload tag boxes each
+restored field the same way. The committed struct layout of the target is the
+only input to this step (`aggregateStoredFieldLocals` in
+`src/postcheck/boxy/lower.zig`).
 
 Boxy box/unbox/adapt operations are explicit LIR statements or explicit helper
 calls selected by the lowerer:

@@ -23014,15 +23014,22 @@ const ProcBodyBuilder = struct {
         }
         const field_locals = try self.parent.allocator.alloc(LIR.LocalId, items.len);
         defer self.parent.allocator.free(field_locals);
-        for (item_tys, field_locals) |item_ty, *local| {
-            local.* = try self.addFrameLocalForType(item_ty);
+        const field_reps = try self.parent.allocator.alloc(Plan.TypeRepId, items.len);
+        defer self.parent.allocator.free(field_reps);
+        for (item_tys, field_locals, field_reps) |item_ty, *local, *field_rep| {
+            field_rep.* = self.repForType(item_ty);
+            local.* = try self.addFrameLocalForRep(field_rep.*);
         }
+        const stored_fields = try self.parent.allocator.alloc(LIR.LocalId, items.len);
+        defer self.parent.allocator.free(stored_fields);
+        try self.aggregateStoredFieldLocals(self.parent.result.store.getLocal(target).layout_idx, field_locals, stored_fields);
 
-        const continuation = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
+        const assign_struct = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
             .target = target,
-            .fields = try self.parent.result.store.addLocalSpan(field_locals),
+            .fields = try self.parent.result.store.addLocalSpan(stored_fields),
             .next = next,
         } }, self.scaffoldOrigin());
+        const continuation = try self.prependAggregateStoredFieldBoxes(field_locals, stored_fields, field_reps, assign_struct);
         const chain_items = try self.parent.allocator.alloc(ExprChainItem, items.len);
         for (chain_items, 0..) |*item, offset| {
             const index = items.len - 1 - offset;
@@ -23097,6 +23104,8 @@ const ProcBodyBuilder = struct {
         @memset(source_field_locals, null);
         const source_field_reps = try self.parent.allocator.alloc(Plan.TypeRepId, fields.len);
         defer self.parent.allocator.free(source_field_reps);
+        const field_reps = try self.parent.allocator.alloc(Plan.TypeRepId, fields.len);
+        defer self.parent.allocator.free(field_reps);
 
         var layout_index: usize = 0;
         for (children) |child| {
@@ -23106,6 +23115,7 @@ const ProcBodyBuilder = struct {
                         boxyLowerInvariant("ConstStore record representation referenced a field outside checked type");
                     const local = try self.addFrameLocalForRep(child.rep);
                     field_locals[layout_index] = local;
+                    field_reps[layout_index] = child.rep;
                     descriptor_fields[layout_index] = .{
                         .local = local,
                         .target_rep = child.rep,
@@ -23127,6 +23137,10 @@ const ProcBodyBuilder = struct {
                 boxyLowerInvariant("ConstStore record field was not selected by representation order");
             }
         }
+        const stored_fields = try self.parent.allocator.alloc(LIR.LocalId, fields.len);
+        defer self.parent.allocator.free(stored_fields);
+        try self.aggregateStoredFieldLocals(self.parent.result.store.getLocal(record_target).layout_idx, field_locals, stored_fields);
+        for (descriptor_fields, stored_fields) |*field, stored| field.local = stored;
 
         const aggregate_desc = try self.constructedAggregateDescriptorForFields(record_target, rep_id, descriptor_fields);
         var aggregate_desc_owned = true;
@@ -23134,10 +23148,11 @@ const ProcBodyBuilder = struct {
 
         var continuation = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
             .target = record_target,
-            .fields = try self.parent.result.store.addLocalSpan(field_locals),
+            .fields = try self.parent.result.store.addLocalSpan(stored_fields),
             .contents_desc = try self.parent.result.store.addStmtRowIfPresent(LIR.BoxyDescRef, aggregate_desc.contents_desc),
             .next = record_next,
         } }, self.scaffoldOrigin());
+        continuation = try self.prependAggregateStoredFieldBoxes(field_locals, stored_fields, field_reps, continuation);
         continuation = try self.prependOptionalDescriptorMaterialization(aggregate_desc.materialize, continuation);
         const chain_items = try self.parent.allocator.alloc(ExprChainItem, items.len + 1);
         for (0..items.len) |offset| {
@@ -23431,15 +23446,22 @@ const ProcBodyBuilder = struct {
 
         const field_locals = try self.parent.allocator.alloc(LIR.LocalId, tag.payloads.len);
         defer self.parent.allocator.free(field_locals);
-        for (payload_children, field_locals) |child, *local| {
+        const field_reps = try self.parent.allocator.alloc(Plan.TypeRepId, tag.payloads.len);
+        defer self.parent.allocator.free(field_reps);
+        for (payload_children, field_locals, field_reps) |child, *local, *field_rep| {
+            field_rep.* = child.rep;
             local.* = try self.addFrameLocalForRep(child.rep);
         }
+        const stored_fields = try self.parent.allocator.alloc(LIR.LocalId, tag.payloads.len);
+        defer self.parent.allocator.free(stored_fields);
+        try self.aggregateStoredFieldLocals(payload_layout, field_locals, stored_fields);
 
-        const continuation = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
+        const assign_struct = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
             .target = payload_local,
-            .fields = try self.parent.result.store.addLocalSpan(field_locals),
+            .fields = try self.parent.result.store.addLocalSpan(stored_fields),
             .next = assign_tag,
         } }, self.scaffoldOrigin());
+        const continuation = try self.prependAggregateStoredFieldBoxes(field_locals, stored_fields, field_reps, assign_struct);
         const chain_items = try self.parent.allocator.alloc(ExprChainItem, tag.payloads.len);
         for (chain_items, 0..) |*item, offset| {
             const index = tag.payloads.len - 1 - offset;
@@ -33215,6 +33237,41 @@ const ProcBodyBuilder = struct {
         return try self.storageDescriptorForRepIfNeeded(rep_id);
     }
 
+    /// The local each field of a struct in `aggregate_layout` is assigned
+    /// from: the field's own local, or a new local of the stored box where the
+    /// layout stores the field boxed because it is on a recursive type's cycle.
+    fn aggregateStoredFieldLocals(
+        self: *ProcBodyBuilder,
+        aggregate_layout: layout.Idx,
+        field_locals: []const LIR.LocalId,
+        stored_locals: []LIR.LocalId,
+    ) Allocator.Error!void {
+        for (field_locals, stored_locals, 0..) |field_local, *stored, index| {
+            const stored_layout = try self.aggregateFieldLayout(aggregate_layout, index);
+            stored.* = if (stored_layout == self.parent.result.store.getLocal(field_local).layout_idx)
+                field_local
+            else
+                try self.addFrameLocal(stored_layout);
+        }
+    }
+
+    /// Box each field local into the stored local `aggregateStoredFieldLocals`
+    /// chose for it, before `next`.
+    fn prependAggregateStoredFieldBoxes(
+        self: *ProcBodyBuilder,
+        field_locals: []const LIR.LocalId,
+        stored_locals: []const LIR.LocalId,
+        field_reps: []const Plan.TypeRepId,
+        next: LIR.CFStmtId,
+    ) Allocator.Error!LIR.CFStmtId {
+        var continuation = next;
+        for (field_locals, stored_locals, field_reps) |field_local, stored, field_rep| {
+            if (stored == field_local) continue;
+            continuation = try self.assignWorkerValueToTagPayloadStorage(stored, field_local, field_rep, continuation);
+        }
+        return continuation;
+    }
+
     fn assignWorkerValueToTagPayloadStorage(
         self: *ProcBodyBuilder,
         target: LIR.LocalId,
@@ -39905,10 +39962,25 @@ const ProcBodyBuilder = struct {
             .record => |*state| {
                 if (child) |converted| {
                     const index = state.remaining;
+                    // A field on a recursive type's cycle is stored boxed;
+                    // read the stored field, then unbox it to the field's
+                    // own layout.
+                    const stored_layout = self.parent.recordPayloadFieldLayout(
+                        self.parent.result.store.getLocal(state.fields_source).layout_idx,
+                        state.source_field_indices[index],
+                    );
+                    const stored = if (stored_layout == self.parent.result.store.getLocal(state.source_fields[index]).layout_idx)
+                        state.source_fields[index]
+                    else
+                        try self.addFrameLocal(stored_layout);
+                    const after_stored = if (stored == state.source_fields[index])
+                        converted
+                    else
+                        try self.assignWorkerValueToTagPayloadStorage(state.source_fields[index], stored, state.source_field_reps[index], converted);
                     const read_field = try self.parent.result.store.addCFStmt(.{ .assign_ref = .{
-                        .target = state.source_fields[index],
+                        .target = stored,
                         .op = .field(state.fields_source, state.source_field_indices[index]),
-                        .next = converted,
+                        .next = after_stored,
                     } }, self.glueOrigin());
                     state.current = try self.prependAggregateFieldDescriptorBind(
                         state.aggregate,
@@ -40276,14 +40348,20 @@ const ProcBodyBuilder = struct {
             boxyLowerInvariant(kind ++ " record boundary field count disagreed with target record children");
         }
 
+        // A field on a recursive type's cycle is stored boxed: the converted
+        // field is boxed into the stored field the struct holds.
+        const stored_fields = try allocator.alloc(LIR.LocalId, target_field_count);
+        defer allocator.free(stored_fields);
+        try self.aggregateStoredFieldLocals(self.parent.result.store.getLocal(state.target).layout_idx, state.target_fields, stored_fields);
+
         const descriptor_fields = try allocator.alloc(AggregateDescriptorField, target_field_count);
         defer allocator.free(descriptor_fields);
-        for (state.target_fields, state.target_field_reps, state.source_field_reps, descriptor_fields) |field_local, target_field_rep, source_field_rep, *field| {
+        for (state.target_fields, stored_fields, state.target_field_reps, state.source_field_reps, descriptor_fields) |field_local, stored, target_field_rep, source_field_rep, *field| {
             field.* = .{
-                .local = field_local,
+                .local = stored,
                 .target_rep = target_field_rep,
                 // This local is the boundary output, not the original field.
-                .source_rep = if (self.representationBoundaryIsDirect(target_field_rep, source_field_rep))
+                .source_rep = if (stored == field_local and self.representationBoundaryIsDirect(target_field_rep, source_field_rep))
                     source_field_rep
                 else
                     target_field_rep,
@@ -40293,11 +40371,12 @@ const ProcBodyBuilder = struct {
 
         const assign_struct = try self.parent.result.store.addCFStmt(.{ .assign_struct = .{
             .target = state.target,
-            .fields = try self.parent.result.store.addLocalSpan(state.target_fields),
+            .fields = try self.parent.result.store.addLocalSpan(stored_fields),
             .contents_desc = try self.parent.result.store.addStmtRowIfPresent(LIR.BoxyDescRef, state.aggregate_desc.contents_desc),
             .next = request.next,
         } }, self.glueOrigin());
-        state.current = try self.prependOptionalDescriptorMaterialization(state.aggregate_desc.materialize, assign_struct);
+        const fields_stored = try self.prependAggregateStoredFieldBoxes(state.target_fields, stored_fields, state.target_field_reps, assign_struct);
+        state.current = try self.prependOptionalDescriptorMaterialization(state.aggregate_desc.materialize, fields_stored);
         state.remaining = target_field_count;
         try frames.append(allocator, frame);
         return .pushed;
