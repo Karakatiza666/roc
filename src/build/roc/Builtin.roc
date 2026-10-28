@@ -23923,9 +23923,12 @@ Builtin :: [].{
 		## | `Crash` | the message |
 		## | `Derived` | the derived method's arguments |
 		##
-		## `Prim` names a builtin, or a function of another package, by its owner
-		## and method apart: `Num.F32` and `sin`, `Glsl.Vec3` and `scale`. A
-		## translator keys its table by method and reads the type from the node.
+		## `Prim` names a builtin, or a function in the translator's cut, by its
+		## owner and method apart: `Num.F32` and `sin`, `Glsl.Vec3` and `scale`.
+		## A translator declares its cut with the item `code_primitives` of its
+		## type, one function or a tuple of them; every other function arrives
+		## as its body. A translator keys its table by method and reads the type
+		## from the node.
 		##
 		## The normal form rewrites some expressions before a translator reads
 		## them, so a node is not always the call that was written. Each form

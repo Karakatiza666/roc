@@ -15,6 +15,7 @@
 //! | M7 | a loop `var` as one scalar, as a record or as a tuple that carries a field nothing changes; a private helper that takes `a, b`, `{ a, b }`, `(a, b)`, or either destructured, called twice |
 //! | M11 | a literal operand of `+`, `*` and `==` first or last; a sum over `0..=n` under a test that bounds `n`, as a `for` over the range or a `while $i <= n` |
 //! | M12 | a sum over `0..<n` as a `for` over the range, a `while $i < n`, or a `while !$done` whose `else` sets the flag; a second counter from `j0` as a `var` stepped by 1 with the index, or as `i + j0` |
+//! | M13 | an M7 helper defined in the app's own module, or in a module `Lib` of another package that the app calls it through, outside every cut (N8l) |
 //!
 //! The two prints must describe as one normal form (L4), and the normal form
 //! must compute what Roc computes wherever Roc does not crash (L5, C2).
@@ -46,6 +47,9 @@ pub const Options = struct {
     /// counter stepped with the index), whose spellings meet through N11n
     /// and N11o.
     m12: bool = false,
+    /// The choice of M13: an M7 helper in the app, or in a package `lib`,
+    /// which the walk reads by its body because no cut lists it (N8l).
+    m13: bool = false,
 };
 
 /// Bytes the generator reads its choices from. Past the end it reads zeros,
@@ -122,9 +126,13 @@ pub const Case = struct {
     input: Input,
     /// Set where the case may hold the constructs of M10.
     lawful: bool,
+    /// The body of the module `Lib` of a package `lib`, the helpers M13 put
+    /// there, or empty where the case calls into no other package.
+    lib_source: []u8,
 
     pub fn deinit(self: *Case, gpa: Allocator) void {
         gpa.free(self.source);
+        gpa.free(self.lib_source);
         gpa.free(self.left_param);
         gpa.free(self.right_param);
         gpa.free(self.answer);
@@ -373,6 +381,9 @@ const Printer = struct {
     symbols: *Symbols,
     /// The private helpers this print defines at the top level, before its function.
     helpers: *std.ArrayList(u8),
+    /// The helpers this print defines in the module `Lib` of another package
+    /// (M13), which its calls name through `Lib.`.
+    lib_helpers: *std.ArrayList(u8),
     options: Options = .{},
 
     fn write(self: *Printer, text: []const u8) Allocator.Error!void {
@@ -806,13 +817,17 @@ const Printer = struct {
         const q = try self.symbols.fresh("lc");
         const whole = try self.symbols.fresh("lc");
         const shape = self.extra.pick(5);
+        // M13: the helper in another package, called through its module.
+        const away = self.options.m13 and self.extra.pick(2) == 0;
+        const into = if (away) self.lib_helpers else self.helpers;
         switch (shape) {
-            0 => try self.helpers.print(self.gpa, "{s} : U64, U64 -> U64\n{s} = |{s}, {s}| {s} + {s} * {d}\n\n", .{ name, name, p, q, p, q, k }),
-            1 => try self.helpers.print(self.gpa, "{s} : {{ {s} : U64, {s} : U64 }} -> U64\n{s} = |{s}| {s}.{s} + {s}.{s} * {d}\n\n", .{ name, p, q, name, whole, whole, p, whole, q, k }),
-            2 => try self.helpers.print(self.gpa, "{s} : (U64, U64) -> U64\n{s} = |{s}| {s}.0 + {s}.1 * {d}\n\n", .{ name, name, whole, whole, whole, k }),
-            3 => try self.helpers.print(self.gpa, "{s} : {{ {s} : U64, {s} : U64 }} -> U64\n{s} = |{{ {s}, {s} }}| {s} + {s} * {d}\n\n", .{ name, p, q, name, p, q, p, q, k }),
-            else => try self.helpers.print(self.gpa, "{s} : (U64, U64) -> U64\n{s} = |({s}, {s})| {s} + {s} * {d}\n\n", .{ name, name, p, q, p, q, k }),
+            0 => try into.print(self.gpa, "{s} : U64, U64 -> U64\n{s} = |{s}, {s}| {s} + {s} * {d}\n\n", .{ name, name, p, q, p, q, k }),
+            1 => try into.print(self.gpa, "{s} : {{ {s} : U64, {s} : U64 }} -> U64\n{s} = |{s}| {s}.{s} + {s}.{s} * {d}\n\n", .{ name, p, q, name, whole, whole, p, whole, q, k }),
+            2 => try into.print(self.gpa, "{s} : (U64, U64) -> U64\n{s} = |{s}| {s}.0 + {s}.1 * {d}\n\n", .{ name, name, whole, whole, whole, k }),
+            3 => try into.print(self.gpa, "{s} : {{ {s} : U64, {s} : U64 }} -> U64\n{s} = |{{ {s}, {s} }}| {s} + {s} * {d}\n\n", .{ name, p, q, name, p, q, p, q, k }),
+            else => try into.print(self.gpa, "{s} : (U64, U64) -> U64\n{s} = |({s}, {s})| {s} + {s} * {d}\n\n", .{ name, name, p, q, p, q, k }),
         }
+        const callee = if (away) try std.fmt.allocPrint(self.symbols.arena, "Lib.{s}", .{name}) else name;
         try self.write("(");
         for (0..2) |call| {
             if (call == 1) try self.write(" + ");
@@ -820,21 +835,21 @@ const Printer = struct {
             const y = args[call * 2 + 1];
             switch (shape) {
                 0 => {
-                    try self.print("{s}(", .{name});
+                    try self.print("{s}(", .{callee});
                     try self.expr(x);
                     try self.write(", ");
                     try self.expr(y);
                     try self.write(")");
                 },
                 1, 3 => {
-                    try self.print("{s}({{ {s}: ", .{ name, p });
+                    try self.print("{s}({{ {s}: ", .{ callee, p });
                     try self.expr(x);
                     try self.print(", {s}: ", .{q});
                     try self.expr(y);
                     try self.write(" })");
                 },
                 else => {
-                    try self.print("{s}((", .{name});
+                    try self.print("{s}((", .{callee});
                     try self.expr(x);
                     try self.write(", ");
                     try self.expr(y);
@@ -1070,6 +1085,8 @@ pub fn generateWith(gpa: Allocator, bytes: []const u8, options: Options) Allocat
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
+    var lib = std.ArrayList(u8).empty;
+    errdefer lib.deinit(gpa);
     try out.print(gpa, "{s} : {{ {s} : U64, {s} : U64, {s} : Bool, {s} : List(U64) }}\n\n", .{ input_ty, fields[0], fields[1], fields[2], fields[3] });
 
     // The two prints read their spelling choices from what follows the
@@ -1093,7 +1110,9 @@ pub fn generateWith(gpa: Allocator, bytes: []const u8, options: Options) Allocat
         defer body.deinit(gpa);
         var helpers: std.ArrayList(u8) = .empty;
         defer helpers.deinit(gpa);
-        var printer: Printer = .{ .gpa = gpa, .out = &body, .choices = side.choices, .extra = side.extra, .names = side.names, .symbols = &symbols, .helpers = &helpers, .options = options };
+        var lib_helpers: std.ArrayList(u8) = .empty;
+        defer lib_helpers.deinit(gpa);
+        var printer: Printer = .{ .gpa = gpa, .out = &body, .choices = side.choices, .extra = side.extra, .names = side.names, .symbols = &symbols, .helpers = &helpers, .lib_helpers = &lib_helpers, .options = options };
         // `return` last, in some prints.
         if (side.choices.pick(3) == 0) {
             try body.appendSlice(gpa, "{\nreturn ");
@@ -1101,6 +1120,14 @@ pub fn generateWith(gpa: Allocator, bytes: []const u8, options: Options) Allocat
             try body.appendSlice(gpa, "\n}");
         } else try printer.expr(root);
         try out.appendSlice(gpa, helpers.items);
+        // A helper of `Lib` is an associated item of its type, so its lines
+        // are indented into the type's block.
+        var lines = std.mem.splitScalar(u8, lib_helpers.items, '\n');
+        while (lib_helpers.items.len != 0) {
+            const line = lines.next() orelse break;
+            if (line.len != 0) try lib.print(gpa, "    {s}", .{line});
+            try lib.append(gpa, '\n');
+        }
         try out.print(gpa, "{s} : {s} -> U64\n{s} = |{s}| ", .{ side.name, input_ty, side.name, side.names.param });
         try out.appendSlice(gpa, body.items);
         try out.appendSlice(gpa, "\n\n");
@@ -1122,7 +1149,22 @@ pub fn generateWith(gpa: Allocator, bytes: []const u8, options: Options) Allocat
         .answer = try gpa.dupe(u8, answer),
         .lawful = options.m10,
         .input = input,
+        .lib_source = try lib.toOwnedSlice(gpa),
     };
+}
+
+test "M13 puts some helpers in the module of another package, and calls them through it" {
+    var prng = std.Random.DefaultPrng.init(0x0d13);
+    var bytes: [96]u8 = undefined;
+    const placed = for (0..200) |_| {
+        prng.random().bytes(&bytes);
+        var case = try generateWith(std.testing.allocator, &bytes, .{ .m13 = true });
+        defer case.deinit(std.testing.allocator);
+        if (case.lib_source.len == 0) continue;
+        try std.testing.expect(std.mem.find(u8, case.source, "Lib.hp") != null);
+        break true;
+    } else false;
+    try std.testing.expect(placed);
 }
 
 test "a case prints two functions and the constant of their answer" {

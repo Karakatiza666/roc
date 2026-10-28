@@ -136,6 +136,18 @@ const Staged = struct {
         return createWalked(gpa, wobble_source, main_statement, param, lib_source, .named);
     }
 
+    /// `createSite` for a fixture whose `main_statement` passes `wobble` to
+    /// a translator: the site is walked with the cut the translator's type
+    /// declares (I14), as publication walks it.
+    fn createTranslated(
+        gpa: Allocator,
+        wobble_source: []const u8,
+        main_statement: []const u8,
+        lib_source: ?[]const u8,
+    ) StagedError!*Staged {
+        return createWalked(gpa, wobble_source, main_statement, "input", lib_source, .translated);
+    }
+
     /// The lambda whose one parameter is named `input`, walked as a lambda
     /// written at a `Code` position inside a block: at its own type, reading
     /// the block around it. With `binds_inputs`, the site's translator
@@ -161,6 +173,9 @@ const Staged = struct {
     const WalkedAs = union(enum) {
         /// A definition, at the scheme of its template.
         named,
+        /// A definition, at the scheme of its template, with the cut of the
+        /// translator the app's one translator call names.
+        translated,
         /// A definition, at the scheme of its template, in the `inline` view.
         inlined,
         /// A definition, at the scheme of its template, in the `outline` view.
@@ -195,6 +210,15 @@ const Staged = struct {
         });
         switch (walked_as) {
             .named => {},
+            .translated => {
+                // The translator is the callee `main_statement` writes,
+                // `_n = Lib.arity(wobble)`, found by its source text: the
+                // source-node map is build-only.
+                const start = (std.mem.find(u8, main_statement, "= ") orelse return error.StagedLambdaNotFound) + 2;
+                const end = std.mem.findScalarPos(u8, main_statement, start, '(') orelse return error.StagedLambdaNotFound;
+                const callee = checkedExprWithSource(artifact, self.env, main_statement[start..end]) orelse return error.StagedLambdaNotFound;
+                try self.walk.useCut(self.reifier, callee);
+            },
             .inlined => self.walk.view = .inline_,
             .outlined => self.walk.view = .outline,
             .in_block => |binds_inputs| {
@@ -1579,8 +1603,9 @@ test "a top-level value that is another computed function describes as the one i
     );
 }
 
-test "a top-level value of another package that computes a function is a Prim named by its module and name" {
-    // N8h: the definition is that package's body, which the walk does not read.
+test "N8l M13: a top-level value of another package that computes a function is walked by its definition" {
+    // No cut lists it, so its definition is read where the name stands, as a
+    // value of the site's own package is.
     const written = try Staged.createSite(std.testing.allocator,
         \\wobble : { a : F32, b : F32 } -> F32
         \\wobble = |input| Lib.doubler(input.a)
@@ -1596,8 +1621,30 @@ test "a top-level value of another package that computes a function is a Prim na
     try written.expectDump(
         \\row r0 ({ a : F32, b : F32 }) -> F32
         \\  n0 = field 0(p0) : F32
-        \\  n1 = Lib.doubler(n0) : F32 !spec
-        \\  value n1
+        \\  n1 = float 0x40000000 : F32
+        \\  n2 = Num.F32.times(n0, n1) : F32
+        \\  value n2
+        \\
+    );
+}
+
+test "N8l M13: a computed constant of another package folds to its computation" {
+    const written = try Staged.createSite(std.testing.allocator,
+        \\wobble : { a : F32, b : F32 } -> F32
+        \\wobble = |input| input.a * Lib.limit
+    , "", "input",
+        \\Lib := {}.{
+        \\    limit : F32
+        \\    limit = 7.0.F32 * 2.0.F32
+        \\}
+    );
+    defer written.destroy();
+    try written.expectDump(
+        \\row r0 ({ a : F32, b : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = float 0x41600000 : F32
+        \\  n2 = Num.F32.times(n0, n1) : F32
+        \\  value n2
         \\
     );
 }
@@ -3171,30 +3218,38 @@ test "L4 and L5: every seed's two prints are one normal form, which computes wha
     try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
 }
 
-test "L7: a refactor inside a function of another package leaves the caller's normal form unchanged" {
-    // N8h: a function of another package is a named `Prim`, so its body is
-    // not the description's, and a refactor inside it changes nothing here.
-    const gpa = std.testing.allocator;
-    const caller =
-        \\wobble : { a : U64, b : U64 } -> U64
-        \\wobble = |input| Lib.scale(input.a, input.b) + 1
-    ;
-    const written = try Staged.createSite(gpa, caller, "", "input",
-        \\Lib := {}.{
-        \\    scale : U64, U64 -> U64
-        \\    scale = |v, k| v * k
+/// A package whose type is a translator, `Lib.arity`, with `scale` in its
+/// cut. `body` is the definition of `scale`.
+fn translatorLib(comptime body: []const u8, comptime cut: []const u8) []const u8 {
+    return
+    \\Lib := {}.{
+    \\    scale : U64, U64 -> U64
+    \\
+    ++ "    scale = " ++ body ++ "\n\n" ++
+        "    code_primitives = " ++ cut ++ "\n\n" ++
+        \\    arity : Code(f) -> U64
+        \\    arity = |code| code.graph().root_row().params.len()
         \\}
-    );
+    ;
+}
+
+const translated_caller =
+    \\wobble : { a : U64, b : U64 } -> U64
+    \\wobble = |input| Lib.scale(input.a, input.b) + 1
+;
+
+test "L7: a refactor inside a function in the translator's cut leaves the caller's normal form unchanged" {
+    // N8h: a function in the cut is a named `Prim`, so its body is not the
+    // description's, and a refactor inside it changes nothing here.
+    const gpa = std.testing.allocator;
+    const written = try Staged.createTranslated(gpa, translated_caller, "_n = Lib.arity(wobble)", translatorLib("|v, k| v * k", "(scale)"));
     defer written.destroy();
-    const refactored = try Staged.createSite(gpa, caller, "", "input",
-        \\Lib := {}.{
-        \\    scale : U64, U64 -> U64
-        \\    scale = |v, k| {
+    const refactored = try Staged.createTranslated(gpa, translated_caller, "_n = Lib.arity(wobble)", translatorLib(
+        \\|v, k| {
         \\        product = k * v
         \\        product
         \\    }
-        \\}
-    );
+    , "(scale)"));
     defer refactored.destroy();
     try written.expectDump(
         \\row r0 ({ a : U64, b : U64 }) -> U64
@@ -3207,6 +3262,150 @@ test "L7: a refactor inside a function of another package leaves the caller's no
         \\
     );
     try std.testing.expectEqualStrings(written.dump.items, refactored.dump.items);
+}
+
+test "N8l M13: a function of another package outside the cut is walked by its body" {
+    // The type declares a cut without `scale`, so the call is the body.
+    const gpa = std.testing.allocator;
+    const walked = try Staged.createTranslated(gpa, translated_caller, "_n = Lib.arity(wobble)", translatorLib("|v, k| v * k", "(arity)"));
+    defer walked.destroy();
+    try walked.expectDump(
+        \\row r0 ({ a : U64, b : U64 }) -> U64
+        \\  n0 = field 0(p0) : U64
+        \\  n1 = field 1(p0) : U64
+        \\  n2 = Num.U64.times(n0, n1) : U64 !spec
+        \\  n3 = 1 : U64
+        \\  n4 = Num.U64.plus(n2, n3) : U64 !spec
+        \\  value n4
+        \\
+    );
+    // A site no translator call holds has an empty cut, and reads the same body.
+    const bare = try Staged.createSite(gpa, translated_caller, "", "input", translatorLib("|v, k| v * k", "(scale)"));
+    defer bare.destroy();
+    try std.testing.expectEqualStrings(walked.dump.items, bare.dump.items);
+}
+
+test "N8h M13: a method in the cut called as a method is the Prim its direct call is" {
+    // The name is the qualified name of the definition, `Lib.Vec` and
+    // `scale`, however the call is written.
+    const gpa = std.testing.allocator;
+    const lib =
+        \\Lib := {}.{
+        \\    Vec := { x : U64 }.{
+        \\        scale : Vec, U64 -> U64
+        \\        scale = |v, k| v.x * k
+        \\    }
+        \\
+        \\    code_primitives = (Vec.scale)
+        \\
+        \\    arity : Code(f) -> U64
+        \\    arity = |code| code.graph().root_row().params.len()
+        \\}
+    ;
+    const direct = try Staged.createTranslated(gpa,
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| Lib.Vec.scale(Lib.Vec.({ x: input.a }), input.b)
+    , "_n = Lib.arity(wobble)", lib);
+    defer direct.destroy();
+    const method = try Staged.createTranslated(gpa,
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| Lib.Vec.({ x: input.a }).scale(input.b)
+    , "_n = Lib.arity(wobble)", lib);
+    defer method.destroy();
+    if (direct.outcome != .reified) return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, direct.dump.items, "Lib.Vec.scale(") != null);
+    try std.testing.expectEqualStrings(direct.dump.items, method.dump.items);
+}
+
+test "N8h M13: a function in the cut of a translator in the site's own module is a Prim" {
+    // The cut is the translator's, in any package, the site's own included.
+    const staged = try Staged.createTranslated(std.testing.allocator,
+        \\Tr := {}.{
+        \\    twice : U64 -> U64
+        \\    twice = |x| x * 2
+        \\
+        \\    code_primitives = (Tr.twice)
+        \\
+        \\    arity : Code(f) -> U64
+        \\    arity = |code| code.graph().root_row().params.len()
+        \\}
+        \\
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| Tr.twice(input.a)
+    , "_n = Tr.arity(wobble)", null);
+    defer staged.destroy();
+    if (staged.outcome != .reified) return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, staged.dump.items, ".Tr.twice(n0)") != null or std.mem.find(u8, staged.dump.items, " Tr.twice(n0)") != null);
+}
+
+test "L3 M13: a refactor inside a dependency's function outside the cut meets the same refactor inside the package" {
+    // N8l: the dependency's body is walked as the site's own helper is, so
+    // a refactor in R inside it is absorbed, wherever the helper lives.
+    const gpa = std.testing.allocator;
+    const caller_away =
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| Lib.scale(input.a, input.b) + 1
+    ;
+    const plain = "|v, k| v * k";
+    const bound =
+        \\|v, k| {
+        \\        product = v * k
+        \\        product
+        \\    }
+    ;
+    const away = try Staged.createSite(gpa, caller_away, "", "input", translatorLib(plain, "(arity)"));
+    defer away.destroy();
+    const away_refactored = try Staged.createSite(gpa, caller_away, "", "input", translatorLib(bound, "(arity)"));
+    defer away_refactored.destroy();
+    const here = try Staged.createRunning(gpa,
+        \\scale : U64, U64 -> U64
+        \\scale = |v, k| v * k
+        \\
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| scale(input.a, input.b) + 1
+    , "");
+    defer here.destroy();
+    const here_refactored = try Staged.createRunning(gpa,
+        \\scale : U64, U64 -> U64
+        \\scale = |v, k| {
+        \\    product = v * k
+        \\    product
+        \\}
+        \\
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| scale(input.a, input.b) + 1
+    , "");
+    defer here_refactored.destroy();
+    if (away.outcome != .reified) return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(away.dump.items, away_refactored.dump.items);
+    try std.testing.expectEqualStrings(away.dump.items, here.dump.items);
+    try std.testing.expectEqualStrings(away.dump.items, here_refactored.dump.items);
+}
+
+test "M13: a dependency upgrade that changes the operations of a function outside the cut changes the normal form" {
+    // Plan 5.12: apart. The upgrade is a new body, and the body is read.
+    const gpa = std.testing.allocator;
+    const caller =
+        \\wobble : { a : F32, b : F32 } -> F32
+        \\wobble = |input| Lib.norm(input.a) + 1.0.F32
+    ;
+    const before = try Staged.createSite(gpa, caller, "", "input",
+        \\Lib := {}.{
+        \\    norm : F32 -> F32
+        \\    norm = |x| x * x
+        \\}
+    );
+    defer before.destroy();
+    const after = try Staged.createSite(gpa, caller, "", "input",
+        \\Lib := {}.{
+        \\    norm : F32 -> F32
+        \\    norm = |x| x.sqrt()
+        \\}
+    );
+    defer after.destroy();
+    if (before.outcome != .reified or after.outcome != .reified) return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, after.dump.items, "Num.F32.sqrt") != null);
+    try std.testing.expect(!std.mem.eql(u8, before.dump.items, after.dump.items));
 }
 
 /// The two sources describe `wobble` to different dumps.
@@ -5343,19 +5542,24 @@ test "an interpolated literal passed as an argument describes as the value it co
     );
 }
 
-test "an interpolated literal of a type of another package is a Prim over its segments and values" {
-    // N8h: the conversion is that package's body, which the walk does not
-    // read, so the literal is named by the type's module and `from_interpolation`.
-    const written = try Staged.createSite(std.testing.allocator,
+test "an interpolated literal of a type whose conversion is in the cut is a Prim over its segments and values" {
+    // N8h: the conversion and `size` are in the translator's cut, so the
+    // literal is named by the type and `from_interpolation`.
+    const written = try Staged.createTranslated(std.testing.allocator,
         \\wobble : { a : F32, b : F32 } -> F32
         \\wobble = |input| Lib.size("x${input.a.to_str()}y")
-    , "", "input",
+    , "_n = Lib.arity(wobble)",
         \\Lib := { text : Str }.{
         \\    from_interpolation : List(Str) -> Try((List(Str) -> Lib), [InvalidInterpolation(Str)])
         \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| { text: assemble(values) })
         \\
         \\    size : Lib -> F32
         \\    size = |l| if l.text.is_empty() 0.0.F32 else 1.0.F32
+        \\
+        \\    code_primitives = (Lib.from_interpolation, Lib.size)
+        \\
+        \\    arity : Code(f) -> U64
+        \\    arity = |code| code.graph().root_row().params.len()
         \\}
     );
     defer written.destroy();
@@ -6357,6 +6561,26 @@ test "L4 and L5 M12: `$done` flag loops and derived counters keep every seed's t
         defer arena.deinit();
         const ctx = CoreCtx.default(std.testing.allocator, arena.allocator(), std.testing.io);
         verdicts.getPtr(try reify_fuzz.runCaseWith(ctx, try sharedBuiltinModules(), tmp.dir, &bytes, .{ .m7 = false, .m12 = true })).* += 1;
+    }
+    try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
+}
+
+test "L4 and L5 M13: a helper in another package, outside every cut, keeps every seed's two prints one normal form" {
+    // The generator's M7 helpers are on, and M13 puts each one, per print,
+    // in the app or in a module `Lib` of another package. No cut lists it,
+    // so its body is walked wherever it lives (N8l).
+    var prng = std.Random.DefaultPrng.init(0x0d13);
+    const random = prng.random();
+    var bytes: [96]u8 = undefined;
+    var verdicts = std.EnumArray(reify_fuzz.Verdict, u32).initFill(0);
+    for (0..200) |_| {
+        random.bytes(&bytes);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const ctx = CoreCtx.default(std.testing.allocator, arena.allocator(), std.testing.io);
+        verdicts.getPtr(try reify_fuzz.runCaseWith(ctx, try sharedBuiltinModules(), tmp.dir, &bytes, .{ .m13 = true })).* += 1;
     }
     try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
 }

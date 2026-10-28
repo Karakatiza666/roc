@@ -10499,6 +10499,7 @@ const TestImportViewTables = struct {
     interface_capabilities: ModuleInterfaceCapabilities = .{},
     const_store: ConstStore,
     code_provenance: CodeProvenanceTable = .{},
+    code_cuts: CodeCutTable = .{},
 
     fn init(allocator: Allocator) TestImportViewTables {
         if (!builtin.is_test) unreachable; // test scaffolding: only test blocks call this
@@ -10550,6 +10551,7 @@ const TestImportViewTables = struct {
             .interface_capabilities = &self.interface_capabilities,
             .const_store = &self.const_store,
             .code_provenance = &self.code_provenance,
+            .code_cuts = &self.code_cuts,
         };
     }
 };
@@ -27522,6 +27524,8 @@ pub const PlatformPairing = struct {
                 // The platform's own reification sites, which publication of
                 // the platform described.
                 "code_provenance",
+                // The translators' cuts the platform declares.
+                "code_cuts",
                 // Value reuse metadata: borrowed from the platform. Reuse
                 // moves values between versions of a module's own entry,
                 // never into a composition.
@@ -34565,6 +34569,54 @@ pub const CompileTimeRootPortability = struct {
     pub const deinit = artifact_serialize.SliceStoreDeinit(@This()).deinit;
 };
 
+/// The translators' cuts this module declares (plan I14, normal-form 3.8):
+/// per nominal type whose `code_primitives` item publication accepted, the
+/// checked lookups that item lists. The walk of a site whose translator the
+/// type owns resolves each lookup to the function it names, which is then a
+/// `Prim` by its qualified name rather than a body to walk.
+///
+/// | Slice | One entry per | Holds |
+/// |---|---|---|
+/// | `cuts` | nominal type with a cut | its declaration statement, and its span of `members` |
+/// | `members` | function in a cut, in the order the tuple lists it | the checked lookup that names it |
+pub const CodeCutTable = struct {
+    pub const Cut = extern struct { owner_decl: u32, members: Span };
+    pub const Span = extern struct { start: u32 = 0, len: u32 = 0 };
+
+    cuts: []const Cut = &.{},
+    members: []const u32 = &.{},
+
+    pub const Serialized = extern struct {
+        cuts: SerializedSlice(Cut) = .{},
+        members: SerializedSlice(u32) = .{},
+        const Serde = artifact_serialize.SliceStoreSerde(CodeCutTable, @This());
+        pub const serialize = Serde.serialize;
+        pub const deserialize = Serde.deserialize;
+    };
+
+    /// The checked lookups of the cut that the nominal declared at
+    /// `owner_decl` lists, or null for a type that declares none, whose cut
+    /// is empty.
+    pub fn membersOf(self: *const CodeCutTable, owner_decl: u32) ?[]const u32 {
+        for (self.cuts) |cut| {
+            if (cut.owner_decl == owner_decl) return self.members[cut.members.start..][0..cut.members.len];
+        }
+        return null;
+    }
+
+    pub fn validate(self: CodeCutTable) error{CorruptArtifact}!void {
+        for (self.cuts) |cut| {
+            if (cut.members.start > self.members.len or cut.members.len > self.members.len - cut.members.start) return error.CorruptArtifact;
+        }
+    }
+
+    pub fn deinit(self: *CodeCutTable, allocator: Allocator) void {
+        allocator.free(self.cuts);
+        allocator.free(self.members);
+        self.* = .{};
+    }
+};
+
 /// The provenance of the module's `Code` sites (normal-form 3.10, plan I9):
 /// per site key, where each node of the site's graph came from. Nothing a
 /// translator reads holds it; a refusal reads it to report a node at its
@@ -34766,6 +34818,7 @@ pub const CheckedModuleArtifact = struct {
     compile_time_root_identities: CompileTimeRootIdentityTable = .{},
     compile_time_root_portability: CompileTimeRootPortability = .{},
     code_provenance: CodeProvenanceTable = .{},
+    code_cuts: CodeCutTable = .{},
     /// Process-local publication state; cache entries always contain finalized output.
     evaluation_state: enum { prepared, finalized } = .finalized,
     /// Owns the evaluation columns of a finalized artifact that a compilation
@@ -35001,6 +35054,7 @@ pub const CheckedModuleArtifact = struct {
         compile_time_root_identities: CompileTimeRootIdentityTable.Serialized,
         compile_time_root_portability: CompileTimeRootPortability.Serialized,
         code_provenance: CodeProvenanceTable.Serialized,
+        code_cuts: CodeCutTable.Serialized,
 
         pub const root_contract: collections.serde_validation.RootContract = .{
             .Owner = CheckedModuleArtifact,
@@ -35034,8 +35088,8 @@ pub const CheckedModuleArtifact = struct {
             // two pools of their own. Template demand vectors add one. The
             // code provenance table adds its seven slices, and the calls that
             // bind input slots four in the body store, and the roots a Code site
-            // reads one.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 258);
+            // reads one. The code cut table adds its two slices.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 260);
         }
 
         /// Every field but the inline POD `key`, `source_hash`, and
@@ -35099,6 +35153,7 @@ pub const CheckedModuleArtifact = struct {
             try self.compile_time_root_identities.deserialize(base_addr).validate(roots.roots.len);
             try self.compile_time_root_portability.deserialize(base_addr).validate(roots.roots.len);
             try self.code_provenance.deserialize(base_addr).validate();
+            try self.code_cuts.deserialize(base_addr).validate();
         }
 
         pub fn deserialize(
@@ -36363,6 +36418,7 @@ pub const CheckedModuleArtifact = struct {
         if (self.evaluation_state != .finalized) checkedArtifactInvariant("complete checked module still awaits evaluation", .{});
         self.compile_time_debug.validate(self.compile_time_roots.roots.len) catch checkedArtifactInvariant("compile-time debug observation has an invalid root or message range", .{});
         self.code_provenance.validate() catch checkedArtifactInvariant("code provenance has a span outside its table", .{});
+        self.code_cuts.validate() catch checkedArtifactInvariant("a code cut has a span outside its table", .{});
         if (builtin.mode != .debug) return;
 
         std.debug.assert(self.module_identity.module_idx != std.math.maxInt(u32));
@@ -37018,6 +37074,9 @@ pub const ImportedModuleView = struct {
     /// The provenance of the module's reification sites, which a refusal
     /// report reads (I9c).
     code_provenance: *const CodeProvenanceTable = &no_code_provenance,
+    /// The translators' cuts the module declares (I14), which the walk of a
+    /// site in another module reads when the module owns its translator.
+    code_cuts: *const CodeCutTable = &no_code_cuts,
 
     /// The keys of the modules this module imports directly.
     pub fn directImportKeys(self: ImportedModuleView) []const CheckedModuleArtifactKey {
@@ -37028,6 +37087,7 @@ pub const ImportedModuleView = struct {
 const no_compile_time_root_reads: CompileTimeRootReadTable = .{};
 const no_compile_time_root_identities: CompileTimeRootIdentityTable = .{};
 const no_code_provenance: CodeProvenanceTable = .{};
+const no_code_cuts: CodeCutTable = .{};
 
 /// Public `LoweringModuleView` declaration.
 pub const LoweringModuleView = struct {
@@ -37078,6 +37138,7 @@ pub fn importedView(artifact: *const CheckedModuleArtifact) ImportedModuleView {
         .compile_time_root_reads = &artifact.compile_time_root_reads,
         .compile_time_root_identities = &artifact.compile_time_root_identities,
         .code_provenance = &artifact.code_provenance,
+        .code_cuts = &artifact.code_cuts,
     };
 }
 
@@ -38514,6 +38575,7 @@ fn foreignModule(view: ImportedModuleView) code_reifier.ForeignModule {
             .callable_eval_templates = view.callable_eval_templates,
             .const_templates = view.const_templates,
             .const_bodies = view.checked_const_bodies,
+            .code_cuts = view.code_cuts,
         },
         .env = view.module_env,
     };
@@ -38521,7 +38583,7 @@ fn foreignModule(view: ImportedModuleView) code_reifier.ForeignModule {
 
 /// The body an exported constant holds, read from the owning module's own
 /// tables the way a procedure's body is.
-fn exportedConstant(view: ImportedModuleView, const_ref: ConstRef) ?code_reifier.ForeignConstant {
+pub fn exportedConstant(view: ImportedModuleView, const_ref: ConstRef) ?code_reifier.ForeignConstant {
     const body = code_reifier.constantBody(view.const_templates, view.checked_const_bodies, const_ref) orelse
         return null;
     return .{ .module = foreignModule(view), .body = body };
@@ -38604,6 +38666,7 @@ fn reifyStagedCode(
     store: *ConstStore,
     hoisted_constants: *const HoistedConstTable,
     problem_store: ?*problem.Store,
+    code_cuts: *CodeCutTable,
 ) Allocator.Error!CodeProvenanceTable {
     var foreign = ForeignStagedLookup{
         .module = module,
@@ -38612,6 +38675,40 @@ fn reifyStagedCode(
         .imports = imports,
         .available = available,
     };
+    // The cuts first: a site of this module whose translator this module's
+    // type owns reads them.
+    const no_cuts: CodeCutTable = .{};
+    var cuts = try code_reifier.moduleCuts(allocator, store, .{
+        .types = &type_publication.store,
+        .bodies = checked_bodies,
+        .plans = plans,
+        .names = names,
+        .artifact = artifact_key,
+        .value_refs = value_refs,
+        .procedure_bindings = procedure_bindings,
+        .procedure_templates = procedure_templates,
+        .callable_eval_templates = callable_eval_templates,
+        .const_templates = const_templates,
+        .const_bodies = const_bodies,
+        .top_level_values = top_level_values,
+        .site_types = type_publication,
+        .code_cuts = &no_cuts,
+    }, module_env, foreign.lookup());
+    defer allocator.free(cuts.problems);
+    if (problem_store) |problems| {
+        for (cuts.problems) |refused| {
+            _ = try problems.appendProblem(.{ .staged_code = .{
+                .reason = switch (refused.kind) {
+                    .not_a_function => .primitive_not_a_function,
+                    .listed_twice => .primitive_listed_twice,
+                },
+                .region = refused.region,
+            } });
+        }
+    }
+    code_cuts.* = cuts.table;
+    cuts.table = .{};
+
     var sites = try code_reifier.reifyModuleSites(allocator, store, .{
         .types = &type_publication.store,
         .bodies = checked_bodies,
@@ -38626,6 +38723,7 @@ fn reifyStagedCode(
         .const_bodies = const_bodies,
         .top_level_values = top_level_values,
         .site_types = type_publication,
+        .code_cuts = code_cuts,
     }, module, module_env, foreign.lookup());
     defer sites.deinit(allocator);
 
@@ -39280,6 +39378,8 @@ pub fn publishFromTypedModule(
     // reads a dispatch plan's resolution, which total resolution assigns, and
     // the body of any constant it folds, which sealing above fills in, so this
     // is the earliest point in publication it can run.
+    var code_cuts: CodeCutTable = .{};
+    errdefer code_cuts.deinit(allocator);
     var code_provenance = try reifyStagedCode(
         allocator,
         module,
@@ -39302,6 +39402,7 @@ pub fn publishFromTypedModule(
         &checked_const_store,
         &hoisted_constants,
         inputs.problem_store,
+        &code_cuts,
     );
     errdefer code_provenance.deinit(allocator);
 
@@ -39522,12 +39623,15 @@ pub fn publishFromTypedModule(
         .const_store = checked_const_store,
         .compile_time_root_identities = compile_time_root_identities,
         .code_provenance = code_provenance,
+        .code_cuts = code_cuts,
         .evaluation_state = .prepared,
     };
     checked_const_store = ConstStore.init(allocator);
     errdefer artifact.const_store.deinit();
     code_provenance = .{};
     errdefer artifact.code_provenance.deinit(allocator);
+    code_cuts = .{};
+    errdefer artifact.code_cuts.deinit(allocator);
 
     if (inputs.evaluation_phase == .immediate) {
         try inputs.compile_time_finalizer.run(
@@ -40690,6 +40794,7 @@ fn testVisibilityImportedView(
         .interface_capabilities = undefined,
         .const_store = undefined,
         .code_provenance = undefined,
+        .code_cuts = undefined,
     };
 }
 
@@ -41908,8 +42013,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0x96, 0x23, 0x86, 0xB7, 0x4D, 0x31, 0x18, 0xE8, 0x0C, 0xD9, 0x59, 0x56, 0x77, 0x01, 0x63, 0x11,
-        0x0C, 0x4B, 0x86, 0xE6, 0x19, 0x56, 0xFA, 0xF5, 0x0B, 0xF8, 0x42, 0x96, 0xAB, 0x80, 0x7E, 0x4E,
+        0x37, 0x91, 0xB8, 0x1C, 0x09, 0xB3, 0xE0, 0x92, 0x20, 0x1C, 0xFB, 0xE2, 0xA8, 0xC2, 0xF1, 0x47,
+        0x3A, 0x6A, 0x87, 0x79, 0x5C, 0x9A, 0x63, 0x53, 0x14, 0x62, 0x58, 0xA2, 0x9B, 0x3B, 0x8D, 0xB8,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

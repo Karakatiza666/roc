@@ -429,6 +429,11 @@ pub const StagedCode = struct {
         /// runs, its translator returns a `Code.Bound`, and the site cannot
         /// bind the value as an input slot.
         input_not_bound,
+        /// An entry of a type's `code_primitives` item is no reference to a
+        /// top-level function defined as a lambda (I14).
+        primitive_not_a_function,
+        /// A type's `code_primitives` item lists one function twice (I14).
+        primitive_listed_twice,
     };
 };
 

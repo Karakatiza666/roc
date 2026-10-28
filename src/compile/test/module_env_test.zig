@@ -169,10 +169,11 @@ test "ModuleEnv.Serialized roundtrip" {
     // Plus the fully qualified Range type name and 2 range method identifiers:
     // Builtin.Num.Range, range_exclusive_to, range_inclusive_to
     // Plus 5 fully qualified staging type names: Builtin.Code, Builtin.Code.Inlined,
-    // Builtin.Code.Outlined, Builtin.Code.Lawful, Builtin.Code.Bound
+    // Builtin.Code.Outlined, Builtin.Code.Lawful, Builtin.Code.Bound, and the
+    // well-known item code_primitives
     // Count reflects the merged builtin set, including structural parser/encoder
     // method identifiers, Builtin.Json.Encoding's parse/encode helpers, and Crypto.
-    try testing.expectEqual(@as(u32, 129), original.common.idents.interner.entry_count);
+    try testing.expectEqual(@as(u32, 130), original.common.idents.interner.entry_count);
     try testing.expectEqualStrings("hello", original.getIdent(hello_idx));
     try testing.expectEqualStrings("world", original.getIdent(world_idx));
 
@@ -183,7 +184,7 @@ test "ModuleEnv.Serialized roundtrip" {
     // First verify that the CommonEnv data was preserved after deserialization
     // Should have same identifiers as original, including the builtin structural method identifiers.
     // (Note: "Try" is now shared with well-known identifiers, reducing total by 1)
-    try testing.expectEqual(@as(u32, 129), env.common.idents.interner.entry_count);
+    try testing.expectEqual(@as(u32, 130), env.common.idents.interner.entry_count);
 
     try testing.expectEqual(@as(usize, 1), env.common.exposed_items.count());
     try testing.expectEqual(@as(?u32, 42), env.common.exposed_items.getValueNodeIndexById(gpa, @as(u32, @bitCast(hello_idx))));

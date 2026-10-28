@@ -366,7 +366,7 @@ hoisted).
 
 | Complication | Evidence | Design answer | Steps | Tests |
 |---|---|---|---|---|
-| translators recognize functions of their own library by name, and inlining would replace them with their CPU bodies | `Glsl.roc` maps `Glsl.Vec3.scale` to `*` and `Glsl.Sampler.texture` to `texture` (`examples/reifying/glsl/Glsl.roc:516-517`, `:552`) | a function in the site's cut is a `Prim` named by its qualified name, never walked, not speculatable. Until M13 the cut is every function of another package; from M13 the translator declares it (1.9) | N8h, M1; I14, M13 | the GLSL example keeps its output; a refactor inside a `Glsl` function body leaves the caller's normal form unchanged; renaming it changes it |
+| translators recognize functions of their own library by name, and inlining would replace them with their CPU bodies | `Glsl.roc` maps `Glsl.Vec3.scale` to `*` and `Glsl.Sampler.texture` to `texture` (`examples/reifying/glsl/Glsl.roc:516-517`, `:552`) | a function in the site's cut is a `Prim` named by its qualified name, never walked, not speculatable. Before M13 the cut was every function of another package; M13 made the translator declare it (1.9), and `Glsl.roc` declares its vector methods and `Sampler.texture` | N8h, M1; I14, M13 | the GLSL example keeps its output; a refactor inside a `Glsl` function body leaves the caller's normal form unchanged; renaming it changes it |
 | walking an opaque nominal's own method reads the representation the opaque hides, and the walk then meets a field access that the opaque's type does not have | `Sealed :: { x : U16 }` with a written `is_eq` (`test/cli/StagedNominalMethods.roc:123-126`) | a method of an opaque nominal that is not a builtin is a `Prim` named by the nominal and the method, never walked, as N8h does for another package's function. A derived method over an opaque stays refused | N8h, M1 | "an opaque nominal's own method is named, not walked" in `src/compile/test/code_reifier_test.zig` |
 | a `Code` value's equality and its identity pull apart | rows are shared by digest across a module's sites (1.7), and translator output should be cacheable by `Code` equality | the value carries a site key; `is_eq` and `to_hash` are written by hand in `Builtin.roc` and skip it; provenance is keyed by site and node; the site module's provenance is reachable wherever compile-time evaluation runs the translator | I10, M1 | two sites with one normal form are equal and hash equal; `refuse_at` on each reports its own regions; a translator in another module reports at the right site |
 | compiler upgrades change normal forms | every rule is part of the language version (normal-form 10) | `Code.version`; rules, the speculatable list and layer L change only with a language version; golden files change exactly when the version does | I11, M1 | a fingerprint test over the rule set, the speculatable list and the builtin table fails unless the version changes with it |
@@ -478,7 +478,7 @@ walk and in every later rebuild, or a pass.
 | I11 | `Code.version` and the rule-set fingerprint | `prims.zig`, `Builtin.roc` | 10 |
 | I12 | the pipeline driver: per-module arena; components in callee-first order, each simplified to its fixpoint and then finalized; rows created during simplification simplified and finalized on demand; the round bound and the check after every round that the measure fell; per-site view stage | `driver.zig` | 3.0; 1.3 here |
 | I13 | the rule table: every smart-constructor rule as root op, argument patterns, side condition and result; dispatch, the knockout switch that disables one rule in test builds, the fingerprint of I11 and the overlap list of 5.7 read from it | `rules/table.zig` | 3.0 |
-| I14 | the translator's cut: the well-known item `code_primitives` of the nominal type that owns the `Code(f)` function, a function reference or a tuple of them (normal-form 12); the checker's lookup through that type, its check of the form and of duplicates, and the cut recorded in the checked artifact for that type's sites | checker, checked artifact, site rule | 3.8, 12 |
+| I14, done | the translator's cut: the well-known item `code_primitives` of the nominal type that owns the `Code(f)` function, a function reference or a tuple of them (normal-form 12); the checker's lookup through that type, its check of the form and of duplicates, and the cut recorded in the checked artifact for that type's sites. The checker records each site's translator call (`CodeReificationSite.translator`, `src/canonicalize/NodeStore.zig`); publication checks each item and records the cut (`moduleCuts` in `src/check/code_reifier.zig`, `CodeCutTable` in `src/check/checked_artifact.zig`); the walk takes a site's cut from the type that owns its translator (`Walk.useCut`). A site that is no argument of a direct call has an empty cut | checker, checked artifact, site rule | 3.8, 12 |
 
 ### 3.2 Construct: during the walk
 
@@ -511,8 +511,8 @@ walk and in every later rebuild, or a pass.
 | N8b | a lambda passed as a value to `Closure(row)` with captures | walk | 3.8 |
 | N8c | eta: `\|x\| f(x)` to `Closure(f)`; its call half: a call of a finalized row, not recursive, whose body only calls another row over its parameters, to that call | SC | 3.8 |
 | N8d | known-function specialization keyed by the function's digest, not the call site | walk, then rows | 3.8 |
-| N8h | a function in the site's cut to `Prim` by qualified name, not walked, not speculatable; until I14, the cut is every function of another package | walk | 3.8 |
-| N8l | a function of another package outside the cut walked as a function of the same package; its body enters the normal form | walk | 3.8 |
+| N8h, done | a function in the site's cut to `Prim` by qualified name, not walked, not speculatable: the nominal it is an associated item of and the item, `Glsl.Vec3` and `scale`, or its module and its name where it is no item, for a direct call and a method call alike (`Reifier.qualifiedName`) | walk | 3.8 |
+| N8l, done | a function of another package outside the cut walked as a function of the same package; its body enters the normal form. So does a computed value of another package, a constant or a value that computes a function | walk | 3.8 |
 | P1 | a site's normal form memoized by the digest of the rows its walk built, which reads types, literals, primitives and names by content, because each site has a store and a type table of its own; a site with an earlier site's digest is not normalized again | walk | none: performance |
 
 ### 3.3 Simplify: smart constructors, applied in every rebuild
@@ -694,7 +694,7 @@ made breaks a translator.
 | 3 | M2, done | N5b, N5c, N5d, N6, N9 | order and placement are canonical under C2. These rows of R hold: reorder, rename, bind twice (also once before a `match` against once in every arm), move into a branch, and drop dead code. A dominating test applies to a binding, whether it is written inside the branch or before it | 4.1: reorder bindings, bind once or twice, drop a dead binding |
 | 4 | M3, done | N8d to N8g, N8i, N8j, V1, P1 | rows are digests and are finalized before their callers. These rows of R hold: helper renames, moves, generic helpers, parameter order, extraction of a helper with one use, and two identical helpers. A component that stops being recursive is treated as not recursive. A function chosen by an `if` or read from a record literal is called directly | 4.1: extract or inline a helper with one use; reorder top-level definitions |
 | 5 | M8a, done | I9, V2, V6 | a translator refuses a node through `refuse_at`, and the compiler reports it at every source region of that node. A `Code.Inlined(f)` site gets the `inline` view. In it, every non-recursive helper is inlined, however many calls it has, and a `Closure` of a non-recursive row is a `Lambda` region | 4.1: extract or inline a helper with many uses. 4.2: `refuse_at` |
-| 6 | M13 | I14, N8h with the declared cut, N8l; the edits of `roc-reify-refactor-safety.md` 6 | a translator declares its cut, and the site carries it. A function in the cut is a primitive (N8h). Every other function is walked by its body, in any package (N8l). The GLSL example declares `Glsl.roc`'s primitives as its cut and keeps its output. `roc-reify-proposal.md` states R, the cut, the policy of 1.9 for dependency bodies, and the table of safety section 5 | 4.3, replaced by the policy of 1.9. 6: the proposal edits |
+| 6 | M13, done | I14, N8h with the declared cut, N8l; the edits of `roc-reify-refactor-safety.md` 6 | a translator declares its cut, and the site carries it. A function in the cut is a primitive (N8h). Every other function is walked by its body, in any package (N8l). The GLSL example declares `Glsl.roc`'s primitives as its cut and keeps its output. `roc-reify-proposal.md` states R, the cut, the policy of 1.9 for dependency bodies, and the table of safety section 5 | 4.3, replaced by the policy of 1.9. 6: the proposal edits |
 | 7 | M14 | no new steps; tests only | each row of the safety document's R table (its 4.1), and each row of its section 2 that R absorbs, has an L3 pair that names the row and meets. Each row of its section 5 has an L3 pair that stays apart. Section 5.12 here records the matrix | 4.2: the guarantee is a test |
 | 8 | M6, done | N12, N11g to N11l, V7 | there are three canonical loop forms, with the slot, exit and raising rules. The three `sum_to` bodies of normal-form 11.1 meet as one `ForRange`. `for x in xs` meets `for x in xs.iter()` and an index `while`. Translators read what a loop iterates over | none. It is the first extension, because loop form is the refactor that section 2 there shows breaking the GLSL translator. Built as normal form version 8, with limits: (1) the slots keep their order, so the N9 loop-slot rule below is still not a fixpoint question, because no rule reorders slots; (2) a bounded loop keeps one output per slot and narrows by whole slots; (3) the return-to-break rule needs a general `Loop` with one output of the row's type; (4) the language has no `continue` yet (`docs/langref/statements.md`), so the L3 pair for `continue` is the update in each branch against one update of the `if`; (5) `exits_early` counts a `Break` of the loop itself and a `Return`, and not a `Break` of a loop nested in it |
 | 9 | M15 | the rule-derivation phase D5 | S1 and S2 reach an empty report at k = 6 (`roc-reify-rule-derivation.md` 5). The admitted rows enter the table through `--admit`, and criterion 1 of 6.1 there is run again, for rows whose left side has a size of 6 or less | none: completeness of the rule set up to size 6 |
@@ -719,8 +719,11 @@ evaluation runs only where no problem store is present, so it never reports
 one.
 
 M13 declares the cut with the well-known item `code_primitives` on the
-translator's type (normal-form 12), so it needs no new syntax. Until M13, N8h keeps every
-function of another package a primitive, and no dependency body is read.
+translator's type (normal-form 12), so it needs no new syntax. Before M13, N8h
+kept every function of another package a primitive, and no dependency body was
+read. M13 leaves one limit: the translator is the callee of a direct call whose
+argument is the site, so a site passed to a translator called as a method, or
+written where no call takes it, has an empty cut.
 
 After M13 is built, check the delegated form of an interpolated literal of a
 custom type. A translator that declares that type's `from_interpolation` in
@@ -1038,13 +1041,13 @@ marked "apart" must give two, and each is a row of `roc-reify-refactor-safety.md
 | add or remove a type annotation | 4.1 | types from the checker | M1 | meets | |
 | reorder unrelated top-level definitions | 4.1 | N8g, N9 | M3 | meets | |
 | reorder two calls to one generic function | 2 | N8d, N8g | M3 | meets | |
-| a refactor inside a function in the translator's cut | 2, 4.3 | N8h | M1 | meets | |
-| a refactor inside a dependency's function outside the cut that keeps its normal form | 4.3 | N8l | M13 | meets | |
+| a refactor inside a function in the translator's cut | 2, 4.3 | N8h | M1 | meets | "L7: a refactor inside a function in the translator's cut leaves the caller's normal form unchanged" |
+| a refactor inside a dependency's function outside the cut that keeps its normal form | 4.3 | N8l | M13 | meets | "L3 M13: a refactor inside a dependency's function outside the cut meets the same refactor inside the package" |
 | `x * 2` or `x + x`; `(a + b) + c` or `a + (b + c)` | 5 | none | none | apart | |
 | `x.len() > 0` or `!x.is_empty()` | 2, 5 | none without layer L; N16f at a `Code.Lawful(f)` site, where it meets (`L3 M10`) | M10 | apart | |
 | a fold or a `for` loop with a `var` | 2 | none without layer L; N16c at a `Code.Lawful(f)` site, where it meets (`L3 M10`) | M10 | apart | |
 | a recursive function or a fold | 5 | none | none | apart | |
-| a dependency upgrade whose function outside the cut changes its operations: non-tail recursion, a list of input-dependent length, a builtin the target lacks | 4.3, replaced by 1.9 here | none | M13 | apart; the build stops at the site | |
+| a dependency upgrade whose function outside the cut changes its operations: non-tail recursion, a list of input-dependent length, a builtin the target lacks | 4.3, replaced by 1.9 here | none | M13 | apart; the build stops at the site | "M13: a dependency upgrade that changes the operations of a function outside the cut changes the normal form"; the CLI case "a dependency's function outside the cut that the translator has no form for stops the build at the site" (`test/cli/StagedCut/stops.roc`) |
 
 ---
 

@@ -36,11 +36,14 @@ compiler then describes `post_process` and hands the description over;
 shader is compiled during the build, not on the way to the first frame.
 
 `main.roc` reaches `Glsl` as a package, `glsl: "package.roc"`, and not as a
-module of its own package. A function of another package reaches the
-translator as a named `Prim` and its body is not read, so `Glsl.Vec3.scale`
-arrives as `scale` under the owner `Glsl.Vec3`, and the translator maps it to
-`*`. A builtin arrives the same way, `sin` under `Num.F32`, so the table of
-GLSL functions is keyed by method.
+module of its own package. `Glsl` declares the functions it reads by name with
+its item `code_primitives` (`Glsl.roc:122`): the vector methods and
+`Sampler.texture`. A function in that cut reaches the translator as a named
+`Prim` and its body is not read, so `Glsl.Vec3.scale` arrives as `scale` under
+the owner `Glsl.Vec3`, and the translator maps it to `*`. Any other function a
+shader calls, in any package, arrives as its body. A builtin arrives as a
+`Prim`, `sin` under `Num.F32`, so the table of GLSL functions is keyed by
+method.
 
 ## The interface is the two parameter records
 

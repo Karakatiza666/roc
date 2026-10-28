@@ -5943,6 +5943,18 @@ pub const ReportBuilder = struct {
                 "This function reads a value that exists only when the program runs, and the site cannot give it to the translator's result as an input slot.",
                 .runtime_error,
             ),
+            .primitive_not_a_function => try Report.init(
+                self.gpa,
+                "Not A Primitive",
+                "Each entry of code_primitives names a function the translator reads by its name, and this entry is not a reference to a top-level function.",
+                .runtime_error,
+            ),
+            .primitive_listed_twice => try Report.init(
+                self.gpa,
+                "Primitive Listed Twice",
+                "This function is already an entry of this code_primitives item.",
+                .runtime_error,
+            ),
         };
         errdefer report.deinit();
 
@@ -6006,6 +6018,18 @@ pub const ReportBuilder = struct {
                 D.bytes("round can enable the next. A fixed bound stops a function whose rules"),
                 D.bytes("keep enabling one another, so a build never runs without end. Split"),
                 D.bytes("the function into smaller helpers."),
+            }, self, &report),
+            .primitive_not_a_function => try D.renderSlice(&.{
+                D.bytes("The item"),
+                D.bytes("code_primitives").withAnnotation(.emphasized),
+                D.bytes("is one name of a top-level function, or a tuple of such names."),
+                D.bytes("A translator receives each of them as a"),
+                D.bytes("Prim").withAnnotation(.emphasized),
+                D.bytes("by its qualified name, and receives the body of every other function it"),
+                D.bytes("reaches. Name a function defined with a lambda here."),
+            }, self, &report),
+            .primitive_listed_twice => try D.renderSlice(&.{
+                D.bytes("A function is in the translator's cut once. Remove this entry."),
             }, self, &report),
             .outside_staged_position => try D.renderSlice(&.{
                 D.bytes("A"),
@@ -6105,7 +6129,7 @@ pub const ReportBuilder = struct {
             .definition_not_reachable => "The compiler could not follow:",
             .exceeds_a_bound => "The bound is:",
             .input_not_bound => "The site cannot bind:",
-            .not_a_named_function, .outside_staged_position, .argument_not_constant => null,
+            .not_a_named_function, .outside_staged_position, .argument_not_constant, .primitive_not_a_function, .primitive_listed_twice => null,
         };
     }
 

@@ -35,7 +35,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 17;
+pub const normal_form_version: u32 = 18;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -73,6 +73,10 @@ pub fn fingerprint() u64 {
     // N11l on `while $i <= n` under a bounded `n`, a checked `plus` chain,
     // and N15c's parameter half with N7b over two root parameters.
     h.update("N13u: literals, tests against a literal, ForRange indices, interval arithmetic, N8k result ranges; decided comparisons, proved checked arithmetic speculatable within its facts, checked plus chains, inclusive ForRange; root parameters in parameter order in N15c and N7b");
+    // M13: the translator's declared cut (I14). A function in it is a `Prim`
+    // by its qualified name (N8h); every other function, in any package, is
+    // walked by its body (N8l), and so is a computed value of any package.
+    h.update("N8h: a function in the cut of the site's translator, code_primitives, is a Prim named by the nominal it is an item of and the item; N8l: every other function and computed value, in any package, is walked by its body");
     return h.final();
 }
 
@@ -160,6 +164,12 @@ const recorded = [_]Recorded{
     // slots, and the number stage merges what the hoist brings into every
     // arm (N5c).
     .{ .version = 17, .fingerprint = 0x666aa601711352db },
+    // M13 of the plan: a translator declares its cut with the item
+    // `code_primitives` of its type (I14). A function in the cut is a `Prim`
+    // named by its qualified name, in any package (N8h), and every other
+    // function and computed value, in any package, is walked by its body
+    // (N8l).
+    .{ .version = 18, .fingerprint = 0xcd9bd93efff0ff8c },
 };
 
 const std = @import("std");

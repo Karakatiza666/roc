@@ -51,13 +51,14 @@ Section 4 defines it; section 11 covers where its output executes.
 | Part | State |
 |---|---|
 | What it describes | Pure Roc as section 10 states it: literals, operators, calls (helpers, generic and recursive functions, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods. A construct it does not describe stops with a report that names the construct |
-| What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 17 (`src/reify/mod.zig:38`) |
+| What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 18 (`src/reify/mod.zig:38`) |
 | How a translator names a node | `Code.Inlined.inline_digest` gives a node of the `inline` view a content digest that survives the refactors above and helper extraction (`roc-reify-normalization-plan.md`, M8) |
 | Rows the compiler chooses | A `Code.Outlined(f)` site gets the `outline` view: each computation of at least four operations that repeats is one row (`roc-reify-normalization-plan.md`, M9). Places that differ in a value pass it as an argument, so `step(input.a)` and `step(input.b)` call one row (V3b). The rows do not depend on how the author split the code into helpers |
 | Laws of the builtins | A `Code.Lawful(f)` site gets the `graph` view under layer L: a loop that appends meets `List.map` or `List.keep_if`, a `List.fold` meets its loop, two `map`s meet one, and `len() > 0` meets `!is_empty()` (`roc-reify-normalization-plan.md`, M10). A site of any other type keeps each form as written |
 | Literal intervals | Every integer value has an interval from literals, from the tests that dominate it and from the index of a range loop. A test it decides is gone, `while $i <= n` with `n` bounded below the type's highest value meets `for i in 0..=n`, a checked `+` proved to fit can leave a loop, and a bounded `(a + b) + c` meets `a + (b + c)`. `1 + a` meets `a + 1`, and two parameters of the root are in parameter order (`roc-reify-normalization-plan.md`, M11) |
 | Facts across loop turns | A loop controlled by a `$done` flag meets the same loop with `break`, and a second counter stepped with the index meets `i + j0` (`roc-reify-normalization-plan.md`, M12) |
 | How a translator refuses | It returns an `Err`, or calls `Code.refuse_at`, which the compiler reports at the source of the node (section 13) |
+| What a translator reads by name | Its cut: the functions the item `code_primitives` of its type lists, each a `Prim` named by its qualified name. Every other function, in any package, arrives as its body, and so does a computed value of any package (section 7.10, `roc-reify-normalization-plan.md`, M13) |
 
 Three translators ship as examples. Each one has an `expected_output` file and a
 `refactored.roc` that prints the same text after renames and reordered bindings.
@@ -81,7 +82,6 @@ unticked boxes cost"):
 | A function value nothing fixes: read from a list, or from a parameter of the described function | there is no definition to describe. A function chosen by an `if`, or read from a record literal, between known functions describes |
 | A name that exists only at run time: a function parameter, a branch or loop binder, a `var`, read by a lambda from outside itself | timing: the description is built before the value exists |
 | A site that names a top-level value computing a function | the site's root needs a lambda whose parameters it can list. A use of such a value inside a described body describes (section 13, "Naming a constant") |
-| A computed top-level value of another package | its body belongs to that package, and the description does not read it |
 | A tag union whose row nothing closed | it stands for many unions, and a description is monomorphic |
 | A custom `from_interpolation` that returns early with `?` or is generic in its item type | the walk runs the first stage where the literal stands, and a `?` can leave the row it is walked in |
 | `dbg`, and any effect | out of scope by design (sections 7.8 and 13) |
@@ -90,10 +90,10 @@ The tests, in layers. The counts were taken at the time of writing.
 
 | Layer | Where | What it catches |
 |---|---|---|
-| Normal-form unit tests | `src/reify/` (160 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
-| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (181 tests) | a walk that describes a body wrongly |
-| Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (116 cases) | the same, for calls into other modules and builtins |
-| CLI fixtures | `test/cli/Staged*.roc` (48 files), run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
+| Normal-form unit tests | `src/reify/` (221 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
+| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (234 tests) | a walk that describes a body wrongly |
+| Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (134 cases) | the same, for calls into other modules and builtins |
+| CLI fixtures | `test/cli/Staged*.roc` (61 files) and `test/cli/StagedCut/`, run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
 | Fuzzers | `src/reify/fuzz_gen.zig`, `src/compile/reify_fuzz.zig`, `test/fuzzing/fuzz-reify.zig` | two spellings of one term that differ, or a normal form that computes what Roc does not |
 | Examples | the three above | translator output that changed under a refactor |
 | Rule derivation, offline | `zig build reify-rules`, `src/reify/derive/` (48 `test` blocks) | a normalization rule that is missing |
@@ -146,8 +146,9 @@ role would imply a new kind of module, and a translator is an ordinary package.
      the lambda's body, so it describes as a `Let`.
    - a named function, which describes by its body: inlined where it is
      called, or a `Call` of a row of its own where it is called from two
-     places or recurses (section 4). A function of another package is the
-     exception. It arrives as a named primitive and its body is not read.
+     places or recurses (section 4), in any package. A function in the
+     translator's cut is the exception. It arrives as a named primitive and
+     its body is not read (section 7.10).
 
    What it cannot read is a value that exists only once the program runs: a
    function parameter, a branch or loop binder, a `var`. That is timing rather
@@ -158,10 +159,9 @@ role would imply a new kind of module, and a translator is an ordinary package.
    value: the program receives the values next to the translator's result
    (section 10.1). A top-level value that computes a function,
    `doubler = make(2.0)`, describes as the definition it was written as, so
-   the lambda of `make` is a row and its capture is the literal `2.0`. A
-   computed value of another package is refused, because its body the
-   description does not read. Each refusal names the value. Section 13
-   carries what is left of this.
+   the lambda of `make` is a row and its capture is the literal `2.0`, in
+   any package. Each refusal names the value. Section 13 carries what is left
+   of this.
 
    A template goes further: a function returning `Code` whose arguments are
    fixed at the call and written into the body it returns. An argument can be
@@ -422,8 +422,9 @@ for a helper that two places share. A translator with no function form, such as
 one that writes one expression, declares `Code.Inlined(f)` and meets `Call` for
 recursion, and for the one exception in the table. The GLSL example is such a
 translator. The SQL example reads the `graph` view and expands each `Call`. A
-function of another package, and a builtin, is a `Prim` whose body is not read, so a library that belongs to the translator, such as
-`Glsl.Vec3.scale`, is mapped by name. `src/reify/views.zig:3-6` states the
+builtin, and a function in the translator's cut, is a `Prim` whose body is not
+read, so a library that belongs to the translator, such as `Glsl.Vec3.scale`,
+which `Glsl.roc` lists in its `code_primitives`, is mapped by name. `src/reify/views.zig:3-6` states the
 two rules. A third view that picks helper boundaries from the computation alone
 is designed (`roc-reify-normal-form.md` section 5.3) and not built.
 
@@ -628,7 +629,7 @@ macros on purpose.
 | Can change what the program means | yes | no |
 | The original code still runs | not necessarily | always |
 | Needs hygiene | yes | no |
-| Reader must know it happened to read the code | yes | no |
+| Reader must know it happened to read the code | yes | no: a translator reads a normal form, so a refactor in R changes nothing it reads (section 7.10) |
 
 Reification is observation, not transformation. A reified function still
 compiles, still runs, still tests. That is why it is not what Roc excluded when
@@ -892,6 +893,67 @@ This is a sketch, not a plan. [`roc-reify-fold-alternative.md`](roc-reify-fold-a
 has the method vocabulary, the GLSL and SQL versions, the costs in full and the
 open questions.
 
+### 7.10 Refactors a translator cannot see
+
+The language's creator raised the objection that decides whether reification
+is safe to use: a translator that reads a body observes how it was written, so
+a refactor that keeps the meaning can change what the translator emits, or
+break it (`roc-reify-refactor-safety.md`). The answer is that a translator
+never reads the body. It reads a quotient of it.
+
+| Part | What it is | Where |
+|---|---|---|
+| R | the list of refactors that keep the `Code` value, each absorbed by a rule of the normal form | `roc-reify-normal-form.md` section 7 |
+| The normal form | the only thing a translator reads: no names, no regions, one canonical order | `roc-reify-normal-form.md` sections 2 and 3 |
+| The cut | the functions a translator reads by name, which it declares | `roc-reify-normal-form.md` section 3.8 |
+| The test matrix | one source pair per row of R that meets, and one per row below that stays apart | `roc-reify-normalization-plan.md` section 5.12 |
+
+R holds the refactors authors make: rename, reorder, bind once or write
+twice, destructure, `and` and `or` against the `if` they mean, `?` against its
+`match`, extract or inline a helper, move a helper to another module or to
+another package, make it generic, and change loop form. Each one gives the
+same `Code`, and the fuzzers compare two spellings of one term on every run
+(`src/reify/fuzz_gen.zig`).
+
+The cut. A translator declares the functions it reads by name with the
+well-known item `code_primitives` of its type, as `Glsl.roc` does
+(`examples/reifying/glsl/Glsl.roc:122`):
+
+```roc
+code_primitives = (Vec2.plus, Vec2.scale, Vec3.scale, Sampler.texture)
+```
+
+A function in the cut arrives as a `Prim` named by its qualified name,
+`Glsl.Vec3` and `scale`, and its body is never read, so a refactor inside it
+changes nothing a translator sees. The item is one name of a top-level
+function or a tuple of names, and anything else, or a name listed twice, is a
+compile error at the entry. The cut belongs to the translator and not to the
+library, because the target decides it: a GLSL translator keeps a math
+library's `lerp` as GLSL's `mix`, and a SQL translator reads its body.
+
+Every other function is read by its body, in any package, and so is a
+computed value of any package. A dependency's body is therefore part of what a
+translator reads. An upgrade that changes the normal form of a function a site
+reaches can change the translation, or stop it at the site
+(`test/cli/StagedCut/stops.roc`). The upgrade is explicit, because a package
+is pinned by its URL and content hash, and the report names the site and the
+calls that reached the refused node. A refactor in R inside the dependency
+changes nothing (`roc-reify-normalization-plan.md` section 5.12).
+
+What stays unsafe. The quotient cannot be complete, because contextual
+equivalence is undecidable. These refactors keep the meaning and still change
+the `Code`:
+
+| Refactor outside R | Why it stays out | What happens |
+|---|---|---|
+| `x * 2` to `x + x`, reassociating `(a + b) + c` | not an equivalence in Roc: integer `+` crashes on overflow, and float addition is not associative | the output changes, and it should, because the target's arithmetic differs too |
+| `x.len() > 0` to `!x.is_empty()` | two different builtins; proving them equal is a theorem about their bodies, which a `Code.Lawful(f)` site opts into | a translator that lacks one refuses the build, at the site |
+| a recursive function rewritten as a fold | a different recursion structure | the same |
+| a function read at a site starts to use a primitive the translator lacks, in the site's package or in a dependency | the operations really changed | the same |
+
+Every row fails loudly, at build time, on a refactor whose operations really
+changed.
+
 ---
 
 ## 8. Prior art
@@ -1137,8 +1199,8 @@ takes its row default. A default that does not fit its use, as in
 The walk seals each variable the way Monotype does (`defaultedVariable` in
 `src/check/code_reifier.zig`).
 
-Everything else in pure Roc describes: calls into other modules of the package
-(a function of another package is a named primitive), recursive
+Everything else in pure Roc describes: calls into other modules and other
+packages (a function in the translator's cut is a named primitive), recursive
 functions, generic functions at whatever types the program settles them to,
 `where` constrained functions at the type the site fixes, a function passed to
 a function that the call fixes, lambdas written inside the body, a lambda
@@ -1161,7 +1223,7 @@ further down the pipeline.
 
 | Kind | What is left |
 |---|---|
-| Needs a decision | a computed value of another package, whose body the description does not read; a custom `from_interpolation` that returns early with `?`, or is generic in the item type of its assembler. Derived `is_eq` on a function stays refused, because Roc has no equality on functions |
+| Needs a decision | a custom `from_interpolation` that returns early with `?`, or is generic in the item type of its assembler. Derived `is_eq` on a function stays refused, because Roc has no equality on functions |
 
 The mechanical kind is empty. A tag union whose row the checker left open
 seals to the variants the definition names. An unset or omitted optional
@@ -1455,9 +1517,9 @@ literal or an aggregate of literals folds to that data, and a computed value,
 the order of compile-time evaluation does not change, and nothing is needed for
 an opaque value. A template argument named by a value written as data folds the
 same way; a value the block around a lambda binds is repeated at the head of
-its body. What is still refused is a computed value of another package,
-because its body belongs to that package, and a site that itself names a
-top-level value computing a function, because the site's root needs a lambda.
+its body. This holds in any package. What is still refused is a site that
+itself names a top-level value computing a function, because the site's root
+needs a lambda.
 
 A top-level value that computes a function, `doubler = make(2.0)`, was listed
 here as needing a decision. The decision is that it folds by definition, the
@@ -1506,15 +1568,13 @@ translator reads off a row is the row's own type, so the substitution stays
 inside the compiler and section 7.6's question about what a `Code` value
 contains does not move.
 
-A function of another package, and a builtin, is a different case. It is a
-`Prim` named by owner and method, and its body is not read. That fits the
-library a translator owns, `Glsl.Vec3.scale` mapped to `*`, and does not fit a
-dependency whose body the translator should read. The design lets a translator
-declare which functions are its primitives and reads every other body
-(`roc-reify-normal-form.md` section 3.8, the item `code_primitives`). The
-prototype has not built that: `src/check/code_reifier.zig:17` is the rule today,
-and milestone M13 of `roc-reify-normalization-plan.md` is the work. Until then
-every function of another package is a primitive.
+Another package is settled too, by the translator's cut (section 7.10). A
+function the item `code_primitives` of the translator's type lists is a `Prim`
+named by its qualified name, and its body is not read. That fits the library a
+translator owns, `Glsl.Vec3.scale` mapped to `*`. Every other function is read
+by its body in any package, as a function of another module of the package is,
+and so is a computed value of any package. That fits a dependency whose body
+the translator should read (`src/check/code_reifier.zig:4527`, `inCut`).
 
 **A refusal as a compiler diagnostic.** Settled in kind, with gaps in use.
 `Code.refuse_at(code, { row, node }, message)` names a node by its row's `id` and

@@ -217,6 +217,18 @@ What it costs:
 | a marker for bodies exposed across packages | the language: one declaration form, new syntax or a header entry |
 | S1 on a cross-package function without the marker is refused | users, who get a message naming the missing marker |
 
+Status, after milestone M13 of `roc-reify-normalization-plan.md`: the
+proposal makes these changes, in its sections 1, 3, 4, 7.2, 7.10 and 13.
+The reach rule of 4.3 and its marker were replaced by the policy of
+`roc-reify-normalization-plan.md` 1.9, so the last two rows of the cost table
+are not paid:
+
+| Item of 4.3 | What the prototype does instead |
+|---|---|
+| a body is read only within a package, or where its author exposed it | every body is read, in any package, except the functions in the translator's cut |
+| a marker for bodies exposed across packages | none. The translator declares its cut with the item `code_primitives` of its type |
+| a cross-package function without the marker is refused | it is walked; a dependency upgrade that changes its operations stops the build at the site |
+
 ---
 
 ## 7. Verdict

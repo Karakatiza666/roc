@@ -128,9 +128,9 @@ of `roc-reify-normal-form.md`). The rules are in `src/reify/views.zig:1`. The no
       only leads to it, so a rejection written as an `if`, a `match`, a chain
       of tests or a test in a helper describes as the conversion that never
       rejects. A rejection whose path stays behind a call that is not
-      inlined stays a crash. A conversion of
-      another package is one `Prim` named by its type's module and
-      `from_interpolation`, over the segments and the values. Pinned by the
+      inlined stays a crash. A conversion in the translator's cut is one
+      `Prim` named by its type and `from_interpolation`, over the segments and
+      the values. Pinned by the
       staging cases at `src/eval/test/eval_staging_tests.zig:2452`, `:2458`
       and `:2464`, and by `src/compile/test/code_reifier_test.zig:4799`,
       `:4867`, `:4914`, `:4951` and `:5003`, and the spellings of a
@@ -173,10 +173,9 @@ stays shared, so a binding written once stays written once.
       path that folds a literal (`src/check/code_reifier.zig` (`foldedConstant`)).
       `x > limit` describes as `x > 7.0 * 2.0`, and a constant the definition
       reads folds in turn, so `List.len([1, 2, 3])` stands where `limit` did.
-      One case stays refused. A computed value of another package is a body of
-      that package, which the walk does not read (N8h): "a computed constant
-      of another package" (`src/check/code_reifier.zig` (`foldedConstant`)). A top-level
-      value that computes a function is the item after the alias item below.
+      A computed value of another package folds the same way (N8l, M13). A
+      top-level value that computes a function is the item after the alias
+      item below.
 - [x] A value the block around a lambda written at a `Code` position binds,
       read by that lambda. The statement that bound it is replayed at the head
       of the lambda's body, so the lambda holds the node that computes it
@@ -278,10 +277,14 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       description when that module changes: an artifact key hashes its
       imports' keys, and the call graph is a subgraph of the import graph,
       because a call resolves only where the checker resolved a reference.
-- [x] A call to a function of another package. It describes as a `Prim` whose
-      `owner` is the module name and whose `method` is the function name. Its
-      body is not read (N8h), and a translator maps it by name, as the GLSL
-      example maps `Glsl.Vec3.scale` (`src/check/code_reifier.zig` (`resolvedTarget`)).
+- [x] A call to a function of another package. It describes by its body, as a
+      function of the site's package does (N8l). A function in the
+      translator's cut, which the item `code_primitives` of the translator's
+      type lists, in any package, describes as a `Prim` named by its qualified
+      name: the nominal it is an associated item of and the item. Its body is
+      not read (N8h), and a translator maps it by name, as the GLSL example
+      maps `Glsl.Vec3.scale` (`src/check/code_reifier.zig` (`resolvedTarget`,
+      `inCut`)).
 - [x] A call to a function the compiler provides. The builtin is a `Prim` named
       by its owner and method, and no row is written for it, because its body
       is the compiler's and a translator resolves the name against what its
@@ -352,9 +355,9 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       (`src/check/code_reifier.zig` (`passedCallee`)): `apply_to(double, x)` and
       `apply_to(triple, x)` are two rows. A definition that hands back a
       function and the use that runs it are one flattened row and one `Call`,
-      which is how a hand-written `encoder_for` is run. A function of the
-      compiler or of another package used as a value is refused: "a function of
-      the compiler or of another package used as a value"
+      which is how a hand-written `encoder_for` is run. A builtin or a
+      function in the translator's cut used as a value is refused: "a builtin
+      or a function in the translator's cut used as a value"
       (`src/check/code_reifier.zig` (`functionValue`)). A `var` that holds a function is
       refused: "a var that holds a function"
       (`src/check/code_reifier.zig` (`carriedValue`)).
@@ -388,21 +391,19 @@ The normal form also reorders a literal to the last place of an integer `plus`,
       as a value is a `Closure` of the row over the capture. A function the
       definition captures is a row of its own by the same rule, and a value
       written as another such value, `renamed = doubler`, is the one it names.
-      A value of another module of the same package is read in that module's
+      A value of another module, in any package, is read in that module's
       reader (`ForeignLookup.resolve_exported_computed`,
       `src/check/checked_artifact.zig` (`exportedComputed`)). A capture the walk
       cannot describe stops the walk with its own reason, for example "dbg".
-      Three cases stay refused: a value of another package, whose definition is
-      that package's body (N8h), where a call is a `Prim` named by the module and
-      the value and a use as a value is "a function of the compiler or of another
-      package used as a value"; a value that reads itself, "a top-level constant
+      Two cases stay refused: a value that reads itself, "a top-level constant
       that computes a function and reads itself"; and a site that names such a
       value as the function to describe, "a top-level constant that computes a
       function, named as the function to describe", because the site's root
       needs a lambda whose parameters it can list (`reachedHere`). Pinned by
       `src/eval/test/eval_staging_tests.zig:2066`, `:2072`, `:2078`, `:2084`,
       `:2090` and `:2107`, and by `src/compile/test/code_reifier_test.zig:1388`,
-      `:1420`, `:1448`, `:1483`, `:1503` and `:1527` (a value of another package).
+      `:1420`, `:1448`, `:1483`, `:1503` and "N8l M13: a top-level value of
+      another package that computes a function is walked by its definition".
 - [x] A function chosen by an `if` between known functions, and then called:
       `(if c double else triple)(x)`. The call is first an `Apply` of the value,
       and simplifying turns each `Apply` whose function is a known closure into
@@ -1053,7 +1054,6 @@ auto-imported, so a user module may still be named `Ty` or `Node`.
 | No function taken from a list | `[double].first()` and then a call: simplifying does not read a closure back out of a list, so the call stays an `Apply` and the site is refused; a function chosen by an `if` between known functions does describe |
 | No name whose value exists only at run time | a lambda cannot read a parameter, binder or `var` of the function it is written in; the value becomes a parameter of the lambda, or a template fixes it |
 | No computed function at a site | `main = Stage.describe(doubler)` where `doubler = make(2.0)` is refused, because the site's root needs a lambda; the author writes `\|x\| doubler(x)` at the site, or writes `doubler` as a lambda. A use of `doubler` inside a described body, and an exact alias, `same = add_one`, do describe |
-| No computed value of another package | `limit = xs.len()` in a package the app depends on is refused, because its body is that package's; a value written as data still folds |
 | No custom string interpolation through a `?` | a `from_interpolation` of a type of your own whose body can leave early, with a `?`, or that is generic in the item type of its assembler, is refused at the literal; every other one describes (the box above) |
 
 A shader or a codec is written as one function calling others, over as many

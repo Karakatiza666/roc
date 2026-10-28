@@ -27420,7 +27420,7 @@ fn beginExprCheckFrame(
         // A parameter already holding a description is passed along; only a
         // name the compiler can follow to a body is reified.
         if (!self.namesAReifiableDefinition(expr)) break :staged null;
-        break :staged .{ .fn_var = code.fn_var, .view = code.view, .expected_type = expected_type };
+        break :staged .{ .fn_var = code.fn_var, .view = code.view, .expected_type = expected_type, .translator = self.translatorCallee(expected_type.context) };
     };
     frame.staged_code_fn_var = if (staged_code) |staged| staged.fn_var else null;
     if (staged_code) |staged| {
@@ -27431,15 +27431,16 @@ fn beginExprCheckFrame(
             self.lambdaSiteKind(frame.is_call_arg)
         else
             .named_function;
-        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(expr_idx), staged.fn_var, kind, staged.view);
+        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(expr_idx), staged.fn_var, kind, staged.view, staged.translator);
     }
 
     // A call to a template is the other way a description is built. The call
     // is the whole value: neither it nor the name it calls is compiled, so
     // both nodes leave the checked body as descriptions.
     if (self.stagedTemplateCall(expr)) |call| {
-        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(expr_idx), call.code.fn_var, .template_call, call.code.view);
-        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(call.callee), call.code.fn_var, .template_callee, call.code.view);
+        const translator = if (expected.aggregateType()) |expected_type| self.translatorCallee(expected_type.context) else null;
+        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(expr_idx), call.code.fn_var, .template_call, call.code.view, translator);
+        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(call.callee), call.code.fn_var, .template_callee, call.code.view, null);
     }
 
     // Materialize an annotation once at the expression frame that owns it.
@@ -27518,10 +27519,25 @@ fn recordCodeSite(
     fn_var: Var,
     kind: CodeReificationSite.Kind,
     view: CodeReificationSite.View,
+    translator: ?CIR.Node.Idx,
 ) std.mem.Allocator.Error!void {
     std.debug.assert(self.current_code_owner != null);
-    try self.cir.recordCodeReificationSite(node_idx, fn_var, kind, view);
+    try self.cir.recordCodeReificationSite(node_idx, fn_var, kind, view, translator);
     try self.code_site_owners.put(self.gpa, @intCast(@backingInt(node_idx)), self.current_code_owner.?);
+}
+
+/// The callee of the call a site is an argument of, read from the context
+/// the call checked the argument in. The function it names is the site's
+/// translator, whose nominal type declares the site's cut (I14). A site
+/// that is no argument of a call has no translator, and so an empty cut.
+fn translatorCallee(self: *const Self, context: problem.Context) ?CIR.Node.Idx {
+    const arg = switch (context) {
+        .fn_call_arg => |arg| arg,
+        else => return null,
+    };
+    const call = self.cir.store.getExpr(arg.call_expr);
+    if (call != .e_call) return null;
+    return ModuleEnv.nodeIdxFrom(call.e_call.func);
 }
 
 /// A `Code` type a description is reified at: the function type `f` inside
@@ -27629,6 +27645,7 @@ fn claimOrRejectCodeCall(
     callee_idx: CIR.Expr.Idx,
     region: Region,
     callee_returns_code: bool,
+    translator: ?CIR.Node.Idx,
 ) std.mem.Allocator.Error!void {
     // A call that merely yields a `Code` because its result was related to
     // one (a generic passing a description through) is an ordinary call.
@@ -27637,8 +27654,8 @@ fn claimOrRejectCodeCall(
     if (self.cir.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr_idx)) != null) return;
 
     if (self.cir.store.getExpr(callee_idx) == .e_lookup_external) {
-        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(expr_idx), code.fn_var, .template_call, code.view);
-        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(callee_idx), code.fn_var, .template_callee, code.view);
+        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(expr_idx), code.fn_var, .template_call, code.view, translator);
+        try self.recordCodeSite(ModuleEnv.nodeIdxFrom(callee_idx), code.fn_var, .template_callee, code.view, null);
         self.markCurrentHoistCodeSite();
         return;
     }
@@ -31337,7 +31354,8 @@ fn resumeCallCheck(self: *Self, task: *ExprTask, state: *CallCheck, env: *Env, c
     // called by the compiler. One the site recording did not claim is either
     // an imported template, which is recorded here where the callee's type is
     // known, or a call the walk cannot reach.
-    try self.claimOrRejectCodeCall(expr_idx, call.func, expr_region, state.callee_returns_code);
+    const translator = if (frame.nested_expected.aggregateType()) |expected_type| self.translatorCallee(expected_type.context) else null;
+    try self.claimOrRejectCodeCall(expr_idx, call.func, expr_region, state.callee_returns_code, translator);
 
     // Argument unification above is the point at which an effect-polymorphic
     // callback can become pure or effectful. Resolve the directed formula

@@ -924,9 +924,17 @@ pub const CodeReificationSite = extern struct {
     /// input slots (the call's result is a `Code.Bound`), or `no_bound_call`.
     /// The checker sets it when the call finishes checking.
     bound_call: u32 = no_bound_call,
+    /// The callee of the call this site is an argument of, or
+    /// `no_translator`. The function that callee names is the translator,
+    /// and the nominal type that owns it declares the site's cut
+    /// (`code_primitives`, roc-reify-normal-form.md 3.8).
+    translator: u32 = no_translator,
 
     /// `bound_call` of a site no call binds inputs for.
     pub const no_bound_call: u32 = std.math.maxInt(u32);
+
+    /// `translator` of a site that is no argument of a call.
+    pub const no_translator: u32 = std.math.maxInt(u32);
 
     /// The view a site's declared type selects (plan 1.5): `Code(f)` holds
     /// the `graph` view, `Code.Inlined(f)` the `inline` view,
@@ -1491,8 +1499,10 @@ pub fn recordCodeReificationSite(
     fn_var: types.Var,
     kind: CodeReificationSite.Kind,
     view: CodeReificationSite.View,
+    translator: ?Node.Idx,
 ) Allocator.Error!void {
     const raw = @backingInt(node_idx);
+    const translator_raw = if (translator) |callee| @backingInt(callee) else CodeReificationSite.no_translator;
     const items = store.code_reification_sites.items.items;
     const at = codeReificationSiteLowerBound(items, raw);
     if (at < items.len and items[at].node_idx == raw) {
@@ -1500,6 +1510,7 @@ pub fn recordCodeReificationSite(
         items[at].kind = kind;
         items[at].view = view;
         items[at].bound_call = CodeReificationSite.no_bound_call;
+        items[at].translator = translator_raw;
         return;
     }
     const site: CodeReificationSite = .{
@@ -1507,6 +1518,7 @@ pub fn recordCodeReificationSite(
         .fn_var = @backingInt(fn_var),
         .kind = kind,
         .view = view,
+        .translator = translator_raw,
     };
     const list = &store.code_reification_sites.items;
     try list.insert(store.gpa, at, site);
@@ -6038,10 +6050,10 @@ test "code reification sites are found by node and kept in node order" {
     }.at;
 
     try testing.expect(store.codeReificationSiteForNode(node(7)) == null);
-    try store.recordCodeReificationSite(node(9), var_(1), .named_function, .graph);
-    try store.recordCodeReificationSite(node(3), var_(2), .inline_lambda, .graph);
-    try store.recordCodeReificationSite(node(6), var_(3), .template, .inline_);
-    try store.recordCodeReificationSite(node(3), var_(4), .template_call, .inline_);
+    try store.recordCodeReificationSite(node(9), var_(1), .named_function, .graph, node(8));
+    try store.recordCodeReificationSite(node(3), var_(2), .inline_lambda, .graph, null);
+    try store.recordCodeReificationSite(node(6), var_(3), .template, .inline_, null);
+    try store.recordCodeReificationSite(node(3), var_(4), .template_call, .inline_, null);
 
     const sites = store.codeReificationSites();
     try testing.expectEqual(@as(usize, 3), sites.len);
@@ -6052,6 +6064,8 @@ test "code reification sites are found by node and kept in node order" {
     try testing.expectEqual(CodeReificationSite.Kind.template_call, updated.kind);
     try testing.expectEqual(CodeReificationSite.View.inline_, updated.view);
     try testing.expectEqual(@as(u32, 1), store.codeReificationSiteForNode(node(9)).?.fn_var);
+    try testing.expectEqual(@as(u32, 8), store.codeReificationSiteForNode(node(9)).?.translator);
+    try testing.expectEqual(CodeReificationSite.no_translator, updated.translator);
     try testing.expect(store.codeReificationSiteForNode(node(4)) == null);
     try testing.expect(store.codeReificationSiteForNode(node(10)) == null);
 }

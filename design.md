@@ -23662,6 +23662,22 @@ Invariants:
   an ordinary call. Each site records the definition or top-level `expect`
   that owns it, and `poisonUndescribableStagedCode` retires that owner when
   the site's function type holds an error.
+- A site's cut is explicit data, never a guess about which functions a
+  translator knows (I14 of `roc-reify-normalization-plan.md`). The checker
+  records the callee of the direct call a site is an argument of
+  (`CodeReificationSite.translator`, from the argument's `fn_call_arg`
+  context in `translatorCallee`). Publication checks each `code_primitives`
+  item of a nominal the module declares, one lookup of a function defined as
+  a lambda or a tuple of them, each once, and records its checked lookups in
+  `CodeCutTable`; any other entry is a `staged_code` problem at the entry
+  (`moduleCuts` in `src/check/code_reifier.zig`). The walk resolves the
+  translator to the nominal that has it as an associated item and reads that
+  nominal's cut from the table of the module that declares it
+  (`Walk.useCut`). A callee whose module and body are in the cut is a `Prim`
+  named by the nominal and the item (`inCut`, `qualifiedName`); every other
+  function and computed value, in any package, is walked. The site's rows are
+  keyed by what its walk built, so two sites with different cuts share no
+  normal form they do not both build.
 - A row that holds a `Return` in a loop or in a switch arm is not inlined, in
   the `graph` view and in the `inline` view, because inlining it would make
   the caller return the value of the callee. A `Return` in a lambda body ends

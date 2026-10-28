@@ -13,7 +13,8 @@
 //! | a parameter, a binding, a `var` version | a reference to a row parameter or a node (N2 to N4) |
 //! | an operator, a method or builtin call | `Prim`, named by owner and method (N1a) |
 //! | a call of a definition | `Call` of the definition's row, walked once per key (N8a) |
-//! | a function of another package | `Prim` by its qualified name; its body is not walked (N8h) |
+//! | a function in the site's cut (`code_primitives`) | `Prim` by its qualified name; its body is not walked (N8h) |
+//! | a function outside the cut, in any package | its body, walked as one of the site's own (N8l) |
 //! | a lambda used as a value | `Closure` of its row, with its captures (N8b) |
 //! | `if`, `match` | switches, first match wins; a construct that can exit is an exiting switch whose continuation is one join (N1c, N11f) |
 //! | `for`, `while` | `ForRange`, `ForList` or `Loop`, with each carried `var` a slot (N11) |
@@ -252,6 +253,7 @@ pub const Reifier = struct {
     callable_eval_templates: checked.CallableEvalTemplateTableView,
     const_templates: *const checked.ConstTemplateTable,
     const_bodies: *const checked.CheckedConstBodyTable,
+    code_cuts: *const checked.CodeCutTable,
     env: *const ModuleEnv,
     ranges: RangeNames,
     bool_tags: BoolTags,
@@ -469,7 +471,7 @@ pub const Reifier = struct {
     };
 
     /// What a call's callee is: a definition the walk builds a row for, a
-    /// builtin, or a function of another package, which is a named
+    /// builtin, or a function in the site's cut, which is a named
     /// primitive (N8h).
     const Callee = union(enum) {
         definition: CalleeTarget,
@@ -566,6 +568,8 @@ pub const Reifier = struct {
         /// stands, so the walk needs the template that holds its body.
         const_templates: *const checked.ConstTemplateTable,
         const_bodies: *const checked.CheckedConstBodyTable,
+        /// The translators' cuts the module declares (I14).
+        code_cuts: *const checked.CodeCutTable,
     };
 
     pub fn init(
@@ -587,6 +591,7 @@ pub const Reifier = struct {
             .callable_eval_templates = sources.callable_eval_templates,
             .const_templates = sources.const_templates,
             .const_bodies = sources.const_bodies,
+            .code_cuts = sources.code_cuts,
             .env = env,
             .ranges = RangeNames.resolve(sources.names),
             .bool_tags = BoolTags.resolve(sources.names),
@@ -608,6 +613,7 @@ pub const Reifier = struct {
             .callable_eval_templates = artifact.callable_eval_templates.view(),
             .const_templates = &artifact.const_templates,
             .const_bodies = &artifact.checked_const_bodies,
+            .code_cuts = &artifact.code_cuts,
         };
     }
 
@@ -1957,7 +1963,7 @@ pub const Reifier = struct {
             // A constant a name folds to is built at `at`.
             .lookup_local => |lookup| self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, expr_id, at, region),
             .lookup_external, .lookup_required => |reference| blk: {
-                if (try self.foldedConstant(reference, at, region)) |folded| break :blk folded;
+                if (try self.foldedConstant(reference, at)) |folded| break :blk folded;
                 break :blk self.exprRef(expr_id);
             },
             .match_ => |match_expr| (try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .{ .at = at }, region)).?,
@@ -2054,7 +2060,7 @@ pub const Reifier = struct {
             // A name of another module holds no binding in the scope, so it is
             // the value it was fixed to, or the definition it names.
             .lookup_external, .lookup_required => |reference| blk: {
-                if (try self.foldedConstant(reference, null, region)) |folded| break :blk folded;
+                if (try self.foldedConstant(reference, null)) |folded| break :blk folded;
                 if (reference) |resolved| {
                     if (self.functionOf(expr_data.ty) != null) break :blk try self.functionValue(resolved, null, expr_data.ty, region);
                 }
@@ -2173,7 +2179,7 @@ pub const Reifier = struct {
     /// captures and the list. The `Err` of the first stage is the crash of a
     /// rejected literal, as the `Err` of a `from_numeral` is
     /// (`convertedWith`), and the rule N13w drops the branches that reach it.
-    /// A conversion of another package is one `Prim` over the segments and
+    /// A conversion in the site's cut is one `Prim` over the segments and
     /// the values.
     fn interpolationExpr(self: *Reifier, interpolation: checked.CheckedInterpolation, checked_ty: CheckedTypeId, region: base.Region) Error!Ref {
         const id = interpolation.plan orelse return self.rejectError(.unresolved_reference, region, "this literal");
@@ -2705,7 +2711,7 @@ pub const Reifier = struct {
         at: ?TyId,
         region: base.Region,
     ) Error!Ref {
-        if (try self.foldedConstant(resolved, at, region)) |folded| return folded;
+        if (try self.foldedConstant(resolved, at)) |folded| return folded;
         if (resolved) |id| {
             if (self.functionOf(use_ty) != null) return self.functionValue(id, binder, use_ty, region);
         }
@@ -2763,14 +2769,13 @@ pub const Reifier = struct {
     ) Error!Ref {
         // A top-level value that computes a function is the definition it was
         // written as, built where the name stands, as a constant is.
-        if (try self.computedFunction(resolved, region)) |computed| switch (computed) {
-            .written => |written| return try self.foldedBody(written.reader, written.body, null) orelse
-                self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function and reads itself"),
-            .foreign => return self.rejectError(.unsupported_expression, region, "a function of the compiler or of another package used as a value"),
-        };
+        if (try self.computedFunction(resolved, region)) |computed| {
+            return try self.foldedBody(computed.written.reader, computed.written.body, null) orelse
+                self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function and reads itself");
+        }
         return switch (try self.resolvedTarget(resolved, written_binder, region)) {
             .definition => |target| self.closureOf(target, try self.tyOf(use_ty, region)),
-            .provided, .foreign => self.rejectError(.unsupported_expression, region, "a function of the compiler or of another package used as a value"),
+            .provided, .foreign => self.rejectError(.unsupported_expression, region, "a builtin or a function in the translator's cut used as a value"),
             .value => self.rejectError(.unsupported_expression, region, "a function value that names no definition"),
         };
     }
@@ -2831,17 +2836,11 @@ pub const Reifier = struct {
         self: *Reifier,
         resolved: ?checked.ResolvedValueRefId,
         at: ?TyId,
-        region: base.Region,
     ) Error!?Ref {
         const definition = try self.constantDefinition(resolved) orelse return null;
-        const reader = definition.reader;
-        // A computation of another package is a body of that package, which
-        // the walk does not read, as it does not read that package's
-        // functions (N8h).
-        if (!reader.folding.contains(definition.body) and !samePackage(self.env, reader.env) and !try self.nameHoldsConstant(resolved)) {
-            return self.rejectError(.unsupported_expression, region, "a computed constant of another package");
-        }
-        return self.foldedBody(reader, definition.body, at);
+        // A computed constant folds to its computation in any package, as a
+        // function outside the cut is walked in any package (N8l).
+        return self.foldedBody(definition.reader, definition.body, at);
     }
 
     /// The definition `body` of `reader`'s module, built where a name stands.
@@ -2863,12 +2862,9 @@ pub const Reifier = struct {
     /// reads a computed constant. The definition names the lambda's row and
     /// every capture, so no value the compiler evaluates is needed.
     const ComputedFunction = union(enum) {
-        /// The definition, and the reader of the module that wrote it.
+        /// The definition, and the reader of the module that wrote it, in
+        /// any package (N8l).
         written: struct { reader: *Reifier, body: CheckedExprId },
-        /// A value of another package: its definition is a body of that
-        /// package, which the walk does not read (N8h), so a call on it is a
-        /// `Prim` named by the module and the value.
-        foreign: ForeignName,
     };
 
     /// Where a name that is a top-level value computing a function leads, or
@@ -2906,13 +2902,10 @@ pub const Reifier = struct {
             .imported => |imported| {
                 const away = self.walk.foreign.findExportedComputed(imported.artifact, imported.def) orelse return null;
                 const reader = try self.walk.reader(away.module);
-                if (samePackage(self.env, reader.env)) return .{ .written = .{ .reader = reader, .body = away.body } };
                 if (reader.env.module_role == .builtin) {
                     return self.rejectError(.unsupported_expression, region, "a call to a function the compiler provides");
                 }
-                const binder = reader.bodies.patternBinderForCheckedPattern(imported.pattern) orelse
-                    return reader.rejectError(.unresolved_reference, region, "this call");
-                return .{ .foreign = .{ .owner = reader.env.module_name, .method = reader.binderName(binder) } };
+                return .{ .written = .{ .reader = reader, .body = away.body } };
             },
             .hosted, .platform_required => return null,
         }
@@ -4411,13 +4404,132 @@ pub const Reifier = struct {
 
     // Calls //
 
-    /// A function of another package, named by owner and method (N8h). For a
-    /// method the owner is its type's name; for a plain function, its
-    /// module's.
-    const ForeignName = struct { owner: []const u8, method: []const u8 };
+    /// A function in the site's cut, or a method of an opaque nominal, named
+    /// by owner and method (N8h). The owner of a function in the cut is the
+    /// nominal it is an associated item of, or its module where it is none.
+    pub const ForeignName = struct { owner: []const u8, method: []const u8 };
+
+    /// What identifies a function in a site's cut: the module that defines it
+    /// and its checked body, which is what every path to a callee resolves it
+    /// to (`resolvedTarget`, `methodTargetCallee`), and what a row is keyed by.
+    pub const CutKey = struct { artifact: [32]u8, body: CheckedExprId };
+
+    /// A function a `code_primitives` item, or a translator call, names: the
+    /// reader of the module that defines it, its body, and its definition.
+    const CutMember = struct { reader: *Reifier, body: CheckedExprId, def: CIR.Def.Idx };
+
+    /// The function a resolved reference names, where it names one defined
+    /// as a lambda, following every exact alias (`same = add_one`), or null
+    /// for any other reference: a local, a constant, a value that computes a
+    /// function, a function the host or the platform provides.
+    fn cutMember(self: *Reifier, resolved: checked.ResolvedValueRefId) Allocator.Error!?CutMember {
+        const use = switch (self.value_refs.callableTarget(resolved).ref) {
+            .top_level_proc, .imported_proc => |use| use,
+            .promoted_top_level_proc,
+            .local_proc,
+            .local_param,
+            .local_value,
+            .local_mutable_version,
+            .pattern_binder,
+            .selected_hoisted_const,
+            .top_level_const,
+            .imported_const,
+            .hosted_proc,
+            .platform_required_declaration,
+            .platform_required_checked_error,
+            .platform_required_const,
+            .platform_required_proc,
+            => return null,
+        };
+        switch (use.binding) {
+            .top_level => |top_level| {
+                std.debug.assert(std.meta.eql(top_level.artifact.bytes, self.artifact.bytes));
+                switch (self.procedure_bindings.get(top_level.binding).body) {
+                    .direct_template => |direct| {
+                        const template_ref = switch (direct.template) {
+                            .checked => |template| template,
+                            .lifted, .synthetic => return null,
+                        };
+                        const template = self.procedure_templates.templates.items[@backingInt(template_ref.template)];
+                        const body_id = switch (template.body) {
+                            .checked_body => |body| body,
+                            .intrinsic_wrapper, .entry_wrapper, .unimplemented => return null,
+                        };
+                        const def = self.names.procBase(template.proc_base).source_def_idx orelse return null;
+                        return .{ .reader = self, .body = self.bodies.body(body_id).root_expr, .def = @fromBackingInt(def) };
+                    },
+                    .callable_eval_template => |id| {
+                        const lookup = self.callable_eval_templates.templates[@backingInt(id)].forwarded_lookup orelse return null;
+                        const forwarded = self.value_refs.lookupIdByCheckedExpr(lookup) orelse
+                            invariant("an alias forwards to a lookup with no resolved reference");
+                        return self.cutMember(forwarded);
+                    },
+                    .checked_error => return null,
+                }
+            },
+            .imported => |imported| {
+                if (self.walk.foreign.findExported(imported.artifact, imported.def)) |definition| {
+                    const reader = try self.walk.reader(definition.module);
+                    return .{ .reader = reader, .body = definition.body, .def = imported.def };
+                }
+                const alias = self.walk.foreign.findExportedAlias(imported.artifact, imported.def) orelse return null;
+                const reader = try self.walk.reader(alias.module);
+                const forwarded = reader.value_refs.lookupIdByCheckedExpr(alias.lookup) orelse
+                    invariant("an alias forwards to a lookup with no resolved reference");
+                return reader.cutMember(forwarded);
+            },
+            .hosted, .platform_required => return null,
+        }
+    }
+
+    /// The resolved reference a checked lookup holds, or null for an
+    /// expression that is no lookup.
+    fn lookupResolved(self: *Reifier, expr_id: CheckedExprId) ?checked.ResolvedValueRefId {
+        return switch (self.bodies.expr(expr_id).data) {
+            .lookup_local => |lookup| lookup.resolved,
+            .lookup_external => |resolved| resolved,
+            else => null,
+        };
+    }
+
+    /// The nominal this module declares that has `def` as an associated
+    /// item, and the item's name, or null for a definition that is none.
+    fn ownerOf(self: *Reifier, def: CIR.Def.Idx) ?struct { decl: CIR.Statement.Idx, method: base.Ident.Idx } {
+        for (self.env.method_defs.entries.items) |entry| {
+            if (entry.value.def_idx != def) continue;
+            if (entry.key.ownerIdent().moduleIdentity() != null) continue;
+            if (self.env.store.getStatement(entry.key.owner) != .s_nominal_decl) continue;
+            return .{ .decl = entry.key.owner, .method = entry.key.methodIdent() };
+        }
+        return null;
+    }
+
+    /// The qualified name of the definition `def` of this module (N8h): the
+    /// nominal it is an associated item of and the item, `Glsl.Vec3` and
+    /// `scale`, or the module and the definition where it is no item.
+    fn qualifiedName(self: *Reifier, def: CIR.Def.Idx) ForeignName {
+        if (self.ownerOf(def)) |owned| {
+            const header = self.env.store.getStatement(owned.decl).s_nominal_decl.header;
+            return .{
+                .owner = self.env.getIdentText(self.env.store.getTypeHeader(header).name),
+                .method = self.env.getIdentText(owned.method),
+            };
+        }
+        const ident = switch (self.env.store.getPattern(self.env.store.getDef(def).pattern)) {
+            .assign => |assign| assign.ident,
+            else => invariant("a function defined as a lambda binds one name"),
+        };
+        return .{ .owner = self.env.module_name, .method = self.env.getIdentText(ident) };
+    }
+
+    /// The function in the site's cut that a callee resolved to `reader` and
+    /// `body` is, named, or null where the callee is no such function.
+    fn inCut(self: *Reifier, reader: *Reifier, body: CheckedExprId) ?ForeignName {
+        return self.walk.cut.get(.{ .artifact = reader.artifact.bytes, .body = body });
+    }
 
     /// A plain call, `f(x)`: `Call` of the callee's row, a `Prim` for a
-    /// builtin or a function of another package, or the derived codec or
+    /// builtin or a function in the site's cut, or the derived codec or
     /// curried definition the call runs, folded into one node.
     fn callExpr(
         self: *Reifier,
@@ -4605,11 +4717,7 @@ pub const Reifier = struct {
     fn computedConstructor(self: *Reifier, resolved: ?checked.ResolvedValueRefId, region: base.Region) Error!?Constructor {
         const id = resolved orelse return null;
         const computed = try self.computedFunction(id, region) orelse return null;
-        const written = switch (computed) {
-            .written => |written| written,
-            // A function of another package has no body here to flatten.
-            .foreign => return null,
-        };
+        const written = computed.written;
         // A value written as another such value, `renamed = doubler`, is the
         // one it names. The definition is marked while the walk follows it, so
         // a value that reaches itself ends at its own definition.
@@ -4659,7 +4767,7 @@ pub const Reifier = struct {
         const found = try writer.dispatchTarget(DispatchSpec.ofPlan(plan), region);
         const callee = switch (found) {
             .definition => |target| target,
-            // A builtin or a function of another package carries no body to
+            // A builtin or a function in the site's cut carries no body to
             // flatten a curried call through.
             .provided, .foreign, .none => return null,
         };
@@ -4747,7 +4855,7 @@ pub const Reifier = struct {
         return switch (try self.calleeTarget(operand, region)) {
             .definition => |definition| definition,
             .value => null,
-            .provided, .foreign => self.rejectError(.unsupported_expression, region, "a builtin or a function of another package, passed as an argument"),
+            .provided, .foreign => self.rejectError(.unsupported_expression, region, "a builtin or a function in the translator's cut, passed as an argument"),
         };
     }
 
@@ -4922,7 +5030,7 @@ pub const Reifier = struct {
     }
 
     /// What a resolved reference reaches: a definition and the reader that
-    /// walks it, a builtin, or a function of another package.
+    /// walks it, a builtin, or a function in the site's cut.
     ///
     /// Every hop is a ref the producer recorded: the reference names a
     /// binding, the binding names a template, and the template holds the body.
@@ -4935,10 +5043,7 @@ pub const Reifier = struct {
         // curried call (`curriedCall`), and otherwise an `Apply` of the value
         // it is written as, which the builder resolves once the value is a
         // known closure.
-        if (try self.computedFunction(resolved, region)) |computed| return switch (computed) {
-            .written => .value,
-            .foreign => |name| .{ .foreign = name },
-        };
+        if (try self.computedFunction(resolved, region) != null) return .value;
         const use = switch (self.value_refs.callableTarget(resolved).ref) {
             // A promoted local function is a procedure of the module with a
             // binding of its own, which captures nothing: the checker proved
@@ -4961,9 +5066,9 @@ pub const Reifier = struct {
         };
         const reached = try self.reachedProcedure(use.binding, written_binder, region);
         const reader = reached.reader;
-        // A definition of another module is a builtin by its export name, a
-        // function of another package by its module and name (N8h), and
-        // otherwise the definition to walk.
+        // A builtin is named by its export name, a function in the site's
+        // cut by its qualified name (N8h), and every other function, in any
+        // package, is the definition to walk (N8l).
         // A builtin is named wherever it is called, the builtin module's own
         // bodies included. A first stage walks the Roc definition of a
         // builtin that hands back a function, and names every other.
@@ -4973,9 +5078,8 @@ pub const Reifier = struct {
                     return self.rejectError(.unsupported_expression, region, "a call to a function the compiler provides");
                 return .{ .provided = .{ .name = export_name.text, .role = roleOf(use.iterator_procedure) } };
             }
-        } else if (!std.meta.eql(reader.artifact.bytes, self.artifact.bytes) and !samePackage(self.env, reader.env)) {
-            const binder = reached.binder orelse return reader.rejectError(.unresolved_reference, region, "this call");
-            return .{ .foreign = .{ .owner = reader.env.module_name, .method = reader.binderName(binder) } };
+        } else if (self.inCut(reader, reached.body)) |name| {
+            return .{ .foreign = name };
         }
         // What the use copied the procedure's variables to is keyed by the
         // use, and only a use of the procedure's own scheme has it.
@@ -5001,8 +5105,7 @@ pub const Reifier = struct {
         reader: *Reifier,
         body: CheckedExprId,
         template: checked.CheckedProcedureTemplate,
-        /// What the procedure's own name binds in `reader`'s module. A call
-        /// to a function of another package names the function by it.
+        /// What the procedure's own name binds in `reader`'s module.
         binder: ?PatternBinderId,
         /// Whether an exact alias was followed to get here. A use then
         /// instantiates the alias's scheme, not the procedure's.
@@ -5168,7 +5271,7 @@ pub const Reifier = struct {
     };
 
     /// A static dispatch: `Call` of the method's row, a `Prim` for a builtin
-    /// or a method of another package, or the derivation the checker chose.
+    /// or a method in the site's cut, or the derivation the checker chose.
     /// `!=` on a written `is_eq` is `Bool.not` of the call (N1k).
     fn dispatchExpr(self: *Reifier, plan_id: ?static_dispatch.StaticDispatchPlanId, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
         const id = plan_id orelse return self.rejectError(.unresolved_reference, region, "this call");
@@ -5289,8 +5392,8 @@ pub const Reifier = struct {
 
     /// The literal the compiler hands to a `from_numeral` conversion, in the
     /// widest form a `Lit` holds: `I128` for a whole number, `F64` for a
-    /// fractional one. It is the argument only of a builtin or a method of
-    /// another package, whose `Prim` takes it as the number it is.
+    /// fractional one. It is the argument only of a builtin or a method in
+    /// the site's cut, whose `Prim` takes it as the number it is.
     fn generatedNumeral(self: *Reifier, literal: ModuleEnv.NumeralLiteral, region: base.Region) Error!Ref {
         const exact = self.env.exactNumeral(literal);
         const primitive: checked.CheckedBuiltinNominal = if (exact.is_fractional) .f64 else .i128;
@@ -5395,7 +5498,7 @@ pub const Reifier = struct {
         definition: CalleeTarget,
         /// A builtin, by its export name.
         provided: Provided,
-        /// A method of another package (N8h), or of an opaque nominal.
+        /// A method in the site's cut (N8h), or of an opaque nominal.
         foreign: ForeignName,
         /// Nothing the walk reaches.
         none,
@@ -5431,8 +5534,8 @@ pub const Reifier = struct {
     ///
     /// `owner` is the reader of the module that recorded the target, which is
     /// the module whose ids the target is named in; `dispatcher_ty` is the
-    /// type the method is called on, whose name a method of another package
-    /// is owned by.
+    /// type the method is called on, whose name a method of an opaque
+    /// nominal is owned by.
     fn methodTargetCallee(
         self: *Reifier,
         owner: *Reifier,
@@ -5465,15 +5568,11 @@ pub const Reifier = struct {
                 owner
             else
                 return .{ .provided = .{ .name = builtin.name, .role = roleOf(procedure.runtime_target.iteratorProcedure()) } },
-            .away => |definition| blk: {
-                if (!samePackage(self.env, definition.module.env)) {
-                    const type_name = self.typeName(dispatcher_ty) orelse
-                        return self.rejectError(.unresolved_type, region, "the type a method of another package is called on");
-                    return .{ .foreign = .{ .owner = type_name, .method = method } };
-                }
-                break :blk try self.walk.reader(definition.module);
-            },
+            .away => |definition| try self.walk.reader(definition.module),
         };
+        // A method in the site's cut is named by its qualified name (N8h);
+        // every other method, in any package, is walked (N8l).
+        if (self.inCut(reader, found.body())) |name| return .{ .foreign = name };
         var instance = switch (fixing) {
             .edge => |edge| try owner.dispatchInstantiation(reader, found.template(), edge.node, region),
             .receiver => |receiver| try reader.receiverInstantiation(found.template(), receiver, region),
@@ -7440,17 +7539,6 @@ fn positionOf(comptime Id: type, ids: []const Id, id: Id) ?usize {
     return null;
 }
 
-/// Whether two modules belong to one package, by the name the workspace gives
-/// each (N8h). A module no coordinator placed in a package belongs to the
-/// unnamed one.
-fn samePackage(a: *const ModuleEnv, b: *const ModuleEnv) bool {
-    return std.mem.eql(u8, packageText(a), packageText(b));
-}
-
-fn packageText(env: *const ModuleEnv) []const u8 {
-    return env.package_name;
-}
-
 /// The method an arithmetic or comparison operator desugars to.
 fn binopMethod(op: CIR.Expr.Binop.Op) []const u8 {
     return switch (op) {
@@ -8210,6 +8298,10 @@ pub const Walk = struct {
     through: ?Reifier.TypeRef = null,
     /// The view the site being walked declares (plan 1.5, V6).
     view: View = .graph,
+    /// The site's cut (I14, N8h): each function the `code_primitives` item of
+    /// its translator's type lists, by what a callee resolves to, with the
+    /// name its `Prim` carries. Every other function is walked (N8l).
+    cut: std.AutoHashMapUnmanaged(Reifier.CutKey, Reifier.ForeignName) = .empty,
     /// Where set, the walk measures K (`ROC_REIFY_OUTLINE_STATS`): `finish`
     /// prints the size of the site's `outline` view at this K and emits
     /// nothing.
@@ -8281,6 +8373,7 @@ pub const Walk = struct {
         }
         self.readers.deinit(self.gpa);
         self.endSite();
+        self.cut.deinit(self.gpa);
         self.definitions.deinit(self.gpa);
         self.rows.deinit(self.gpa);
         self.clearClosureTargets();
@@ -8334,11 +8427,33 @@ pub const Walk = struct {
     /// `site_reader` is the site module's reader.
     pub fn beginSite(self: *Walk, view: View, binds_inputs: bool, site_reader: *Reifier) void {
         self.view = view;
+        self.cut.clearRetainingCapacity();
         self.rejection = null;
         self.endInputs();
         self.freeSlots();
         self.reads.clearRetainingCapacity();
         if (binds_inputs) self.inputs = .{ .reader = site_reader };
+    }
+
+    /// Take the cut of the site begun last from its translator (I14): the
+    /// function `translator`, a callee `site_reader` checked, names. The
+    /// nominal type that has that function as an associated item declares
+    /// the cut with its `code_primitives` item, which publication of the
+    /// type's module checked. A translator that is no such function, or whose
+    /// type declares no cut, leaves the cut empty.
+    pub fn useCut(self: *Walk, site_reader: *Reifier, translator: CheckedExprId) Allocator.Error!void {
+        const resolved = site_reader.lookupResolved(translator) orelse return;
+        const function = try site_reader.cutMember(resolved) orelse return;
+        const owner = function.reader;
+        const owned = owner.ownerOf(function.def) orelse return;
+        const members = owner.code_cuts.membersOf(@backingInt(owned.decl)) orelse return;
+        for (members) |raw| {
+            const member_resolved = owner.lookupResolved(@fromBackingInt(raw)) orelse
+                invariant("a cut member is a lookup, which publication checked");
+            const member = try owner.cutMember(member_resolved) orelse
+                invariant("a cut member names a function, which publication checked");
+            try self.cut.put(self.gpa, .{ .artifact = member.reader.artifact.bytes, .body = member.body }, member.reader.qualifiedName(member.def));
+        }
     }
 
     /// Note that the walk met a literal whose conversion is a compile-time
@@ -8636,6 +8751,8 @@ pub const LocalSources = struct {
     /// source variable, and only the module being published still has the
     /// index from a source variable to the checked type it solved for.
     site_types: *const checked.CheckedTypePublication,
+    /// The translators' cuts this module declares, which `moduleCuts` built.
+    code_cuts: *const checked.CodeCutTable,
 
     fn views(self: LocalSources) Reifier.Sources {
         return .{
@@ -8650,9 +8767,104 @@ pub const LocalSources = struct {
             .callable_eval_templates = self.callable_eval_templates.view(),
             .const_templates = self.const_templates,
             .const_bodies = self.const_bodies,
+            .code_cuts = self.code_cuts,
         };
     }
 };
+
+/// The cuts the module declares (I14), and the entries refused.
+pub const ModuleCuts = struct {
+    /// Owned slices, which the artifact takes.
+    table: checked.CodeCutTable = .{},
+    problems: []Problem = &.{},
+
+    /// An entry of a `code_primitives` item that is no reference to a
+    /// function defined as a lambda, or one that names a function an earlier
+    /// entry names: a compile error at the entry.
+    pub const Problem = struct {
+        region: base.Region,
+        kind: enum { not_a_function, listed_twice },
+    };
+
+    pub fn deinit(self: *ModuleCuts, gpa: Allocator) void {
+        self.table.deinit(gpa);
+        gpa.free(self.problems);
+    }
+};
+
+/// Check each `code_primitives` item of a nominal type this module declares,
+/// and record the cut it declares (I14, roc-reify-normal-form.md 3.8 and
+/// section 12). The item is one reference to a top-level function, or a
+/// tuple of such references; an entry that is anything else, or that names
+/// a function an earlier entry names, is refused at the entry. The walk reads
+/// the checked lookups the table records, not an evaluated value.
+pub fn moduleCuts(
+    gpa: Allocator,
+    store: *ConstStore,
+    local: LocalSources,
+    env: *const ModuleEnv,
+    foreign: ForeignLookup,
+) Allocator.Error!ModuleCuts {
+    var cuts = std.ArrayList(checked.CodeCutTable.Cut).empty;
+    defer cuts.deinit(gpa);
+    var members = std.ArrayList(u32).empty;
+    defer members.deinit(gpa);
+    var problems = std.ArrayList(ModuleCuts.Problem).empty;
+    defer problems.deinit(gpa);
+    var keys = std.ArrayList(Reifier.CutKey).empty;
+    defer keys.deinit(gpa);
+
+    var walk = Walk.init(gpa, store, foreign);
+    defer walk.deinit();
+    var reifier: ?*Reifier = null;
+
+    for (env.method_defs.entries.items) |entry| {
+        if (!entry.key.methodIdent().eql(env.idents.code_primitives)) continue;
+        if (entry.key.ownerIdent().moduleIdentity() != null) continue;
+        if (env.store.getStatement(entry.key.owner) != .s_nominal_decl) continue;
+        const reader = reifier orelse try walk.reader(.{ .sources = local.views(), .env = env });
+        reifier = reader;
+        const item = local.bodies.exprIdForSource(env.store.getDef(entry.value.def_idx).expr) orelse
+            invariant("a top-level definition has a checked body");
+        const listed: []const CheckedExprId = switch (reader.bodies.expr(item).data) {
+            .tuple => |elems| elems,
+            else => &.{item},
+        };
+        keys.clearRetainingCapacity();
+        const start: u32 = @intCast(members.items.len);
+        for (listed) |member| {
+            const data = reader.bodies.expr(member);
+            // Canonicalization reported a name it could not resolve.
+            if (data.data == .runtime_error) continue;
+            const function = if (reader.lookupResolved(member)) |resolved| try reader.cutMember(resolved) else null;
+            const named = function orelse {
+                try problems.append(gpa, .{ .region = data.source_region, .kind = .not_a_function });
+                continue;
+            };
+            const key: Reifier.CutKey = .{ .artifact = named.reader.artifact.bytes, .body = named.body };
+            const repeated = for (keys.items) |seen| {
+                if (std.meta.eql(seen, key)) break true;
+            } else false;
+            if (repeated) {
+                try problems.append(gpa, .{ .region = data.source_region, .kind = .listed_twice });
+                continue;
+            }
+            try keys.append(gpa, key);
+            try members.append(gpa, @backingInt(member));
+        }
+        try cuts.append(gpa, .{
+            .owner_decl = @backingInt(entry.key.owner),
+            .members = .{ .start = start, .len = @as(u32, @intCast(members.items.len)) - start },
+        });
+    }
+
+    var result: ModuleCuts = .{};
+    errdefer result.deinit(gpa);
+    result.table.cuts = try cuts.toOwnedSlice(gpa);
+    result.table.members = try members.toOwnedSlice(gpa);
+    result.problems = try problems.toOwnedSlice(gpa);
+    return result;
+}
 
 /// Walk every function this module stages into `store`, one description per
 /// recorded site. Publication runs this: the walk reads checked bodies and
@@ -8709,6 +8921,7 @@ pub fn reifyModuleSites(
                 const k = std.fmt.parseInt(u32, text, 10) catch continue;
                 if (k < 3) continue;
                 walk.beginSite(site.view, bound_call != null, reifier);
+                try useSiteCut(&walk, reifier, local, site);
                 walk.measure_k = k;
                 defer walk.measure_k = null;
                 _ = try walkSite(gpa, &walk, reifier, module, local, site, site_expr, region, &call_args, &call_values);
@@ -8717,6 +8930,7 @@ pub fn reifyModuleSites(
             }
         }
         walk.beginSite(site.view, bound_call != null, reifier);
+        try useSiteCut(&walk, reifier, local, site);
         const outcome = try walkSite(gpa, &walk, reifier, module, local, site, site_expr, region, &call_args, &call_values);
         const slots = walk.takeSlots();
         errdefer freeSlotSources(gpa, slots);
@@ -8728,6 +8942,15 @@ pub fn reifyModuleSites(
     const outcomes = try results.toOwnedSlice(gpa);
     errdefer gpa.free(outcomes);
     return .{ .outcomes = outcomes, .provenance = try walk.published.toOwnedSlice(gpa) };
+}
+
+/// The cut of `site`, from the translator its call names (I14).
+fn useSiteCut(walk: *Walk, reifier: *Reifier, local: LocalSources, site: @import("can").NodeStore.CodeReificationSite) Allocator.Error!void {
+    if (site.translator == @import("can").NodeStore.CodeReificationSite.no_translator) return;
+    // A callee checking rejected has no checked expression, and the build
+    // already stops at its error.
+    const callee = local.bodies.exprIdAtRawNode(site.translator) orelse return;
+    try walk.useCut(reifier, callee);
 }
 
 // The walk of one site, by its kind.

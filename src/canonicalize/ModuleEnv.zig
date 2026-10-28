@@ -215,6 +215,8 @@ pub const CommonIdents = extern struct {
     builtin_box_box: Ident.Idx,
     builtin_box_unbox: Ident.Idx,
     to_inspect: Ident.Idx,
+    /// The well-known item that declares a translator's cut (I14).
+    code_primitives: Ident.Idx,
     ok: Ident.Idx,
     err: Ident.Idx,
     from_numeral: Ident.Idx,
@@ -378,6 +380,7 @@ pub const CommonIdents = extern struct {
             .builtin_box_box = try common.insertIdent(gpa, Ident.for_text("Builtin.Box.box")),
             .builtin_box_unbox = try common.insertIdent(gpa, Ident.for_text("Builtin.Box.unbox")),
             .to_inspect = try common.insertIdent(gpa, Ident.for_text("to_inspect")),
+            .code_primitives = try common.insertIdent(gpa, Ident.for_text("code_primitives")),
             .ok = try common.insertIdent(gpa, Ident.for_text("Ok")),
             .err = try common.insertIdent(gpa, Ident.for_text("Err")),
             .from_numeral = try common.insertIdent(gpa, Ident.for_text(Ident.FROM_NUMERAL_METHOD_NAME)),
@@ -4745,8 +4748,9 @@ pub fn recordCodeReificationSite(
     fn_var: TypeVar,
     kind: NodeStore.CodeReificationSite.Kind,
     view: NodeStore.CodeReificationSite.View,
+    translator: ?Node.Idx,
 ) std.mem.Allocator.Error!void {
-    try self.store.recordCodeReificationSite(node_idx, fn_var, kind, view);
+    try self.store.recordCodeReificationSite(node_idx, fn_var, kind, view, translator);
 }
 
 /// Record that the call at `call_idx` binds the run-time reads of the lambda

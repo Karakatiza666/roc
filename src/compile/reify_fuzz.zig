@@ -89,6 +89,7 @@ pub const Lookup = struct {
         asked.resolve_method = resolveMethod;
         asked.resolve_exported = resolveExported;
         asked.resolve_exported_computed = resolveExportedComputed;
+        asked.resolve_constant = resolveConstant;
         asked.resolve_inspect_override = resolveInspectOverride;
         return asked;
     }
@@ -116,6 +117,17 @@ pub const Lookup = struct {
         const self: *const Lookup = @ptrCast(@alignCast(context));
         for (self.imports) |view| {
             if (std.meta.eql(view.key.bytes, artifact.bytes)) return check.CheckedArtifact.exportedComputed(view, def);
+        }
+        return null;
+    }
+
+    fn resolveConstant(
+        context: *const anyopaque,
+        const_ref: check.CheckedArtifact.ConstRef,
+    ) ?CodeReifier.ForeignConstant {
+        const self: *const Lookup = @ptrCast(@alignCast(context));
+        for (self.imports) |view| {
+            if (std.meta.eql(view.key.bytes, const_ref.artifact.bytes)) return check.CheckedArtifact.exportedConstant(view, const_ref);
         }
         return null;
     }
@@ -303,7 +315,7 @@ pub fn runCaseWith(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir
     var case = try reify.fuzz_gen.generateWith(ctx.gpa, bytes, options);
     defer case.deinit(ctx.gpa);
     return runGenerated(ctx, builtins, dir, &case) catch |err| {
-        std.debug.print("{t} on the generated case:\n{s}\n", .{ err, case.source });
+        std.debug.print("{t} on the generated case:\n{s}\nLib:\n{s}\n", .{ err, case.source, case.lib_source });
         return err;
     };
 }
@@ -315,16 +327,29 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
     try dir.createDirPath(io, ".roc_echo_platform");
     try dir.writeFile(io, .{ .sub_path = ".roc_echo_platform/main.roc", .data = platform_main });
     try dir.writeFile(io, .{ .sub_path = ".roc_echo_platform/Echo.roc", .data = platform_echo });
+    // M13: the helpers the case put in another package, in its module `Lib`.
+    const has_lib = case.lib_source.len != 0;
+    if (has_lib) {
+        try dir.createDirPath(io, "lib");
+        try dir.writeFile(io, .{ .sub_path = "lib/main.roc", .data = "package [Lib] {}\n\nimport /Lib as Lib\n" });
+        const lib_source = try std.fmt.allocPrint(gpa, "Lib := {{}}.{{\n{s}}}\n", .{case.lib_source});
+        defer gpa.free(lib_source);
+        try dir.writeFile(io, .{ .sub_path = "lib/Lib.roc", .data = lib_source });
+    }
     const app_source = try std.fmt.allocPrint(gpa,
-        \\app [main!] {{ pf: platform "./.roc_echo_platform/main.roc" }}
+        \\app [main!] {{ pf: platform "./.roc_echo_platform/main.roc"{s} }}
         \\
-        \\import pf.Echo
+        \\import pf.Echo{s}
         \\
         \\{s}
         \\
         \\main! = |_args| Ok({{}})
         \\
-    , .{case.source});
+    , .{
+        if (has_lib) ", lib: \"./lib/main.roc\"" else "",
+        if (has_lib) "\nimport lib.Lib" else "",
+        case.source,
+    });
     defer gpa.free(app_source);
     try dir.writeFile(io, .{ .sub_path = "main.roc", .data = app_source });
     const app_path = try dir.realPathFileAlloc(io, "main.roc", gpa);
@@ -353,7 +378,11 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
 
     const artifact = coord.appRootCheckedArtifact();
     const env = artifact.module_env.env();
-    const lookup: Lookup = .{ .artifact = artifact, .builtins = &builtins.checked_artifact };
+    const lookup: Lookup = .{
+        .artifact = artifact,
+        .builtins = &builtins.checked_artifact,
+        .imports = try coord.collectImportedArtifactViews(arena, artifact),
+    };
     // A case with the constructs of M10 meets in the `lawful` view, where
     // layer L applies (L4, loop to builtin).
     const view: @TypeOf(@as(CodeReifier.Walk, undefined).view) = if (case.lawful) .lawful else .graph;

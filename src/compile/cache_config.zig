@@ -406,7 +406,10 @@ pub const Constants = struct {
     /// 179: Normal form 16: N13u intervals, N8k result ranges and the
     ///      parameter half of N15c (M11), so plus chains, decided tests,
     ///      inclusive counter loops and speculatable flags change.
-    pub const CACHE_VERSION = 180;
+    /// 181: Normal form 18: the translator's cut (I14). A site records its
+    ///      translator call, the artifact records each type's cut, and a
+    ///      function of another package outside the cut is walked (N8l).
+    pub const CACHE_VERSION = 181;
 };
 
 /// Configuration for the Roc cache system.

@@ -99,7 +99,7 @@ All the types are in the `Code` module of `Builtin.roc` (lines 23625 to 24400). 
 
 A node does not carry a name or a source place. A parameter is `Param(0)`, not `w`. The order of `nodes` comes from the graph alone.
 
-A function of another package, and a builtin, is a `Prim`. The body is not read. A translator maps it by name. The GLSL example maps `Glsl.Vec3.scale` to `*`.
+A builtin, and a function in the translator's cut, is a `Prim`. The body is not read. A translator maps it by name. The GLSL example lists `Glsl.Vec3.scale` in its `code_primitives` and maps it to `*`. Every other function, in any package, is read by its body.
 
 A `Record` node holds the names of the fields it sets. They are every field of the type, unless the type marks a field `Optional` and the record leaves it unset (`{ a: v, b: _ }`). A translator reads the names, and the type says which fields may be absent.
 
@@ -204,13 +204,13 @@ Notes on accuracy:
 | --- | --- |
 | Where | The `reify` branch. Not merged into `main`. |
 | What works | Pure Roc as listed in [../roc-reify-design.md](../roc-reify-design.md): literals, operators, calls (helpers, generic, recursive, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods, and captured run-time values for a translator that returns a `Code.Bound`. |
-| Tests | 134 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 209 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 60 fixtures `test/cli/Staged*.roc`. 206 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
+| Tests | 134 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 234 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 61 fixtures `test/cli/Staged*.roc`, and the two-package fixture `test/cli/StagedCut/`. 221 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
 | Node identities | `Code.Inlined.inline_digest` names a node of the `inline` view by its content (milestone M8). |
 | Rows the compiler chooses | A `Code.Outlined(f)` site gets the `outline` view (milestone M9). Places that differ in a value pass it as an argument (V3b), so the GLSL shader's two calls of `ripple` are one row ([../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 12). |
 | Laws of the builtins | A `Code.Lawful(f)` site gets the graph view under layer L (milestone M10). No example opts in: the SQL translator matches `List.sum(List.map(..))` and `len() > 0`, which the laws change. |
 | Literal intervals | Every integer value has an interval from literals, dominating tests against a literal, and range indices (milestone M11). A test that an interval decides is gone, and `while $i <= n` with a bounded `n` is the `for` over `0..=n`. The rules and their limits are in [../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 3.13. |
 | Facts across loop turns | A `while !$done` loop whose flag every edge sets as a known value is the loop with `break`, and a second counter stepped with a range index is `i + j0` (milestone M12). The rules and their limits are in [../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 3.11. |
-| Not done | The translator cannot yet declare which functions of another package it reads (`code_primitives`, milestone M13 of [../roc-reify-normalization-plan.md](../roc-reify-normalization-plan.md)). |
+| The translator's cut | A translator declares the functions it reads by name with the item `code_primitives` of its type (milestone M13). Each one is a `Prim` named by its qualified name, such as `Glsl.Vec3` and `scale`. Every other function, in any package, is read by its body, and so is a computed value of any package. A dependency upgrade can change a translation, or stop it at the site. The rule is in [../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 3.8. |
 
 ### What is refused today
 
@@ -223,8 +223,6 @@ A refusal names the construct. The rule is that the function must name only thin
 | A captured `var`, a captured value read in a row other than the root, a captured function value, a captured value of an opaque type, a captured record with an optional field | The program supplies a slot's value at the call, as one `Code.Value`. These have no such value. |
 | A call that binds the slots of two sites, a call whose other arguments are not fixed while the compiler runs, a call whose result type it does not fix, a translator result that holds a function | The call must be a compile-time root of its own. |
 | A site that names a top-level value which computes a function, like `Calc.to_expr(doubler)` with `doubler = make(2.0)` | The site's root must be a lambda with parameters that the walk can list. A use of `doubler` inside a described function is described. Write `\|x\| doubler(x)` at the site. |
-| A computed top-level value of another package | The body belongs to that package, and the walk does not read it. A value written as data is folded. |
-| The body of a function of another package | It is a `Prim`. The translator maps it by name. |
 | An effect, `dbg`, a hosted function | Out of scope by design. |
 | A type variable that nothing fixes and no default seals | The body reads differently at each type. |
 | A numeric default that does not fit its use | For example `\|x\| x * 2.U8`. |
@@ -241,7 +239,6 @@ The list with the exact reason lines is in the section "What the remaining untic
 | --- | --- |
 | What does a crash mean in a target such as a GPU or a database? `Node.speculatable` gives a translator a part of the answer. | [../roc-reify-proposal.md](../roc-reify-proposal.md), section 13 |
 | How should a translator refuse a `Dec` that its target cannot run? The refusal exists, but its quality is open. | [../roc-reify-proposal.md](../roc-reify-proposal.md), section 13 |
-| Should a translator declare its own set of primitives (`code_primitives`)? Decided, not built. | [../roc-reify-normal-form.md](../roc-reify-normal-form.md), section 12 |
 | Should the normal form ever carry a node for the application of an expression? | [../roc-reify-proposal.md](../roc-reify-proposal.md), section 13 |
 | How do translators that hand values to a native engine encode them? | [../roc-reify-proposal.md](../roc-reify-proposal.md), section 13 |
 | What is the cost for editor latency? A translator runs in `roc check`. | [../roc-reify-proposal.md](../roc-reify-proposal.md), section 13 |

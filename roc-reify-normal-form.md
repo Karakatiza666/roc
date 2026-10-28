@@ -673,7 +673,12 @@ bodies that must not be inlined into the description. The cut belongs to the
 translator, not to the library, because what a target has natively decides it:
 a GLSL translator keeps a math library's `lerp` as GLSL's `mix`, and a SQL
 translator reads its body. Such a primitive is not speculatable, whatever its
-body. Builtins are primitives in every cut (7.2).
+body. Builtins are primitives in every cut (7.2). The name is the one the
+function is defined under, the nominal it is an associated item of and the
+item, so a direct call `Glsl.Vec3.scale(v, k)` and a method call
+`v.scale(k)` give one `Prim`. A site's translator is the function its call
+names (`src/check/Check.zig`, `translatorCallee`); a site that no direct call
+takes has an empty cut.
 
 Every function outside the cut is walked by its body, in any package. A
 dependency's body is therefore part of what a translator reads: an upgrade
@@ -1844,6 +1849,7 @@ Every row is an edit that preserves meaning in Roc under C2. "A" means the norma
 | literal spelling: `1_000`, `1000`, `0x3E8` | A | A | N1 |
 | rename a helper; move it to another module in the package; reorder top-level definitions | A | A | N8 |
 | any refactor inside a function in the site's cut | A | A | 3.8: the function is a primitive by name |
+| any refactor in R inside a dependency's function outside the cut; move a helper to another package, or back | A | A | N8l: the body is walked in any package |
 | turn a local closure into a top-level helper, or back | A | A | N8 |
 | reorder a private helper's parameters; drop an unused one | A | A | N8 |
 | `List.map(xs, \|x\| f(x))` and `List.map(xs, f)` | A | A | N8, eta |

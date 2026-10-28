@@ -107,7 +107,20 @@ A translator for a target with no function form, such as one expression, reads t
 
 A translator for a target with functions whose output must not change when the author moves code into or out of helpers reads the `outline` view. Its rows are not the author's helpers.
 
-A function of another package, and a builtin, is a `Prim` whose body is not read. A translator maps it by name. The GLSL example maps `Glsl.Vec3.scale` to `*` in this way.
+A builtin is a `Prim` whose body isn't read, and so is any function in the translator's _cut_: the functions the translator reads by name. A translator declares its cut with an item named `code_primitives` on its type, which is one function or a tuple of them:
+
+```roc
+Glsl :: {}.{
+    code_primitives = (Vec3.scale, Vec3.plus, Sampler.texture)
+
+    fragment_330 : Code.Inlined(f) -> Try(Fragment, Error)
+    # ...
+}
+```
+
+A call of `Glsl.Vec3.scale` then reaches the translator as a `Prim` with the owner `Glsl.Vec3` and the method `scale`, whether it's written `Glsl.Vec3.scale(v, k)` or `v.scale(k)`, and the GLSL example maps it to `*`. Every other function the described function calls is read by its body, in this package or in any package it depends on.
+
+The cut belongs to the translator rather than to the library, because the target decides it: a GLSL translator keeps a math library's `lerp` as GLSL's `mix`, while a SQL translator reads its body. The tradeoff is that a dependency's body is part of what a translator reads. If an upgrade changes the operations of a function that a described function calls, the translation can change, or the build can stop at the call. Upgrades are explicit, because packages are pinned by URL and content hash, and the report names the call.
 
 ## Reading a Graph
 
@@ -164,7 +177,7 @@ There are 24 ops. This table groups them by what they stand for.
 | Group | Ops | Stand for |
 | --- | --- | --- |
 | Constants | `Lit` | A literal, with its type. |
-| Builtin calls | `Prim` | A builtin, or a function of another package. `owner` and `method` are apart, as in `Num.F32` and `sin`. Key your table by `method` and read the type from the node. |
+| Builtin calls | `Prim` | A builtin, or a function in the translator's `code_primitives`. `owner` and `method` are apart, as in `Num.F32` and `sin`. Key your table by `method` and read the type from the node. |
 | Function calls | `Call`, `Closure`, `Lambda` | A call of another row, a function value, and a function value written where it is built (`inline` view). |
 | Building data | `Record`, `Tuple`, `List`, `Tag`, `Wrap` | `Wrap` puts a value in a nominal type, by name. |
 | Reading data | `Field`, `Index`, `Payload`, `Item`, `OptField`, `Unwrap` | A record field, a tuple index, a tag payload, a list item, an optional field, the backing of a nominal. |
@@ -246,7 +259,6 @@ Some limits exist today and are not part of the rule:
 
 | Limit | Effect |
 | --- | --- |
-| A function of another package is a `Prim` and its body is not read | A translator cannot read a helper library. It maps it by name. |
 | A lambda parameter has no annotation syntax | A lambda whose types neither the site nor the numeric default fixes needs a named, annotated function. `\|x\| x * 2` describes at `Dec`. For `U8`, write `double : U8 -> U8`. |
 | A tag union whose row has no default to seal it, a record update over a record with an optional field, a `.?` path, and a record pattern that binds its rest | Refused by name. |
 

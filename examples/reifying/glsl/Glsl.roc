@@ -114,6 +114,27 @@ Glsl :: {}.{
 	no_input : Error
 	no_input = Unsupported("a value the shader reads from around itself has no GLSL form; pass it as a uniform")
 
+	## The functions this translator reads by name: its cut. Each one is a
+	## GLSL operator or function, so a shader that calls it receives a `Prim`
+	## named `Glsl.Vec3` and `scale`, never the CPU body below, which would
+	## turn one vector product into three lane products. Every other function
+	## a shader calls, in this package or in any other, arrives as its body.
+	code_primitives = (
+		Vec2.plus,
+		Vec2.times,
+		Vec2.scale,
+		Vec2.offset,
+		Vec3.plus,
+		Vec3.times,
+		Vec3.scale,
+		Vec3.offset,
+		Vec4.plus,
+		Vec4.times,
+		Vec4.scale,
+		Vec4.offset,
+		Sampler.texture,
+	)
+
 	## Compile a reified Roc function to a GLSL 330 fragment shader.
 	##
 	## Naming a function here reifies it: the compiler describes the function
