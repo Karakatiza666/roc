@@ -5578,6 +5578,141 @@ test "an interpolated literal of a type whose conversion is in the cut is a Prim
     );
 }
 
+/// A package whose type `Lib` converts interpolated literals by wrapping the
+/// assembler of `Str`, and is a translator, `Lib.arity`, with `cut`.
+fn interpolatingLib(comptime cut: []const u8) []const u8 {
+    return
+    \\Lib := { text : Str }.{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Lib), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| { text: assemble(values) })
+    \\
+    \\    size : Lib -> F32
+    \\    size = |l| if l.text.is_empty() 0.0.F32 else 1.0.F32
+    \\
+    ++ "    code_primitives = " ++ cut ++ "\n\n" ++
+        \\    arity : Code(f) -> U64
+        \\    arity = |code| code.graph().root_row().params.len()
+        \\}
+    ;
+}
+
+test "M13: an interpolated literal of another package's type whose conversion is outside the cut is walked by its definition" {
+    // N8l: the cut names `size` only, so `from_interpolation` is walked as
+    // the site's own type's is, and the literal is the fold of `Str`.
+    const staged = try Staged.createTranslated(std.testing.allocator,
+        \\wobble : { a : F32, b : F32 } -> F32
+        \\wobble = |input| Lib.size("x${input.a.to_str()}y")
+    , "_n = Lib.arity(wobble)", interpolatingLib("(Lib.size)"));
+    defer staged.destroy();
+    try staged.expectDump(
+        \\row r0 ({ a : F32, b : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = Num.F32.to_str(n0) : Str !spec
+        \\  n2 = list(n1) : List(Str)
+        \\  n3 = "x" : Str
+        \\  n4 = "y" : Str
+        \\  n5 = list(n3, n4) : List(Str)
+        \\  n6 = List.first(n5) : Builtin.Try !spec
+        \\  n7 = "" : Str
+        \\  n8 = Try.ok_or(n6, n7) : Str !spec
+        \\  n9 = closure r1(n5) : (Str, Str, U64 -> Str)
+        \\  n10 = List.fold_with_index(n2, n8, n9) : Str !spec
+        \\  n11 = record(n10) : { text : Str }
+        \\  n12 = wrap(n11) : Lib
+        \\  n13 = Lib.size(n12) : F32 !spec
+        \\  value n13
+        \\row r1 (List(Str), Str, Str, U64) -> Str
+        \\  n0 = 1 : U64
+        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
+        \\  n2 = List.get(p0, n1) : Builtin.Try
+        \\  n3 = "" : Str
+        \\  n4 = Try.ok_or(n2, n3) : Str !spec
+        \\  n5 = Str.concat(p1, p2, n4) : Str
+        \\  value n5
+        \\
+    );
+}
+
+/// The site's own module: a type `Label` that converts interpolated literals,
+/// and a translator `Tr.arity` with `cut`, called on `wobble`.
+fn ownInterpolationSource(comptime cut: []const u8) []const u8 {
+    return
+    \\Label := { text : Str }.{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Label), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| { text: assemble(values) })
+    \\
+    \\    size : Label -> F32
+    \\    size = |l| if l.text.is_empty() 0.0.F32 else 1.0.F32
+    \\}
+    \\
+    \\Tr := {}.{
+    \\
+    ++ "    code_primitives = " ++ cut ++ "\n\n" ++
+        \\    arity : Code(f) -> U64
+        \\    arity = |code| code.graph().root_row().params.len()
+        \\}
+        \\
+        \\wobble : { a : F32, b : F32 } -> F32
+        \\wobble = |input| Label.size("x${input.a.to_str()}${input.b.to_str()}y")
+    ;
+}
+
+test "M13: an interpolated literal of a type in the site's own module is a Prim in the cut and walked outside it" {
+    // N8h and N8l: the cut of a translator in the site's module decides as
+    // a dependency's does. In the cut, the conversion is one `Prim` over the
+    // segments and the values, each list in source order.
+    const gpa = std.testing.allocator;
+    const cut = try Staged.createTranslated(gpa, ownInterpolationSource("(Label.from_interpolation, Label.size)"), "_n = Tr.arity(wobble)", null);
+    defer cut.destroy();
+    try cut.expectDump(
+        \\row r0 ({ a : F32, b : F32 }) -> F32
+        \\  n0 = "x" : Str
+        \\  n1 = "" : Str
+        \\  n2 = "y" : Str
+        \\  n3 = list(n0, n1, n2) : List(Str)
+        \\  n4 = field 0(p0) : F32
+        \\  n5 = Num.F32.to_str(n4) : Str !spec
+        \\  n6 = field 1(p0) : F32
+        \\  n7 = Num.F32.to_str(n6) : Str !spec
+        \\  n8 = list(n5, n7) : List(Str)
+        \\  n9 = Label.from_interpolation(n3, n8) : Label !spec
+        \\  n10 = Label.size(n9) : F32 !spec
+        \\  value n10
+        \\
+    );
+    const walked = try Staged.createTranslated(gpa, ownInterpolationSource("(Label.size)"), "_n = Tr.arity(wobble)", null);
+    defer walked.destroy();
+    try walked.expectDump(
+        \\row r0 ({ a : F32, b : F32 }) -> F32
+        \\  n0 = field 0(p0) : F32
+        \\  n1 = Num.F32.to_str(n0) : Str !spec
+        \\  n2 = field 1(p0) : F32
+        \\  n3 = Num.F32.to_str(n2) : Str !spec
+        \\  n4 = list(n1, n3) : List(Str)
+        \\  n5 = "x" : Str
+        \\  n6 = "" : Str
+        \\  n7 = "y" : Str
+        \\  n8 = list(n5, n6, n7) : List(Str)
+        \\  n9 = List.first(n8) : Builtin.Try !spec
+        \\  n10 = Try.ok_or(n9, n6) : Str !spec
+        \\  n11 = closure r1(n8) : (Str, Str, U64 -> Str)
+        \\  n12 = List.fold_with_index(n4, n10, n11) : Str !spec
+        \\  n13 = record(n12) : { text : Str }
+        \\  n14 = wrap(n13) : Label
+        \\  n15 = Label.size(n14) : F32 !spec
+        \\  value n15
+        \\row r1 (List(Str), Str, Str, U64) -> Str
+        \\  n0 = 1 : U64
+        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
+        \\  n2 = List.get(p0, n1) : Builtin.Try
+        \\  n3 = "" : Str
+        \\  n4 = Try.ok_or(n2, n3) : Str !spec
+        \\  n5 = Str.concat(p1, p2, n4) : Str
+        \\  value n5
+        \\
+    );
+}
+
 test "an interpolated literal whose conversion can leave its body early is refused" {
     const staged = try Staged.create(std.testing.allocator,
         \\Early := { text : Str }.{

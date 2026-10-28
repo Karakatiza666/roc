@@ -732,6 +732,23 @@ segments and the values as its arguments. For example, a SQL translator
 then emits `?` placeholders, and a Rust translator emits `format!`. A
 translator that does not declare it must still receive the type's Roc
 implementation, walked by its definition. Pin both sides with a test.
+Done: both sides hold for a type in another package and for a type in the
+site's own module. In the cut, the literal is
+`T.from_interpolation(list(segments), list(values))`, where the n + 1
+segments include the empty ones and both lists keep source order
+(`src/check/code_reifier.zig` `interpolationExpr`). Outside the cut, the
+conversion is walked to the fold of `Str`. These tests in
+`src/compile/test/code_reifier_test.zig` pin it:
+
+| Type's module | In the cut | Outside the cut |
+|---|---|---|
+| another package | "an interpolated literal of a type whose conversion is in the cut is a Prim over its segments and values" (line 5545) | "M13: an interpolated literal of another package's type whose conversion is outside the cut is walked by its definition" (line 5599) |
+| the site's own | "M13: an interpolated literal of a type in the site's own module is a Prim in the cut and walked outside it" (line 5660) | the same test |
+
+A method of an opaque nominal (`::`) is a `Prim` with or without the cut,
+as the opaque-method entry at line 370 says, so this check applies to `:=`
+types. The SQL translator does not yet declare a conversion, so the `?`
+example is not built.
 
 M15 and M16 change normal forms when they admit rows, so each one raises
 `normal_form_version`, as every milestone that changes a rule does.
