@@ -293,9 +293,12 @@ test "a record update that mismatches its annotation leaves a base used by Str.i
     try test_env.assertDefTypeOptions("ruth", "{ years: U8 }", .{ .allow_type_errors = true });
 }
 
-test "a record update in a function body that mismatches the result annotation leaves the parameter intact" {
+test "a record update in a function body that mismatches the result annotation leaves the base's alias intact" {
     const source =
         \\Vet : { years : U8 }
+        \\
+        \\label : Vet -> Str
+        \\label = |_vet| "vet"
         \\
         \\older : Vet -> { years : I64 }
         \\older = |vet| { ..vet, years: 30 }
@@ -304,6 +307,7 @@ test "a record update in a function body that mismatches the result annotation l
     defer test_env.deinit();
 
     try test_env.assertOneTypeError("Type Mismatch");
+    try test_env.assertDefTypeOptions("label", "Vet -> Str", .{ .allow_type_errors = true });
     try test_env.assertDefTypeOptions("older", "Vet -> { years: I64 }", .{ .allow_type_errors = true });
 }
 
