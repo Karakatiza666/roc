@@ -5000,10 +5000,9 @@ const m8_helper =
 ;
 
 test "L3 M8: a helper called twice and its body written out have one inline_digest per node" {
-    try expectSameDigests(
-        m8_helper ++
-            \\wobble : U64 -> U64
-            \\wobble = |input| step(input) + step(input + 7)
+    try expectSameDigests(m8_helper ++
+        \\wobble : U64 -> U64
+        \\wobble = |input| step(input) + step(input + 7)
     ,
         \\wobble : U64 -> U64
         \\wobble = |input| (input * 3 + 1) + ((input + 7) * 3 + 1)
@@ -5065,20 +5064,17 @@ test "L3 M8: renamed bindings, a reorder and an if against a match keep every in
 test "L3 M8: a change to what a node computes changes the digests of the node and its readers" {
     // The constant changes the second `step`'s argument, so the first
     // half of the nodes stay and the sum changes.
-    try expectOtherDigests(
-        m8_helper ++
-            \\wobble : U64 -> U64
-            \\wobble = |input| step(input) + step(input + 7)
-    ,
-        m8_helper ++
-            \\wobble : U64 -> U64
-            \\wobble = |input| step(input) + step(input + 8)
+    try expectOtherDigests(m8_helper ++
+        \\wobble : U64 -> U64
+        \\wobble = |input| step(input) + step(input + 7)
+    , m8_helper ++
+        \\wobble : U64 -> U64
+        \\wobble = |input| step(input) + step(input + 8)
     , 1);
     // A different operation in the helper changes every node that reads it.
-    try expectOtherDigests(
-        m8_helper ++
-            \\wobble : U64 -> U64
-            \\wobble = |input| step(input) + step(input + 7)
+    try expectOtherDigests(m8_helper ++
+        \\wobble : U64 -> U64
+        \\wobble = |input| step(input) + step(input + 7)
     ,
         \\step : U64 -> U64
         \\step = |x| x * 3 - 1
@@ -5824,10 +5820,10 @@ test "an interpolated literal whose conversion is generic in the item type of it
 /// literal of it.
 fn htmlSource(comptime body: []const u8) []const u8 {
     return
-        \\Html := [Html(Str)].{
-        \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
-        \\    from_interpolation = |segments|
-        \\
+    \\Html := [Html(Str)].{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments|
+    \\
     ++ body ++
         \\
         \\    check : List(Str) -> Try({}, [InvalidInterpolation(Str)])
@@ -6211,12 +6207,15 @@ test "L3 N8g: a helper with a loop that can return stays apart from one without 
         \\wobble : { xs : List(U64), k : U64 } -> U64
         \\wobble = |input| plain(input.xs, input.k) * looped(input.xs, input.k)
     }) |site| {
-        const source = try std.mem.concat(std.testing.allocator, u8, &.{ find_looped,
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{
+            find_looped,
             \\plain : List(U64), U64 -> U64
             \\plain = |xs, k| xs.len() + k
             \\
             \\
-        , site });
+            ,
+            site,
+        });
         defer std.testing.allocator.free(source);
         const staged = try Staged.createRunning(std.testing.allocator, source, "");
         defer staged.destroy();
