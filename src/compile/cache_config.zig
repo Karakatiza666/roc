@@ -418,7 +418,10 @@ pub const Constants = struct {
     ///      types of described bodies over a cycle of two nominals change.
     /// 185: Normal form 22: a checked `plus` chain with an operand that
     ///      always crashes flattens (N15a), so described bodies change.
-    pub const CACHE_VERSION = 185;
+    /// 186: Normal form 23: a nominal closes only under its own instance
+    ///      (2.1, T1), so described bodies over a nominal inside another
+    ///      instance of its name change, and some are refused.
+    pub const CACHE_VERSION = 186;
 };
 
 /// Configuration for the Roc cache system.

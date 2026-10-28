@@ -268,27 +268,16 @@ pub const Reifier = struct {
     /// at every site, because each site has a type table of its own.
     ty_cache: collections.DenseMapUnmanaged(CheckedTypeId, TyId) = .empty,
     /// The types `tyOf` is part way through building. Roc reaches recursion
-    /// only through a nominal, and `nominal_in_progress` closes that, so a type
-    /// that reaches itself any other way has no description and is refused
-    /// rather than recursed into forever.
+    /// only through a nominal, and `nominalTy` closes that, so a type that
+    /// reaches itself any other way has no description and is refused rather
+    /// than recursed into forever.
     ///
-    /// Keyed by the enclosing instantiation as well as the id, because a
-    /// declaration's backing is one template every use shares: `Chain(F32)`
-    /// and the `Chain(U16)` written inside it walk the same backing id under
-    /// different bindings, and the second is not the first reaching itself.
+    /// Keyed by how many nominals the walk is inside as well as the id,
+    /// because a declaration's backing is one template every expansion
+    /// shares: `Chain(F32)` and the `Chain(U16)` written inside it walk the
+    /// same backing id under different bindings, and the second is not the
+    /// first reaching itself.
     type_in_progress: std.AutoHashMapUnmanaged(TypeFrame, void) = .empty,
-    /// Nominals that a `recursive` type built so far still refers to. A
-    /// nominal closes its own, and a type left holding one names a nominal it
-    /// does not contain, so what it means depends on where it sits rather than
-    /// on its checked id alone.
-    open_recursions: collections.DenseMapUnmanaged(CheckedTypeId, void) = .empty,
-    /// The nominals `tyOf` is part way through building, each keyed by the
-    /// declaration and what this use fixed its variables to, and each valued
-    /// by the checked id the nominal being built carries.
-    nominal_in_progress: std.AutoHashMapUnmanaged([32]u8, CheckedTypeId) = .empty,
-    /// The innermost nominal instantiation `tyOf` is walking inside, zero
-    /// where the walk is inside none.
-    nominal_instance: [32]u8 = @splat(0),
     /// The constants the walk is part way through folding. A definition that
     /// reads itself is refused on the repeat rather than followed forever.
     folding: collections.DenseMapUnmanaged(CheckedExprId, void) = .empty,
@@ -356,9 +345,9 @@ pub const Reifier = struct {
         field: checked.CheckedRecordField,
     };
 
-    /// One type id, under the nominal instantiation the walk reached it in.
+    /// One type id, at the count of nominals the walk reached it inside.
     const TypeFrame = struct {
-        instance: [32]u8,
+        depth: usize,
         id: CheckedTypeId,
     };
 
@@ -621,8 +610,6 @@ pub const Reifier = struct {
         self.scope.deinit(self.gpa);
         self.ty_cache.deinit(self.gpa);
         self.type_in_progress.deinit(self.gpa);
-        self.open_recursions.deinit(self.gpa);
-        self.nominal_in_progress.deinit(self.gpa);
         self.nominal_args.deinit(self.gpa);
         self.related.deinit(self.gpa);
         self.unfit.deinit(self.gpa);
@@ -6325,12 +6312,12 @@ pub const Reifier = struct {
         // its one spelling there (roc-reify-normal-form.md 2.1). Inside one,
         // a part may still name a nominal around it, and the cache can hand
         // back a part spelled at its own root, so a part is left as built.
-        if (self.nominal_in_progress.count() != 0) return ty;
+        if (self.walk.open_nominals.items.len != 0) return ty;
         return self.rt().canonical(ty);
     }
 
     /// `tyOf` while the walk may be inside a nominal: a correct spelling,
-    /// not yet the canonical one.
+    /// not yet the canonical one. `Types.canonical` alone decides T1.
     fn tyInNominals(self: *Reifier, type_id: CheckedTypeId, region: base.Region) Error!TyId {
         // Resolving at the leaf is enough: a composite holding a variable is
         // reached by recursion into the variable itself.
@@ -6342,21 +6329,20 @@ pub const Reifier = struct {
             return fixed.reader.tyOf(fixed.id, region);
         }
         if (self.ty_cache.get(type_id)) |cached| return cached;
-        const frame = TypeFrame{ .instance = self.nominal_instance, .id = type_id };
+        const frame = TypeFrame{ .depth = self.walk.open_nominals.items.len, .id = type_id };
         if (self.type_in_progress.contains(frame)) {
             return self.rejectError(.unsupported_type, region, "a recursive type");
         }
         try self.type_in_progress.put(self.gpa, frame, {});
         defer _ = self.type_in_progress.remove(frame);
 
-        const open_before = self.open_recursions.count();
         const uses_before = self.substitution_uses;
         const ty = try self.buildTy(type_id, region);
-        // Cache only a type that stands alone: one still holding an open
-        // `Recursive` means something else outside the nominal it was built
-        // under, and one a substitution answered inside means something else
-        // at the next instantiation.
-        if (self.open_recursions.count() == open_before and self.substitution_uses == uses_before) {
+        // Cache only a type that stands alone. A substitution that answered
+        // inside means something else at the next instantiation, and a
+        // `Recursive` inside counts as one (`nominalTy`): it means something
+        // else under other enclosing nominals.
+        if (self.substitution_uses == uses_before) {
             try self.ty_cache.put(self.gpa, type_id, ty);
         }
         return ty;
@@ -6396,7 +6382,7 @@ pub const Reifier = struct {
                 defer self.gpa.free(params);
                 break :blk try types.funcTy(params, try self.tyOf(function.ret, region));
             },
-            .nominal => |nominal| self.nominalTy(type_id, nominal, region),
+            .nominal => |nominal| self.nominalTy(nominal, region),
             .tag_union => |tag_union| self.tagUnionTy(tag_union.tags, tag_union.ext, region),
             .empty_tag_union => types.tagUnionTy(&.{}),
         };
@@ -6467,7 +6453,7 @@ pub const Reifier = struct {
         }
     }
 
-    fn nominalTy(self: *Reifier, type_id: CheckedTypeId, nominal: checked.CheckedNominalType, region: base.Region) Error!TyId {
+    fn nominalTy(self: *Reifier, nominal: checked.CheckedNominalType, region: base.Region) Error!TyId {
         const types = self.rt();
         if (nominal.builtin) |builtin_nominal| {
             switch (builtin_nominal) {
@@ -6514,32 +6500,68 @@ pub const Reifier = struct {
             return self.opaqueTy(nominal, region);
         const name = self.names.typeNameText(nominal.name);
 
+        // A `Recursive(name)` refers to the nearest enclosing nominal of
+        // that name, so this use closes only where that nominal is this
+        // instance. Under any other one it expands again (T1). The key reads
+        // this use's arguments under the bindings around it, before this use
+        // binds its own: `Pair(b, a)` inside `Pair(a, b)` is another instance.
+        const instance = self.nominalInstanceKey(nominal);
+        const open = &self.walk.open_nominals;
+        if (nearestOpen(open.items, name)) |at| {
+            if (std.mem.eql(u8, &open.items[at].instance, &instance)) {
+                // What this means depends on the nominals around it, so the
+                // frames that asked decline to cache it.
+                self.substitution_uses += 1;
+                return types.recursiveTy(name);
+            }
+        }
+        if (expansionRepeats(open.items, name, instance)) {
+            return self.rejectError(.unsupported_type, region, "a recursive type with no finite description");
+        }
+        try open.append(self.gpa, .{ .name = name, .instance = instance });
+        defer _ = open.pop();
+
         // The backing is the declaration's template, written in the nominal's
         // own variables, and `args` is what this use fixed them to.
         var bound_args = try self.bindNominalArgs(nominal);
         defer self.releaseNominalArgs(&bound_args);
 
-        // The backing is where a nominal reaches itself, and the nominal this
-        // builds is what such a reference names, so open the reference before
-        // descending and close it after.
-        const instance = self.nominalInstanceKey(nominal);
-        if (self.nominal_in_progress.get(instance)) |open| {
-            try self.open_recursions.put(self.gpa, open, {});
-            // What this answers depends on what the enclosing use fixed, so
-            // the frame that asked declines to cache it.
-            self.substitution_uses += 1;
-            return types.recursiveTy(name);
-        }
-        try self.nominal_in_progress.put(self.gpa, instance, type_id);
-        defer _ = self.nominal_in_progress.remove(instance);
-
-        const enclosing = self.nominal_instance;
-        self.nominal_instance = instance;
-        defer self.nominal_instance = enclosing;
-
         const backing_ty = try self.tyOf(backing, region);
-        _ = self.open_recursions.remove(type_id);
         return self.rt().nominalTy(name, backing_ty);
+    }
+
+    /// The position of the nearest nominal named `name` that `open` holds.
+    fn nearestOpen(open: []const Walk.OpenNominal, name: []const u8) ?usize {
+        var at = open.len;
+        while (at > 0) {
+            at -= 1;
+            if (std.mem.eql(u8, open[at].name, name)) return at;
+        }
+        return null;
+    }
+
+    /// Whether expanding `instance` inside `open` repeats an expansion that
+    /// `open` already holds: the same instance, with the same nearest nominal
+    /// for each name. What an expansion builds depends only on these, so a
+    /// repeat builds itself again inside itself, and the T1 tree of the type
+    /// is infinite. `Pair(a, b) := [Leaf(a), Node(Pair(b, a))]` is one.
+    ///
+    /// Instances and names are finite, so a walk that expands only where
+    /// this is false ends.
+    fn expansionRepeats(open: []const Walk.OpenNominal, name: []const u8, instance: [32]u8) bool {
+        for (open, 0..) |earlier, j| {
+            if (!std.mem.eql(u8, earlier.name, name) or !std.mem.eql(u8, &earlier.instance, &instance)) continue;
+            // The nearest nominal of each name now is the nearest before `j`,
+            // except for a name expanded at or after `j`.
+            const since = open[j..];
+            const same = for (since, 0..) |entry, i| {
+                if (nearestOpen(since[i + 1 ..], entry.name) != null) continue;
+                const before = nearestOpen(open[0..j], entry.name) orelse break false;
+                if (!std.mem.eql(u8, &open[before].instance, &entry.instance)) break false;
+            } else true;
+            if (same) return true;
+        }
+        return false;
     }
 
     /// A key for one nominal at one instantiation: the declaration, and what
@@ -8357,6 +8379,10 @@ pub const Walk = struct {
     /// outermost one, or null outside every substitution. A variable the
     /// use left open is named by the one the annotation wrote.
     through: ?Reifier.TypeRef = null,
+    /// The nominals `tyOf` is part way through building, outermost first,
+    /// in every reader: a `Recursive` refers to the nearest one of its name,
+    /// whichever module's reader opened it.
+    open_nominals: std.ArrayList(OpenNominal) = .empty,
     /// The view the site being walked declares (plan 1.5, V6).
     view: View = .graph,
     /// The site's cut (I14, N8h): each function the `code_primitives` item of
@@ -8403,6 +8429,13 @@ pub const Walk = struct {
         leaves: std.ArrayList(PatternBinderId) = .empty,
     };
 
+    /// One nominal `tyOf` is building: the name its `Recursive` carries, and
+    /// its declaration with what this use fixed its variables to.
+    const OpenNominal = struct {
+        name: []const u8,
+        instance: [32]u8,
+    };
+
     /// A normal form P1 keeps: its `Graph`, its nodes' origins, and the
     /// slots its root reads, in slot order.
     const Normalized = struct {
@@ -8437,6 +8470,7 @@ pub const Walk = struct {
         self.cut.deinit(self.gpa);
         self.definitions.deinit(self.gpa);
         self.rows.deinit(self.gpa);
+        self.open_nominals.deinit(self.gpa);
         self.clearClosureTargets();
         self.closure_targets.deinit(self.gpa);
         var memo = self.normalized.valueIterator();
@@ -8590,9 +8624,8 @@ pub const Walk = struct {
         for (self.readers.items) |open| {
             open.ty_cache.clearRetainingCapacity();
             open.type_in_progress.clearRetainingCapacity();
-            open.open_recursions.clearRetainingCapacity();
-            open.nominal_in_progress.clearRetainingCapacity();
         }
+        self.open_nominals.clearRetainingCapacity();
     }
 
     fn endSite(self: *Walk) void {

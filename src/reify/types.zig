@@ -937,3 +937,42 @@ test "unfolding a recursive nominal puts it where its backing refers back to it,
     const plain = try types.nominalTy("Box", i64_ty);
     try std.testing.expectEqual(i64_ty, try types.unfold(plain));
 }
+
+test "a nominal inside another instance of its name expands again, and closes only under its own instance" {
+    var types = Types.init(std.testing.allocator);
+    defer types.deinit();
+    // Wrap(a) := { items : List(a) }, A := { x : Wrap(B) }, B := { y : Wrap(A) }
+    const wrapOf = struct {
+        fn of(t: *Types, item: TyId) Allocator.Error!TyId {
+            return t.nominalTy("Wrap", try t.recordTy(&.{.{ .name = "items", .ty = try t.listTy(item) }}));
+        }
+    }.of;
+    const aOf = struct {
+        fn of(t: *Types, x: TyId) Allocator.Error!TyId {
+            return t.nominalTy("A", try t.recordTy(&.{.{ .name = "x", .ty = x }}));
+        }
+    }.of;
+    const bOf = struct {
+        fn of(t: *Types, y: TyId) Allocator.Error!TyId {
+            return t.nominalTy("B", try t.recordTy(&.{.{ .name = "y", .ty = y }}));
+        }
+    }.of;
+    // The T1 tree of `Wrap(A)`: the inner `Wrap(A)` sits under `Wrap(B)`, so
+    // it expands, and its `A` closes at the `A` around it.
+    const back_a = try types.recursiveTy("A");
+    const wrap_a = try wrapOf(&types, try aOf(&types, try wrapOf(&types, try bOf(&types, try wrapOf(&types, back_a)))));
+    try std.testing.expectEqual(wrap_a, try types.canonical(wrap_a));
+    // The same type unrolled once more closes at its T1 tree.
+    const unrolled = try wrapOf(&types, try aOf(&types, try wrapOf(&types, try bOf(&types, try wrapOf(&types, try aOf(&types, try wrapOf(&types, try bOf(&types, try wrapOf(&types, back_a)))))))));
+    try std.testing.expect(unrolled != wrap_a);
+    try std.testing.expectEqual(wrap_a, try types.canonical(unrolled));
+    // `Recursive(Wrap)` under `Wrap(B)` is `Wrap(B)`, so this tree gives `B`
+    // a field of `Wrap(B)`: another type.
+    const misread = try wrapOf(&types, try aOf(&types, try wrapOf(&types, try bOf(&types, try types.recursiveTy("Wrap")))));
+    try std.testing.expect(try types.canonical(misread) != wrap_a);
+    // The backing of `Wrap(A)` holds `A` spelled from its own root, where
+    // the `Wrap(A)` inside `B` closes at nothing and expands.
+    const a = try aOf(&types, try wrapOf(&types, try bOf(&types, try wrapOf(&types, back_a))));
+    try std.testing.expectEqual(a, try types.canonical(a));
+    try std.testing.expectEqual(try types.recordTy(&.{.{ .name = "items", .ty = try types.listTy(a) }}), try types.unfold(wrap_a));
+}

@@ -230,7 +230,26 @@ starts at were two `TyId`s. The verifier and the rebuild compare types by
 `TyId`, so they refused or misread equal types. `Types.canonical` and
 `Types.unfold` (`src/reify/types.zig:346`, `:366`) spell a type by T1, and the
 reifier spells each type it gives a node by T1 (`tyOf`,
-`src/check/code_reifier.zig:6322`).
+`src/check/code_reifier.zig:6309`).
+
+The reifier builds the tree from the checked type before `Types.canonical`
+spells it. Each nominal in that tree is one instance: the declaration and
+what its use fixed the variables to. The walk closes an instance only where
+the nearest enclosing nominal of its name is that instance, and expands it
+again everywhere else (`nominalTy`, `src/check/code_reifier.zig:6456`).
+
+| Declarations | The type | What the walk does |
+|---|---|---|
+| `Wrap(a) := { items : List(a) }`, `A := { x : Wrap(B) }`, `B := { y : Wrap(A) }` | `Wrap(A)` | the `Wrap(A)` inside `B` sits under `Wrap(B)`, so it expands, and its `A` closes: `Named(Wrap, { items : List(Named(A, { x : Named(Wrap, { items : List(Named(B, { y : Named(Wrap, { items : List(Recursive(A)) }) })) }) })) })` |
+| `Pair(a, b) := [Leaf(a), Node(Pair(b, a))]` | `Pair(Str, U64)` | the nearest `Pair` is always the other instance, so no `Recursive(Pair)` closes and the T1 tree is infinite. The walk refuses the site: "a recursive type with no finite description" |
+
+An expansion depends only on its instance and on the nearest instance of
+each name around it. The walk refuses an expansion that repeats one that
+encloses it with these same (`expansionRepeats`,
+`src/check/code_reifier.zig:6551`), because the repeat builds itself inside
+itself again. The checker refuses a recursive use that wraps a variable,
+such as `Nest(List(a))` inside `Nest(a)`, so a type has finitely many
+instances and names, and the walk ends.
 
 ---
 

@@ -7454,3 +7454,126 @@ test "an inlined unwrap in a cycle through a union, a generic link, or self recu
         if (staged.outcome != .reified) return error.TestUnexpectedResult;
     }
 }
+
+// A `Recursive(name)` refers to the nearest enclosing nominal of that name
+// (roc-reify-normal-form.md 2.1, T1). A nominal already being built closes
+// only where that nearest nominal is the same instance, and expands again
+// under a different instance of its name.
+
+/// `wobble` over `Wrap(A)`, where `A` reaches `B`, and `B` reaches `A` again
+/// through `link`.
+fn nestedWrapOf(comptime link: []const u8) []const u8 {
+    return
+    \\Wrap(a) := { items : List(a) }.{
+    \\    first_len : Wrap(a) -> U64
+    \\    first_len = |Wrap.(w)| w.items.len()
+    \\    items_of : Wrap(a) -> List(a)
+    \\    items_of = |Wrap.(w)| w.items
+    \\}
+    \\
+    \\Box(a) := { items : List(a) }
+    \\
+    \\A := { x : Wrap(B) }
+    \\
+    ++ "B := { y : " ++ link ++ "(A) }\n\n" ++
+        \\wobble : Wrap(A) -> Bool
+        \\wobble = |input| match input.items_of().first() { Ok(A.(a)) => a.x.first_len() > 0, Err(_) => Bool.False }
+    ;
+}
+
+test "a nominal inside another instance of its name expands again, and closes at its own instance" {
+    // `Wrap(A)` holds `Wrap(B)`, which holds `Wrap(A)` again. Under `Wrap(B)`,
+    // `Recursive(Wrap)` is `Wrap(B)`, so the inner `Wrap(A)` is spelled out,
+    // and its `A` closes at the `A` around it.
+    const staged = try Staged.createRunning(std.testing.allocator, nestedWrapOf("Wrap"), "");
+    defer staged.destroy();
+    try staged.expectDump(
+        \\row r0 (Wrap) -> Bool
+        \\  n0 = unwrap(p0) : { items : List(A) }
+        \\  n1 = field 0(n0) : List(A)
+        \\  n2 = List.first(n1) : Builtin.Try !spec
+        \\  n3 = unwrap(n2) : [Err([ListWasEmpty]), Ok(A)]
+        \\  n13 = switch n3 : Bool !spec
+        \\    arm 0
+        \\      n4 = False : Bool
+        \\      value n4
+        \\    arm 1
+        \\      n5 = 0 : U64
+        \\      n6 = payload Ok.0(n3) : A !spec
+        \\      n7 = unwrap(n6) : { x : Wrap }
+        \\      n8 = field 0(n7) : Wrap
+        \\      n9 = unwrap(n8) : { items : List(B) }
+        \\      n10 = field 0(n9) : List(B)
+        \\      n11 = List.len(n10) : U64
+        \\      n12 = Num.U64.is_lt(n5, n11) : Bool
+        \\      value n12
+        \\  value n13
+        \\
+    );
+    const site = staged.walk.site.?;
+    const types = &site.types;
+    const param = site.store.tySlice(site.store.row(staged.walk.root.?).params)[0];
+    const wrap = struct {
+        fn of(t: *reify.types.Types, item: reify.ir.TyId) !reify.ir.TyId {
+            return t.nominalTy("Wrap", try t.recordTy(&.{.{ .name = "items", .ty = try t.listTy(item) }}));
+        }
+    }.of;
+    const field = struct {
+        fn of(t: *reify.types.Types, nominal: []const u8, name: []const u8, ty: reify.ir.TyId) !reify.ir.TyId {
+            return t.nominalTy(nominal, try t.recordTy(&.{.{ .name = name, .ty = ty }}));
+        }
+    }.of;
+    const expected = try wrap(types, try field(types, "A", "x", try wrap(types, try field(types, "B", "y", try wrap(types, try types.recursiveTy("A"))))));
+    try std.testing.expectEqual(expected, param);
+}
+
+test "a cycle through a nominal of another name, or through `Wrap` to itself alone, reifies alike" {
+    // `B` reaches `A` through `Box`, a nominal of another name.
+    const boxed = try Staged.createRunning(std.testing.allocator, nestedWrapOf("Box"), "");
+    defer boxed.destroy();
+    if (boxed.outcome != .reified) return error.TestUnexpectedResult;
+    // `A` reaches itself through `Wrap` alone.
+    const alone = try Staged.createRunning(std.testing.allocator,
+        \\Wrap(a) := { items : List(a) }.{
+        \\    first_len : Wrap(a) -> U64
+        \\    first_len = |Wrap.(w)| w.items.len()
+        \\    items_of : Wrap(a) -> List(a)
+        \\    items_of = |Wrap.(w)| w.items
+        \\}
+        \\
+        \\A := { x : Wrap(A) }
+        \\
+        \\wobble : Wrap(A) -> Bool
+        \\wobble = |input| match input.items_of().first() { Ok(A.(a)) => a.x.first_len() > 0, Err(_) => Bool.False }
+    , "");
+    defer alone.destroy();
+    if (alone.outcome != .reified) return error.TestUnexpectedResult;
+}
+
+/// `wobble` over `Pair(left, right)`, whose `Node` swaps its arguments.
+fn swappedPairOf(comptime args: []const u8) []const u8 {
+    return
+    \\Pair(a, b) := [Leaf(a), Node(Pair(b, a))].{
+    \\    first_is_leaf : Pair(a, b) -> Bool
+    \\    first_is_leaf = |Pair.(p)| match p { Leaf(_) => Bool.True, Node(_) => Bool.False }
+    \\}
+    \\
+    ++ "wobble : Pair(" ++ args ++ ") -> Bool\n" ++
+        \\wobble = |input| Pair.first_is_leaf(input)
+    ;
+}
+
+test "a nominal that alternates two instances of its name has no finite description and is refused" {
+    // `Pair(Str, U64)` holds `Pair(U64, Str)`, which holds `Pair(Str, U64)`.
+    // The nearest `Pair` is always the other one, so no `Recursive(Pair)`
+    // closes either, and the T1 tree is infinite.
+    const staged = try Staged.createRunning(std.testing.allocator, swappedPairOf("Str, U64"), "");
+    defer staged.destroy();
+    try staged.expectRejected("a recursive type with no finite description");
+}
+
+test "a nominal whose swapped arguments are one type closes at itself" {
+    const staged = try Staged.createRunning(std.testing.allocator, swappedPairOf("Str, Str"), "");
+    defer staged.destroy();
+    if (staged.outcome != .reified) return error.TestUnexpectedResult;
+}

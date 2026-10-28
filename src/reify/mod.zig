@@ -36,7 +36,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 22;
+pub const normal_form_version: u32 = 23;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -88,6 +88,8 @@ pub fn fingerprint() u64 {
     h.update("T1: a nominal is Recursive exactly where the nearest enclosing Named of its name is the same type; T2: a node's type, and the backing an Unwrap gives, are spelled from their own root");
     // N15a over a checked `plus`: monotone in the intervals.
     h.update("N15a: an operand with an empty interval adds nothing to a checked plus chain's bounds");
+    // 2.1 over instances: T1 closes a nominal only under its own instance.
+    h.update("T1: a nominal closes only where the nearest enclosing nominal of its name is the same instance, and expands again under another; a type whose T1 tree is infinite is refused");
     return h.final();
 }
 
@@ -201,6 +203,11 @@ const recorded = [_]Recorded{
     // intervals. An operand with an empty interval, which always crashes
     // where it is read, adds nothing to the chain's bounds.
     .{ .version = 22, .fingerprint = 0x032a7bb4ace86414 },
+    // Fix: a nominal closes only where the nearest enclosing nominal of its
+    // name is the same instance (2.1, T1). Under another instance of its
+    // name it expands again, and a type whose T1 tree is infinite, such as
+    // `Pair(a, b) := [Leaf(a), Node(Pair(b, a))]`, is refused.
+    .{ .version = 23, .fingerprint = 0x8737202fc6def1b1 },
 };
 
 const std = @import("std");

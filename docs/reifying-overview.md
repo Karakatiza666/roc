@@ -159,7 +159,7 @@ Checking commits nothing for a described function. The walk that builds the desc
 
 | Item | Rule |
 | --- | --- |
-| `Code.version` | The version of the normal form. It is 16 today ([../src/reify/mod.zig:38](../src/reify/mod.zig)). |
+| `Code.version` | The version of the normal form. It is 23 today ([../src/reify/mod.zig:39](../src/reify/mod.zig)). |
 | When the version changes | When the rules, the builtin table, or the speculatable lists change. A fingerprint test pins this. |
 | `==` and `to_hash` on a `Code` | They read the normal form and the version. They ignore the site key. Two sites with the same normal form are equal. |
 | A translator cache | Use `Code.version` and `Code.to_hash` as the key. |
