@@ -424,7 +424,10 @@ pub const Constants = struct {
     /// 187: A record update joins its base's type class as an occurrence, so
     ///      a mismatch at the update no longer makes the base's binding
     ///      erroneous, and checked types of such modules change.
-    pub const CACHE_VERSION = 187;
+    /// 188: A staged argument relates the call's own `Code(f)` parameter and
+    ///      takes no copy of it, so a `where` receiver in `f` is not copied,
+    ///      and checked results of modules with such calls change.
+    pub const CACHE_VERSION = 188;
 };
 
 /// Configuration for the Roc cache system.

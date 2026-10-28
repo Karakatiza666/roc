@@ -9925,6 +9925,13 @@ compares only the flags a copy carries (`DescriptorFlags.copied`), so a type
 whose classes record a defaulting decision or a rejection is identical to its
 own copy and shares it like any other.
 
+A contextual type (a call's parameter, which an argument is checked in) is
+never copied: the call relates the argument to it. A staged argument relates
+its function to the `f` of the parameter's `Code(f)`, and its node to the
+parameter, and takes no copy of the parameter either. A copy would hold a
+second instance of each flex `where` receiver in `f`, which nothing relates to
+the call and so nothing fixes.
+
 A row the reference itself WRITES as a type argument is decided the same way,
 by composition rather than by inheritance. A declaration's formal stands
 wherever the declaration's body puts it, so the argument substituted for it is

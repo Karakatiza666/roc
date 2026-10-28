@@ -27446,7 +27446,15 @@ fn beginExprCheckFrame(
     // Materialize an annotation once at the expression frame that owns it.
     frame.expr_var, frame.mb_anno_vars, frame.nested_expected = blk: {
         if (staged_code) |staged| {
-            const backup = try self.instantiateVarOrphan(staged.expected_type.var_, env, env.rank(), .use_last_var);
+            // An expected type (a template's annotated return) keeps a pristine
+            // copy, as for any expected type. A contextual type (a call's
+            // parameter) is the call's own type, which an ordinary argument
+            // never copies: a copy would hold a second, unrelated instance of
+            // each `where` receiver in it (bug 04).
+            const backup = if (expected.expected_type != null)
+                try self.instantiateVarOrphan(staged.expected_type.var_, env, env.rank(), .use_last_var)
+            else
+                staged.expected_type.var_;
             break :blk .{
                 try self.fresh(env, expr_region),
                 AnnoVars{

@@ -1381,6 +1381,30 @@ const staged_imported_alias_called = stage ++
     \\main = Stage.describe(twice)
 ;
 
+// A `where` on the `v` of a `Code(row -> v)` parameter is met by the type the
+// staged argument and the value fix together, as for a plain function
+// parameter (surreal bug 04).
+const put_module =
+    \\Put :: {}.{
+    \\    put : List(row), Code(row -> v), v -> Str where [v.to_str : v -> Str]
+    \\    put = |_rows, path, value| "${Code.graph(path).rows().len().to_str()} / ${value.to_str()}"
+    \\}
+;
+
+const staged_where_on_code_result =
+    \\import Put
+    \\
+    \\R : { a : I64 }
+    \\
+    \\rows : List(R)
+    \\rows = []
+    \\
+    \\five : I64
+    \\five = 5
+    \\
+    \\main = Put.put(rows, |r| r.a, five)
+;
+
 const steps_module =
     \\Steps :: {}.{
     \\    add_one : I64 -> I64
@@ -2608,6 +2632,13 @@ pub const tests = [_]TestCase{
         .source = staged_imported_alias_called,
         .imports = &.{.{ .name = "Steps", .source = steps_module }},
         .expected = .{ .inspect_str = "\"r0 = |I64| -> I64 Num.I64.times(Num.I64.plus(p0, 1), 2)\"" },
+    },
+    .{
+        .name = "staging - a where on the result of a Code argument is met by the type the call fixes",
+        .source_kind = .module,
+        .source = staged_where_on_code_result,
+        .imports = &.{.{ .name = "Put", .source = put_module }},
+        .expected = .{ .inspect_str = "\"1 / 5\"" },
     },
     .{
         .name = "staging - a default operand describes as a switch on the Try",
