@@ -453,7 +453,17 @@ A node that is not speculatable is never hoisted: moving it out of a branch or
 a loop would speculate. The hoist step runs after the fixpoint, because a node
 hoisted out of a branch inside a loop would leave the facts of that branch
 before N13 could use them. It ends by merging the identical nodes it brought
-into one region, which changes no content digest.
+into one region, which changes no content digest, and by the second case of
+the merge table over what it brought into the arms of a switch: a literal
+hoisted out of a loop in one arm is one node with the same literal of every
+other arm, as it is when it was written before the loop (`src/reify/place.zig`,
+`planWith`). A node merged so is hoisted again from the switch's region.
+
+One gap remains: hash-consing merges a node into an identical one of an
+enclosing region when the walk builds it, and when a later round removes the
+reader of the enclosing one, the merged node stays one node read from two
+arms, where the same nodes written in those arms alone stay apart. A literal
+`0` that a `while` over a list's indices started from shows it.
 
 This is Click's schedule (1995): as late as possible, then no deeper in loops
 than necessary. The earliest region of a node that is not speculatable depends
@@ -891,7 +901,7 @@ in the simplify phase:
 
 | Pattern | Becomes | Condition, all exact |
 |---|---|---|
-| a `Loop` whose body ends in `Branch` on a `Switch` on `is_lt(s, b)`, where `s` is a slot of a builtin integer type starting at `a` | `ForRange(a, b, False)` with `s` as the index and the other slots kept | `b` does not depend on the slots; the `False` arm is `Break` of the other slots; every `Continue` passes `plus(s, 1)` or `plus(1, s)` for `s`. The checked `plus` cannot overflow under `s < b`, so dropping it is exact. The slot is the one the test reads, so at most one slot can match, and no order among slots is consulted. The test may also be `is_lte(b, s)` with the `True` arm leaving, which is how `if s >= b { break }` arrives: N13q turns the test of a value switch into `is_lt`, and an exiting switch keeps the form the walk gave it |
+| a `Loop` whose body ends in `Branch` on a `Switch` on `is_lt(s, b)`, where `s` is a slot of a builtin integer type starting at `a` | `ForRange(a, b, False)` with `s` as the index and the other slots kept | `b` does not depend on the slots; the `False` arm is `Break` of the other slots; every `Continue` passes `plus(s, 1)` or `plus(1, s)` for `s`. The checked `plus` cannot overflow under `s < b`, so dropping it is exact. The `False` arm's `Break` may give only some of the other slots, each once, because N11j narrows a general `Loop`'s `Break` to the outputs something reads; the `ForRange` has an output for every slot, and a `Break` in the body gives a slot that no output gave as it stands. The slot is the one the test reads, so at most one slot can match, and no order among slots is consulted. The test may also be `is_lte(b, s)` with the `True` arm leaving, which is how `if s >= b { break }` arrives: N13q turns the test of a value switch into `is_lt`, and an exiting switch keeps the form the walk gave it |
 | `ForRange(Lit(0), List.len(xs), False)` | `ForList(xs)`, with every `Elem(xs, index)` in the body replaced by the element | `xs` does not depend on the slots |
 | a `Loop` with an iterator slot that starts as `List.iter(xs)` (through `Iter.iter`, which is the identity), whose body switches on `Iter.next` of that slot, ends in `Break` of the other slots on `Done`, and passes the `rest` of the step as the iterator on every `Continue` | `ForList(xs)` with the other slots kept; the `item` the body reads is the element | the iterator and the step are read by nothing else. The procedures are recognized by the checker-authored `IteratorProcedureId` on the named primitive, never by a name |
 
@@ -937,6 +947,8 @@ test. This includes a sum that starts at the counter's initial value and
 steps by 1: N11i merges it with the counter, so `var $s = 0` with
 `$s = $s + 1` in `while $i <= n` stays a `Loop`, while the same sum in a
 `for` over `0..=n` is a `ForRange` with two slots. They do not meet today.
+N11o does not close this gap: it replaces a counter that nothing after the
+loop reads, and this one is the loop's result.
 
 Slots are normalized like nodes:
 
@@ -987,6 +999,19 @@ without overflow on the edge before it, so the sum overflows nowhere the slot
 did not. Only the difference can overflow where the body does not, which the
 condition excludes. A step other than 1 would multiply the turn count, whose
 product can overflow where the slot does not, so it stays a slot.
+
+The two rules read these questions so (`src/reify/loops.zig`, `Ctx.decideTest`
+and `Ctx.deriveCounter`):
+
+| Question | Reading |
+|---|---|
+| What an edge is | a `Continue` on the loop's own paths, or an arm of a value switch in the region of that `Continue` that only the `Continue` reads. T3 makes one `Continue` of several (`if c { $done = Bool.True } else { $i = $i + 1 }` is one), so its arms are the edges, and that switch is built as an exiting switch (`Ctx.edgesFrom`) |
+| A value a dominating test decided | a `Bool` literal, or the scrutinee of a `Bool` switch, or the operand of its `Bool.not`, whose arm encloses the edge. The leading test is one of them, so an edge that passes `s` as it is continues (`Ctx.decidedAt`) |
+| The join that holds the exiting arm | it is built where the join rules would put it: at the one edge that exits (T2), or at each edge where the arm has no nodes (T4). An arm with nodes that several edges reach needs a second join of one exiting switch, which an exiting switch cannot carry (as for case-of-case, 3.13), so that loop stays a general `Loop` |
+| An exiting arm that reaches a `Continue`, or reads a node the body computes before the test | the loop stays a general `Loop`: the arm would run where the next turn's computations before the test have not run |
+| N11o over a `ForList` | a `ForList`'s index starts at 0, so N11o reads it as `ForRange(0, List.len(xs))`. Otherwise `for i in 0..<xs.len()` with a second counter would meet `for x in xs` only when N11o ran before the raising rule |
+| No exit reads `j` | no `Break` gives `j` for an output something reads, and no `Return` gives `j`. A node that reads `j` is a read in the body |
+| A `plus_wrap` step | not a derived counter: the sum is checked, and crashes where the wrapping step did not |
 
 #### What a loop iterates over
 

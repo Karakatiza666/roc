@@ -473,6 +473,11 @@ const Active = struct {
     body: RegionId,
     /// Per old slot, its initial value in the new row.
     init: []const Ref,
+    /// Per old body parameter, what it is while N11n builds the exiting arm
+    /// at an edge: the next values that edge passes.
+    override: ?[]const Ref = null,
+    /// Per old body parameter, the value N11o built for a derived counter.
+    derived: []const Ref = &.{},
 };
 
 const Rebuild = struct {
@@ -501,10 +506,10 @@ const Rebuild = struct {
     /// Nodes the copy does not build: what a loop rule or N12 replaced.
     skipped: std.AutoHashMapUnmanaged(NodeId, void) = .empty,
     /// Per old loop body being copied under a rewrite: that rewrite.
-    rewrites: collections.DenseMapUnmanaged(RegionId, *const Active) = .empty,
+    rewrites: collections.DenseMapUnmanaged(RegionId, *Active) = .empty,
     /// The loops being copied, innermost last: null for one copied as it is,
     /// and for a lambda, whose paths are not the loop's.
-    frames: std.ArrayList(?*const Active) = .empty,
+    frames: std.ArrayList(?*Active) = .empty,
     /// Where set, the row is rebuilt as a loop (N12).
     tail: ?*const loops.Tail = null,
     arena_impl: ?std.heap.ArenaAllocator = null,
@@ -584,6 +589,7 @@ const Rebuild = struct {
 
     // What parameter `k` of the old loop body a rewrite replaces is in the new one.
     fn paramRef(self: *const Rebuild, act: *const Active, k: u32) Ref {
+        if (act.override) |values| return values[k];
         return switch (act.rw.params[k]) {
             .param => |i| Ref.regionParam(act.body, @intCast(i)),
             .init => |slot| act.init[slot],
@@ -595,11 +601,12 @@ const Rebuild = struct {
             .gone => act.init[k - (act.rw.params.len - act.init.len)],
             // A split slot is read through the nodes that stand for its components.
             .split => @import("base").invariant("reify rebuild: a split loop slot is read whole", .{}),
+            .derived => act.derived[k],
         };
     }
 
     // The loop whose paths the region being copied is on, when a rewrite copies it.
-    fn active(self: *const Rebuild) ?*const Active {
+    fn active(self: *const Rebuild) ?*Active {
         if (self.frames.items.len == 0) return null;
         return self.frames.items[self.frames.items.len - 1];
     }
@@ -644,6 +651,12 @@ const Rebuild = struct {
             .value, .return_ => return self.tailValue(t, old_refs[0], as),
             .jump, .branch, .open, .continue_, .break_ => {},
         };
+        // N11n: an edge into the next turn continues, or runs the exiting
+        // arm; a region whose `Continue` read a value switch ends in it.
+        if (self.active()) |act| if (act.rw.decide) |d| if (act.override == null) {
+            if (d.branchOf(r)) |sw| return self.close(.{ .branch = self.nodes.get(sw).?.ref.nodeId() }, as);
+            if (d.edgeOf(r)) |e| return self.edge(act, d, e, as);
+        };
         // N14b: a loop that splits slots gives each part its component.
         if (self.active()) |act| if (act.rw.split) |sp| {
             const bounded = act.rw.op != .loop;
@@ -662,9 +675,11 @@ const Rebuild = struct {
             .return_ => returns_break = act.rw.returns_break,
             .value, .jump, .branch, .open => {},
         };
+        // N11l: a slot no output of the general loop gave is its value as it stands.
+        const filled: []const ?Ref = if (end.kind == .break_) if (self.active()) |act| act.rw.break_fill else &.{} else &.{};
         const picked = if (select) |sel| blk: {
             const out = try self.gpa.alloc(Ref, sel.len);
-            for (sel, out) |k, *o| o.* = old_refs[k];
+            for (sel, out, 0..) |k, *o, i| o.* = if (filled.len != 0 and filled[i] != null) filled[i].? else old_refs[k];
             break :blk out;
         } else try self.gpa.dupe(Ref, old_refs);
         defer self.gpa.free(picked);
@@ -700,6 +715,30 @@ const Rebuild = struct {
             },
         };
         try self.close(spec, as);
+    }
+
+    // N11n: the end of edge `e`. One that continues passes the next values
+    // of the slots the loop keeps; one whose value selects the exiting arm
+    // ends in that arm, built over its next values.
+    fn edge(self: *Rebuild, act: *Active, d: *const loops.Decide, e: *const loops.Edge, as: EndAs) Allocator.Error!void {
+        if (!e.exits) {
+            const refs = try self.gpa.alloc(Ref, act.rw.slots.len);
+            defer self.gpa.free(refs);
+            for (act.rw.slots, refs) |k, *o| o.* = self.mapRef(e.values[k]);
+            return self.close(.{ .continue_ = refs }, as);
+        }
+        const values = try self.gpa.alloc(Ref, e.values.len);
+        defer self.gpa.free(values);
+        for (e.values, values, 0..) |v, *o, k| {
+            if (k == d.slot) {
+                self.mark();
+                o.* = try self.b.litBool(d.exit_value);
+            } else o.* = self.mapRef(v);
+        }
+        act.override = values;
+        defer act.override = null;
+        try self.fill(d.exit_arm);
+        try self.finish(d.exit_arm, as, null);
     }
 
     // N14b: per part of the loop `act` builds, the value the old values of
@@ -912,7 +951,8 @@ const Rebuild = struct {
         }
 
         const built: Built = switch (nd.op) {
-            .switch_ => return self.switchNode(n, nd, args, tys, aux, old_regions),
+            // N11n: a value switch whose arms are edges is an exiting switch.
+            .switch_ => return self.switchNode(n, nd, args, if (self.splitByEdges(n)) &.{} else tys, aux, old_regions),
             .and_, .or_ => blk: {
                 const regions = try self.gpa.alloc(RegionId, old_regions.len);
                 defer self.gpa.free(regions);
@@ -927,7 +967,13 @@ const Rebuild = struct {
             .for_range, .for_list, .loop, .lambda => blk: {
                 // The loop rules (`loops.zig`): the loop is copied as a rewrite says.
                 if (nd.op != .lambda and !self.opts.raw) {
-                    const where: loops.Where = .{ .row_body = if (self.inside) null else self.row_body, .usage = try self.usage(), .below_max = .{ .ctx = self, .run = belowMax } };
+                    const where: loops.Where = .{
+                        .row_body = if (self.inside) null else self.row_body,
+                        .usage = try self.usage(),
+                        .below_max = .{ .ctx = self, .run = belowMax },
+                        .fits_minus = .{ .ctx = self, .run = fitsMinus },
+                        .rules = loopRules(self.b),
+                    };
                     if (try loops.analyze(self.arena(), self.p, self.b.types, n, where)) |found| {
                         const rw = found;
                         break :blk try self.rewrittenLoop(nd, &rw, args);
@@ -1058,10 +1104,23 @@ const Rebuild = struct {
                 o.* = try self.components(args[lead + leaf.index], leaf.path);
             }
         } else for (rw.slots, new_args[rw.header.len..]) |k, *o| o.* = args[lead + k];
+        // N11o: a derived counter is the index plus the difference, which is
+        // built where the loop stands.
+        const derived = try self.gpa.alloc(Ref, rw.params.len);
+        defer self.gpa.free(derived);
+        for (rw.params, derived) |to, *o| switch (to) {
+            .derived => |slot| o.* = try self.difference(rw, new_args, args[lead + slot]),
+            .param, .init, .same_as, .gone, .split => o.* = undefined,
+        };
+        if (rw.decide != null) self.b.algorithmFired(.decided_test);
+        for (rw.params) |to| if (to == .derived) {
+            self.b.algorithmFired(.derived_counter);
+            break;
+        };
         const body = try self.b.openRegion(.loop_body, rw.param_tys);
         if (rw.op == .for_list) try self.b.noteListLoop(body, new_args[0]);
         if (rw.op == .for_range) try self.b.noteRangeLoop(body, new_args[0], new_args[1], rw.payload == 1);
-        var act: Active = .{ .rw = rw, .body = body, .init = args[lead..] };
+        var act: Active = .{ .rw = rw, .body = body, .init = args[lead..], .derived = derived };
         try self.regions.put(self.gpa, rw.body, body);
         if (rw.continue_in) |r| try self.regions.put(self.gpa, r, body);
         try self.rewrites.put(self.gpa, rw.body, &act);
@@ -1070,6 +1129,13 @@ const Rebuild = struct {
         for (rw.stands) |st| try self.nodes.put(self.gpa, st.node, .{ .ref = Ref.regionParam(body, @intCast(st.param)), .width = 1 });
         try self.frames.append(self.gpa, &act);
         defer _ = self.frames.pop();
+        for (rw.params, derived) |to, *o| switch (to) {
+            .derived => {
+                self.mark();
+                o.* = try self.b.call(intOwner(self.b.types, rw.param_tys[0]), .plus, &.{ Ref.regionParam(body, 0), o.* });
+            },
+            .param, .init, .same_as, .gone, .split => {},
+        };
         try self.fill(rw.body);
         if (rw.continue_in) |r| {
             try self.fill(r);
@@ -1114,6 +1180,49 @@ const Rebuild = struct {
             _ = o;
         }
         return .{ .ref = ref, .outs = outs, .repl = repl, .width = @intCast(rw.out_tys.len) };
+    }
+
+    // N11n: whether old node `n` is a value switch that a decided test's
+    // edges end in, so it is built as an exiting switch.
+    fn splitByEdges(self: *const Rebuild, n: NodeId) bool {
+        const act = self.active() orelse return false;
+        const d = act.rw.decide orelse return false;
+        return d.splits(n);
+    }
+
+    // N11o: `minus(j0, a)`, over the derived counter's new initial value
+    // `j0` and the new start `a`, built where the loop stands; `j0` itself
+    // where `a` is the literal 0. The body adds it to the index.
+    fn difference(self: *Rebuild, rw: *const loops.Rewrite, header: []const Ref, j0: Ref) Allocator.Error!Ref {
+        if (!rw.derive_minus) return j0;
+        self.mark();
+        return self.b.call(intOwner(self.b.types, rw.param_tys[0]), .minus, &.{ j0, header[0] });
+    }
+
+    // The primitives' owner of the builtin integer type `ty`.
+    fn intOwner(types: *const Types, ty: TyId) @import("prims.zig").Owner {
+        return @import("prims.zig").Owner.ofInt(types.get(ty).int);
+    }
+
+    // The loop rules a knockout stops (L1).
+    fn loopRules(b: *const Builder) loops.Rules {
+        return .{ .decided_test = b.algorithmOn(.decided_test), .derived_counter = b.algorithmOn(.derived_counter) };
+    }
+
+    // `loops.Where.fits_minus`: whether the intervals (N13u) of the old row's
+    // values `x` and `y`, as built where the loop is being built, prove that
+    // `minus(x, y)` fits its type.
+    fn fitsMinus(ctx: *anyopaque, x: Ref, y: Ref) bool {
+        const self: *Rebuild = @ptrCast(@alignCast(ctx));
+        const mx = self.mapRef(x);
+        const my = self.mapRef(y);
+        const rx = self.b.rangeOf(mx) orelse return false;
+        const ry = self.b.rangeOf(my) orelse return false;
+        const int = switch (self.b.types.get(self.store().refTy(self.b.row, mx))) {
+            .int => |i| i,
+            .bool_, .str, .float, .dec, .record, .tuple, .list, .tag_union, .nominal, .func, .opaque_, .recursive => return false,
+        };
+        return @import("ranges.zig").fits(int, .minus, &.{ rx.interval, ry.interval });
     }
 
     // `loops.Where.below_max`: whether the old row's value `ref`, as built

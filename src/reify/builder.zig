@@ -125,6 +125,10 @@ pub const Algorithm = enum {
     law_fusion,
     law_iter_map,
     law_is_empty,
+    /// N11n: a general loop's leading test that every edge decides.
+    decided_test,
+    /// N11o: a derived counter of a bounded loop.
+    derived_counter,
 };
 
 /// The rules on exits and joins (normal-form 3.11), which run when an

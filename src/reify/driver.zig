@@ -817,7 +817,7 @@ fn checkInvariants(gpa: Allocator, b: *const Builder, root: RowId, outlined: []c
         if (store.row(r).merged_into != null) continue;
         var p = try place.plan(gpa, store, &returns, r, .simplify);
         defer p.deinit();
-        if (!try loops.noneRewritable(gpa, store, types, &p)) return error.InvariantBroken;
+        if (!try loops.noneRewritable(gpa, store, types, &p, .{ .decided_test = b.algorithmOn(.decided_test), .derived_counter = b.algorithmOn(.derived_counter) })) return error.InvariantBroken;
         // L2: at a site that opts into layer L, no law applies to a finished row.
         if (with_laws and !try lawsNoneRewritable(gpa, b, &p)) return error.InvariantBroken;
     }

@@ -35,7 +35,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 16;
+pub const normal_form_version: u32 = 17;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -153,6 +153,13 @@ const recorded = [_]Recorded{
     // Two root parameters go in parameter order (N15c), in an operation and
     // in a decision tree (N7b).
     .{ .version = 16, .fingerprint = 0xe01423990801bff4 },
+    // M12 of the plan: facts across loop turns. A general `Loop`'s leading
+    // `Bool` test that every edge decides is gone (N11n), and a counter
+    // stepped with a bounded loop's index is the index plus its start
+    // (N11o). N11l raises a loop whose `Break` gives some of the other
+    // slots, and the number stage merges what the hoist brings into every
+    // arm (N5c).
+    .{ .version = 17, .fingerprint = 0x666aa601711352db },
 };
 
 const std = @import("std");

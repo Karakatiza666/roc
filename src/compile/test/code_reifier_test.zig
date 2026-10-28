@@ -4264,8 +4264,8 @@ test "L3 M6: `while $i <= n` stays a general loop, so it is not the `for` over a
     );
 }
 
-test "L3 M6: a loop with a `$done` flag stays a general loop, so it is not the `for` over a range" {
-    try expectOtherNormalForm(
+test "L3 M12: a loop with a `$done` flag is the `for` over a range (N11n, then N11l)" {
+    try expectSameNormalForm(
         \\wobble : U64 -> U64
         \\wobble = |input| {
         \\    var $i = 0
@@ -4293,8 +4293,10 @@ test "L3 M6: a loop with a `$done` flag stays a general loop, so it is not the `
     );
 }
 
-test "L3 M6: a second counter derived from the first stays a slot of the loop" {
-    try expectOtherNormalForm(
+test "L3 M12: a second counter derived from the first is the index plus its start (N11o)" {
+    // M6 compared `$total + i + $j` with `$total + i + 5`, which differ from
+    // the second turn on; the pair that computes one value is `i + 5`.
+    try expectSameNormalForm(
         \\wobble : U64 -> U64
         \\wobble = |input| {
         \\    var $total = 0
@@ -4310,7 +4312,7 @@ test "L3 M6: a second counter derived from the first stays a slot of the loop" {
         \\wobble = |input| {
         \\    var $total = 0
         \\    for i in 0..<input {
-        \\        $total = $total + i + 5
+        \\        $total = $total + i + (i + 5)
         \\    }
         \\    $total
         \\}
@@ -5696,10 +5698,10 @@ test "L3 M10: a loop whose body reads the index stays a loop" {
     try std.testing.expect(std.mem.find(u8, lawful, "List.map") == null);
 }
 
-// N5d gap (M10 fuzz seed 0x1010): an equal literal that two sibling regions
-// read is one node where it was built before the switch, and one node per
-// arm where an inlined helper built it, so the two spellings below have two
-// normal forms until N5d gives such a literal one place.
+// The N5d gap of M10 (fuzz seed 0x1010): an equal literal that two sibling
+// regions read is one node where it was built before the switch, and one
+// node per arm where an inlined helper built it. Since M12 the number stage
+// runs N5c over what the hoist brings into the arms, so both are one node.
 
 const triple_helpers =
     \\triple : U64, U64, List(U64) -> U64
@@ -5713,8 +5715,8 @@ const triple_helpers =
     \\
 ;
 
-test "L3 N5d gap: a literal two arms read is one node, or one per arm after inlining" {
-    try expectOtherNormalForm(triple_helpers ++
+test "L3 M12: a literal two arms read is one node, whether written before the switch or by an inlined helper" {
+    try expectSameNormalForm(triple_helpers ++
         \\wobble : { a : U64, b : U64, c : Bool, xs : List(U64) } -> U64
         \\wobble = |input| if input.c input.a * 3 else {
         \\    k = 12.U64 * 3
@@ -6103,4 +6105,309 @@ test "L4 and L5 M11: literal operands on either side and bounded inclusive sums 
         verdicts.getPtr(try reify_fuzz.runCaseWith(ctx, try sharedBuiltinModules(), tmp.dir, &bytes, .{ .m7 = false, .m11 = true })).* += 1;
     }
     try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
+}
+
+// M12: facts across loop turns (N11n, N11o).
+
+test "L3 M12: a `$done` flag set where the `break` would be is the loop with `break`" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $i = 0
+        \\    var $total = 0
+        \\    var $done = Bool.False
+        \\    while !$done {
+        \\        if $i >= input {
+        \\            $done = Bool.True
+        \\        } else {
+        \\            $total = $total + $i
+        \\            $i = $i + 1
+        \\        }
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $i = 0
+        \\    var $total = 0
+        \\    while Bool.True {
+        \\        if $i >= input {
+        \\            break
+        \\        }
+        \\        $total = $total + $i
+        \\        $i = $i + 1
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3 M12: a search that sets a `$done` flag in two places is the search with two `break`s" {
+    try expectSameNormalForm(
+        \\wobble : { xs : List(U64), k : U64 } -> U64
+        \\wobble = |input| {
+        \\    var $i = 0
+        \\    var $found = 0
+        \\    var $done = Bool.False
+        \\    while !$done {
+        \\        if $i < input.xs.len() {
+        \\            x = input.xs.get($i) ?? 0
+        \\            if x == input.k {
+        \\                $found = x + 1
+        \\                $done = Bool.True
+        \\            } else {
+        \\                $i = $i + 1
+        \\            }
+        \\        } else {
+        \\            $done = Bool.True
+        \\        }
+        \\    }
+        \\    $found
+        \\}
+    ,
+        \\wobble : { xs : List(U64), k : U64 } -> U64
+        \\wobble = |input| {
+        \\    var $i = 0
+        \\    var $found = 0
+        \\    while $i < input.xs.len() {
+        \\        x = input.xs.get($i) ?? 0
+        \\        if x == input.k {
+        \\            $found = x + 1
+        \\            break
+        \\        }
+        \\        $i = $i + 1
+        \\    }
+        \\    $found
+        \\}
+    );
+}
+
+test "L3 M12: a `$done` flag that a computed value sets stays a general loop" {
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $i = 0
+        \\    var $total = 0
+        \\    var $done = Bool.False
+        \\    while !$done {
+        \\        $total = $total + $i
+        \\        $i = $i + 1
+        \\        $done = $i >= input
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $i = 0
+        \\    var $total = 0
+        \\    while Bool.True {
+        \\        $total = $total + $i
+        \\        $i = $i + 1
+        \\        if $i >= input {
+        \\            break
+        \\        }
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3 M12: a second counter from a range's start that N13u proves below its own is the index plus the difference" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    var $j = 10
+        \\    for i in 3..<input {
+        \\        $total = $total + $j
+        \\        $j = $j + 1
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for i in 3..<input {
+        \\        $total = $total + (i + 7)
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3 M12: a second counter whose difference N13u does not prove stays a slot" {
+    // `0 - input` fits a `U64` only where `input` is 0.
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    var $j = 0
+        \\    for i in input..<20 {
+        \\        $total = $total + $j
+        \\        $j = $j + 1
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for i in input..<20 {
+        \\        $total = $total + (i - input)
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3 M12: a second counter stepped by 2 stays a slot" {
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    var $j = 5
+        \\    for i in 0..<input {
+        \\        $total = $total + $j
+        \\        $j = $j + 2
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for i in 0..<input {
+        \\        $total = $total + (i * 2 + 5)
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3 M12: a second counter read after the loop stays a slot" {
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    var $j = 5
+        \\    for i in 0..<input {
+        \\        $total = $total + $j
+        \\        $j = $j + 1
+        \\    }
+        \\    $total + $j
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for i in 0..<input {
+        \\        $total = $total + (i + 5)
+        \\    }
+        \\    $total + (input + 5)
+        \\}
+    );
+}
+
+test "L3 M12: a second counter over a list's indices is the index plus its start, in either loop" {
+    try expectSameNormalForm(
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    var $j = 1
+        \\    for x in input {
+        \\        $total = $total + x * $j
+        \\        $j = $j + 1
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    var $j = 1
+        \\    for i in 0..<input.len() {
+        \\        x = input.get(i) ?? 0
+        \\        $total = $total + x * $j
+        \\        $j = $j + 1
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L4 and L5 M12: `$done` flag loops and derived counters keep every seed's two prints one normal form" {
+    // The generator's M12 choices are on: a sum over `0..<n` under a test
+    // that bounds `n`, written as a `for`, a `while $i < n` or a `while
+    // !$done`, with a second counter as a stepped `var` or as `i + j0`.
+    // Case 278 of this seed meets a gap of placement that is not M12's: a
+    // literal that hash-consing merged into one node through a node a later
+    // round removed stays one node read from two arms (normal-form 3.5).
+    var prng = std.Random.DefaultPrng.init(0x0b12);
+    const random = prng.random();
+    var bytes: [96]u8 = undefined;
+    var verdicts = std.EnumArray(reify_fuzz.Verdict, u32).initFill(0);
+    for (0..250) |_| {
+        random.bytes(&bytes);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const ctx = CoreCtx.default(std.testing.allocator, arena.allocator(), std.testing.io);
+        verdicts.getPtr(try reify_fuzz.runCaseWith(ctx, try sharedBuiltinModules(), tmp.dir, &bytes, .{ .m7 = false, .m12 = true })).* += 1;
+    }
+    try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
+}
+
+test "L3 M12: a counter `while` with a second slot only its body reads is the `for` over the range (N11l)" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $i = 0
+        \\    var $total = 0
+        \\    var $j = 3
+        \\    while $i < input {
+        \\        $total = $total + $j * $i
+        \\        $j = $j * 2
+        \\        $i = $i + 1
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    var $j = 3
+        \\    for i in 0..<input {
+        \\        $total = $total + $j * i
+        \\        $j = $j * 2
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3 M12: a literal written in a loop of one arm and before it merges alike with the other arm's (N5c after the hoist)" {
+    try expectSameNormalForm(
+        \\wobble : { c : Bool, n : U64 } -> U64
+        \\wobble = |input| if input.c input.n * 7 else {
+        \\    var $total = 0
+        \\    for i in 0..<input.n {
+        \\        $total = $total + i + 7
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : { c : Bool, n : U64 } -> U64
+        \\wobble = |input| if input.c input.n * 7 else {
+        \\    k = 7
+        \\    var $total = 0
+        \\    for i in 0..<input.n {
+        \\        $total = $total + i + k
+        \\    }
+        \\    $total
+        \\}
+    );
 }

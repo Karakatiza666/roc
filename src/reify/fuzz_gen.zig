@@ -14,6 +14,7 @@
 //! | M6 | a `for` over a list, over its `.iter()`, or a `while` over its indices |
 //! | M7 | a loop `var` as one scalar, as a record or as a tuple that carries a field nothing changes; a private helper that takes `a, b`, `{ a, b }`, `(a, b)`, or either destructured, called twice |
 //! | M11 | a literal operand of `+`, `*` and `==` first or last; a sum over `0..=n` under a test that bounds `n`, as a `for` over the range or a `while $i <= n` |
+//! | M12 | a sum over `0..<n` as a `for` over the range, a `while $i < n`, or a `while !$done` whose `else` sets the flag; a second counter from `j0` as a `var` stepped by 1 with the index, or as `i + j0` |
 //!
 //! The two prints must describe as one normal form (L4), and the normal form
 //! must compute what Roc computes wherever Roc does not crash (L5, C2).
@@ -41,6 +42,10 @@ pub const Options = struct {
     /// an inclusive range that a test bounds), whose spellings meet through
     /// N15c and through N13u's intervals.
     m11: bool = false,
+    /// The constructs of M12 (a loop controlled by a `$done` flag, a second
+    /// counter stepped with the index), whose spellings meet through N11n
+    /// and N11o.
+    m12: bool = false,
 };
 
 /// Bytes the generator reads its choices from. Past the end it reads zeros,
@@ -98,6 +103,10 @@ const Node = union(enum) {
     /// `if n < limit { the sum of step over i in 0..=n } else other`, with
     /// `n` a `U64` field or literal; `step` sees `i` at scope index `slot`.
     upto: struct { bound: *const Node, limit: u64, init: u64, step: *const Node, slot: u16, other: *const Node },
+    /// `if n < limit { the sum of step over i in 0..<n } else other`, with
+    /// `n` a `U64` field or literal; `step` sees `i` at scope index `slot`
+    /// and the second counter `j = i + j0` at `slot + 1`.
+    counted: struct { bound: *const Node, limit: u64, init: u64, j0: u64, step: *const Node, slot: u16, other: *const Node },
 };
 
 /// One generated case: the module text and the input it is run on.
@@ -200,6 +209,8 @@ const Builder = struct {
         const d = depth + 1;
         // M11: a sum over an inclusive range, from the extra stream.
         if (self.options.m11 and self.extra.pick(8) == 0) return self.uptoTerm(scope, d);
+        // M12: a counted sum with a second counter, from the extra stream.
+        if (self.options.m12 and self.extra.pick(6) == 0) return self.countedTerm(scope, d);
         return switch (self.reader.pick(9)) {
             0 => self.leaf(.u64_, &scope),
             1 => self.node(.{ .plus = .{ try self.term(.u64_, scope, d), try self.term(.u64_, scope, d) } }),
@@ -277,6 +288,33 @@ const Builder = struct {
         return self.node(.{ .upto = .{ .bound = bound, .limit = limit, .init = init, .step = step, .slot = scope.len, .other = try self.term(.u64_, scope, depth) } });
     }
 
+    fn countedTerm(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
+        if (scope.len + 2 > max_scope) return self.leaf(.u64_, &scope);
+        // A literal bound is above 0. Under the bound 0, N13u decides
+        // `$i < 0` wherever a rebuild builds the test again, and an exiting
+        // switch on a known test stays a switch, while `for i in 0..<0` stays
+        // a `ForRange`: the gap of normal-form 3.11 that `while $i < 0` with
+        // a dead slot shows without M12.
+        const bound = if (self.extra.pick(2) == 0)
+            try self.node(.{ .field_u64 = self.extra.pick(2) })
+        else
+            try self.node(.{ .lit_u64 = 1 + @as(u64, self.extra.pick(11)) });
+        const limit = 1 + @as(u64, self.extra.pick(16));
+        // The sum starts above 0, as `upto`'s does: N11i merges a sum from 0
+        // stepped by 1 with the counter of a `while`, which the read after
+        // the loop keeps a `Loop` (normal-form 3.11). N11o does not close
+        // that gap: it reads a counter that nothing after the loop reads.
+        const init = 1 + @as(u64, self.extra.pick(8));
+        const j0 = @as(u64, self.extra.pick(8));
+        var inner = scope;
+        inner.types[inner.len] = .u64_;
+        inner.types[inner.len + 1] = .u64_;
+        inner.len += 2;
+        // The step is small: it runs once per index and nests no deeper.
+        const step = try self.term(.u64_, inner, max_depth - 1);
+        return self.node(.{ .counted = .{ .bound = bound, .limit = limit, .init = init, .j0 = j0, .step = step, .slot = scope.len, .other = try self.term(.u64_, scope, depth) } });
+    }
+
     fn sumTerm(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
         if (scope.len >= max_scope) return self.leaf(.u64_, &scope);
         const start = try self.term(.u64_, scope, depth);
@@ -320,6 +358,7 @@ fn reads(n: *const Node, slot: u16) bool {
         .twice => |t| reads(t.args[0], slot) or reads(t.args[1], slot) or reads(t.args[2], slot) or reads(t.args[3], slot),
         .empty => false,
         .upto => |u| reads(u.bound, slot) or reads(u.step, slot) or reads(u.other, slot),
+        .counted => |u| reads(u.bound, slot) or reads(u.step, slot) or reads(u.other, slot),
     };
 }
 
@@ -625,6 +664,7 @@ const Printer = struct {
             },
             .twice => |t| try self.twice(t.args, t.k),
             .upto => |u| try self.upto(u.bound, u.limit, u.init, u.step, u.slot, u.other),
+            .counted => |u| try self.counted(u.bound, u.limit, u.init, u.j0, u.step, u.slot, u.other),
             .empty => |e| {
                 const list = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ self.names.param, self.names.fields[3] });
                 defer self.gpa.free(list);
@@ -673,6 +713,64 @@ const Printer = struct {
         try self.print("{s}\n}} else ", .{acc});
         try self.expr(other);
         try self.write(")");
+    }
+
+    /// `if n < limit { sum } else other`, the sum over `i` in `0..<n`
+    /// written as a `for` over the range, as a `while $i < n`, or as a
+    /// `while !$done` whose `else` sets the flag, which N11n makes the
+    /// `while`; and the second counter `j` as a `var` from `j0` stepped by 1
+    /// with the index, which N11o makes `i + j0`, or as `i + j0` itself.
+    fn counted(self: *Printer, bound: *const Node, limit: u64, init: u64, j0: u64, step: *const Node, slot: u16, other: *const Node) Allocator.Error!void {
+        const acc = try self.symbols.fresh("$ac");
+        try self.write("(if ");
+        try self.expr(bound);
+        try self.print(" < {d}.U64 {{\nvar {s} = {d}.U64\n", .{ limit, acc, init });
+        const form = self.extra.pick(3);
+        const index = try self.symbols.fresh(if (form == 0) "lc" else "$ix");
+        const stepped = self.extra.pick(2) == 0;
+        const j = try self.symbols.fresh(if (stepped) "$jx" else "lc");
+        self.names.locals[slot] = index;
+        self.names.twins[slot] = null;
+        self.names.locals[slot + 1] = j;
+        self.names.twins[slot + 1] = null;
+        if (stepped) try self.print("var {s} = {d}.U64\n", .{ j, j0 });
+        switch (form) {
+            0 => {
+                try self.print("for {s} in 0..<", .{index});
+                try self.expr(bound);
+                try self.write(" {\n");
+                try self.countedStep(acc, index, j, j0, stepped, step);
+                try self.write("}\n");
+            },
+            1 => {
+                try self.print("var {s} = 0.U64\nwhile {s} < ", .{ index, index });
+                try self.expr(bound);
+                try self.write(" {\n");
+                try self.countedStep(acc, index, j, j0, stepped, step);
+                try self.print("{s} = {s} + 1\n}}\n", .{ index, index });
+            },
+            else => {
+                const done = try self.symbols.fresh("$dn");
+                try self.print("var {s} = 0.U64\nvar {s} = Bool.False\nwhile !{s} {{\nif {s} < ", .{ index, done, done, index });
+                try self.expr(bound);
+                try self.write(" {\n");
+                try self.countedStep(acc, index, j, j0, stepped, step);
+                try self.print("{s} = {s} + 1\n}} else {{\n{s} = Bool.True\n}}\n}}\n", .{ index, index, done });
+            },
+        }
+        try self.print("{s}\n}} else ", .{acc});
+        try self.expr(other);
+        try self.write(")");
+    }
+
+    /// One turn of `counted`: the second counter as `i + j0`, the step added
+    /// to the sum, and the counter stepped where it is a `var`.
+    fn countedStep(self: *Printer, acc: []const u8, index: []const u8, j: []const u8, j0: u64, stepped: bool, step: *const Node) Allocator.Error!void {
+        if (!stepped) try self.print("{s} = {s} + {d}.U64\n", .{ j, index, j0 });
+        try self.print("{s} = {s} + ", .{ acc, acc });
+        try self.expr(step);
+        try self.write("\n");
+        if (stepped) try self.print("{s} = {s} + 1\n", .{ j, j });
     }
 
     /// The statement that adds `step` to the accumulator.
@@ -875,7 +973,7 @@ const Printer = struct {
                 try self.write(" })");
                 return;
             },
-            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice, .empty, .upto => {},
+            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice, .empty, .upto, .counted => {},
         }
         try self.write("{\n");
         try self.bind(value, slot);

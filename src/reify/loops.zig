@@ -9,6 +9,8 @@
 //! | N11j | a general loop's outputs that nothing reads are not carried by its `Break`s; a `Return` in a loop that is its row's result is a `Break` | `Ctx.sameKind` |
 //! | N11k | a loop over `List.iter(xs)` is `ForList(xs)` | `Ctx.iteratorToList` |
 //! | N11l | a `Loop` that tests a counter against a bound and steps it by one is `ForRange`; `ForRange(0, List.len(xs))` is `ForList(xs)` | `Ctx.raiseCounter`, `Ctx.rangeToList` |
+//! | N11n | a general `Loop` whose body starts with a `Bool` test on a slot that every edge decides is its continuing arm; an edge that selects the exiting arm runs that arm | `Ctx.decideTest` |
+//! | N11o | a slot of a bounded loop stepped by 1 with the index, read only in the body, is `plus(i, minus(j0, a))` | `Ctx.deriveCounter` |
 //! | N14b | a record or tuple slot that the body only reads by field or index, and every `Continue` gives as a construction, is one slot per component | `Ctx.splitSlots` |
 //!
 //! The rules are hooks on the rebuild (`rebuild.zig`). `analyze` reads one
@@ -54,6 +56,9 @@ pub const ParamTo = union(enum) {
     /// The slot is split (N14b): its components are parameters, and nothing
     /// reads the slot as one value.
     split,
+    /// Old slot `k` is a derived counter (N11o): `plus(i, minus(j0, a))`
+    /// over the new index, built at the start of the new body.
+    derived: u32,
 };
 
 /// What an old output of the loop is in the loop a rewrite builds.
@@ -111,6 +116,10 @@ pub const Rewrite = struct {
     outputs: []const OutputTo,
     /// The positions of the old `Break`s' values the new `Break`s keep, in order.
     break_keep: []const u32,
+    /// Where not empty, per new `Break` value: an old value that stands
+    /// there instead of the kept position, or null to keep it (N11l, a slot
+    /// no output of the general loop gave).
+    break_fill: []const ?Ref = &.{},
     /// Nodes of the old body that the header reads: built before the loop.
     hoist: []const NodeId,
     /// The region whose nodes and end the new body continues in after the old
@@ -125,6 +134,58 @@ pub const Rewrite = struct {
     /// Where set, the new slots are the parts of this, and `slots` lists all
     /// the old slots.
     split: ?*const Split = null,
+    /// Where set, the leading test this describes is decided on every edge (N11n).
+    decide: ?*const Decide = null,
+    /// N11o: whether a derived counter subtracts the range's start, which is
+    /// not the literal 0. Where it is 0, the difference is `j0`.
+    derive_minus: bool = false,
+};
+
+/// N11n: how the edges of a general `Loop` whose leading test they decide
+/// end in the loop the rewrite builds. Every ref is in the old row.
+pub const Decide = struct {
+    /// The old slot the leading test reads.
+    slot: u32,
+    /// The arm of the leading test that the initial value does not select.
+    exit_arm: RegionId,
+    /// The value of the slot that selects `exit_arm`.
+    exit_value: bool,
+    /// The regions that end an edge into the next turn.
+    edges: []const Edge,
+    /// The regions whose `Continue` reads a value switch that only it reads:
+    /// that switch is an exiting switch, whose arms are edges, and the
+    /// region ends in it.
+    branches: []const Branch,
+
+    pub fn edgeOf(d: *const Decide, r: RegionId) ?*const Edge {
+        for (d.edges) |*e| if (e.region == r) return e;
+        return null;
+    }
+
+    pub fn branchOf(d: *const Decide, r: RegionId) ?NodeId {
+        for (d.branches) |b| if (b.region == r) return b.sw;
+        return null;
+    }
+
+    pub fn splits(d: *const Decide, n: NodeId) bool {
+        for (d.branches) |b| if (b.sw == n) return true;
+        return false;
+    }
+};
+
+/// One edge into the next turn: the region that ends it, the next value of
+/// every old slot there, and whether the leading test takes the exiting arm
+/// on that value.
+pub const Edge = struct { region: RegionId, values: []const Ref, exits: bool };
+
+/// A region that ends in the value switch `sw` its `Continue` read (N11n).
+pub const Branch = struct { region: RegionId, sw: NodeId };
+
+/// Which loop rules that a knockout can stop are on (L1). The builder's
+/// algorithm switches set them.
+pub const Rules = struct {
+    decided_test: bool = true,
+    derived_counter: bool = true,
 };
 
 /// The context `analyze` reads one loop in.
@@ -140,6 +201,17 @@ pub const Where = struct {
     /// Null where no builder is building the loop, so N11l on
     /// `while $i <= n` does not apply.
     below_max: ?BelowMax = null,
+    /// Whether N13u's intervals, where the loop is built, prove that
+    /// `minus(x, y)` fits its type. Null where no builder is building the
+    /// loop, so N11o applies only to a range that starts at the literal 0.
+    fits_minus: ?FitsMinus = null,
+    rules: Rules = .{},
+};
+
+/// The builder's answer to `Where.fits_minus`, through the rebuild.
+pub const FitsMinus = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, x: Ref, y: Ref) bool,
 };
 
 /// The builder's answer to `Where.below_max`, through the rebuild that maps
@@ -202,11 +274,15 @@ const Ctx = struct {
         if (try c.splitSlots()) |rw| return rw;
         switch (c.nd.op) {
             .loop => {
+                if (try c.decideTest()) |rw| return rw;
                 if (try c.raiseCounter()) |rw| return rw;
                 if (try c.iteratorToList()) |rw| return rw;
             },
-            .for_range => if (try c.rangeToList()) |rw| return rw,
-            .for_list => {},
+            .for_range => {
+                if (try c.deriveCounter()) |rw| return rw;
+                if (try c.rangeToList()) |rw| return rw;
+            },
+            .for_list => if (try c.deriveCounter()) |rw| return rw,
             .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // analyze is called for loops
         }
         return null;
@@ -846,10 +922,21 @@ const Ctx = struct {
             others[at] = @intCast(k);
             at += 1;
         };
+        // The arm that leaves gives each output of the loop as one of the
+        // other slots, each slot at most once: the slots as they stand, of
+        // which N11j kept those something reads. The `ForRange` has one
+        // output per slot, and gives the loop's outputs from them.
         const done_refs = c.endRefs(done);
-        if (done_refs.len != others.len or c.nd.tys.len != others.len) return null;
-        for (done_refs, others, store.tySlice(c.nd.tys)) |ref, k, ty| {
-            if (ref != c.param(@intCast(k)) or ty != c.slotTy(k)) return null;
+        if (done_refs.len != c.nd.tys.len) return null;
+        const outputs = try c.a.alloc(OutputTo, done_refs.len);
+        const given = try c.a.alloc(?u32, others.len);
+        @memset(given, null);
+        for (done_refs, store.tySlice(c.nd.tys), outputs, 0..) |ref, ty, *to, o| {
+            const k = c.slotOf(ref) orelse return null;
+            const at_k = std.mem.findScalar(u32, others, k) orelse return null;
+            if (ty != c.slotTy(k) or given[at_k] != null) return null;
+            given[at_k] = @intCast(o);
+            to.* = .{ .output = @intCast(at_k) };
         }
         // Every `Continue` steps the counter by one.
         if (c.conts.items.len == 0) return null;
@@ -870,13 +957,21 @@ const Ctx = struct {
             params[k] = .{ .param = @intCast(1 + i) };
             param_tys[1 + i] = c.slotTy(k);
         }
-        const outputs = try c.a.alloc(OutputTo, others.len);
-        for (outputs, 0..) |*to, i| to.* = .{ .output = @intCast(i) };
         const header = try c.a.alloc(Ref, 2);
         header[0] = c.args[c.lead + counter];
         header[1] = bound_ref;
+        // A `Break` the body keeps gives each slot its value of the output
+        // that slot gives, and a slot that gives none as it stands.
         const break_keep = try c.a.alloc(u32, others.len);
-        for (break_keep, 0..) |*k, i| k.* = @intCast(i);
+        const break_fill = try c.a.alloc(?Ref, others.len);
+        var filled = false;
+        for (break_keep, break_fill, given, others) |*k, *fill, o, slot| {
+            k.* = o orelse 0;
+            fill.* = if (o == null) c.param(slot) else null;
+            if (o == null) filled = true;
+        }
+        const out_tys = try c.a.alloc(TyId, others.len);
+        for (out_tys, others) |*t, k| t.* = c.slotTy(k);
         const skip = try c.a.alloc(NodeId, 2);
         skip[0] = w;
         skip[1] = cond_ref.nodeId();
@@ -887,10 +982,11 @@ const Ctx = struct {
             .header = header,
             .slots = others,
             .param_tys = param_tys,
-            .out_tys = try c.a.dupe(TyId, c.store.tySlice(c.nd.tys)),
+            .out_tys = out_tys,
             .params = params,
             .outputs = outputs,
             .break_keep = break_keep,
+            .break_fill = if (filled) break_fill else &.{},
             .hoist = cone.items,
             .continue_in = goes_on,
             .skip = skip,
@@ -1127,6 +1223,293 @@ const Ctx = struct {
         };
     }
 
+    // A `Bool` literal's value.
+    fn boolLit(c: *const Ctx, ref: Ref) ?bool {
+        if (ref.kind != .node) return null;
+        const nd = c.store.node(ref.nodeId());
+        if (nd.op != .lit) return null;
+        const lit = c.store.lit(ir.LitId.of(nd.payload));
+        return switch (lit.value) {
+            .bool_ => |b| b,
+            .int, .float, .str, .dec, .bytes => null,
+        };
+    }
+
+    // The operand of `Bool.not(x)`.
+    fn notOf(c: *const Ctx, ref: Ref) ?Ref {
+        const p = c.primOf(ref) orelse return null;
+        if (p.prim.owner != .bool_ or p.prim.method != .not) return null;
+        return c.store.refSlice(p.nd.args)[0];
+    }
+
+    fn isBool(c: *const Ctx, ref: Ref) bool {
+        return c.types.get(c.store.refTy(c.row, ref)) == .bool_;
+    }
+
+    // N11n: the value of the `Bool` `v` where region `at` runs, when it is
+    // known there: a literal, or the scrutinee of a `Bool` switch, or the
+    // operand of its `Bool.not`, whose arm encloses `at`. The tests of the
+    // regions around a lambda's body do not hold where it is called.
+    fn decidedAt(c: *const Ctx, v: Ref, at: RegionId) ?bool {
+        if (c.boolLit(v)) |b| return b;
+        var r = at;
+        while (true) {
+            const reg = c.store.region(r);
+            switch (reg.kind) {
+                .arm => {
+                    const sw = c.store.node(reg.owner);
+                    const q = c.store.refSlice(sw.args)[0];
+                    if (sw.aux.len == 0 and sw.payload == 2 and c.isBool(q)) {
+                        const k = std.mem.findScalar(RegionId, c.store.regionSlice(sw.regions)[0..2], r).?;
+                        // Arm 1 is the one for `True`.
+                        if (q == v) return k == 1;
+                        if (c.notOf(q)) |x| if (x == v) return k == 0;
+                    }
+                },
+                .row_body, .lambda_body => return null,
+                .join, .operand, .loop_body => {},
+            }
+            r = reg.parent;
+        }
+    }
+
+    // N11n: the edges from `region`, whose end passes `values` as the next
+    // slots: one edge where the test's slot is decided there, or one per arm
+    // of the value switch in `region` that only its end reads and that gives
+    // the slot's value. False where an edge is not decided.
+    fn edgesFrom(c: *Ctx, s: u32, exit_value: bool, region: RegionId, values: []const Ref, edges: *std.ArrayList(Edge), branches: *std.ArrayList(Branch)) Allocator.Error!bool {
+        const v = values[s];
+        if (c.decidedAt(v, region)) |d| {
+            try edges.append(c.a, .{ .region = region, .values = values, .exits = d == exit_value });
+            return true;
+        }
+        if (v.kind != .node) return false;
+        const sw = v.nodeId();
+        const nd = c.store.node(sw);
+        if (nd.op != .switch_ or nd.tys.len == 0 or nd.region != region or nd.regions.len != nd.payload) return false;
+        const sites = (c.p.uses.get(sw) orelse return false).items;
+        for (sites) |site| switch (site) {
+            .region => |r| if (r != region) return false,
+            .node => return false,
+        };
+        try branches.append(c.a, .{ .region = region, .sw = sw });
+        for (c.store.regionSlice(nd.regions)) |arm| {
+            std.debug.assert(c.store.region(arm).end.kind == .value);
+            const given = c.endRefs(arm);
+            const next = try c.a.dupe(Ref, values);
+            for (next) |*x| if (x.kind == .node and x.nodeId() == sw) {
+                x.* = given[x.output];
+            };
+            if (!try c.edgesFrom(s, exit_value, arm, next, edges, branches)) return false;
+        }
+        return true;
+    }
+
+    // Whether `ref`, read in the exiting arm `exit`, is a value of that arm,
+    // a slot, or a value from outside the loop: not one the body computes
+    // before the test, which the next turn would compute again.
+    fn readableInExit(c: *const Ctx, ref: Ref, exit: RegionId) bool {
+        const r = switch (ref.kind) {
+            .row_param, .input => return true,
+            .region_param => ref.regionId(),
+            .node => c.store.node(ref.nodeId()).region,
+        };
+        if (ref.kind == .region_param and r == c.body) return true;
+        return !c.store.encloses(c.body, r) or c.store.encloses(exit, r);
+    }
+
+    // N11n, a decided leading test: a general `Loop` whose body ends in a
+    // `Bool` switch on a slot `s`, or on `Bool.not(s)`, whose initial value
+    // selects one arm, and every edge into the next turn passes `s` as a
+    // value known there. The body is the arm the initial value selects; an
+    // edge whose value selects the other arm runs that arm, over the next
+    // values, instead of continuing; and `s` is gone. The exiting arm reaches
+    // no `Continue`, and reads nothing the body computes outside it. Where
+    // several edges exit, it has no nodes, so building its end at each is
+    // what T4 does to the join that would hold it; where one edge exits, it
+    // is built there, as T2 inlines a join one jump reaches (normal-form 3.11).
+    fn decideTest(c: *Ctx) Allocator.Error!?Rewrite {
+        if (!c.where.rules.decided_test) return null;
+        const store = c.store;
+        const body_end = store.region(c.body).end;
+        if (body_end.kind != .branch) return null;
+        const w = NodeId.of(body_end.target);
+        const sw = store.node(w);
+        if (sw.op != .switch_ or sw.payload != 2 or sw.regions.len != 2 or sw.tys.len != 0 or sw.aux.len != 0) return null;
+        const q = store.refSlice(sw.args)[0];
+        if (!c.isBool(q)) return null;
+        const negated = c.slotOf(q) == null;
+        const s_ref = if (negated) c.notOf(q) orelse return null else q;
+        const s = c.slotOf(s_ref) orelse return null;
+        const s0 = c.decidedAt(c.args[c.lead + s], c.nd.region) orelse return null;
+        // The test is `s` or its negation; arm 1 is the one for `True`.
+        const arms = store.regionSlice(sw.regions);
+        const cont_at: usize = @intFromBool(s0 != negated);
+        const goes_on = arms[cont_at];
+        const exit = arms[1 - cont_at];
+        // The exiting arm reads what it would read on the next turn.
+        var has_nodes = false;
+        for (c.p.regions.items) |r| {
+            if (!store.encloses(exit, r)) continue;
+            const members = c.p.membersOf(r);
+            if (members.len != 0) has_nodes = true;
+            for (members) |m| for (store.refSlice(store.node(m).args)) |arg| {
+                if (!c.readableInExit(arg, exit)) return null;
+            };
+            for (c.endRefs(r)) |ref| if (!c.readableInExit(ref, exit)) return null;
+        }
+        var edges: std.ArrayList(Edge) = .empty;
+        var branches: std.ArrayList(Branch) = .empty;
+        for (c.conts.items) |r| {
+            // The exiting arm reaches no `Continue` of this loop.
+            if (store.encloses(exit, r)) return null;
+            if (!try c.edgesFrom(s, !s0, r, c.endRefs(r), &edges, &branches)) return null;
+        }
+        var exits: u32 = 0;
+        for (edges.items) |e| exits += @intFromBool(e.exits);
+        if (exits > 1 and has_nodes) return null;
+
+        // The other slots keep their places; `s` is its initial value, which
+        // is its value in the continuing arm.
+        const others = try c.a.alloc(u32, c.slot_count - 1);
+        const params = try c.a.alloc(ParamTo, c.slot_count);
+        const param_tys = try c.a.alloc(TyId, others.len);
+        var at: u32 = 0;
+        for (0..c.slot_count) |k| {
+            if (k == s) {
+                params[k] = .{ .init = s };
+                continue;
+            }
+            others[at] = @intCast(k);
+            params[k] = .{ .param = at };
+            param_tys[at] = c.slotTy(@intCast(k));
+            at += 1;
+        }
+        const outs = c.nd.tys.len;
+        const outputs = try c.a.alloc(OutputTo, outs);
+        const break_keep = try c.a.alloc(u32, outs);
+        for (outputs, break_keep, 0..) |*to, *k, o| {
+            to.* = .{ .output = @intCast(o) };
+            k.* = @intCast(o);
+        }
+        // The test and its negation, when only the test reads it, are not built.
+        var skip: std.ArrayList(NodeId) = .empty;
+        try skip.append(c.a, w);
+        if (negated) {
+            const sites = (c.p.uses.get(q.nodeId()) orelse return null).items;
+            if (sites.len == 1 and sites[0] == .node and sites[0].node == w) try skip.append(c.a, q.nodeId());
+        }
+        const decide = try c.a.create(Decide);
+        decide.* = .{ .slot = s, .exit_arm = exit, .exit_value = !s0, .edges = edges.items, .branches = branches.items };
+        return .{
+            .body = c.body,
+            .op = .loop,
+            .payload = c.nd.payload,
+            .header = &.{},
+            .slots = others,
+            .param_tys = param_tys,
+            .out_tys = try c.a.dupe(TyId, store.tySlice(c.nd.tys)),
+            .params = params,
+            .outputs = outputs,
+            .break_keep = break_keep,
+            .hoist = &.{},
+            .continue_in = goes_on,
+            .skip = skip.items,
+            .stands = &.{},
+            .returns_break = false,
+            .decide = decide,
+        };
+    }
+
+    // N11o, a derived counter: a slot `j` of a `ForRange(a, b)` or a
+    // `ForList` (whose index starts at 0), of the index's type, that every
+    // `Continue` passes as `plus(j, 1)` or `plus(1, j)`, and that nothing
+    // after the loop and no exit reads, is `plus(i, minus(j0, a))` wherever
+    // the body reads it. Where `a` is not the literal 0, N13u proves that
+    // `minus(j0, a)` fits its type where the loop is built. At each turn the
+    // sum is the value the slot holds, which the edge before it computed
+    // without overflow, so the sum overflows nowhere the slot did not
+    // (normal-form 3.11). A `plus_wrap` step is not a derived counter: the
+    // sum is checked, and crashes where the wrapping step did not.
+    fn deriveCounter(c: *Ctx) Allocator.Error!?Rewrite {
+        if (!c.where.rules.derived_counter) return null;
+        const store = c.store;
+        const old_params = store.tySlice(store.region(c.body).params);
+        const index_ty = old_params[0];
+        const int = switch (c.types.get(index_ty)) {
+            .int => |i| i,
+            .bool_, .str, .float, .dec, .record, .tuple, .list, .tag_union, .nominal, .func, .opaque_, .recursive => return null,
+        };
+        const from_zero = c.nd.op == .for_list or c.isIntLit(c.args[0], 0);
+        const derived = try c.a.alloc(bool, c.slot_count);
+        @memset(derived, false);
+        var any = false;
+        slots: for (0..c.slot_count) |k| {
+            if (c.slotTy(@intCast(k)) != index_ty or c.out_read[k]) continue;
+            const me = c.param(c.header + @as(u32, @intCast(k)));
+            if (c.conts.items.len == 0) continue;
+            for (c.conts.items) |r| {
+                const step = c.primOf(c.endRefs(r)[k]) orelse continue :slots;
+                if (step.prim.method != .plus or step.prim.owner.int() != int) continue :slots;
+                const operands = store.refSlice(step.nd.args);
+                const stepped = (operands[0] == me and c.isIntLit(operands[1], 1)) or (operands[1] == me and c.isIntLit(operands[0], 1));
+                if (!stepped) continue :slots;
+            }
+            // No exit gives the slot as a value something reads.
+            for (c.breaks.items) |r| for (c.endRefs(r), 0..) |ref, o| {
+                if (ref == me and o != k and c.out_read[o]) continue :slots;
+            };
+            for (c.returns.items) |r| for (c.endRefs(r)) |ref| {
+                if (ref == me) continue :slots;
+            };
+            if (!from_zero) {
+                const fits = c.where.fits_minus orelse continue;
+                if (!fits.run(fits.ctx, c.args[c.lead + k], c.args[0])) continue;
+            }
+            derived[k] = true;
+            any = true;
+        }
+        if (!any) return null;
+        var kept: std.ArrayList(u32) = .empty;
+        const params = try c.a.alloc(ParamTo, c.header + c.slot_count);
+        for (params[0..c.header], 0..) |*to, i| to.* = .{ .param = @intCast(i) };
+        const outputs = try c.a.alloc(OutputTo, c.slot_count);
+        var out_tys: std.ArrayList(TyId) = .empty;
+        const param_tys = try c.a.alloc(TyId, c.header + c.slot_count - std.mem.count(bool, derived, &.{true}));
+        @memcpy(param_tys[0..c.header], old_params[0..c.header]);
+        for (derived, 0..) |d, k| {
+            if (d) {
+                params[c.header + k] = .{ .derived = @intCast(k) };
+                outputs[k] = .gone;
+                continue;
+            }
+            const new: u32 = @intCast(kept.items.len);
+            params[c.header + k] = .{ .param = c.header + new };
+            param_tys[c.header + new] = old_params[c.header + k];
+            outputs[k] = .{ .output = new };
+            try kept.append(c.a, @intCast(k));
+            try out_tys.append(c.a, store.tySlice(c.nd.tys)[k]);
+        }
+        return .{
+            .body = c.body,
+            .op = c.nd.op,
+            .payload = c.nd.payload,
+            .header = c.args[0..c.lead],
+            .slots = kept.items,
+            .param_tys = param_tys,
+            .out_tys = out_tys.items,
+            .params = params,
+            .outputs = outputs,
+            .break_keep = kept.items,
+            .hoist = &.{},
+            .continue_in = null,
+            .skip = &.{},
+            .stands = &.{},
+            .returns_break = false,
+            .derive_minus = !from_zero,
+        };
+    }
+
     // `U64`, the type of a list's index.
     fn indexTy(c: *Ctx) Allocator.Error!TyId {
         return c.types.intTy(.u64);
@@ -1280,7 +1663,7 @@ const TailWalk = struct {
 
 /// L2: whether no loop of a row the plan reaches is one a rule of this
 /// file rewrites. A fixpoint of the simplify rounds leaves none.
-pub fn noneRewritable(gpa: Allocator, store: *const ir.Store, types: *Types, p: *const place.Plan) Allocator.Error!bool {
+pub fn noneRewritable(gpa: Allocator, store: *const ir.Store, types: *Types, p: *const place.Plan, rules: Rules) Allocator.Error!bool {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     const usage = try scalar.Usage.ofPlan(scratch.allocator(), p);
@@ -1288,14 +1671,14 @@ pub fn noneRewritable(gpa: Allocator, store: *const ir.Store, types: *Types, p: 
     while (nodes.next()) |n| {
         const op = store.node(n).op;
         if (op != .for_range and op != .for_list and op != .loop) continue;
-        if (try analyze(scratch.allocator(), p, types, n, .{ .row_body = null, .usage = &usage })) |_| return false;
+        if (try analyze(scratch.allocator(), p, types, n, .{ .row_body = null, .usage = &usage, .rules = rules })) |_| return false;
     }
     return true;
 }
 
 /// The steps this file owns, for the normal-form fingerprint (`mod.zig`):
 /// adding, removing or renaming a rule changes it, and so the version.
-pub const steps = [_][]const u8{ "N12", "N11g", "N11h", "N11i", "N11j", "N11k", "N11l" };
+pub const steps = [_][]const u8{ "N12", "N11g", "N11h", "N11i", "N11j", "N11k", "N11l", "N11n", "N11o" };
 
 const testing = std.testing;
 const builder_mod = @import("builder.zig");
@@ -1734,4 +2117,217 @@ test "N14b: the slot's output is read after the loop through the components it w
     // No record is built or read in the row any more.
     try testing.expect(std.mem.find(u8, got, "record(") == null);
     try testing.expect(std.mem.find(u8, got, "field ") == null);
+}
+
+/// How the edges of a `$done`-style flag loop pass the flag: each is a kind
+/// of edge N11n reads, but `undecided`.
+const Flag = enum {
+    /// The edge that exits passes the literal `False`, the one that goes on `True`.
+    literal,
+    /// The edge that goes on passes `go`, which the leading test decided, and
+    /// the one that exits passes the test of its own arm, which that arm decided.
+    decided,
+    /// A `done` flag tested through `Bool.not`, whose two edges are arms of
+    /// the value switch T3 makes of them.
+    switched,
+    /// As `switched`, with the flag starting as a `Bool` parameter that a
+    /// test around the loop decided.
+    init_decided,
+    /// The edge that exits passes `!p`, which no test decides.
+    undecided,
+};
+
+// `|n, p| loop(total = 0, i = 0, go = True) { if go { <step> } else { break total } }`,
+// where `<step>` is `if i < n { continue(total + i, i + 1, go) } else ...`,
+// `if 1000 < total { break 7 } else { continue(total, i, <flag>) }`. With
+// `switched` and `init_decided`, the flag is `done = False`, the test is
+// `!done`, and the edge that exits is `continue(total, i, True)`.
+fn flagRow(f: *Fixture, how: Flag) !RowId {
+    const i64_ty = try f.types.intTy(.i64);
+    const bool_ty = try f.types.boolTy();
+    const row = try f.b.beginRow(&.{ i64_ty, bool_ty }, i64_ty);
+    const zero = try f.b.litInt(i64_ty, 0);
+    const p = Ref.rowParam(1);
+    const negated = how == .switched or how == .init_decided;
+    var outer: [2]RegionId = undefined;
+    if (how == .init_decided) {
+        // The loop stands where `p` is `False`, and starts the flag at `p`.
+        outer[1] = try f.b.openArm(p, 1);
+        try f.b.close(.{ .value = &.{zero} });
+        outer[0] = try f.b.openArm(p, 0);
+    }
+    const lb = try f.b.openRegion(.loop_body, &.{ i64_ty, i64_ty, bool_ty });
+    const total = Ref.regionParam(lb, 0);
+    const i = Ref.regionParam(lb, 1);
+    const flag_slot = Ref.regionParam(lb, 2);
+    const test_ = if (negated) try f.b.call(.bool_, .not, &.{flag_slot}) else flag_slot;
+    var arms: [2]RegionId = undefined;
+    arms[0] = try f.b.openArm(test_, 0);
+    try f.b.close(.{ .break_ = &.{total} });
+    arms[1] = try f.b.openArm(test_, 1);
+    const c = try f.b.call(.i64, .is_lt, &.{ i, Ref.rowParam(0) });
+    var turn: [2]RegionId = undefined;
+    turn[0] = try f.b.openArm(c, 0);
+    if (negated) {
+        try f.b.close(.{ .continue_ = &.{ total, i, try f.b.litBool(true) } });
+    } else {
+        const d = try f.b.call(.i64, .is_lt, &.{ try f.b.litInt(i64_ty, 1000), total });
+        var tails: [2]RegionId = undefined;
+        tails[0] = try f.b.openArm(d, 0);
+        const flag = switch (how) {
+            .literal => try f.b.litBool(false),
+            .decided => d,
+            .undecided => try f.b.call(.bool_, .not, &.{p}),
+            .switched, .init_decided => unreachable, // negated above
+        };
+        try f.b.close(.{ .continue_ = &.{ total, i, flag } });
+        tails[1] = try f.b.openArm(d, 1);
+        try f.b.close(.{ .break_ = &.{try f.b.litInt(i64_ty, 7)} });
+        try f.b.close(.{ .branch = try f.b.exitingSwitch(d, &tails, &.{}, &.{}) });
+    }
+    turn[1] = try f.b.openArm(c, 1);
+    const next_total = try f.b.call(.i64, .plus, &.{ total, i });
+    const next_i = try f.b.call(.i64, .plus, &.{ i, try f.b.litInt(i64_ty, 1) });
+    try f.b.close(.{ .continue_ = &.{ next_total, next_i, if (how == .literal) try f.b.litBool(true) else flag_slot } });
+    try f.b.close(.{ .branch = try f.b.exitingSwitch(c, &turn, &.{}, &.{}) });
+    try f.b.close(.{ .branch = try f.b.exitingSwitch(test_, &arms, &.{}, &.{}) });
+    const init = if (how == .init_decided) p else try f.b.litBool(!negated);
+    const loop = try f.b.loopOf(.loop, &.{ zero, zero, init }, lb, &.{i64_ty});
+    if (how == .init_decided) {
+        try f.b.close(.{ .value = &.{loop} });
+        try f.b.endRow(.{ .value = &.{try f.b.switchOn(p, &outer, &.{}, &.{i64_ty}, &.{})} });
+        return row;
+    }
+    try f.b.endRow(.{ .value = &.{loop} });
+    return row;
+}
+
+// The slots of the first loop body of the site of `root`, after the driver,
+// and that the rules kept what the loop computes.
+fn expectFlagLoop(how: Flag, knocked: bool, want_slots: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    if (knocked) f.b.hooks.algorithms_off.insert(.decided_test);
+    const row = try flagRow(&f, how);
+    const inputs = [_]i128{ 0, 1, 5, 60 };
+    const p: eval.Value = .{ .bool_ = how != .init_decided };
+    var before: [inputs.len]eval.Value = undefined;
+    for (&before, inputs) |*o, n| o.* = try f.run(arena.allocator(), row, &.{ .{ .int = n }, p });
+    // The index, when the loop is a `ForRange`, and the slots.
+    try testing.expectEqual(want_slots, try slotsOf(&f, row));
+    for (before, inputs) |was, n| try testing.expect(was.eql(try f.run(arena.allocator(), row, &.{ .{ .int = n }, p })));
+    try testing.expectEqual(!knocked and how != .undecided, f.b.hooks.algorithms_fired.get(.decided_test) > 0);
+}
+
+test "N11n: an edge that passes the flag as a literal decides the leading test, and the knockout stops it" {
+    try expectFlagLoop(.literal, false, 2);
+    try expectFlagLoop(.literal, true, 3);
+}
+
+test "N11n: an edge that passes a value a dominating test decided, the leading test among them, decides it, and the knockout stops it" {
+    try expectFlagLoop(.decided, false, 2);
+    try expectFlagLoop(.decided, true, 3);
+}
+
+test "N11n: the arms of the value switch T3 makes of two edges are edges, and the loop is then a ForRange" {
+    // The `ForRange` body has the index and the sum.
+    try expectFlagLoop(.switched, false, 2);
+    try expectFlagLoop(.switched, true, 3);
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const row = try flagRow(&f, .switched);
+    try expectLoopKind(&f, row, "for_range(", "loop(");
+}
+
+test "N11n: an initial value that a test around the loop decided selects the continuing arm" {
+    try expectFlagLoop(.init_decided, false, 2);
+    try expectFlagLoop(.init_decided, true, 3);
+}
+
+test "N11n: an edge that no test decides keeps the general Loop and its flag" {
+    try expectFlagLoop(.undecided, false, 3);
+}
+
+/// How a second counter is written: what each field changes is a condition of N11o.
+const Derived = struct {
+    /// The range's start: a literal, or the row's second parameter.
+    start: union(enum) { lit: i128, param } = .{ .lit = 0 },
+    /// The counter's initial value.
+    init: i128 = 5,
+    /// How far each turn steps the counter.
+    step: i128 = 1,
+    /// The row also reads the counter after the loop.
+    read_after: bool = false,
+    /// Whether the test runs the row before and after: not from the type's
+    /// lowest start, which runs for most of the type.
+    evaluate: bool = true,
+};
+
+// `|n, s| for_range(<start>, n, total = 0, j = init) { continue(total + j, j + step) }`,
+// read through the sum, and the counter too with `read_after`.
+fn derivedRow(f: *Fixture, d: Derived) !RowId {
+    const i64_ty = try f.types.intTy(.i64);
+    const row = try f.b.beginRow(&.{ i64_ty, i64_ty }, i64_ty);
+    const zero = try f.b.litInt(i64_ty, 0);
+    const start = switch (d.start) {
+        .lit => |v| try f.b.litInt(i64_ty, v),
+        .param => Ref.rowParam(1),
+    };
+    const lb = try f.b.openRegion(.loop_body, &.{ i64_ty, i64_ty, i64_ty });
+    const total = Ref.regionParam(lb, 1);
+    const j = Ref.regionParam(lb, 2);
+    const next_total = try f.b.call(.i64, .plus, &.{ total, j });
+    const next_j = try f.b.call(.i64, .plus, &.{ j, try f.b.litInt(i64_ty, d.step) });
+    try f.b.close(.{ .continue_ = &.{ next_total, next_j } });
+    const loop = try f.b.loopOf(.for_range, &.{ start, Ref.rowParam(0), zero, try f.b.litInt(i64_ty, d.init) }, lb, &.{ i64_ty, i64_ty });
+    const sum = Ref.node(loop.nodeId(), 0);
+    const out = if (d.read_after) try f.b.call(.i64, .plus, &.{ sum, Ref.node(loop.nodeId(), 1) }) else sum;
+    try f.b.endRow(.{ .value = &.{out} });
+    return row;
+}
+
+fn expectDerived(d: Derived, knocked: bool, want_slots: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    if (knocked) f.b.hooks.algorithms_off.insert(.derived_counter);
+    const row = try derivedRow(&f, d);
+    const inputs = [_][2]i128{ .{ 0, 0 }, .{ 1, 0 }, .{ 9, 3 }, .{ 12, -4 } };
+    var before: [inputs.len]eval.Value = undefined;
+    if (d.evaluate) for (&before, inputs) |*o, in| {
+        o.* = try f.run(arena.allocator(), row, &.{ .{ .int = in[0] }, .{ .int = in[1] } });
+    };
+    // The index and the slots.
+    try testing.expectEqual(want_slots, try slotsOf(&f, row));
+    if (d.evaluate) for (before, inputs) |was, in| {
+        try testing.expect(was.eql(try f.run(arena.allocator(), row, &.{ .{ .int = in[0] }, .{ .int = in[1] } })));
+    };
+    try testing.expectEqual(want_slots == 2, f.b.hooks.algorithms_fired.get(.derived_counter) > 0);
+}
+
+test "N11o: a counter stepped by 1 with an index from 0 is the index plus its start, and the knockout stops it" {
+    try expectDerived(.{}, false, 2);
+    try expectDerived(.{}, true, 3);
+}
+
+test "N11o: from a start N13u proves the difference from, the counter is the index plus the difference" {
+    try expectDerived(.{ .start = .{ .lit = 3 }, .init = 10 }, false, 2);
+    try expectDerived(.{ .start = .{ .lit = 3 }, .init = 10 }, true, 3);
+    // `minus(j0, a)` at the type's lowest start fits too.
+    try expectDerived(.{ .start = .{ .lit = std.math.minInt(i64) }, .init = -1, .evaluate = false }, false, 2);
+}
+
+test "N11o: a start whose difference N13u does not prove, a step of 2, and a counter read after the loop each keep the slot" {
+    // `0 - s` overflows an `I64` at its lowest value.
+    try expectDerived(.{ .start = .param, .init = 0 }, false, 3);
+    // `1 - minInt` overflows.
+    try expectDerived(.{ .start = .{ .lit = std.math.minInt(i64) }, .init = 1, .evaluate = false }, false, 3);
+    try expectDerived(.{ .step = 2 }, false, 3);
+    try expectDerived(.{ .read_after = true }, false, 3);
 }

@@ -406,7 +406,7 @@ pub const Constants = struct {
     /// 179: Normal form 16: N13u intervals, N8k result ranges and the
     ///      parameter half of N15c (M11), so plus chains, decided tests,
     ///      inclusive counter loops and speculatable flags change.
-    pub const CACHE_VERSION = 179;
+    pub const CACHE_VERSION = 180;
 };
 
 /// Configuration for the Roc cache system.

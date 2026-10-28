@@ -209,6 +209,7 @@ Notes on accuracy:
 | Rows the compiler chooses | A `Code.Outlined(f)` site gets the `outline` view (milestone M9). Places that differ in a value pass it as an argument (V3b), so the GLSL shader's two calls of `ripple` are one row ([../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 12). |
 | Laws of the builtins | A `Code.Lawful(f)` site gets the graph view under layer L (milestone M10). No example opts in: the SQL translator matches `List.sum(List.map(..))` and `len() > 0`, which the laws change. |
 | Literal intervals | Every integer value has an interval from literals, dominating tests against a literal, and range indices (milestone M11). A test that an interval decides is gone, and `while $i <= n` with a bounded `n` is the `for` over `0..=n`. The rules and their limits are in [../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 3.13. |
+| Facts across loop turns | A `while !$done` loop whose flag every edge sets as a known value is the loop with `break`, and a second counter stepped with a range index is `i + j0` (milestone M12). The rules and their limits are in [../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 3.11. |
 | Not done | The translator cannot yet declare which functions of another package it reads (`code_primitives`, milestone M13 of [../roc-reify-normalization-plan.md](../roc-reify-normalization-plan.md)). |
 
 ### What is refused today

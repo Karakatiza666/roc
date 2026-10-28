@@ -179,8 +179,14 @@ pub fn planWith(gpa: Allocator, store: *const ir.Store, returns: *live_mod.Retur
     try late(&p, returns);
     try fillMembers(&p);
     switch (stage) {
-        .simplify => try everyArm(&p, returns),
-        .number => try hoist(&p, returns),
+        .simplify => _ = try everyArm(&p, returns),
+        // A node hoisted into the arms of a switch merges with the nodes
+        // every arm computes, as in the simplify phase (normal-form 3.5),
+        // and a merged node is hoisted again from the switch's region.
+        .number => {
+            try hoist(&p, returns);
+            while (try everyArm(&p, returns)) try hoist(&p, returns);
+        },
     }
     try regionOrder(&p, returns);
     return p;
@@ -493,8 +499,9 @@ fn sameRegions(p: *const Plan, a: Allocator, x: NodeId, y: NodeId) Allocator.Err
 // one when its regions read nothing from the arms and end alike. Inner
 // switches first, so a node merged out of an inner switch can merge again
 // out of an outer one; each switch again until nothing merges, so a node
-// over merged nodes merges too.
-fn everyArm(p: *Plan, returns: *live_mod.Returns) Allocator.Error!void {
+// over merged nodes merges too. Says whether a node merged.
+fn everyArm(p: *Plan, returns: *live_mod.Returns) Allocator.Error!bool {
+    var any = false;
     const a = p.arena();
     const store = p.store;
     var inner_first: std.ArrayList(NodeId) = .empty;
@@ -530,9 +537,11 @@ fn everyArm(p: *Plan, returns: *live_mod.Returns) Allocator.Error!void {
                 merged = true;
             }
             if (!merged) break;
+            any = true;
             try fillMembers(p);
         }
     }
+    return any;
 }
 
 // Merge node `from` into `kept`, and every node already merged into `from`,
