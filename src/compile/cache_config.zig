@@ -416,7 +416,9 @@ pub const Constants = struct {
     ///      elements is unrolled, so described bodies change.
     /// 184: Normal form 21: one spelling per recursive type (2.1), so the
     ///      types of described bodies over a cycle of two nominals change.
-    pub const CACHE_VERSION = 184;
+    /// 185: Normal form 22: a checked `plus` chain with an operand that
+    ///      always crashes flattens (N15a), so described bodies change.
+    pub const CACHE_VERSION = 185;
 };
 
 /// Configuration for the Roc cache system.

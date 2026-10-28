@@ -1278,7 +1278,7 @@ Intervals decide nothing on their own. They are conditions that rules read:
 | a checked `plus`, `minus` or `times` proved to fit | speculatable in the regions of its facts (1.1) |
 | N11l on `while $i <= n` | `n` below the type's highest value (3.11) |
 | N11o | the difference `minus(j0, a)` fits |
-| N15a on `plus` | a `plus` chain flattens when the sum of its operands' negative lower bounds and the sum of their positive upper bounds both fit the type, so every partial sum of every grouping fits |
+| N15a on `plus` | a `plus` chain flattens when the sum of its operands' negative lower bounds and the sum of their positive upper bounds both fit the type, so every partial sum of every grouping fits; an operand with an empty interval adds nothing to either sum |
 | tier F rows the rule-derivation tool writes under interval conditions | such as `(x * 2) // 2 -> x` when `x * 2` fits, and `x % n -> x` when `0 <= x < n` (`roc-reify-rule-derivation.md` 3.4) |
 
 Bounds against a value that is not a literal, such as `i < List.len(xs)`,
@@ -1369,6 +1369,22 @@ from, so `(a + b) + c` and `a + (b + c)` meet, and `1 + (a + b)` is
 moves a literal stays apart, as it does for the chains of the table above. A
 chain of more than two operands is checked `plus` only where N13u proved it
 fits, which the verifier checks.
+
+The condition is monotone in the facts: a narrower interval never stops a
+chain that a wider one let flatten. This is necessary because the facts grow
+between rounds. A chain that one print flattens while an operand is still
+unknown must also flatten in the print where the operand is known from the
+start. The narrowest interval is the empty one. An operand has it when it
+always crashes where it is read, such as `0 - 18` at `U64`, or when its facts
+contradict. Such an operand gives no value, so no partial sum holds it, and it
+adds nothing to the two sums (`ranges.chainFits`). The other operands must
+still fit. Under C2 the regrouping is exact:
+
+| Where | Why the crash is the same |
+|---|---|
+| the operand that crashes | it is the same node in both groupings, and the chain keeps the operands in order, so every operand before it is read before it in both |
+| a partial sum without it | it holds only the other operands, whose sums fit, so it does not overflow before the operand crashes |
+| a partial sum with it | it is never computed in either grouping |
 
 Leaf order (N15c). Commutative operands are not sorted in general (7.2), but
 a literal and two leaves have an order that no unrelated edit can change. A

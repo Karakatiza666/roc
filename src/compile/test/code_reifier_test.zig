@@ -7271,6 +7271,42 @@ test "L3 M17: the builtins of a known list are their results" {
     );
 }
 
+test "L3 M17: a chain whose first operand always crashes flattens whether N17g unrolled the loop that computes it or it was written out (N15a)" {
+    // `0 - 18` always crashes, so its interval is empty. Before N17g unrolled
+    // the loop, `$b` was unknown and `0 - $b * 3` was `[0, 0]`, so the chain
+    // flattened; the empty interval must not stop the chain the other print
+    // builds from the statements.
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $a = 0 - ({
+        \\        var $b = 0
+        \\        for x in [9] {
+        \\            $b = $b + 6
+        \\        }
+        \\        $b
+        \\    } * 3)
+        \\    $a = $a + 5
+        \\    $a = $a + 5
+        \\    $a = $a + 5
+        \\    $a + input
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $a = 0 - ({
+        \\        var $b = 0
+        \\        $b = $b + 6
+        \\        $b
+        \\    } * 3)
+        \\    $a = $a + 5
+        \\    $a = $a + 5
+        \\    $a = $a + 5
+        \\    $a + input
+        \\}
+    );
+}
+
 // One recursive type has one `TyId` (roc-reify-normal-form.md 2.1). A cycle
 // through two nominals has a tree for each nominal it can be closed at, and
 // these three sites compared two of those trees as two types.

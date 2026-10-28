@@ -128,12 +128,15 @@ pub fn fits(int: IntTy, method: Method, args: []const Interval) bool {
 
 /// N15a's condition on a checked `plus` chain at `int`: the sum of its
 /// operands' negative lower bounds and the sum of their positive upper bounds
-/// both fit, so every partial sum of every grouping fits.
+/// both fit, so every partial sum of every grouping fits. An operand with an
+/// empty interval gives no value, so no partial sum holds it and it adds
+/// nothing: the condition is monotone, and a narrower interval never stops a
+/// chain that a wider one let flatten.
 pub fn chainFits(int: IntTy, args: []const Interval) bool {
     var neg: i256 = 0;
     var pos: i256 = 0;
     for (args) |a| {
-        if (isEmpty(a)) return false;
+        if (isEmpty(a)) continue;
         neg +|= @min(a.lo, 0);
         pos +|= @max(a.hi, 0);
     }
@@ -324,6 +327,22 @@ test "N13u: a chain fits when its negative lower bounds and its positive upper b
     try testing.expect(!chainFits(.i8, &.{ point(-1), point(127), point(1) }));
     try testing.expect(chainFits(.i8, &.{ .{ .lo = -60, .hi = 60 }, .{ .lo = -60, .hi = 60 }, .{ .lo = -8, .hi = 7 } }));
     try testing.expect(!chainFits(.i8, &.{ .{ .lo = -60, .hi = 60 }, .{ .lo = -60, .hi = 60 }, .{ .lo = -9, .hi = 7 } }));
+}
+
+test "N13u: an operand with an empty interval adds nothing to a chain, so a narrower interval never stops a chain that a wider one lets flatten" {
+    // `0 - 18` at `U64` always crashes: its interval is empty. Where it was
+    // still `[0, 0]`, the chain fit, and it still fits.
+    const others = [_]Interval{ point(5), point(5), point(5) };
+    try testing.expect(chainFits(.u64, &([_]Interval{point(0)} ++ others)));
+    try testing.expect(chainFits(.u64, &([_]Interval{empty} ++ others)));
+    try testing.expect(chainFits(.u64, &(others ++ [_]Interval{empty})));
+    // The other operands must still fit without it.
+    try testing.expect(!chainFits(.u8, &.{ empty, .{ .lo = 0, .hi = 200 }, .{ .lo = 0, .hi = 56 } }));
+    try testing.expect(chainFits(.u8, &.{ .{ .lo = 0, .hi = 200 }, empty, .{ .lo = 0, .hi = 55 } }));
+    // Monotone: every interval inside one that fits fits, the empty one included.
+    for ([_]Interval{ .{ .lo = 0, .hi = 55 }, point(55), point(0), empty }) |inner| {
+        try testing.expect(chainFits(.u8, &.{ .{ .lo = 0, .hi = 200 }, inner }));
+    }
 }
 
 test "N13u: each arm of a comparison with a literal gives its half line or point, and decides only what it holds" {
@@ -592,6 +611,40 @@ test "N13u with N15a: a checked plus chain whose intervals prove no grouping ove
         // A literal goes last before the chain flattens.
         const k = try b.call(.u8, .plus, &.{ try b.litInt(u8_ty, 1), try b.call(.u8, .plus, &.{ p(0), p(1) }) });
         if (!knocked) try testing.expectEqualSlices(Ref, &.{ p(0), p(1), try b.litInt(u8_ty, 1) }, f.store.refSlice(f.store.node(k.nodeId()).args));
+        for (arms) |_| try b.close(.{ .value = &.{l} });
+        try b.endRow(.{ .value = &.{p(0)} });
+    }
+}
+
+test "N13u with N15a: an operand that always crashes lets a chain flatten when the other operands fit, and the knockout stops it" {
+    for ([_]bool{ false, true }) |knocked| {
+        var f: Fixture = undefined;
+        f.init();
+        defer f.deinit();
+        const b = &f.b;
+        if (knocked) b.hooks.algorithms_off.insert(.range_chain);
+        const u8_ty = try f.types.intTy(.u8);
+        _ = try b.beginRow(&.{ u8_ty, u8_ty }, u8_ty);
+        const p = Ref.rowParam;
+        // `0 - 18` at `U8` always crashes: its interval is empty.
+        const m = try b.call(.u8, .minus, &.{ try b.litInt(u8_ty, 0), try b.litInt(u8_ty, 18) });
+        try testing.expect(f.store.node(m.nodeId()).op == .prim);
+        try testing.expect(isEmpty(f.interval(m)));
+        // With `a` and `b` unbounded, `(m + a) + b` stays as written: `a + b`
+        // can overflow before `m` is read in another grouping.
+        const unbounded = try b.call(.u8, .plus, &.{ try b.call(.u8, .plus, &.{ m, p(0) }), p(1) });
+        try testing.expectEqual(@as(usize, 2), f.store.node(unbounded.nodeId()).args.len);
+        // Under `a < 80` and `b < 80`, `(m + a) + b` and `m + (a + b)` are `plus(m, a, b)`.
+        var arms: [2]ir.RegionId = undefined;
+        for (&arms, 0..) |*arm, k| arm.* = try b.openArm(try b.call(.u8, .is_lt, &.{ p(@intCast(k)), try b.litInt(u8_ty, 80) }), 1);
+        const l = try b.call(.u8, .plus, &.{ try b.call(.u8, .plus, &.{ m, p(0) }), p(1) });
+        const r = try b.call(.u8, .plus, &.{ m, try b.call(.u8, .plus, &.{ p(0), p(1) }) });
+        if (knocked) {
+            try testing.expect(l != r);
+        } else {
+            try testing.expectEqual(l, r);
+            try testing.expectEqualSlices(Ref, &.{ m, p(0), p(1) }, f.store.refSlice(f.store.node(l.nodeId()).args));
+        }
         for (arms) |_| try b.close(.{ .value = &.{l} });
         try b.endRow(.{ .value = &.{p(0)} });
     }

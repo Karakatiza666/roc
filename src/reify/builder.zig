@@ -1911,7 +1911,9 @@ pub const Builder = struct {
     // Then every partial sum of every grouping fits, so `(a + b) + c` and
     // `a + (b + c)` fail nowhere and meet. Where the intervals do not prove
     // it, the grouping as written stays, because a regrouped sum can
-    // overflow where the written one does not.
+    // overflow where the written one does not. An operand with an empty
+    // interval always crashes where it is read and adds nothing to the
+    // bounds, so a stronger fact never stops a chain a weaker one flattened.
     fn rangeChain(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
         if (!self.algorithmOn(.range_chain)) return null;
         const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;

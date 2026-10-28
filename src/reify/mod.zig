@@ -36,7 +36,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 21;
+pub const normal_form_version: u32 = 22;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -86,6 +86,8 @@ pub fn fingerprint() u64 {
     h.update(std.mem.asBytes(&lists.max_unrolled));
     // 2.1: one spelling per type.
     h.update("T1: a nominal is Recursive exactly where the nearest enclosing Named of its name is the same type; T2: a node's type, and the backing an Unwrap gives, are spelled from their own root");
+    // N15a over a checked `plus`: monotone in the intervals.
+    h.update("N15a: an operand with an empty interval adds nothing to a checked plus chain's bounds");
     return h.final();
 }
 
@@ -195,6 +197,10 @@ const recorded = [_]Recorded{
     // name is the same type, however the walk entered the cycle, and the
     // backing an `Unwrap` gives is spelled from its own root.
     .{ .version = 21, .fingerprint = 0x36f06b3039448e99 },
+    // Fix: N15a's condition on a checked `plus` chain is monotone in the
+    // intervals. An operand with an empty interval, which always crashes
+    // where it is read, adds nothing to the chain's bounds.
+    .{ .version = 22, .fingerprint = 0x032a7bb4ace86414 },
 };
 
 const std = @import("std");
