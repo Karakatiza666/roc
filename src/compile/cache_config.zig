@@ -421,7 +421,10 @@ pub const Constants = struct {
     /// 186: Normal form 23: a nominal closes only under its own instance
     ///      (2.1, T1), so described bodies over a nominal inside another
     ///      instance of its name change, and some are refused.
-    pub const CACHE_VERSION = 186;
+    /// 187: A record update joins its base's type class as an occurrence, so
+    ///      a mismatch at the update no longer makes the base's binding
+    ///      erroneous, and checked types of such modules change.
+    pub const CACHE_VERSION = 187;
 };
 
 /// Configuration for the Roc cache system.
