@@ -27420,7 +27420,7 @@ fn beginExprCheckFrame(
         // A parameter already holding a description is passed along; only a
         // name the compiler can follow to a body is reified.
         if (!self.namesAReifiableDefinition(expr)) break :staged null;
-        break :staged .{ .fn_var = code.fn_var, .view = code.view, .expected_type = expected_type, .translator = self.translatorCallee(expected_type.context) };
+        break :staged .{ .fn_var = code.fn_var, .view = code.view, .expected_type = expected_type, .translator = self.translatorCall(expected_type.context) };
     };
     frame.staged_code_fn_var = if (staged_code) |staged| staged.fn_var else null;
     if (staged_code) |staged| {
@@ -27438,7 +27438,7 @@ fn beginExprCheckFrame(
     // is the whole value: neither it nor the name it calls is compiled, so
     // both nodes leave the checked body as descriptions.
     if (self.stagedTemplateCall(expr)) |call| {
-        const translator = if (expected.aggregateType()) |expected_type| self.translatorCallee(expected_type.context) else null;
+        const translator = if (expected.aggregateType()) |expected_type| self.translatorCall(expected_type.context) else null;
         try self.recordCodeSite(ModuleEnv.nodeIdxFrom(expr_idx), call.code.fn_var, .template_call, call.code.view, translator);
         try self.recordCodeSite(ModuleEnv.nodeIdxFrom(call.callee), call.code.fn_var, .template_callee, call.code.view, null);
     }
@@ -27526,18 +27526,29 @@ fn recordCodeSite(
     try self.code_site_owners.put(self.gpa, @intCast(@backingInt(node_idx)), self.current_code_owner.?);
 }
 
-/// The callee of the call a site is an argument of, read from the context
-/// the call checked the argument in. The function it names is the site's
-/// translator, whose nominal type declares the site's cut (I14). A site
-/// that is no argument of a call has no translator, and so an empty cut.
-fn translatorCallee(self: *const Self, context: problem.Context) ?CIR.Node.Idx {
+/// The call a site is an argument of, read from the context the call
+/// checked the argument in. The function that call names is the site's
+/// translator, whose nominal type declares the site's cut (I14): the
+/// callee of a direct call, or the method a method call dispatches to. A
+/// method call checks its arguments against the method's parameters only
+/// once its dispatch is planned, so its node is a dispatch call here, and
+/// the walk reads the target from that plan. A site that is no argument of
+/// a call has no translator, and so an empty cut.
+fn translatorCall(self: *const Self, context: problem.Context) ?CIR.Node.Idx {
     const arg = switch (context) {
         .fn_call_arg => |arg| arg,
         else => return null,
     };
-    const call = self.cir.store.getExpr(arg.call_expr);
-    if (call != .e_call) return null;
-    return ModuleEnv.nodeIdxFrom(call.e_call.func);
+    return switch (self.cir.store.getExpr(arg.call_expr)) {
+        .e_call, .e_dispatch_call => ModuleEnv.nodeIdxFrom(arg.call_expr),
+        // A method the dispatch could not find retired the call, and the
+        // build stops at that error.
+        .e_runtime_error => null,
+        // A method call the dispatch resolved to equality or hashing, whose
+        // operands are values of one type and never a `Code`.
+        .e_structural_eq, .e_structural_hash, .e_method_eq => null,
+        else => unreachable, // only a call and a method call check arguments in a call-argument context
+    };
 }
 
 /// A `Code` type a description is reified at: the function type `f` inside
@@ -31354,7 +31365,7 @@ fn resumeCallCheck(self: *Self, task: *ExprTask, state: *CallCheck, env: *Env, c
     // called by the compiler. One the site recording did not claim is either
     // an imported template, which is recorded here where the callee's type is
     // known, or a call the walk cannot reach.
-    const translator = if (frame.nested_expected.aggregateType()) |expected_type| self.translatorCallee(expected_type.context) else null;
+    const translator = if (frame.nested_expected.aggregateType()) |expected_type| self.translatorCall(expected_type.context) else null;
     try self.claimOrRejectCodeCall(expr_idx, call.func, expr_region, state.callee_returns_code, translator);
 
     // Argument unification above is the point at which an effect-polymorphic

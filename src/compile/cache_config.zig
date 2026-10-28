@@ -409,7 +409,9 @@ pub const Constants = struct {
     /// 181: Normal form 18: the translator's cut (I14). A site records its
     ///      translator call, the artifact records each type's cut, and a
     ///      function of another package outside the cut is walked (N8l).
-    pub const CACHE_VERSION = 181;
+    /// 182: Normal form 19: a site passed to a translator called as a
+    ///      method records that call, and takes its method's cut (I14).
+    pub const CACHE_VERSION = 182;
 };
 
 /// Configuration for the Roc cache system.

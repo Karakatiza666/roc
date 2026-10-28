@@ -35,7 +35,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 18;
+pub const normal_form_version: u32 = 19;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -77,6 +77,9 @@ pub fn fingerprint() u64 {
     // by its qualified name (N8h); every other function, in any package, is
     // walked by its body (N8l), and so is a computed value of any package.
     h.update("N8h: a function in the cut of the site's translator, code_primitives, is a Prim named by the nominal it is an item of and the item; N8l: every other function and computed value, in any package, is walked by its body");
+    // I14: the translator of a site is the function the call it is an
+    // argument of names, a direct call's callee or a method call's target.
+    h.update("I14: a site's translator is the callee of the direct call or the target of the method call the site is an argument of");
     return h.final();
 }
 
@@ -170,6 +173,9 @@ const recorded = [_]Recorded{
     // function and computed value, in any package, is walked by its body
     // (N8l).
     .{ .version = 18, .fingerprint = 0xcd9bd93efff0ff8c },
+    // Fix: a site passed to a translator called as a method takes the cut
+    // of the method's type, as its direct call does (I14).
+    .{ .version = 19, .fingerprint = 0x9c643e7520951391 },
 };
 
 const std = @import("std");

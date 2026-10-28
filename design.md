@@ -23664,9 +23664,12 @@ Invariants:
   the site's function type holds an error.
 - A site's cut is explicit data, never a guess about which functions a
   translator knows (I14 of `roc-reify-normalization-plan.md`). The checker
-  records the callee of the direct call a site is an argument of
+  records the call a site is an argument of, a direct call or a method call
   (`CodeReificationSite.translator`, from the argument's `fn_call_arg`
-  context in `translatorCallee`). Publication checks each `code_primitives`
+  context in `translatorCall`). A method call checks its arguments against
+  the method's parameters only after its dispatch is planned, so the walk
+  reads the method from that plan's target, never from the method's name
+  (`translatorFunction`). Publication checks each `code_primitives`
   item of a nominal the module declares, one lookup of a function defined as
   a lambda or a tuple of them, each once, and records its checked lookups in
   `CodeCutTable`; any other entry is a `staged_code` problem at the entry

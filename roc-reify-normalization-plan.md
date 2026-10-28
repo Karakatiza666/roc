@@ -478,7 +478,7 @@ walk and in every later rebuild, or a pass.
 | I11 | `Code.version` and the rule-set fingerprint | `prims.zig`, `Builtin.roc` | 10 |
 | I12 | the pipeline driver: per-module arena; components in callee-first order, each simplified to its fixpoint and then finalized; rows created during simplification simplified and finalized on demand; the round bound and the check after every round that the measure fell; per-site view stage | `driver.zig` | 3.0; 1.3 here |
 | I13 | the rule table: every smart-constructor rule as root op, argument patterns, side condition and result; dispatch, the knockout switch that disables one rule in test builds, the fingerprint of I11 and the overlap list of 5.7 read from it | `rules/table.zig` | 3.0 |
-| I14, done | the translator's cut: the well-known item `code_primitives` of the nominal type that owns the `Code(f)` function, a function reference or a tuple of them (normal-form 12); the checker's lookup through that type, its check of the form and of duplicates, and the cut recorded in the checked artifact for that type's sites. The checker records each site's translator call (`CodeReificationSite.translator`, `src/canonicalize/NodeStore.zig`); publication checks each item and records the cut (`moduleCuts` in `src/check/code_reifier.zig`, `CodeCutTable` in `src/check/checked_artifact.zig`); the walk takes a site's cut from the type that owns its translator (`Walk.useCut`). A site that is no argument of a direct call has an empty cut | checker, checked artifact, site rule | 3.8, 12 |
+| I14, done | the translator's cut: the well-known item `code_primitives` of the nominal type that owns the `Code(f)` function, a function reference or a tuple of them (normal-form 12); the checker's lookup through that type, its check of the form and of duplicates, and the cut recorded in the checked artifact for that type's sites. The checker records each site's translator call (`CodeReificationSite.translator`, `src/canonicalize/NodeStore.zig`); publication checks each item and records the cut (`moduleCuts` in `src/check/code_reifier.zig`, `CodeCutTable` in `src/check/checked_artifact.zig`); the walk takes a site's cut from the type that owns its translator (`Walk.useCut`). The translator is the function the call that takes the site names: a direct call's callee, or the method a method call dispatches to, read from its dispatch plan (`Reifier.translatorFunction`). A site passed to a wrapper takes the cut of the wrapper's type, which is empty when no type owns the wrapper (normal-form 3.8) | checker, checked artifact, site rule | 3.8, 12 |
 
 ### 3.2 Construct: during the walk
 
@@ -721,9 +721,18 @@ one.
 M13 declares the cut with the well-known item `code_primitives` on the
 translator's type (normal-form 12), so it needs no new syntax. Before M13, N8h
 kept every function of another package a primitive, and no dependency body was
-read. M13 leaves one limit: the translator is the callee of a direct call whose
-argument is the site, so a site passed to a translator called as a method, or
-written where no call takes it, has an empty cut.
+read. The translator is the function the call that takes the site names: the
+callee of a direct call or a pipe, through every alias, or the method a method
+call dispatches to, read from the call's dispatch plan. Each form gives one
+normal form, pinned by "I14 M13: a translator called as a method, through a
+pipe or through an alias takes the cut its direct call takes"
+(`src/compile/test/code_reifier_test.zig:3339`) and by "staging - a translator
+called as a method keeps the functions of its cut primitives, as its direct
+call does, and a wrapper has its own cut"
+(`src/eval/test/eval_staging_tests.zig:2033`), which pins the wrapper too. A site no call
+takes is a compile error, because a `Code` names only a function parameter or
+result. A site passed to a wrapper takes the wrapper's cut, which is empty
+when no type owns the wrapper: normal-form 3.8 states the rule and its table.
 
 After M13 is built, check the delegated form of an interpolated literal of a
 custom type. A translator that declares that type's `from_interpolation` in
@@ -1080,6 +1089,7 @@ marked "apart" must give two, and each is a row of `roc-reify-refactor-safety.md
 | the language rejects C2 | the strict variant of 1.9 is a bounded change to seven steps; the decision is needed before M2, which builds placement |
 | a translator's cut misses a function its target has | the function is walked and its body inlined, which is sound; the translator's refusal names the function, and the fix is one cut entry |
 | the cut is per type, so two translators that need different cuts must be two types | the rule is stated in normal-form 12; a finer grain would need the second `Code` parameter that 12 rejects |
+| a wrapper around a translator, `helper = \|c\| Tr.show(t, c)`, is the translator of its sites, so a site passed to it takes the wrapper's cut and not `Tr`'s | the rule is stated in normal-form 3.8; the fix is to make the wrapper an item of a type that declares the cut. Following the `Code` value through the wrapper's body to the next translator would read data flow, which no stage records |
 | the hand-written `is_eq` on `Code` drifts from the normal form | it is written over the emitted fields with the site key named once, and the sites test of 5.9 compares it with equality of dumps |
 | intervals make the rule set depend on a fact the builder computes | an interval is one operation per node over literals and dominating tests, with no widening; L2 checks on the L5 inputs that every interval contains the value, so a wrong interval is found rather than trusted |
 | rule derivation at k = 6 and 7 outgrows the tool's time or memory: a run at k = 5 over S2 peaks at 5.4 GB (`roc-reify-rule-derivation.md` 5.2) | M15 runs S1 before S2, and the D3 record keeps each run's time and peak memory beside those at k = 5. Making the tool fit is M15's work, in the tool, which the compiler does not import |

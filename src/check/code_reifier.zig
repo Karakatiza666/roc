@@ -4482,6 +4482,53 @@ pub const Reifier = struct {
         }
     }
 
+    /// The function a translator call names, as a member of a cut is named:
+    /// the callee of a direct call, through its resolved reference, or the
+    /// method a method call dispatches to, through its dispatch plan. Null
+    /// where the call names no function defined as a lambda.
+    fn translatorFunction(self: *Reifier, call: CheckedExprId) Allocator.Error!?CutMember {
+        switch (self.bodies.expr(call).data) {
+            .call => |direct| {
+                const resolved = self.lookupResolved(direct.func) orelse return null;
+                return self.cutMember(resolved);
+            },
+            .dispatch_call => |plan_id| {
+                // A dispatch checking rejected has no plan, and the build
+                // already stops at its error.
+                const id = plan_id orelse return null;
+                const node_id = switch (self.plans.plans[@backingInt(id)].resolution) {
+                    .direct_closed, .direct_parametric => |direct| direct.evidence,
+                    .direct_pending => |node_id| node_id,
+                    .checked_error, .@"unreachable" => return null,
+                    // The checker plans a method call's arguments against the
+                    // method's parameters only once its receiver's type is
+                    // known, so a site's translator is dispatched directly.
+                    .evidence_dependent, .structural => invariant("a translator's method call dispatches to a target its receiver's type names"),
+                };
+                return self.methodCutMember(self.plans.evidenceNode(node_id).target);
+            },
+            // A call checking rejected, which the build stops at.
+            .runtime_error => return null,
+            else => invariant("a translator call is a direct call or a method call"),
+        }
+    }
+
+    /// The function one method target names, as a member of a cut is named,
+    /// or null for a method that is no function of a module the walk reads:
+    /// a builtin, whose type declares no cut, a local function, a derived one.
+    fn methodCutMember(self: *Reifier, target: static_dispatch.MethodTarget) Allocator.Error!?CutMember {
+        const procedure = switch (target.kind) {
+            .procedure => |procedure| procedure,
+            .local_proc, .structural => return null,
+        };
+        const found = self.methodDefinition(procedure.template, target.def_idx) orelse return null;
+        return switch (found) {
+            .here => |local| .{ .reader = self, .body = local.body, .def = target.def_idx },
+            .away => |definition| .{ .reader = try self.walk.reader(definition.module), .body = definition.body, .def = target.def_idx },
+            .here_builtin, .provided => null,
+        };
+    }
+
     /// The resolved reference a checked lookup holds, or null for an
     /// expression that is no lookup.
     fn lookupResolved(self: *Reifier, expr_id: CheckedExprId) ?checked.ResolvedValueRefId {
@@ -8436,14 +8483,13 @@ pub const Walk = struct {
     }
 
     /// Take the cut of the site begun last from its translator (I14): the
-    /// function `translator`, a callee `site_reader` checked, names. The
+    /// function that `call`, a call `site_reader` checked, names. The
     /// nominal type that has that function as an associated item declares
     /// the cut with its `code_primitives` item, which publication of the
     /// type's module checked. A translator that is no such function, or whose
     /// type declares no cut, leaves the cut empty.
-    pub fn useCut(self: *Walk, site_reader: *Reifier, translator: CheckedExprId) Allocator.Error!void {
-        const resolved = site_reader.lookupResolved(translator) orelse return;
-        const function = try site_reader.cutMember(resolved) orelse return;
+    pub fn useCut(self: *Walk, site_reader: *Reifier, call: CheckedExprId) Allocator.Error!void {
+        const function = try site_reader.translatorFunction(call) orelse return;
         const owner = function.reader;
         const owned = owner.ownerOf(function.def) orelse return;
         const members = owner.code_cuts.membersOf(@backingInt(owned.decl)) orelse return;
@@ -8947,10 +8993,10 @@ pub fn reifyModuleSites(
 /// The cut of `site`, from the translator its call names (I14).
 fn useSiteCut(walk: *Walk, reifier: *Reifier, local: LocalSources, site: @import("can").NodeStore.CodeReificationSite) Allocator.Error!void {
     if (site.translator == @import("can").NodeStore.CodeReificationSite.no_translator) return;
-    // A callee checking rejected has no checked expression, and the build
+    // A call checking rejected has no checked expression, and the build
     // already stops at its error.
-    const callee = local.bodies.exprIdAtRawNode(site.translator) orelse return;
-    try walk.useCut(reifier, callee);
+    const call = local.bodies.exprIdAtRawNode(site.translator) orelse return;
+    try walk.useCut(reifier, call);
 }
 
 // The walk of one site, by its kind.

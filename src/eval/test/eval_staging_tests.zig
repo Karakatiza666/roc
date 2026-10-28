@@ -2003,7 +2003,38 @@ const staged_lawful_empty = lawful_stage ++
     \\main = Lawful.describe(nonempty)
 ;
 
+// A translator called as a method takes the cut its direct call takes: the
+// translator is the method the call dispatches to, and its type declares
+// `twice` a primitive, so both sites keep `Tr.twice` a named call. A wrapper
+// is the translator of the site passed to it, and no type owns `wrapper`, so
+// that site has an empty cut and `twice` is walked (normal-form 3.8).
+const staged_cut_by_method = stage ++
+    \\Tr := {}.{
+    \\    twice : F32 -> F32
+    \\    twice = |x| x * 2.0.F32
+    \\
+    \\    code_primitives = (Tr.twice)
+    \\
+    \\    show : Tr, Code(f) -> Str
+    \\    show = |_, code| Stage.describe(code)
+    \\}
+    \\
+    \\bump : F32 -> F32
+    \\bump = |x| Tr.twice(x) + 1.0.F32
+    \\
+    \\wrapper : Code(f) -> Str
+    \\wrapper = |code| Tr.show(Tr.({}), code)
+    \\
+    \\main = Str.join_with([Tr.show(Tr.({}), bump), Tr.({}).show(bump), wrapper(bump)], " ; ")
+;
+
 pub const tests = [_]TestCase{
+    .{
+        .name = "staging - a translator called as a method keeps the functions of its cut primitives, as its direct call does, and a wrapper has its own cut",
+        .source_kind = .module,
+        .source = staged_cut_by_method,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.plus(Tr.twice(p0), 1) ; r0 = |F32| -> F32 Num.F32.plus(Tr.twice(p0), 1) ; r0 = |F32| -> F32 Num.F32.plus(Num.F32.times(p0, 2), 1)\"" },
+    },
     .{
         .name = "staging - a Code.Lawful site describes a loop that appends to an empty list as List.map",
         .source_kind = .module,

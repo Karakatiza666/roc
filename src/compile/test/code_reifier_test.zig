@@ -211,13 +211,15 @@ const Staged = struct {
         switch (walked_as) {
             .named => {},
             .translated => {
-                // The translator is the callee `main_statement` writes,
-                // `_n = Lib.arity(wobble)`, found by its source text: the
+                // The translator is the call the checker recorded for the
+                // fixture's one translated site, found by its region: the
                 // source-node map is build-only.
-                const start = (std.mem.find(u8, main_statement, "= ") orelse return error.StagedLambdaNotFound) + 2;
-                const end = std.mem.findScalarPos(u8, main_statement, start, '(') orelse return error.StagedLambdaNotFound;
-                const callee = checkedExprWithSource(artifact, self.env, main_statement[start..end]) orelse return error.StagedLambdaNotFound;
-                try self.walk.useCut(self.reifier, callee);
+                const translator = for (self.env.store.codeReificationSites()) |site| {
+                    if (site.translator != can.NodeStore.CodeReificationSite.no_translator) break site.translator;
+                } else return error.StagedLambdaNotFound;
+                const region = self.env.store.getRegionAt(@fromBackingInt(translator));
+                const call = checkedCallWithRegion(artifact, region) orelse return error.StagedLambdaNotFound;
+                try self.walk.useCut(self.reifier, call);
             },
             .inlined => self.walk.view = .inline_,
             .outlined => self.walk.view = .outline,
@@ -540,6 +542,23 @@ fn checkedExprWithSource(
         const expr = artifact.checked_bodies.expr(expr_id);
         if (!std.mem.eql(u8, env.getSource(expr.source_region), text)) continue;
         return expr_id;
+    }
+    return null;
+}
+
+/// The checked call, direct or dispatched, written at `region`.
+fn checkedCallWithRegion(
+    artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
+    region: base.Region,
+) ?CheckedExprId {
+    for (0..artifact.checked_bodies.exprCount()) |raw| {
+        const expr_id: CheckedExprId = @fromBackingInt(@intCast(@as(u32, @intCast(raw))));
+        const expr = artifact.checked_bodies.expr(expr_id);
+        if (!std.meta.eql(expr.source_region, region)) continue;
+        switch (expr.data) {
+            .call, .dispatch_call => return expr_id,
+            else => {},
+        }
     }
     return null;
 }
@@ -3315,6 +3334,49 @@ test "N8h M13: a method in the cut called as a method is the Prim its direct cal
     if (direct.outcome != .reified) return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.find(u8, direct.dump.items, "Lib.Vec.scale(") != null);
     try std.testing.expectEqualStrings(direct.dump.items, method.dump.items);
+}
+
+test "I14 M13: a translator called as a method, through a pipe or through an alias takes the cut its direct call takes" {
+    // The translator is the function the call names: the callee of a direct
+    // call, the method a method call dispatches to. Its type's cut keeps
+    // `scale` a `Prim` however the call is written.
+    const gpa = std.testing.allocator;
+    const lib =
+        \\Lib := {}.{
+        \\    scale : U64, U64 -> U64
+        \\    scale = |v, k| v * k
+        \\
+        \\    code_primitives = (scale)
+        \\
+        \\    arity : Lib, Code(f) -> U64
+        \\    arity = |_, code| code.graph().root_row().params.len()
+        \\}
+    ;
+    const direct = try Staged.createTranslated(gpa, translated_caller, "_n = Lib.arity(Lib.({}), wobble)", lib);
+    defer direct.destroy();
+    try direct.expectDump(
+        \\row r0 ({ a : U64, b : U64 }) -> U64
+        \\  n0 = field 0(p0) : U64
+        \\  n1 = field 1(p0) : U64
+        \\  n2 = Lib.scale(n0, n1) : U64 !spec
+        \\  n3 = 1 : U64
+        \\  n4 = Num.U64.plus(n2, n3) : U64 !spec
+        \\  value n4
+        \\
+    );
+    const forms = [_][]const u8{
+        "_n = Lib.({}).arity(wobble)",
+        "_n = Lib.({}) |> Lib.arity(wobble)",
+        // A local alias of the translator forwards to it.
+        "s = Lib.arity\n    _n = s(Lib.({}), wobble)",
+        // A site in a branch of the argument is an argument of the call.
+        "_n = Lib.arity(Lib.({}), if Bool.True wobble else wobble)",
+    };
+    for (forms) |form| {
+        const called = try Staged.createTranslated(gpa, translated_caller, form, lib);
+        defer called.destroy();
+        try std.testing.expectEqualStrings(direct.dump.items, called.dump.items);
+    }
 }
 
 test "N8h M13: a function in the cut of a translator in the site's own module is a Prim" {

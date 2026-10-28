@@ -930,6 +930,10 @@ function or a tuple of names, and anything else, or a name listed twice, is a
 compile error at the entry. The cut belongs to the translator and not to the
 library, because the target decides it: a GLSL translator keeps a math
 library's `lerp` as GLSL's `mix`, and a SQL translator reads its body.
+A site takes the cut of the type that owns the function its call names,
+whether the call is `Tr.show(t, f)`, `t |> Tr.show(f)` or `t.show(f)`. A
+wrapper that takes the `Code` itself is the translator of the sites passed
+to it, with the cut of its own type (`roc-reify-normal-form.md` 3.8).
 
 Every other function is read by its body, in any package, and so is a
 computed value of any package. A dependency's body is therefore part of what a

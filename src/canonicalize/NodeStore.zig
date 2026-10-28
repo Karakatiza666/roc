@@ -924,9 +924,10 @@ pub const CodeReificationSite = extern struct {
     /// input slots (the call's result is a `Code.Bound`), or `no_bound_call`.
     /// The checker sets it when the call finishes checking.
     bound_call: u32 = no_bound_call,
-    /// The callee of the call this site is an argument of, or
-    /// `no_translator`. The function that callee names is the translator,
-    /// and the nominal type that owns it declares the site's cut
+    /// The call this site is an argument of, a direct call or a method
+    /// call, or `no_translator`. The function that call names is the
+    /// translator: the callee of a direct call, the method a method call
+    /// dispatches to. The nominal type that owns it declares the site's cut
     /// (`code_primitives`, roc-reify-normal-form.md 3.8).
     translator: u32 = no_translator,
 
@@ -1502,7 +1503,7 @@ pub fn recordCodeReificationSite(
     translator: ?Node.Idx,
 ) Allocator.Error!void {
     const raw = @backingInt(node_idx);
-    const translator_raw = if (translator) |callee| @backingInt(callee) else CodeReificationSite.no_translator;
+    const translator_raw = if (translator) |call| @backingInt(call) else CodeReificationSite.no_translator;
     const items = store.code_reification_sites.items.items;
     const at = codeReificationSiteLowerBound(items, raw);
     if (at < items.len and items[at].node_idx == raw) {

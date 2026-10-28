@@ -676,9 +676,26 @@ translator reads its body. Such a primitive is not speculatable, whatever its
 body. Builtins are primitives in every cut (7.2). The name is the one the
 function is defined under, the nominal it is an associated item of and the
 item, so a direct call `Glsl.Vec3.scale(v, k)` and a method call
-`v.scale(k)` give one `Prim`. A site's translator is the function its call
-names (`src/check/Check.zig`, `translatorCallee`); a site that no direct call
-takes has an empty cut.
+`v.scale(k)` give one `Prim`.
+
+A site's translator is the function that the call the site is an argument
+of names, as the checker resolved it (`src/check/Check.zig:27537`,
+`translatorCall`; `src/check/code_reifier.zig:4489`, `translatorFunction`).
+The cut is the cut of the type that owns that function:
+
+| How the site reaches the translator | The translator | The cut |
+|---|---|---|
+| a direct call, `Tr.show(t, f)`; a pipe, `t \|> Tr.show(f)`, which is that call | the callee, through its resolved reference, through every alias | its type's |
+| a method call, `t.show(f)` | the method the call dispatches to, from its dispatch plan | its type's |
+| a site in a branch of the argument, `Tr.show(t, if c f else g)` | as for the call | its type's |
+| a template call as the argument, `t.show(mk(k))` | as for the call | its type's |
+| a wrapper, `helper(f)` where `helper = \|c\| Tr.show(t, c)` | `helper`, the function with the `Code(f)` parameter (12) | the cut of the type that owns `helper`; empty when no type owns it |
+| `f.show()`, a method call on a receiver whose type is not yet known, a `Code` in a value annotation or a record field | none: no site | a compile error: a missing method, a type mismatch, or a `Code` outside a parameter (`rejectMisplacedStagedCode`) |
+
+A wrapper is the translator of the sites passed to it, because its
+parameter is the `Code(f)` the site fills, and nothing but its body says
+which translator receives the value next. A wrapper that must keep a cut is
+an item of a type that declares it.
 
 Every function outside the cut is walked by its body, in any package. A
 dependency's body is therefore part of what a translator reads: an upgrade
@@ -2215,7 +2232,7 @@ for all three.
 | Should `graph` inline single-use rows? | yes in this design, because it moves the most common helper extraction into tier A. The price is that a GLSL translator reading `graph` never emits a function the author called once |
 | Do translators need names for emitted identifiers? | no in this design: the dump and provenance cover debugging. A name exposed for emission becomes observable again |
 | Should the rules be derived rather than accumulated? | yes: the gate of `roc-reify-rule-derivation.md` section 6 passed on 2026-09-27. That document defines an offline tool, `zig build reify-rules`, that finds unjoined critical pairs and equal small terms that normalize apart, proves them in a most-defined semantics in which every rule is an equation, and writes the first-order rules as table rows. After the gate, a tier F rule enters the table through the tool, and a hand-written tier F row, such as N15a's rows over operand runs, states its reason |
-| How does a translator declare its cut? | decided: a well-known associated item `code_primitives` on the nominal type that owns the function with the `Code(f)` parameter, found through that type as `iter` and `to_inspect` are. It is public, like every well-known name, and it tells a translator's users which functions it reads by name. It is a direct reference to one top-level function, or a tuple of such references; anything else, and a function listed twice, is a compile error at the item. A type without it has an empty cut. The checker resolves it and records the cut in the checked artifact, as it records `IteratorProcedureId`; the reifier reads the checked expression, not an evaluated value. The cut is per type: two translators with different cuts are two types. Rejected: a private module constant read by name, which no Roc mechanism is like; a second `Code` type parameter with a `Code.prim` intrinsic (new surface), a package header entry (one cut per package, which `Glsl` and `Interp` in one package cannot share), and a cut passed to a `Code` function at run time (the normalizer would have to run in every backend, as plan 1.5 rejects for views) |
+| How does a translator declare its cut? | decided: a well-known associated item `code_primitives` on the nominal type that owns the function with the `Code(f)` parameter, found through that type as `iter` and `to_inspect` are. It is public, like every well-known name, and it tells a translator's users which functions it reads by name. It is a direct reference to one top-level function, or a tuple of such references; anything else, and a function listed twice, is a compile error at the item. A type without it has an empty cut. The function with the `Code(f)` parameter is the one the call that takes the site names: the callee of a direct call, the method a method call dispatches to, or a wrapper (3.8). The checker resolves it and records the cut in the checked artifact, as it records `IteratorProcedureId`; the reifier reads the checked expression, not an evaluated value. The cut is per type: two translators with different cuts are two types. Rejected: a private module constant read by name, which no Roc mechanism is like; a second `Code` type parameter with a `Code.prim` intrinsic (new surface), a package header entry (one cut per package, which `Glsl` and `Interp` in one package cannot share), and a cut passed to a `Code` function at run time (the normalizer would have to run in every backend, as plan 1.5 rejects for views) |
 | Where does the `graph` view stop being worth it? | if no translator ends up reading it, drop it and keep only `inline`; the normal form's definition does not change |
 
 K was measured with `ROC_REIFY_OUTLINE_STATS=3,4,5,6,8,12` (a Debug compiler
