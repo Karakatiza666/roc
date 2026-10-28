@@ -152,9 +152,9 @@ pub const Lookup = struct {
     }
 };
 
-/// The lambda whose one parameter is named `param`. The
-/// source-node map is build-only, so the test reads the pattern's region the
-/// same way the reifier does.
+/// The lambda whose first parameter is named `param`, so a site may take
+/// more than one. The source-node map is build-only, so the test reads the
+/// pattern's region the same way the reifier does.
 pub fn lambdaByParam(
     artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
     env: *const ModuleEnv,
@@ -165,7 +165,7 @@ pub fn lambdaByParam(
         const data = artifact.checked_bodies.expr(expr_id).data;
         if (data != .lambda) continue;
         const lambda = data.lambda;
-        if (lambda.args.len != 1) continue;
+        if (lambda.args.len == 0) continue;
         const pattern = artifact.checked_bodies.pattern(lambda.args[0]);
         if (pattern.data != .assign) continue;
         if (!std.mem.eql(u8, env.getSource(pattern.source_region), param)) continue;
@@ -223,6 +223,7 @@ pub const Error = Allocator.Error ||
         NormalFormsDiffer,
         RefusalsDiffer,
         ValuesDiffer,
+        IntervalMissed,
     };
 
 /// How a case ended where nothing disagreed.
@@ -430,10 +431,16 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
         if (each.outcome != .reified) continue;
         const site = each.walk.site.?;
         var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
+        // L2 for N13u and N8k: every interval holds every value computed.
+        evaluator.check_ranges = true;
         const computed = try evaluator.run(each.walk.root.?, &args);
         if (!computed.eql(.{ .int = expected })) {
             std.debug.print("the normal form computes {any}, and Roc computes {d}\n{s}\n", .{ computed, expected, each.dump.items });
             return error.ValuesDiffer;
+        }
+        if (evaluator.range_miss) |miss| {
+            std.debug.print("node {d} of row {d} computes {d}, outside its interval [{d}, {d}]\n{s}\n", .{ miss.node.index(), miss.row.index(), miss.value, miss.interval.lo, miss.interval.hi, each.dump.items });
+            return error.IntervalMissed;
         }
     }
     return .agree;

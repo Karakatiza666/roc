@@ -157,6 +157,8 @@ const Verifier = struct {
                 // A primitive the table does not hold takes the types the checker gave it.
                 const p = prims.lookup(ir.PrimId.of(nd.payload)) orelse break :blk !single;
                 if (!single or !p.takes(args.len)) break :blk true;
+                // A checked chain is one only where N13u proved it fits.
+                if (!p.associative and args.len > p.arity and !self.provedFit(n)) break :blk true;
                 break :blk !try self.primTypesAgree(p, nd, tys[0]);
             },
             .record => blk: {
@@ -363,13 +365,20 @@ const Verifier = struct {
         const want: bool = switch (nd.op) {
             .lit, .record, .tuple, .list, .tag, .wrap, .unwrap, .closure, .field, .index, .opt_field, .lambda => true,
             .payload, .elem, .crash, .derived, .loop, .apply => false,
-            .prim => if (prims.lookup(ir.PrimId.of(nd.payload))) |p| p.speculatable else false,
+            // A checked op N13u proved fits its type is speculatable, and the
+            // store records the proof (`ir.NodeRange.fits`).
+            .prim => if (prims.lookup(ir.PrimId.of(nd.payload))) |p| p.speculatable or self.provedFit(n) else false,
             .call => self.store.row(RowId.of(nd.payload)).speculatable,
             .and_, .or_, .switch_, .for_range, .for_list => for (self.store.regionSlice(nd.regions)) |r| {
                 if (!self.regionSpeculatable(r)) break false;
             } else true,
         };
         if (want != nd.flags.speculatable) try self.report.add("node {d}: speculatable is {}, the op gives {}", .{ n.index(), nd.flags.speculatable, want });
+    }
+
+    fn provedFit(self: *const Verifier, n: NodeId) bool {
+        const r = self.store.ranges.get(n) orelse return false;
+        return r.fits;
     }
 
     fn regionSpeculatable(self: *Verifier, r: RegionId) bool {

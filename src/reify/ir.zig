@@ -481,6 +481,29 @@ pub const Row = struct {
     /// the root, whose parameters are the type in `Code(fn)`, and a row
     /// that gives a closure its type's calling convention.
     fixed_params: bool = false,
+    /// The result range N8k recorded when the row was finalized: the union
+    /// of the intervals of the values it returns, for a row whose result is
+    /// a builtin integer. N13u reads it on each `Call` of the row.
+    result_range: ?Interval = null,
+};
+
+/// An integer interval with literal bounds (N13u, normal-form 3.13), empty
+/// where `lo > hi`. The bounds are wide enough for every builtin integer type.
+pub const Interval = struct {
+    lo: i256,
+    hi: i256,
+};
+
+/// The interval N13u gave a node of a builtin integer type when it was built
+/// (`ranges.zig`): it holds wherever `holds_in` encloses the node's place,
+/// or everywhere when `holds_in` is `none`, because its sources are the facts
+/// of `holds_in` and of the regions around it. `fits` says that the node is a
+/// checked `plus`, `minus` or `times` whose operands' intervals prove that it
+/// fits its type, so it is speculatable there and no further out (1.1).
+pub const NodeRange = struct {
+    interval: Interval,
+    holds_in: RegionId,
+    fits: bool,
 };
 
 /// A literal's value. Floats and integers are compared by their bits.
@@ -559,6 +582,9 @@ pub const Store = struct {
     /// Per region, by id: the nodes built in it, in id order. A node never
     /// moves to another region, so this is true at every point of a build.
     region_members: std.ArrayList(std.ArrayList(NodeId)) = .empty,
+    /// Per node of a builtin integer type that N13u gave an interval narrower
+    /// than its type, or that it proved fits: that interval (`NodeRange`).
+    ranges: std.AutoHashMapUnmanaged(NodeId, NodeRange) = .empty,
 
     pub fn init(gpa: Allocator) Store {
         return .{ .gpa = gpa };
@@ -579,6 +605,15 @@ pub const Store = struct {
         self.provenance.deinit(self.gpa);
         for (self.region_members.items) |*m| m.deinit(self.gpa);
         self.region_members.deinit(self.gpa);
+        self.ranges.deinit(self.gpa);
+    }
+
+    /// The region a node that N13u proved fits its type may not be hoisted
+    /// out of (normal-form 1.1), or null where nothing limits it.
+    pub fn fitFloor(self: *const Store, n: NodeId) ?RegionId {
+        const r = self.ranges.get(n) orelse return null;
+        if (!r.fits or r.holds_in == RegionId.none) return null;
+        return r.holds_in;
     }
 
     /// Append `items` to the ref pool.

@@ -403,7 +403,10 @@ pub const Constants = struct {
     ///      nodes for provenance by the comparison.
     /// 178: Normal form 15: `outline` matches places by anti-unification
     ///      (V3b), so the rows of a `Code.Outlined` site change.
-    pub const CACHE_VERSION = 178;
+    /// 179: Normal form 16: N13u intervals, N8k result ranges and the
+    ///      parameter half of N15c (M11), so plus chains, decided tests,
+    ///      inclusive counter loops and speculatable flags change.
+    pub const CACHE_VERSION = 179;
 };
 
 /// Configuration for the Roc cache system.

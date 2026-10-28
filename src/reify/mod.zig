@@ -27,6 +27,7 @@ pub const rebuild = @import("rebuild.zig");
 pub const number = @import("number.zig");
 pub const loops = @import("loops.zig");
 pub const scalar = @import("scalar.zig");
+pub const ranges = @import("ranges.zig");
 pub const laws = @import("laws.zig");
 pub const fuzz_gen = @import("fuzz_gen.zig");
 
@@ -34,7 +35,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 15;
+pub const normal_form_version: u32 = 16;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -68,6 +69,10 @@ pub fn fingerprint() u64 {
     // A region's loops that can return, read or not, are in its digest and
     // its structural comparison (`live.exits`).
     h.update("a region's digest and comparison read its loops that can return");
+    // M11: N13u's sources and the rules that read them, N8k's result ranges,
+    // N11l on `while $i <= n` under a bounded `n`, a checked `plus` chain,
+    // and N15c's parameter half with N7b over two root parameters.
+    h.update("N13u: literals, tests against a literal, ForRange indices, interval arithmetic, N8k result ranges; decided comparisons, proved checked arithmetic speculatable within its facts, checked plus chains, inclusive ForRange; root parameters in parameter order in N15c and N7b");
     return h.final();
 }
 
@@ -139,6 +144,15 @@ const recorded = [_]Recorded{
     // parameter is that value, and a hole moves only a speculatable value
     // out of an arm or a loop body. Places are grouped by keys to depth D.
     .{ .version = 15, .fingerprint = 0xf9ae43f95561a55e },
+    // M11 of the plan: literal intervals (N13u) from literals, tests against
+    // a literal, `ForRange` indices, interval arithmetic and the result
+    // ranges of finalized rows (N8k). A comparison an interval decides is a
+    // literal, a checked op proved to fit is speculatable within its facts,
+    // a checked `plus` chain proved to fit is one `Prim`, and `while $i <= n`
+    // with `n` below its type's highest value is an inclusive `ForRange`.
+    // Two root parameters go in parameter order (N15c), in an operation and
+    // in a decision tree (N7b).
+    .{ .version = 16, .fingerprint = 0xe01423990801bff4 },
 };
 
 const std = @import("std");
@@ -178,6 +192,7 @@ test "reify tests" {
     std.testing.refAllDecls(@import("number.zig"));
     std.testing.refAllDecls(@import("loops.zig"));
     std.testing.refAllDecls(@import("scalar.zig"));
+    std.testing.refAllDecls(@import("ranges.zig"));
     std.testing.refAllDecls(@import("laws.zig"));
     std.testing.refAllDecls(@import("fuzz_gen.zig"));
 }

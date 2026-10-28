@@ -1813,14 +1813,14 @@ test "a `?` on a block-generalized helper's Try in the inline view is the helper
         \\row r0 (U64) -> Builtin.Try
         \\  n0 = 10 : U64
         \\  n1 = Num.U64.is_lt(p0, n0) : Bool
-        \\  n12 = switch n1 : Builtin.Try !spec
+        \\  n12 = switch n1 : Builtin.Try
         \\    arm 0
         \\      n2 = tag Err(p0) : [Err(U64), Ok(U64)]
         \\      n3 = wrap(n2) : Builtin.Try
         \\      value n3
         \\    arm 1
         \\      n4 = 1 : U64
-        \\      n5 = Num.U64.plus(p0, n4) : U64 !spec
+        \\      n5 = Num.U64.plus(p0, n4) : U64
         \\      n6 = Num.U64.is_lt(n5, n0) : Bool
         \\      n11 = switch n6 : Builtin.Try
         \\        arm 0
@@ -1915,14 +1915,14 @@ test "a block-generalized helper read at its own union and at the Try it lifts i
         \\row r0 (U64) -> Builtin.Try
         \\  n0 = 10 : U64
         \\  n1 = Num.U64.is_lt(p0, n0) : Bool
-        \\  n8 = switch n1 : Builtin.Try !spec
+        \\  n8 = switch n1 : Builtin.Try
         \\    arm 0
         \\      n2 = tag Err(p0) : [Err(U64), Ok(U64)]
         \\      n3 = wrap(n2) : Builtin.Try
         \\      value n3
         \\    arm 1
         \\      n4 = 1 : U64
-        \\      n5 = Num.U64.plus(p0, n4) : U64 !spec
+        \\      n5 = Num.U64.plus(p0, n4) : U64
         \\      n6 = tag Ok(n5) : [Err(U64), Ok(U64)]
         \\      n7 = wrap(n6) : Builtin.Try
         \\      value n7
@@ -1986,19 +1986,19 @@ test "a `?` on a block-generalized helper's Try in a match arm is that arm's swi
     try staged.expectDump(
         \\row r0 ({ a : [P, Q], n : U64 }) -> Builtin.Try
         \\  n0 = field 0(p0) : [P, Q]
-        \\  n14 = switch n0 : Builtin.Try !spec
+        \\  n14 = switch n0 : Builtin.Try
         \\    arm 0
         \\      n1 = field 1(p0) : U64
         \\      n2 = 10 : U64
         \\      n3 = Num.U64.is_lt(n1, n2) : Bool
-        \\      n10 = switch n3 : Builtin.Try !spec
+        \\      n10 = switch n3 : Builtin.Try
         \\        arm 0
         \\          n4 = tag Err(n1) : [Err(U64), Ok(U64)]
         \\          n5 = wrap(n4) : Builtin.Try
         \\          value n5
         \\        arm 1
         \\          n6 = 1 : U64
-        \\          n7 = Num.U64.plus(n1, n6) : U64 !spec
+        \\          n7 = Num.U64.plus(n1, n6) : U64
         \\          n8 = tag Ok(n7) : [Err(U64), Ok(U64)]
         \\          n9 = wrap(n8) : Builtin.Try
         \\          value n9
@@ -2889,7 +2889,7 @@ test "a list pattern's rest splits the patterns written around it" {
         \\      n3 = 0 : U64
         \\      n4 = elem(p0, n3) : F32 !spec
         \\      n5 = 1 : U64
-        \\      n6 = Num.U64.minus(n0, n5) : U64 !spec
+        \\      n6 = Num.U64.minus(n0, n5) : U64
         \\      n7 = elem(p0, n6) : F32 !spec
         \\      n8 = Num.F32.plus(n4, n7) : F32
         \\      n9 = List.drop_first(p0, n5) : List(F32) !spec
@@ -5849,4 +5849,258 @@ test "L3 N7: an if whose arms differ only in a loop that can return keeps the lo
     try std.testing.expect(staged.outcome == .reified);
     try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "for_list") != null);
     try std.testing.expect(std.mem.indexOf(u8, staged.dump.items, "return") != null);
+}
+
+// M11: literal intervals (N13u, N8k) and the parameter half of N15c.
+
+test "L3 M11: `while $i <= n` with `n` bounded is the `for` over `0..=n`" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 100 {
+        \\    var $i = 0
+        \\    var $total = 0
+        \\    while $i <= input {
+        \\        $total = $total + $i
+        \\        $i = $i + 1
+        \\    }
+        \\    $total
+        \\} else 0
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 100 {
+        \\    var $total = 0
+        \\    for i in 0..=input {
+        \\        $total = $total + i
+        \\    }
+        \\    $total
+        \\} else 0
+    );
+}
+
+test "L3 M11: `while $i <= n` with `n` unbounded stays apart from the `for` over `0..=n`" {
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $i = 0
+        \\    var $total = 0
+        \\    while $i <= input {
+        \\        $total = $total + $i
+        \\        $i = $i + 1
+        \\    }
+        \\    $total
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $total = 0
+        \\    for i in 0..=input {
+        \\        $total = $total + i
+        \\    }
+        \\    $total
+        \\}
+    );
+}
+
+test "L3 M11: `a + 1` is `1 + a`, and so on for `*` and `==` with a literal" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| input + 1
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| 1 + input
+    );
+    try expectSameNormalForm(
+        \\wobble : U64 -> Bool
+        \\wobble = |input| input * 3 == 6
+    ,
+        \\wobble : U64 -> Bool
+        \\wobble = |input| 6 == 3 * input
+    );
+}
+
+test "L3 M11: two root parameters swapped in `+`, `*` and `==` are one normal form, over integers and Str" {
+    try expectSameNormalForm(
+        \\wobble : U64, U64 -> U64
+        \\wobble = |input, other| (input + other) * (input * other)
+    ,
+        \\wobble : U64, U64 -> U64
+        \\wobble = |input, other| (other + input) * (other * input)
+    );
+    try expectSameNormalForm(
+        \\wobble : U64, U64 -> Bool
+        \\wobble = |input, other| input == other
+    ,
+        \\wobble : U64, U64 -> Bool
+        \\wobble = |input, other| other == input
+    );
+    try expectSameNormalForm(
+        \\wobble : Str, Str -> Bool
+        \\wobble = |input, other| input == other
+    ,
+        \\wobble : Str, Str -> Bool
+        \\wobble = |input, other| other == input
+    );
+    // `-` is not commutative.
+    try expectOtherNormalForm(
+        \\wobble : U64, U64 -> U64
+        \\wobble = |input, other| input - other
+    ,
+        \\wobble : U64, U64 -> U64
+        \\wobble = |input, other| other - input
+    );
+}
+
+test "L3 M11: a helper with its parameters reordered still meets itself" {
+    try expectSameNormalForm(
+        \\wobble : { x : U64, y : U64 } -> U64
+        \\wobble = |input| {
+        \\    h = |a, b| a * 2 + b
+        \\    h(input.x, input.y) * h(input.y, input.x)
+        \\}
+    ,
+        \\wobble : { x : U64, y : U64 } -> U64
+        \\wobble = |input| {
+        \\    h = |b, a| a * 2 + b
+        \\    h(input.y, input.x) * h(input.x, input.y)
+        \\}
+    );
+}
+
+test "L3 M11: matches on two root parameters in either test order are one decision tree" {
+    try expectSameNormalForm(
+        \\wobble : [P, Q], [A, B] -> U64
+        \\wobble = |input, other| match input {
+        \\    P => match other { A => 1, B => 2 }
+        \\    Q => match other { A => 3, B => 4 }
+        \\}
+    ,
+        \\wobble : [P, Q], [A, B] -> U64
+        \\wobble = |input, other| match other {
+        \\    A => match input { P => 1, Q => 3 }
+        \\    B => match input { P => 2, Q => 4 }
+        \\}
+    );
+}
+
+test "L3 M11: a test that an enclosing test decides is gone" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 10 {
+        \\    if input < 20 input + 1 else 7
+        \\} else 3
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 10 input + 1 else 3
+    );
+}
+
+test "L3 M11: a `plus` chain whose operands a test bounds is one sum in either grouping" {
+    try expectSameNormalForm(
+        \\wobble : { a : U64, b : U64, c : U64 } -> U64
+        \\wobble = |input| if input.a < 100 and input.b < 100 and input.c < 100 {
+        \\    (input.a + input.b) + input.c
+        \\} else 0
+    ,
+        \\wobble : { a : U64, b : U64, c : U64 } -> U64
+        \\wobble = |input| if input.a < 100 and input.b < 100 and input.c < 100 {
+        \\    input.a + (input.b + input.c)
+        \\} else 0
+    );
+    // Unbounded, regrouping can overflow where the written sum does not.
+    try expectOtherNormalForm(
+        \\wobble : { a : U64, b : U64, c : U64 } -> U64
+        \\wobble = |input| (input.a + input.b) + input.c
+    ,
+        \\wobble : { a : U64, b : U64, c : U64 } -> U64
+        \\wobble = |input| input.a + (input.b + input.c)
+    );
+}
+
+test "L3 M11: a comparison of a helper's call that its result range decides is gone (N8k)" {
+    try expectSameNormalForm(
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| {
+        \\    h = |v| v * 2 + 1
+        \\    if h(input.a) > 0 h(input.a) * h(input.b) else 7
+        \\}
+    ,
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| {
+        \\    h = |v| v * 2 + 1
+        \\    h(input.a) * h(input.b)
+        \\}
+    );
+}
+
+test "L3 M11: an interval a test gives a node holds only inside that test, in either build order and in a sibling arm" {
+    // Built in the arm first, then outside: outside, `input + 1 > 100` can hold.
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| (if input < 10 { input + 1 } else { 0 }) + (if input + 1 > 100 { 1 } else { 2 })
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| (if input < 10 { input + 1 } else { 0 }) + 2
+    );
+    // Built outside first, then in the arm.
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| (if input + 1 > 100 { 1 } else { 2 }) + (if input < 10 { input + 1 } else { 0 })
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| 2 + (if input < 10 { input + 1 } else { 0 })
+    );
+    // In the sibling arm `input + 1` is at least 11, which decides `< 11` and not `< 50`.
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 10 { input + 1 } else if input + 1 < 50 { 1 } else { 2 }
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 10 { input + 1 } else { 1 }
+    );
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 10 { input + 1 } else if input + 1 < 11 { 1 } else { 2 }
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| if input < 10 { input + 1 } else { 2 }
+    );
+}
+
+test "L3 M11: a helper's result range is the union over all its results, not the interval of one returned under a test (N8k)" {
+    try expectOtherNormalForm(
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| {
+        \\    h = |v| {
+        \\        if v < 10 {
+        \\            return v + 1
+        \\        }
+        \\        v
+        \\    }
+        \\    if h(input.a) > 100 h(input.b) else 7
+        \\}
+    ,
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| 7
+    );
+}
+
+test "L4 and L5 M11: literal operands on either side and bounded inclusive sums keep every seed's two prints one normal form" {
+    // The generator's M11 choices are on: a literal operand of `+`, `*` and
+    // `==` first or last, and a sum over `0..=n` under a test that bounds
+    // `n`, written as a `for` or a `while $i <= n`. The harness checks that
+    // every interval holds every value the normal form computes (L2).
+    var prng = std.Random.DefaultPrng.init(0x0b11);
+    const random = prng.random();
+    var bytes: [96]u8 = undefined;
+    var verdicts = std.EnumArray(reify_fuzz.Verdict, u32).initFill(0);
+    for (0..300) |_| {
+        random.bytes(&bytes);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const ctx = CoreCtx.default(std.testing.allocator, arena.allocator(), std.testing.io);
+        verdicts.getPtr(try reify_fuzz.runCaseWith(ctx, try sharedBuiltinModules(), tmp.dir, &bytes, .{ .m7 = false, .m11 = true })).* += 1;
+    }
+    try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
 }

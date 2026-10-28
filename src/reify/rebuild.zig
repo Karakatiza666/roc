@@ -927,7 +927,7 @@ const Rebuild = struct {
             .for_range, .for_list, .loop, .lambda => blk: {
                 // The loop rules (`loops.zig`): the loop is copied as a rewrite says.
                 if (nd.op != .lambda and !self.opts.raw) {
-                    const where: loops.Where = .{ .row_body = if (self.inside) null else self.row_body, .usage = try self.usage() };
+                    const where: loops.Where = .{ .row_body = if (self.inside) null else self.row_body, .usage = try self.usage(), .below_max = .{ .ctx = self, .run = belowMax } };
                     if (try loops.analyze(self.arena(), self.p, self.b.types, n, where)) |found| {
                         const rw = found;
                         break :blk try self.rewrittenLoop(nd, &rw, args);
@@ -950,6 +950,7 @@ const Rebuild = struct {
                     defer self.gpa.free(params);
                     new.* = try self.b.openRegion(s.region(old).kind, params);
                     if (nd.op == .for_list) try self.b.noteListLoop(new.*, args[0]);
+                    if (nd.op == .for_range) try self.b.noteRangeLoop(new.*, args[0], args[1], nd.payload == 1);
                     try self.regions.put(self.gpa, old, new.*);
                     try self.fill(old);
                     try self.finish(old, if (nd.op == .lambda) .{ .lambda = new.* } else .region, null);
@@ -1059,6 +1060,7 @@ const Rebuild = struct {
         } else for (rw.slots, new_args[rw.header.len..]) |k, *o| o.* = args[lead + k];
         const body = try self.b.openRegion(.loop_body, rw.param_tys);
         if (rw.op == .for_list) try self.b.noteListLoop(body, new_args[0]);
+        if (rw.op == .for_range) try self.b.noteRangeLoop(body, new_args[0], new_args[1], rw.payload == 1);
         var act: Active = .{ .rw = rw, .body = body, .init = args[lead..] };
         try self.regions.put(self.gpa, rw.body, body);
         if (rw.continue_in) |r| try self.regions.put(self.gpa, r, body);
@@ -1112,6 +1114,25 @@ const Rebuild = struct {
             _ = o;
         }
         return .{ .ref = ref, .outs = outs, .repl = repl, .width = @intCast(rw.out_tys.len) };
+    }
+
+    // `loops.Where.below_max`: whether the old row's value `ref`, as built
+    // where the loop is being built, has an interval (N13u) below its type's
+    // highest value. A value not built yet has no interval.
+    fn belowMax(ctx: *anyopaque, ref: Ref) bool {
+        const self: *Rebuild = @ptrCast(@alignCast(ctx));
+        switch (ref.kind) {
+            .node => if (!self.nodes.contains(self.p.aliasOf(ref.nodeId()))) return false,
+            .region_param => if (self.rewrites.get(ref.regionId()) == null and self.regions.get(ref.regionId()) == null) return false,
+            .row_param, .input => {},
+        }
+        const mapped = self.mapRef(ref);
+        const r = self.b.rangeOf(mapped) orelse return false;
+        const int = switch (self.b.types.get(self.store().refTy(self.b.row, mapped))) {
+            .int => |i| i,
+            .bool_, .str, .float, .dec, .record, .tuple, .list, .tag_union, .nominal, .func, .opaque_, .recursive => return false,
+        };
+        return r.interval.hi < int.max();
     }
 
     // The body of the row `callee` places, built in the current region over

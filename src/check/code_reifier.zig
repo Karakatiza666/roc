@@ -4186,7 +4186,7 @@ pub const Reifier = struct {
 
         const body = try b.openRegion(.loop_body, params.items);
         switch (counted) {
-            .range => {},
+            .range => |range| try b.noteRangeLoop(body, range.start, range.end, range.inclusive),
             .list => |list| try b.noteListLoop(body, list),
         }
         try self.loopBody(.{ .body = body, .slot_base = slot_base, .iterator = false, .carried = carried.binders.items }, carried, body_id, switch (counted) {

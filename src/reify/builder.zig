@@ -23,6 +23,7 @@ const match = @import("match.zig");
 const provenance = @import("provenance.zig");
 const scalar = @import("scalar.zig");
 const laws_mod = @import("laws.zig");
+const ranges = @import("ranges.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -55,11 +56,23 @@ pub const NodeSpec = struct {
 pub const Fact = struct {
     ref: Ref,
     key: u32,
+    /// The region the fact holds in: the arm, operand or loop body whose
+    /// test or index established it. N13u reads it as the region an interval
+    /// computed from the fact holds in.
+    region: RegionId,
     lit: ?LitId = null,
     excluded: ir.Span = .empty,
     /// Set when `ref` is the index parameter of the body of a `ForList` over
     /// a list: the fact then names no arm, and only N13m reads it.
     loop: ?ListLoop = null,
+    /// Set when `ref` is the index parameter of the body of a `ForRange`: its
+    /// interval (N13u). The fact names no arm, and only N13u reads it.
+    index: ?ir.Interval = null,
+
+    /// Whether the fact is a test's arm, which names an arm key.
+    fn isTest(f: Fact) bool {
+        return f.loop == null and f.index == null;
+    }
 };
 
 /// The list a `ForList` body runs over, and the body's element parameter.
@@ -84,11 +97,22 @@ const Link = struct {
 
 /// The context rules that are algorithms, not rows (plan 3.3): N7b over
 /// positions, N13r over a switch's arms, N13w over the arms that reach a
-/// rejected literal, N13m over the facts of a bound, and N13d over
-/// `Bool.not`, and N14a over a call. A test turns one off to see its rule
-/// stop.
+/// rejected literal, N13m over the facts of a bound, N13d over `Bool.not`,
+/// N14a over a call, N13u over the intervals of the fact stack, and N15c's
+/// parameter half over the root's parameter positions, which the rule
+/// table's terms do not name. A test turns one off to see its rule stop.
 pub const Algorithm = enum {
     interchange,
+    /// N15c's parameter half: two root parameters in parameter order.
+    param_order,
+    /// N13u: a comparison with a literal that an interval decides.
+    range_compare,
+    /// N13u: a checked `plus`, `minus` or `times` that an interval proves
+    /// fits is speculatable in the regions of its facts.
+    range_fit,
+    /// N13u with N15a: a checked `plus` chain whose operands' intervals
+    /// prove no grouping overflows is one `Prim`.
+    range_chain,
     case_of_case,
     rejected_arm,
     bounded_get,
@@ -541,7 +565,7 @@ pub const Builder = struct {
         if (std.debug.runtime_safety and self.types.get(self.store.refTy(self.row, scrutinee)) == .tag_union)
             @import("base").invariant("reify builder: a tag switch opens its arms by tag name", .{});
         const r = try self.openRegion(.arm, &.{});
-        try self.facts.append(self.gpa, .{ .ref = scrutinee, .key = key });
+        try self.facts.append(self.gpa, .{ .ref = scrutinee, .key = key, .region = r });
         return r;
     }
 
@@ -549,7 +573,7 @@ pub const Builder = struct {
     /// the fact that the scrutinee is that tag.
     pub fn openTagArm(self: *Builder, scrutinee: Ref, name: NameId) Allocator.Error!RegionId {
         const r = try self.openRegion(.arm, &.{});
-        try self.facts.append(self.gpa, .{ .ref = scrutinee, .key = name.index() });
+        try self.facts.append(self.gpa, .{ .ref = scrutinee, .key = name.index(), .region = r });
         return r;
     }
 
@@ -573,9 +597,9 @@ pub const Builder = struct {
     pub fn openLitArm(self: *Builder, scrutinee: Ref, keys: []const u32, arm: u32) Allocator.Error!RegionId {
         const r = try self.openRegion(.arm, &.{});
         try self.facts.append(self.gpa, if (arm < keys.len)
-            .{ .ref = scrutinee, .key = arm, .lit = LitId.of(keys[arm]) }
+            .{ .ref = scrutinee, .key = arm, .region = r, .lit = LitId.of(keys[arm]) }
         else
-            .{ .ref = scrutinee, .key = arm, .excluded = try self.store.addWords(keys) });
+            .{ .ref = scrutinee, .key = arm, .region = r, .excluded = try self.store.addWords(keys) });
         return r;
     }
 
@@ -588,7 +612,7 @@ pub const Builder = struct {
             .or_ => 0,
             .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // openOperand is only called for the operands of an And or Or node
         };
-        for (earlier) |e| try self.facts.append(self.gpa, .{ .ref = e, .key = key });
+        for (earlier) |e| try self.facts.append(self.gpa, .{ .ref = e, .key = key, .region = r });
         return r;
     }
 
@@ -601,7 +625,24 @@ pub const Builder = struct {
         try self.facts.append(self.gpa, .{
             .ref = Ref.regionParam(body, 0),
             .key = 0,
+            .region = body,
             .loop = .{ .list = list, .element = Ref.regionParam(body, 1) },
+        });
+    }
+
+    /// Note that the open region `body` is the body of a `ForRange` from
+    /// `start` to `end`: its index parameter runs from the least value of
+    /// `start`'s interval to the greatest of `end`'s, less one when the range
+    /// excludes its end (N13u). The fact holds until the body closes.
+    pub fn noteRangeLoop(self: *Builder, body: RegionId, start: Ref, end: Ref, inclusive: bool) Allocator.Error!void {
+        std.debug.assert(self.open.items[self.open.items.len - 1].region == body);
+        const a = self.rangeOf(start) orelse return;
+        const b = self.rangeOf(end) orelse return;
+        try self.facts.append(self.gpa, .{
+            .ref = Ref.regionParam(body, 0),
+            .key = 0,
+            .region = body,
+            .index = ranges.ofIndex(a.interval, b.interval, inclusive),
         });
     }
 
@@ -878,11 +919,11 @@ pub const Builder = struct {
         const scrutinee = self.store.refSlice(nd.args)[0];
         const k: u32 = @intCast(std.mem.findScalar(RegionId, self.store.regionSlice(nd.regions), arm).?);
         const keys = self.store.wordSlice(nd.aux);
-        if (keys.len == 0) return self.facts.append(self.gpa, .{ .ref = scrutinee, .key = self.armKey(scrutinee, k) });
+        if (keys.len == 0) return self.facts.append(self.gpa, .{ .ref = scrutinee, .key = self.armKey(scrutinee, k), .region = arm });
         try self.facts.append(self.gpa, if (k < keys.len)
-            .{ .ref = scrutinee, .key = k, .lit = LitId.of(keys[k]) }
+            .{ .ref = scrutinee, .key = k, .region = arm, .lit = LitId.of(keys[k]) }
         else
-            .{ .ref = scrutinee, .key = k, .excluded = nd.aux });
+            .{ .ref = scrutinee, .key = k, .region = arm, .excluded = nd.aux });
     }
 
     // A copy of region `r`'s end built in the current region, copying what
@@ -930,7 +971,7 @@ pub const Builder = struct {
         while (i > 0) {
             i -= 1;
             const f = self.facts.items[i];
-            if (f.ref == ref and f.loop == null) return f.key;
+            if (f.ref == ref and f.isTest()) return f.key;
         }
         return null;
     }
@@ -944,7 +985,7 @@ pub const Builder = struct {
         while (i > 0) {
             i -= 1;
             const f = self.facts.items[i];
-            if (f.ref != ref or f.loop != null) continue;
+            if (f.ref != ref or !f.isTest()) continue;
             if (f.lit) |l| return l == lit;
             if (std.mem.findScalar(u32, self.store.wordSlice(f.excluded), lit.index()) != null) return false;
         }
@@ -1321,6 +1362,8 @@ pub const Builder = struct {
             if (self.laws != null) if (try laws_mod.prim(self, spec)) |r| return r;
             if (try self.decidedNot(spec)) |r| return r;
             if (try self.boundedGet(spec)) |r| return r;
+            if (try self.rangeCompare(spec)) |r| return r;
+            if (try self.paramOrder(spec)) |r| return r;
         }
         if (self.rulesActive() and spec.op == .elem) {
             if (self.loopElement(spec)) |r| return r;
@@ -1583,7 +1626,7 @@ pub const Builder = struct {
     // Whether a dominating test proved `i < List.len(xs)`.
     fn provedInBounds(self: *const Builder, xs: Ref, i: Ref) bool {
         for (self.facts.items) |f| {
-            if (f.loop != null) continue;
+            if (!f.isTest()) continue;
             if (self.impliesInBounds(f.ref, f.key, xs, i)) return true;
         }
         return false;
@@ -1625,6 +1668,246 @@ pub const Builder = struct {
         return p.owner == .list and p.method == .len and self.store.refSlice(n.args)[0] == xs;
     }
 
+    // N13u (normal-form 3.13): the interval of a value of a builtin integer
+    // type where it is read. A literal is its value; a node N13u gave an
+    // interval when it was built has it (`nodeRange`); anything else has its
+    // type's full range. Each fact on the stack that bounds the value narrows
+    // it: a dominating arm of a comparison with a literal, an arm of a
+    // literal switch on it, and the index of the `ForRange` body it is.
+    // `holds_in` is the innermost region whose fact the interval read, or
+    // `none` where it read none.
+    pub fn rangeOf(self: *const Builder, ref: Ref) ?Ranged {
+        const int = self.intOf(ref) orelse return null;
+        var out: Ranged = .{ .interval = ranges.full(int), .holds_in = RegionId.none };
+        if (ref.kind == .node) {
+            if (self.intLit(ref)) |v| return .{ .interval = ranges.point(v), .holds_in = RegionId.none };
+            if (self.store.ranges.get(ref.nodeId())) |r| {
+                // A node is read only where it is in scope, which its facts
+                // enclose (`appendNode`), so its interval holds here.
+                std.debug.assert(r.holds_in == RegionId.none or self.store.encloses(r.holds_in, self.current()));
+                out = .{ .interval = r.interval, .holds_in = r.holds_in };
+            }
+        }
+        for (self.facts.items) |f| {
+            const iv = self.factInterval(f, ref, int) orelse continue;
+            out.interval = ranges.meet(out.interval, iv);
+            out.holds_in = self.deeper(out.holds_in, f.region);
+        }
+        return out;
+    }
+
+    /// An interval and the region it holds in (`rangeOf`).
+    pub const Ranged = struct { interval: ir.Interval, holds_in: RegionId };
+
+    // The builtin integer type of `ref`, if it has one.
+    fn intOf(self: *const Builder, ref: Ref) ?types_mod.IntTy {
+        return switch (self.types.get(self.store.refTy(self.row, ref))) {
+            .int => |i| i,
+            .bool_, .str, .float, .dec, .record, .tuple, .list, .tag_union, .nominal, .func, .opaque_, .recursive => null,
+        };
+    }
+
+    // The value of `ref` when it is an integer literal.
+    fn intLit(self: *const Builder, ref: Ref) ?i256 {
+        const n = self.nodeOf(ref) orelse return null;
+        if (n.op != .lit) return null;
+        return litIntValue(self.types, self.store.lit(LitId.of(n.payload)));
+    }
+
+    // The interval fact `f` gives `ref`, of type `int`, if it bounds it.
+    fn factInterval(self: *const Builder, f: Fact, ref: Ref, int: types_mod.IntTy) ?ir.Interval {
+        if (f.index) |iv| return if (f.ref == ref) iv else null;
+        if (f.loop != null) return null;
+        if (f.ref == ref) {
+            const l = f.lit orelse return null;
+            return ranges.point(litIntValue(self.types, self.store.lit(l)) orelse return null);
+        }
+        if (f.key > 1) return null;
+        return self.testInterval(f.ref, f.key == 1, ref, int);
+    }
+
+    // The interval `x`, of type `int`, has where the `Bool` `t` is `holds`:
+    // `t` compares `x` with a literal, or is a true `And` or a false `Or`
+    // one of whose operands does, as N13m reads a bound through them.
+    fn testInterval(self: *const Builder, t: Ref, holds: bool, x: Ref, int: types_mod.IntTy) ?ir.Interval {
+        const n = self.nodeOf(t) orelse return null;
+        switch (n.op) {
+            .prim => {
+                const p = prims.lookup(ir.PrimId.of(n.payload)) orelse return null;
+                if (p.owner.int() != int) return null;
+                switch (p.method) {
+                    .is_lt, .is_lte, .is_eq => {},
+                    else => return null,
+                }
+                const args = self.store.refSlice(n.args);
+                if (self.sameValue(args[0], x)) return ranges.ofTest(int, p.method, true, self.intLit(args[1]) orelse return null, holds);
+                if (self.sameValue(args[1], x)) return ranges.ofTest(int, p.method, false, self.intLit(args[0]) orelse return null, holds);
+                return null;
+            },
+            .and_, .or_ => {
+                if (holds != (n.op == .and_)) return null;
+                var out: ?ir.Interval = self.testInterval(self.store.refSlice(n.args)[0], holds, x, int);
+                for (self.store.regionSlice(n.regions)) |r| {
+                    const v = self.armValue(r) orelse continue;
+                    const iv = self.testInterval(v, holds, x, int) orelse continue;
+                    out = if (out) |o| ranges.meet(o, iv) else iv;
+                }
+                return out;
+            },
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .call, .switch_, .for_range, .for_list, .loop, .lambda, .apply => return null,
+        }
+    }
+
+    // Whether `a` and `b` give one value wherever both are evaluated: one
+    // ref, or two nodes of one regionless projection or builtin op, with the
+    // same payload, types and immediates, over operands that give one value.
+    // A test in an `And` operand compares the copy of a value built in that
+    // operand's region, not the copy the arm builds.
+    fn sameValue(self: *const Builder, a: Ref, b: Ref) bool {
+        if (a == b) return true;
+        const x = self.nodeOf(a) orelse return false;
+        const y = self.nodeOf(b) orelse return false;
+        if (x.op != y.op or x.payload != y.payload) return false;
+        switch (x.op) {
+            .lit, .prim, .field, .index, .payload, .opt_field, .unwrap => {},
+            .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .call, .switch_, .for_range, .for_list, .loop, .lambda, .apply, .and_, .or_ => return false,
+        }
+        if (x.regions.len != 0 or y.regions.len != 0) return false;
+        if (!std.mem.eql(TyId, self.store.tySlice(x.tys), self.store.tySlice(y.tys))) return false;
+        if (!std.mem.eql(u32, self.store.wordSlice(x.aux), self.store.wordSlice(y.aux))) return false;
+        if (x.op == .lit) return std.meta.eql(self.store.lit(LitId.of(x.payload)), self.store.lit(LitId.of(y.payload)));
+        const xs = self.store.refSlice(x.args);
+        const ys = self.store.refSlice(y.args);
+        if (xs.len != ys.len) return false;
+        for (xs, ys) |p, q| if (!self.sameValue(p, q)) return false;
+        return true;
+    }
+
+    // Of two regions on the chain of open regions, the inner one; `none`
+    // stands for no region.
+    fn deeper(self: *const Builder, a: RegionId, b: RegionId) RegionId {
+        if (a == RegionId.none) return b;
+        if (b == RegionId.none) return a;
+        return if (self.store.region(b).depth > self.store.region(a).depth) b else a;
+    }
+
+    // N13u's interval of a node of a builtin integer type being built, where
+    // it narrows the type or proves a checked op fits: interval arithmetic
+    // over its operands' intervals for `plus`, `minus`, `times` and the
+    // `_wrap` forms, and the result range of a finalized row for a `Call`
+    // (N8k). Null for anything else.
+    fn nodeRange(self: *Builder, spec: NodeSpec) Allocator.Error!?ir.NodeRange {
+        if (spec.tys.len != 1) return null;
+        const int = switch (self.types.get(spec.tys[0])) {
+            .int => |i| i,
+            .bool_, .str, .float, .dec, .record, .tuple, .list, .tag_union, .nominal, .func, .opaque_, .recursive => return null,
+        };
+        switch (spec.op) {
+            .prim => {
+                const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;
+                if (p.owner.int() != int) return null;
+                switch (p.method) {
+                    .plus, .minus, .times, .plus_wrap, .times_wrap => {},
+                    else => return null,
+                }
+                const ivs = try self.gpa.alloc(ir.Interval, spec.args.len);
+                defer self.gpa.free(ivs);
+                var holds_in = RegionId.none;
+                for (spec.args, ivs) |a, *iv| {
+                    const r = self.rangeOf(a) orelse return null;
+                    iv.* = r.interval;
+                    holds_in = self.deeper(holds_in, r.holds_in);
+                }
+                const interval = ranges.of(int, p.method, ivs).?;
+                const fits = ranges.fits(int, p.method, ivs) and self.algorithmOn(.range_fit);
+                if (fits) self.algorithmFired(.range_fit);
+                if (!fits and !ranges.narrows(interval, int)) return null;
+                return .{ .interval = interval, .holds_in = holds_in, .fits = fits };
+            },
+            .call => {
+                const row = self.store.row(RowId.of(spec.payload));
+                if (row.digest == null) return null;
+                const r = row.result_range orelse return null;
+                if (!ranges.narrows(r, int)) return null;
+                return .{ .interval = r, .holds_in = RegionId.none, .fits = false };
+            },
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => return null,
+        }
+    }
+
+    // N13u (normal-form 3.13): a comparison of a value with a literal that
+    // the value's interval decides is that answer, as N13d decides a test a
+    // dominating arm made. So inside `if x < 10`, `x < 20` is `True`, and in
+    // the body of `for i in 0..10`, `i < 10` is.
+    fn rangeCompare(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        if (spec.args.len != 2 or !self.algorithmOn(.range_compare)) return null;
+        const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;
+        if (p.owner.int() == null) return null;
+        switch (p.method) {
+            .is_lt, .is_lte, .is_eq => {},
+            else => return null,
+        }
+        const k0 = self.intLit(spec.args[0]);
+        const k1 = self.intLit(spec.args[1]);
+        if ((k0 == null) == (k1 == null)) return null;
+        const x_first = k1 != null;
+        const x = self.rangeOf(spec.args[if (x_first) 0 else 1]) orelse return null;
+        const answer = ranges.decide(p.method, x_first, x.interval, (k1 orelse k0).?) orelse return null;
+        self.algorithmFired(.range_compare);
+        return try self.litBool(answer);
+    }
+
+    // N15c, the parameter half (normal-form 3.15): two parameters of the
+    // root row as the operands of integer `plus` or `times`, or of `is_eq`
+    // over a builtin integer type or `Str`, go in parameter order. The
+    // root's parameters are its type in `Code(f)`, so no unrelated edit moves
+    // them. Another row's parameters are numbered in first-read order (N8f),
+    // which an order by position would change, so they stay as written.
+    fn paramOrder(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        if (spec.args.len != 2 or !self.algorithmOn(.param_order)) return null;
+        const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;
+        if (!prims.ordersLiteralLast(p.owner, p.method)) return null;
+        const a = spec.args[0];
+        const b = spec.args[1];
+        if (a.kind != .row_param or b.kind != .row_param or a.output <= b.output) return null;
+        if (!self.store.row(self.row).fixed_params) return null;
+        self.algorithmFired(.param_order);
+        return try self.make(.{ .op = .prim, .payload = spec.payload, .args = &.{ b, a }, .tys = spec.tys });
+    }
+
+    // N15a over a checked `plus` (normal-form 3.15, N13u): a `plus` whose
+    // operands include `plus` nodes of its type is one `Prim` over all of
+    // their operands, in order, when the sum of the operands' negative lower
+    // bounds and the sum of their positive upper bounds both fit the type.
+    // Then every partial sum of every grouping fits, so `(a + b) + c` and
+    // `a + (b + c)` fail nowhere and meet. Where the intervals do not prove
+    // it, the grouping as written stays, because a regrouped sum can
+    // overflow where the written one does not.
+    fn rangeChain(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        if (!self.algorithmOn(.range_chain)) return null;
+        const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;
+        const int = p.owner.int() orelse return null;
+        if (p.method != .plus) return null;
+        var flat: std.ArrayList(Ref) = .empty;
+        defer flat.deinit(self.gpa);
+        var spliced = false;
+        for (spec.args) |a| {
+            if (self.nodeOf(a)) |n| if (n.op == .prim and n.payload == spec.payload and a.output == 0) {
+                try flat.appendSlice(self.gpa, self.store.refSlice(n.args));
+                spliced = true;
+                continue;
+            };
+            try flat.append(self.gpa, a);
+        }
+        if (!spliced) return null;
+        const ivs = try self.gpa.alloc(ir.Interval, flat.items.len);
+        defer self.gpa.free(ivs);
+        for (flat.items, ivs) |x, *iv| iv.* = (self.rangeOf(x) orelse return null).interval;
+        if (!ranges.chainFits(int, ivs)) return null;
+        self.algorithmFired(.range_chain);
+        return try self.make(.{ .op = .prim, .payload = spec.payload, .args = flat.items, .tys = spec.tys });
+    }
+
     // N13d over `Bool.not` (normal-form 3.13): the negation of a value that a
     // dominating arm, or an earlier operand of an enclosing `And` or `Or`,
     // decided is the opposite literal. So `if c !c else b` is
@@ -1662,6 +1945,11 @@ pub const Builder = struct {
                 if (hooks_enabled) self.hooks.fired[i] += 1;
                 return self.instantiate(rule.result, &b, spec.tys);
             }
+            // After the rows, so N15c puts a literal last in a two-operand
+            // `plus` before the chain flattens: `1 + (a + b)` is `a + b + 1`.
+            if (spec.op == .prim) {
+                if (try self.rangeChain(spec)) |r| return r;
+            }
             if (spec.op == .switch_) {
                 if (try self.rejectedArm(spec)) |r| return r;
                 if (try self.caseOfCase(spec)) |r| return r;
@@ -1684,7 +1972,7 @@ pub const Builder = struct {
     // | Left alone | Why |
     // |---|---|
     // | two `Bool` switches | N7d and N13o own their order: nested `if`s meet `and`, in the operand order the nesting gave |
-    // | a position of another root | the order of two roots waits for N15c's parameter half (plan 4.2, M11) |
+    // | a position of another root, unless both are parameters of the root row | two parameters of the root are in parameter order, N15c's parameter half (`match.rootedBefore`); other roots have no order |
     // | a test that is not a position | a guard keeps its place: the first guard that holds wins |
     // | a switch with several outputs, or joins | N13c and N13d decide only single-output switches |
     fn interchange(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
@@ -1701,6 +1989,7 @@ pub const Builder = struct {
         const inner_of = try self.gpa.alloc(?NodeId, spec.regions.len);
         defer self.gpa.free(inner_of);
         var best: ?Ref = null;
+        var best_root: Ref = undefined;
         var best_steps: std.ArrayList(match.Step) = .empty;
         defer best_steps.deinit(self.gpa);
         var steps: std.ArrayList(match.Step) = .empty;
@@ -1712,12 +2001,13 @@ pub const Builder = struct {
             steps.clearRetainingCapacity();
             const root = try match.positionOf(self.gpa, self.store, q, &steps);
             const q_is_bool = self.types.get(self.store.refTy(self.row, q)) == .bool_;
-            if (root != p_root or !match.before(self.types, steps.items, p_steps.items) or (p_is_bool and q_is_bool) or !self.readable(q)) {
+            if (!match.rootedBefore(self.store, self.types, self.row, root, steps.items, p_root, p_steps.items) or (p_is_bool and q_is_bool) or !self.readable(q)) {
                 slot.* = null;
                 continue;
             }
-            if (best == null or match.before(self.types, steps.items, best_steps.items)) {
+            if (best == null or match.rootedBefore(self.store, self.types, self.row, root, steps.items, best_root, best_steps.items)) {
                 best = q;
+                best_root = root;
                 best_steps.clearRetainingCapacity();
                 try best_steps.appendSlice(self.gpa, steps.items);
             }
@@ -1727,8 +2017,8 @@ pub const Builder = struct {
         for (spec.regions, inner_of) |_, *slot| {
             const inner = slot.* orelse continue;
             steps.clearRetainingCapacity();
-            _ = try match.positionOf(self.gpa, self.store, self.store.refSlice(self.store.node(inner).args)[0], &steps);
-            if (!match.samePosition(self.types, steps.items, best_steps.items)) slot.* = null;
+            const root = try match.positionOf(self.gpa, self.store, self.store.refSlice(self.store.node(inner).args)[0], &steps);
+            if (root != best_root or !match.samePosition(self.types, steps.items, best_steps.items)) slot.* = null;
         }
 
         // The constructors of the position: the arms of a tag or `Bool`
@@ -2007,7 +2297,14 @@ pub const Builder = struct {
         std.debug.assert(arms.len == keys.len + 1);
         var excluded: std.ArrayList(u32) = .empty;
         defer excluded.deinit(self.gpa);
-        const known = try self.litKnown(scrutinee, &excluded);
+        var known = try self.litKnown(scrutinee, &excluded);
+        // N13u: a key outside the scrutinee's interval selects no input, and
+        // an interval that is one key's value selects that key's arm, as a
+        // comparison with the key would decide (`rangeCompare`).
+        const range: ?ir.Interval = if (self.algorithmOn(.range_compare)) if (self.rangeOf(scrutinee)) |r| r.interval else null else null;
+        if (known == null) if (range) |iv| if (iv.lo == iv.hi) for (keys) |k| {
+            if (litIntValue(self.types, self.store.lit(LitId.of(k))) == iv.lo) known = LitId.of(k);
+        };
         var kept: std.ArrayList(u32) = .empty;
         defer kept.deinit(self.gpa);
         if (known) |l| {
@@ -2020,6 +2317,10 @@ pub const Builder = struct {
         } else for (keys, 0..) |k, i| {
             if (std.mem.findScalar(u32, excluded.items, k) != null) continue;
             if (std.mem.findScalar(u32, keys[0..i], k) != null) continue;
+            if (range) |iv| if (litIntValue(self.types, self.store.lit(LitId.of(k)))) |v| if (!ranges.contains(iv, v)) {
+                self.algorithmFired(.range_compare);
+                continue;
+            };
             try kept.append(self.gpa, @intCast(i));
         }
         std.mem.sort(u32, kept.items, LitOrder{ .b = self, .keys = keys }, LitOrder.lt);
@@ -2071,7 +2372,7 @@ pub const Builder = struct {
     fn litKnown(self: *Builder, scrutinee: Ref, excluded: *std.ArrayList(u32)) Allocator.Error!?LitId {
         if (self.nodeOf(scrutinee)) |n| if (n.op == .lit) return LitId.of(n.payload);
         for (self.facts.items) |f| {
-            if (f.ref != scrutinee or f.loop != null) continue;
+            if (f.ref != scrutinee or !f.isTest()) continue;
             if (f.lit) |l| return l;
             try excluded.appendSlice(self.gpa, self.store.wordSlice(f.excluded));
         }
@@ -2238,7 +2539,8 @@ pub const Builder = struct {
     }
 
     fn appendNode(self: *Builder, spec: NodeSpec, here: RegionId) Allocator.Error!NodeId {
-        const spec_flag = self.speculatableOf(spec);
+        const range = try self.nodeRange(spec);
+        const spec_flag = self.speculatableOf(spec) or (range != null and range.?.fits);
         const n = try self.store.appendNode(.{
             .op = spec.op,
             .flags = .{ .speculatable = spec_flag },
@@ -2250,6 +2552,12 @@ pub const Builder = struct {
             .aux = try self.store.addWords(spec.aux),
         });
         try self.copy_of.append(self.gpa, null);
+        // The facts an interval read are on the stack, so their region
+        // encloses the node's, and hash-consing finds the node only in a
+        // region its own encloses (`cons_`): the interval holds wherever the
+        // node is read.
+        if (range) |r| std.debug.assert(r.holds_in == RegionId.none or self.store.encloses(r.holds_in, here));
+        if (range) |r| try self.store.ranges.put(self.gpa, n, r);
         self.region_nodes.items[here.index()] += 1;
         for (spec.regions) |r| self.store.setOwner(r, n);
         if (!spec_flag) self.store.regions.items(.speculatable)[here.index()] = false;
@@ -3124,6 +3432,7 @@ pub const Builder = struct {
                     .row_body => unreachable, // row_body regions are never owned by a node
                 };
                 if (kind == .loop_body and nd.op == .for_list) try self.noteListLoop(regions[i], args[0]);
+                if (kind == .loop_body and nd.op == .for_range) try self.noteRangeLoop(regions[i], args[0], args[1], nd.payload == 1);
                 self.region_copy.items[old.index()] = regions[i];
                 try self.fillFrom(old);
             }
@@ -4614,6 +4923,44 @@ test "N15c: a literal operand of integer is_eq, plus and times goes last, and tw
     const off = f.store.node((try f.b.call(.i64, .plus, &.{ three, p(0) })).nodeId());
     try testing.expectEqualSlices(Ref, &.{ three, p(0) }, f.store.refSlice(off.args));
     try f.b.endRow(.{ .value = &.{p(0)} });
+}
+
+test "N15c, parameter half: two root parameters of integer plus, times and is_eq, and of Str is_eq, go in parameter order; other operands and other rows stay, and the knockout stops it" {
+    for ([_]bool{ false, true }) |knocked| {
+        var f: Fixture = undefined;
+        f.init();
+        defer f.deinit();
+        if (knocked) f.b.hooks.algorithms_off.insert(.param_order);
+        const i64_ty = try f.types.intTy(.i64);
+        const str_ty = try f.types.strTy();
+        const row = try f.b.beginRow(&.{ i64_ty, i64_ty, str_ty, str_ty }, i64_ty);
+        f.store.rows.items[row.index()].fixed_params = true;
+        const p = Ref.rowParam;
+        const args = struct {
+            fn of(fx: *Fixture, r: Ref) []const Ref {
+                return fx.store.refSlice(fx.store.node(r.nodeId()).args);
+            }
+        }.of;
+        const want: [2]Ref = if (knocked) .{ p(1), p(0) } else .{ p(0), p(1) };
+        for ([_]prims.Method{ .plus, .times, .is_eq }) |m| try testing.expectEqualSlices(Ref, &want, args(&f, try f.b.call(.i64, m, &.{ p(1), p(0) })));
+        const str_want: [2]Ref = if (knocked) .{ p(3), p(2) } else .{ p(2), p(3) };
+        try testing.expectEqualSlices(Ref, &str_want, args(&f, try f.b.call(.str, .is_eq, &.{ p(3), p(2) })));
+        // `minus` is not commutative, and a parameter beside a node keeps its place.
+        try testing.expectEqualSlices(Ref, &.{ p(1), p(0) }, args(&f, try f.b.call(.i64, .minus, &.{ p(1), p(0) })));
+        const node = try f.b.call(.i64, .minus, &.{ p(0), p(1) });
+        try testing.expectEqualSlices(Ref, &.{ node, p(0) }, args(&f, try f.b.call(.i64, .plus, &.{ node, p(0) })));
+        // A region parameter is no root parameter.
+        const lb = try f.b.openRegion(.loop_body, &.{ i64_ty, i64_ty });
+        const s1 = Ref.regionParam(lb, 1);
+        try testing.expectEqualSlices(Ref, &.{ s1, p(0) }, args(&f, try f.b.call(.i64, .plus, &.{ s1, p(0) })));
+        try f.b.close(.{ .continue_ = &.{s1} });
+        try f.b.endRow(.{ .value = &.{p(0)} });
+        // A row whose parameters are numbered in first-read order keeps them as written.
+        const helper = try f.b.beginRow(&.{ i64_ty, i64_ty }, i64_ty);
+        _ = helper;
+        try testing.expectEqualSlices(Ref, &.{ p(1), p(0) }, args(&f, try f.b.call(.i64, .plus, &.{ p(1), p(0) })));
+        try f.b.endRow(.{ .value = &.{p(0)} });
+    }
 }
 
 test "T1.11 and the other speculatable conditions read the operand cone: a field of a loop output keeps x - x and x * 0" {

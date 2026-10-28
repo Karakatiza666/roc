@@ -1332,7 +1332,9 @@ const Gen = struct {
                 continue;
             }
             const nd = an.node(m);
-            var ok = nd.flags.speculatable and nd.regions.len == 0;
+            // A checked op N13u proved fits only under the facts where it
+            // stands does not move out of them.
+            var ok = nd.flags.speculatable and nd.regions.len == 0 and store.fitFloor(an.nodes.items[m]) == null;
             var waiting = false;
             if (ok) for (store.refSlice(nd.args)) |x| {
                 if (an.boundIn(p, x)) {

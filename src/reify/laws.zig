@@ -343,7 +343,9 @@ const Cone = struct {
                 if (c.pre.contains(n)) continue;
                 const nd = store.node(n);
                 const constant = nd.args.len == 0 and nd.regions.len == 0 and nd.op != .crash;
-                const copied = constant or (nd.regions.len == 0 and nd.flags.speculatable and own(c.p, n) and c.onlyRead(n));
+                // A checked op N13u proved fits only under the facts where it
+                // stands is not copied into another row.
+                const copied = constant or (nd.regions.len == 0 and nd.flags.speculatable and store.fitFloor(n) == null and own(c.p, n) and c.onlyRead(n));
                 if (!copied) continue;
                 try c.pre.put(c.a, n, {});
                 changed = true;

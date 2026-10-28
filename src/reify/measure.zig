@@ -33,7 +33,10 @@
 //! scrutinees (`polarity.zig`), which N13q and N13s flip, and
 //! `flipping_scrutinees` the `Bool` switches that N13s flips.
 //! `unordered_leaves` counts the calls `prims.ordersLiteralLast` names whose
-//! first operand is a literal and whose second is not, which N15c swaps.
+//! first operand is a literal and whose second is not, and, in the root row,
+//! those whose two operands are parameters out of parameter order: N15c swaps
+//! both. N13u's decided comparisons lower `nodes`, and its `plus` chains
+//! lower `nodes` too, one node per operand they splice.
 //! `arms_and_operands` counts arm and operand regions, one of which N7d's
 //! factoring removes; it comes after `joins`, which T3 lowers by adding one.
 //! Every component but the last
@@ -149,6 +152,7 @@ pub fn ofRow(gpa: std.mem.Allocator, store: *const ir.Store, types: *const types
             if (prims.lookup(ir.PrimId.of(nd.payload))) |p| {
                 const args = store.refSlice(nd.args);
                 if (args.len == 2 and prims.ordersLiteralLast(p.owner, p.method) and isLit(store, args[0]) and !isLit(store, args[1])) m.add(.unordered_leaves, mult);
+                if (args.len == 2 and prims.ordersLiteralLast(p.owner, p.method) and r.fixed_params and args[0].kind == .row_param and args[1].kind == .row_param and args[0].output > args[1].output) m.add(.unordered_leaves, mult);
                 if (p.owner == .list and p.method == .get) m.add(.list_gets, mult);
                 switch (p.method) {
                     .is_gt, .is_gte => m.add(.flipped_comparisons, mult),

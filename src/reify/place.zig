@@ -147,6 +147,13 @@ pub fn noSpeculation(p: *const Plan) bool {
     var it = p.info.constIterator();
     while (it.next()) |e| {
         const n = e.key_ptr.*;
+        if (e.value_ptr.merged) continue;
+        // A checked op N13u proved fits is speculatable inside the region
+        // of its facts and no further out (normal-form 1.1).
+        if (p.store.fitFloor(n)) |floor| {
+            if (!within(p, e.value_ptr.place, floor)) return false;
+            continue;
+        }
         if (p.store.nodes.items(.flags)[n.index()].speculatable or e.value_ptr.merged) continue;
         const home = p.store.nodes.items(.region)[n.index()];
         var at = e.value_ptr.place;
@@ -553,6 +560,9 @@ fn hoist(p: *Plan, returns: *live_mod.Returns) Allocator.Error!void {
     for (order.items) |n| {
         const nd = p.store.node(n);
         if (!nd.flags.speculatable or pinned(p, returns, n)) continue;
+        // A proved op placed outside the region of its facts, by N5c, is
+        // not speculatable where it stands.
+        if (p.store.fitFloor(n)) |floor| if (!within(p, p.info.get(n).?.place, floor)) continue;
         reads.clearRetainingCapacity();
         try readRegions(p, a, n, &reads);
         const body = p.store.row(p.row).body;
@@ -606,10 +616,15 @@ fn endReads(p: *const Plan, a: Allocator, r: RegionId) Allocator.Error![]const R
 // The regions node `n` reads from: where each node it reads is placed, the
 // region of each region parameter, and for a node that owns regions, the
 // same for everything its regions read from outside them.
+//
+// A checked op N13u proved fits reads the region of its facts too, so it is
+// hoisted no further out than that region, and neither is a node whose
+// regions hold it (normal-form 1.1).
 fn readRegions(p: *const Plan, a: Allocator, n: NodeId, out: *collections.DenseMapUnmanaged(RegionId, void)) Allocator.Error!void {
     const store = p.store;
     const nd = store.node(n);
     for (store.refSlice(nd.args)) |arg| try readRegion(p, a, arg, n, out);
+    if (store.fitFloor(n)) |floor| try out.put(a, floor, {});
     if (!nd.op.ownsRegions()) return;
     var stack: std.ArrayList(RegionId) = .empty;
     try stack.appendSlice(a, store.regionSlice(nd.regions));
@@ -617,6 +632,7 @@ fn readRegions(p: *const Plan, a: Allocator, n: NodeId, out: *collections.DenseM
         for (try endReads(p, a, r)) |ref| try readRegion(p, a, ref, n, out);
         for (p.membersOf(r)) |m| {
             for (store.refSlice(store.node(m).args)) |arg| try readRegion(p, a, arg, n, out);
+            if (store.fitFloor(m)) |floor| if (!inside(p, floor, n)) try out.put(a, floor, {});
             try stack.appendSlice(a, store.regionSlice(store.node(m).regions));
         }
     }
@@ -631,6 +647,15 @@ fn readRegion(p: *const Plan, a: Allocator, ref: Ref, owner: NodeId, out: *colle
     // A value read from inside `owner`'s own regions is not read from outside.
     if (inside(p, r, owner)) return;
     try out.put(a, r, {});
+}
+
+// Whether region `r` is `outer` or nested in it, in the plan's tree.
+fn within(p: *const Plan, r: RegionId, outer: RegionId) bool {
+    var at = r;
+    while (at != RegionId.none) : (at = p.parentOf(at)) {
+        if (at == outer) return true;
+    }
+    return false;
 }
 
 // Whether region `r` is one of `owner`'s regions or nested in one.
@@ -784,6 +809,67 @@ const Fixture = struct {
         try testing.expectEqualStrings(want, out.written());
     }
 };
+
+// `|n| for i in 0..10 (acc = 0) { for _ in 0..n (acc) { acc + (i + k) } }`.
+fn nestedSum(f: *Fixture, k: i128) !RowId {
+    const b = &f.b;
+    const u8_ty = try f.types.intTy(.u8);
+    const row = try b.beginRow(&.{u8_ty}, u8_ty);
+    const zero = try b.litInt(u8_ty, 0);
+    const outer = try b.openRegion(.loop_body, &.{ u8_ty, u8_ty });
+    const i = Ref.regionParam(outer, 0);
+    const inner = try b.openRegion(.loop_body, &.{ u8_ty, u8_ty });
+    const step = try b.call(.u8, .plus, &.{ i, try b.litInt(u8_ty, k) });
+    try b.close(.{ .continue_ = &.{try b.call(.u8, .plus, &.{ Ref.regionParam(inner, 1), step })} });
+    const inner_loop = try b.loopOf(.for_range, &.{ zero, Ref.rowParam(0), Ref.regionParam(outer, 1) }, inner, &.{u8_ty});
+    try b.close(.{ .continue_ = &.{inner_loop} });
+    const outer_loop = try b.loopOf(.for_range, &.{ zero, try b.litInt(u8_ty, 10), zero }, outer, &.{u8_ty});
+    try b.endRow(.{ .value = &.{outer_loop} });
+    return row;
+}
+
+test "N5b with N13u: a checked plus proved to fit leaves the inner loop for the body whose index bounds it, and one not proved stays" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    // `i` is at most 9, so `i + 1` fits and is computed once per outer turn.
+    try f.expectSite(try nestedSum(&f, 1),
+        \\row r0 (U8) -> U8
+        \\  n0 = 0 : U8
+        \\  n1 = 10 : U8
+        \\  n2 = 1 : U8
+        \\  n6 = for_range(n0, n1, n0) : U8 !spec
+        \\    body (s6.0: U8, s6.1: U8)
+        \\      n3 = Num.U8.plus(s6.0, n2) : U8
+        \\      n5 = for_range(n0, p0, s6.1) : U8 !spec
+        \\        body (s5.0: U8, s5.1: U8)
+        \\          n4 = Num.U8.plus(s5.1, n3) : U8 !spec
+        \\          continue n4
+        \\      continue n5
+        \\  value n6
+        \\
+    );
+    var g: Fixture = undefined;
+    g.init();
+    defer g.deinit();
+    // `i + 250` can overflow, so it stays where the inner body computes it.
+    try g.expectSite(try nestedSum(&g, 250),
+        \\row r0 (U8) -> U8
+        \\  n0 = 0 : U8
+        \\  n1 = 10 : U8
+        \\  n2 = 250 : U8
+        \\  n6 = for_range(n0, n1, n0) : U8 !spec
+        \\    body (s6.0: U8, s6.1: U8)
+        \\      n5 = for_range(n0, p0, s6.1) : U8 !spec
+        \\        body (s5.0: U8, s5.1: U8)
+        \\          n3 = Num.U8.plus(s6.0, n2) : U8 !spec
+        \\          n4 = Num.U8.plus(s5.1, n3) : U8 !spec
+        \\          continue n4
+        \\      continue n5
+        \\  value n6
+        \\
+    );
+}
 
 test "N5d with N5b: a speculatable node in a branch in a loop lands just outside the loop, after the branch's fact simplified it" {
     var f: Fixture = undefined;

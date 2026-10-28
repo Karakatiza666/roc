@@ -135,6 +135,18 @@ pub const Where = struct {
     row_body: ?RegionId,
     /// How the nodes of the row and the ends of its regions use values.
     usage: *const scalar.Usage,
+    /// Whether a value of the old row, read where the loop is built, has an
+    /// interval (N13u) whose greatest value is below its type's highest.
+    /// Null where no builder is building the loop, so N11l on
+    /// `while $i <= n` does not apply.
+    below_max: ?BelowMax = null,
+};
+
+/// The builder's answer to `Where.below_max`, through the rebuild that maps
+/// the old row's values to the ones it built.
+pub const BelowMax = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, ref: Ref) bool,
 };
 
 /// How `analyze` finds a loop: the plan of its row and the types.
@@ -590,6 +602,8 @@ const Ctx = struct {
                 const nd = c.store.node(n);
                 if (!c.store.encloses(c.body, nd.region)) return true;
                 if (!nd.flags.speculatable or nd.regions.len != 0) return false;
+                // A checked op N13u proved fits under facts of the body fails outside it.
+                if (c.store.fitFloor(n)) |floor| if (c.store.encloses(c.body, floor)) return false;
                 if (std.mem.findScalar(NodeId, cone.items, n) != null) return true;
                 for (c.store.refSlice(nd.args)) |arg| if (!try c.invariant(arg, cone)) return false;
                 try cone.append(c.a, n);
@@ -785,24 +799,39 @@ const Ctx = struct {
         if (arms.len != 2) return null;
         const cond_ref = store.refSlice(sw.args)[0];
         const cond = c.primOf(cond_ref) orelse return null;
-        // The test is `is_lt(s, b)` with the arm for `False` leaving, or its
-        // dual `is_lte(b, s)` with the arm for `True` leaving, which is what
-        // `if s >= b { break }` gives (N13q does not reach an exiting switch).
-        const dual = switch (cond.prim.method) {
-            .is_lt => false,
-            .is_lte => true,
+        // The test compares the counter `s` with the bound `b`. With the
+        // counter first, the arm for `False` leaves: `is_lt(s, b)` is
+        // `while s < b`, and `is_lte(s, b)` is `while s <= b`. With the
+        // counter second, the arm for `True` leaves: `is_lte(b, s)` is what
+        // `if s >= b { break }` gives, and `is_lt(b, s)` what
+        // `if s > b { break }` gives (N13q does not reach an exiting switch).
+        // A test with `<=` ends at `b` itself, so it is an inclusive range.
+        switch (cond.prim.method) {
+            .is_lt, .is_lte => {},
             else => return null,
-        };
+        }
         const int = cond.prim.owner.int() orelse return null;
         // The test is read by this switch alone.
         const sites = (c.p.uses.get(cond_ref.nodeId()) orelse return null).items;
         if (sites.len != 1 or sites[0] != .node or sites[0].node != w) return null;
         const test_args = store.refSlice(cond.nd.args);
+        const dual = c.slotOf(test_args[0]) == null;
+        const inclusive = (cond.prim.method == .is_lte) != dual;
         const counter_ref = test_args[if (dual) 1 else 0];
         const bound_ref = test_args[if (dual) 0 else 1];
         const counter = c.slotOf(counter_ref) orelse return null;
         var cone: std.ArrayList(NodeId) = .empty;
         if (!try c.outside(bound_ref, &cone)) return null;
+        // `while s <= b` steps past `b`, which overflows where `b` is the
+        // type's highest value, and the inclusive range does not: the two
+        // meet only where N13u's interval of `b` is below it (normal-form
+        // 3.11). The interval is the builder's where the loop is built, so a
+        // bound computed in the body has none yet.
+        if (inclusive) {
+            if (cone.items.len != 0) return null;
+            const below = c.where.below_max orelse return null;
+            if (!below.run(below.ctx, bound_ref)) return null;
+        }
         // The counter is a builtin integer.
         const counter_ty = c.slotTy(counter);
         if (!c.types.isInt(counter_ty)) return null;
@@ -854,7 +883,7 @@ const Ctx = struct {
         return .{
             .body = c.body,
             .op = .for_range,
-            .payload = 0,
+            .payload = @intFromBool(inclusive),
             .header = header,
             .slots = others,
             .param_tys = param_tys,
@@ -1315,7 +1344,11 @@ const Fixture = struct {
 const Counter = struct {
     /// How far each turn steps the counter.
     step: i128 = 1,
-    test_: enum { lt, lte, ge_exits } = .lt,
+    /// `gt_exits` is `if i > n { break }`.
+    test_: enum { lt, lte, ge_exits, gt_exits } = .lt,
+    /// Where set, the loop stands in the arm of `if n < limit`, and the row
+    /// is 0 in the other arm, so N13u bounds `n` there.
+    limit: ?i128 = null,
     /// The bound is the other slot, not a value from outside the loop.
     bound_in_slot: bool = false,
     /// The `Break` carries the other slot plus one, not the slot itself.
@@ -1327,6 +1360,14 @@ fn counterRow(f: *Fixture, c: Counter) !RowId {
     const i64_ty = try f.types.intTy(.i64);
     const row = try f.b.beginRow(&.{i64_ty}, i64_ty);
     const zero = try f.b.litInt(i64_ty, 0);
+    var guard: Ref = undefined;
+    var arms_outer: [2]RegionId = undefined;
+    if (c.limit) |limit| {
+        guard = try f.b.call(.i64, .is_lt, &.{ Ref.rowParam(0), try f.b.litInt(i64_ty, limit) });
+        arms_outer[0] = try f.b.openArm(guard, 0);
+        try f.b.close(.{ .value = &.{zero} });
+        arms_outer[1] = try f.b.openArm(guard, 1);
+    }
     const lb = try f.b.openRegion(.loop_body, &.{ i64_ty, i64_ty });
     const total = Ref.regionParam(lb, 0);
     const i = Ref.regionParam(lb, 1);
@@ -1335,9 +1376,10 @@ fn counterRow(f: *Fixture, c: Counter) !RowId {
         .lt => try f.b.call(.i64, .is_lt, &.{ i, bound }),
         .lte => try f.b.call(.i64, .is_lte, &.{ i, bound }),
         .ge_exits => try f.b.call(.i64, .is_lte, &.{ bound, i }),
+        .gt_exits => try f.b.call(.i64, .is_lt, &.{ bound, i }),
     };
     // The arm for `False` is key 0.
-    const goes_on_key: u32 = if (c.test_ == .ge_exits) 0 else 1;
+    const goes_on_key: u32 = if (c.test_ == .ge_exits or c.test_ == .gt_exits) 0 else 1;
     var arms: [2]RegionId = undefined;
     for (&arms, 0..) |*a, key| {
         a.* = try f.b.openArm(test_, @intCast(key));
@@ -1353,6 +1395,11 @@ fn counterRow(f: *Fixture, c: Counter) !RowId {
     const sw = try f.b.exitingSwitch(test_, &arms, &.{}, &.{});
     try f.b.close(.{ .branch = sw });
     const loop = try f.b.loopOf(.loop, &.{ zero, zero }, lb, &.{i64_ty});
+    if (c.limit != null) {
+        try f.b.close(.{ .value = &.{loop} });
+        try f.b.endRow(.{ .value = &.{try f.b.switchOn(guard, &arms_outer, &.{}, &.{i64_ty}, &.{})} });
+        return row;
+    }
     try f.b.endRow(.{ .value = &.{loop} });
     return row;
 }
@@ -1376,7 +1423,7 @@ fn expectSameValues(c: Counter, want_range: bool) !void {
     const row = try counterRow(&f, c);
     var before: [4]eval.Value = undefined;
     for (&before, [_]i128{ 0, 1, 5, 9 }) |*o, n| o.* = try f.run(arena.allocator(), row, &.{.{ .int = n }});
-    if (want_range) try expectLoopKind(&f, row, "for_range(", "loop(") else try expectLoopKind(&f, row, "loop(", "for_range");
+    if (want_range) try expectLoopKind(&f, row, "for_range", "loop(") else try expectLoopKind(&f, row, "loop(", "for_range");
     for (before, [_]i128{ 0, 1, 5, 9 }) |was, n| try testing.expect(was.eql(try f.run(arena.allocator(), row, &.{.{ .int = n }})));
 }
 
@@ -1406,6 +1453,18 @@ test "N11l: a Break that is not the other slots stays a general Loop" {
 
 test "N11l: a test with `<=` stays a general Loop" {
     try expectSameValues(.{ .test_ = .lte }, false);
+    try expectSameValues(.{ .test_ = .gt_exits }, false);
+}
+
+test "N11l with N13u: `while i <= n` under a test that bounds `n` below the type's highest value is an inclusive ForRange" {
+    try expectSameValues(.{ .test_ = .lte, .limit = 100 }, true);
+    // `if i > n { break }` is the same loop.
+    try expectSameValues(.{ .test_ = .gt_exits, .limit = 100 }, true);
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const row = try counterRow(&f, .{ .test_ = .lte, .limit = 100 });
+    try expectLoopKind(&f, row, "for_range inclusive(", "loop(");
 }
 
 // `|xs| for_range(0, List.len(xs), acc = 0) { acc + xs[i] }`.

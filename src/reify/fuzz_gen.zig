@@ -13,6 +13,7 @@
 //! | M5 | an `if` on `a and b` or `a or b` as nested `if`s that repeat a leaf arm, `(a and b) and c` or `(a or b) or c` regrouped, `!(a and b)` as `!a or !b` and `!(a or b)` as `!a and !b` |
 //! | M6 | a `for` over a list, over its `.iter()`, or a `while` over its indices |
 //! | M7 | a loop `var` as one scalar, as a record or as a tuple that carries a field nothing changes; a private helper that takes `a, b`, `{ a, b }`, `(a, b)`, or either destructured, called twice |
+//! | M11 | a literal operand of `+`, `*` and `==` first or last; a sum over `0..=n` under a test that bounds `n`, as a `for` over the range or a `while $i <= n` |
 //!
 //! The two prints must describe as one normal form (L4), and the normal form
 //! must compute what Roc computes wherever Roc does not crash (L5, C2).
@@ -36,6 +37,10 @@ pub const Options = struct {
     /// list being empty). A case with them is compared in the `lawful` view,
     /// where layer L makes the spellings meet.
     m10: bool = false,
+    /// The constructs of M11 (a literal operand on either side, a sum over
+    /// an inclusive range that a test bounds), whose spellings meet through
+    /// N15c and through N13u's intervals.
+    m11: bool = false,
 };
 
 /// Bytes the generator reads its choices from. Past the end it reads zeros,
@@ -90,6 +95,9 @@ const Node = union(enum) {
     twice: struct { args: [4]*const Node, k: u64 },
     /// Whether the list field is empty, or with `negated` whether it is not.
     empty: struct { negated: bool },
+    /// `if n < limit { the sum of step over i in 0..=n } else other`, with
+    /// `n` a `U64` field or literal; `step` sees `i` at scope index `slot`.
+    upto: struct { bound: *const Node, limit: u64, init: u64, step: *const Node, slot: u16, other: *const Node },
 };
 
 /// One generated case: the module text and the input it is run on.
@@ -190,6 +198,8 @@ const Builder = struct {
 
     fn u64Term(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
         const d = depth + 1;
+        // M11: a sum over an inclusive range, from the extra stream.
+        if (self.options.m11 and self.extra.pick(8) == 0) return self.uptoTerm(scope, d);
         return switch (self.reader.pick(9)) {
             0 => self.leaf(.u64_, &scope),
             1 => self.node(.{ .plus = .{ try self.term(.u64_, scope, d), try self.term(.u64_, scope, d) } }),
@@ -248,6 +258,25 @@ const Builder = struct {
         return self.node(.{ .let = .{ .value = value, .body = try self.term(ty, inner, depth), .slot = scope.len } });
     }
 
+    fn uptoTerm(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
+        if (scope.len >= max_scope) return self.leaf(.u64_, &scope);
+        const bound = if (self.extra.pick(2) == 0)
+            try self.node(.{ .field_u64 = self.extra.pick(2) })
+        else
+            try self.node(.{ .lit_u64 = self.extra.pick(12) });
+        const limit = 1 + @as(u64, self.extra.pick(16));
+        // The sum starts above the index's 0. A sum that starts at 0 and
+        // steps by 1 is the index itself, which N11i merges with the
+        // counter, and the counter read after the loop keeps it a `Loop`.
+        const init = 1 + @as(u64, self.extra.pick(8));
+        var inner = scope;
+        inner.types[inner.len] = .u64_;
+        inner.len += 1;
+        // The step is small: it runs once per index and nests no deeper.
+        const step = try self.term(.u64_, inner, max_depth - 1);
+        return self.node(.{ .upto = .{ .bound = bound, .limit = limit, .init = init, .step = step, .slot = scope.len, .other = try self.term(.u64_, scope, depth) } });
+    }
+
     fn sumTerm(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
         if (scope.len >= max_scope) return self.leaf(.u64_, &scope);
         const start = try self.term(.u64_, scope, depth);
@@ -290,6 +319,7 @@ fn reads(n: *const Node, slot: u16) bool {
         .sum => |x| reads(x.start, slot) or reads(x.step, slot),
         .twice => |t| reads(t.args[0], slot) or reads(t.args[1], slot) or reads(t.args[2], slot) or reads(t.args[3], slot),
         .empty => false,
+        .upto => |u| reads(u.bound, slot) or reads(u.step, slot) or reads(u.other, slot),
     };
 }
 
@@ -312,6 +342,14 @@ const Printer = struct {
 
     fn print(self: *Printer, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
         try self.out.print(self.gpa, fmt, args);
+    }
+
+    /// `a op b` for a commutative `op`; under M11, with a literal operand
+    /// and another that is not, in some prints the literal first (N15c).
+    fn commuting(self: *Printer, pair: [2]*const Node, operator: []const u8, method: []const u8) Allocator.Error!void {
+        const one_literal = (pair[0].* == .lit_u64) != (pair[1].* == .lit_u64);
+        if (self.options.m11 and one_literal and self.extra.pick(2) == 0) return self.two(.{ pair[1], pair[0] }, operator, method);
+        return self.two(pair, operator, method);
     }
 
     fn two(self: *Printer, pair: [2]*const Node, operator: []const u8, method: []const u8) Allocator.Error!void {
@@ -378,15 +416,22 @@ const Printer = struct {
                 const twin = self.names.twins[slot];
                 try self.write(if (twin != null and self.choices.pick(2) == 0) twin.? else self.names.locals[slot]);
             },
-            .plus => |pair| try self.two(pair, "+", "plus"),
+            .plus => |pair| try self.commuting(pair, "+", "plus"),
             .minus => |pair| try self.two(pair, "-", "minus"),
             .times => |t| {
+                // M11: the literal factor first.
+                if (self.options.m11 and t.value.* != .lit_u64 and self.extra.pick(2) == 0) {
+                    try self.print("({d}.U64 * ", .{t.k});
+                    try self.expr(t.value);
+                    try self.write(")");
+                    return;
+                }
                 try self.write("(");
                 try self.expr(t.value);
                 if (self.choices.pick(2) == 0) try self.print(" * {d})", .{t.k}) else try self.print(").times({d})", .{t.k});
             },
             .is_lt => |pair| try self.lessThan(pair),
-            .is_eq => |pair| try self.two(pair, "==", "is_eq"),
+            .is_eq => |pair| try self.commuting(pair, "==", "is_eq"),
             .is_ne => |pair| if (self.choices.pick(2) == 0) {
                 try self.write("(");
                 try self.expr(pair[0]);
@@ -395,7 +440,7 @@ const Printer = struct {
                 try self.write(")");
             } else {
                 try self.write("!(");
-                try self.two(pair, "==", "is_eq");
+                try self.commuting(pair, "==", "is_eq");
                 try self.write(")");
             },
             .and_ => |pair| switch (self.choices.pick(3)) {
@@ -579,6 +624,7 @@ const Printer = struct {
                 try self.write("\n}");
             },
             .twice => |t| try self.twice(t.args, t.k),
+            .upto => |u| try self.upto(u.bound, u.limit, u.init, u.step, u.slot, u.other),
             .empty => |e| {
                 const list = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ self.names.param, self.names.fields[3] });
                 defer self.gpa.free(list);
@@ -595,6 +641,38 @@ const Printer = struct {
                 }
             },
         }
+    }
+
+    /// `if n < limit { sum } else other`, the sum over `i` in `0..=n` written
+    /// as a `for` over the range or as a `while $i <= n`, which N11l raises
+    /// to the range only where N13u bounds `n` below the type's highest value.
+    fn upto(self: *Printer, bound: *const Node, limit: u64, init: u64, step: *const Node, slot: u16, other: *const Node) Allocator.Error!void {
+        const acc = try self.symbols.fresh("$ac");
+        try self.write("(if ");
+        try self.expr(bound);
+        try self.print(" < {d}.U64 {{\nvar {s} = {d}.U64\n", .{ limit, acc, init });
+        if (self.extra.pick(2) == 0) {
+            const index = try self.symbols.fresh("lc");
+            self.names.locals[slot] = index;
+            self.names.twins[slot] = null;
+            try self.print("for {s} in 0..=", .{index});
+            try self.expr(bound);
+            try self.print(" {{\n{s} = {s} + ", .{ acc, acc });
+            try self.expr(step);
+            try self.write("\n}\n");
+        } else {
+            const index = try self.symbols.fresh("$ix");
+            self.names.locals[slot] = index;
+            self.names.twins[slot] = null;
+            try self.print("var {s} = 0.U64\nwhile {s} <= ", .{ index, index });
+            try self.expr(bound);
+            try self.print(" {{\n{s} = {s} + ", .{ acc, acc });
+            try self.expr(step);
+            try self.print("\n{s} = {s} + 1\n}}\n", .{ index, index });
+        }
+        try self.print("{s}\n}} else ", .{acc});
+        try self.expr(other);
+        try self.write(")");
     }
 
     /// The statement that adds `step` to the accumulator.
@@ -797,7 +875,7 @@ const Printer = struct {
                 try self.write(" })");
                 return;
             },
-            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice, .empty => {},
+            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice, .empty, .upto => {},
         }
         try self.write("{\n");
         try self.bind(value, slot);

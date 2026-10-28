@@ -23942,6 +23942,9 @@ Builtin :: [].{
 		## | `!(a <= b)` over integers | `is_lt(b, a)` |
 		## | `a != b` | `Bool.not` of `is_eq(a, b)` |
 		## | `1 + x`, `1 * x`, `10 == x` over integers, `"a" == s` | `plus(x, 1)`, `times(x, 1)`, `is_eq(x, 10)`, `is_eq(s, "a")`: a literal is last. Two parameters of the root row are in parameter order. |
+		## | `(a + b) + c` over integers, where tests bound `a`, `b` and `c` so that no sum overflows | one `Prim` `plus` with `a`, `b` and `c` in `args`, a literal last. Without such bounds, the grouping stays as written. |
+		## | `x < 10` where an enclosing test already decides it | the `Bool` literal, and a `Switch` on it is the arm it takes. A `match` on an integer drops the keys the bounds exclude. |
+		## | `while $i <= n` with `$i = $i + 1`, where `n` is a literal, or a test bounds it, below the type's highest value | a `ForRange` with `inclusive` set, as `for i in $i..=n` gives. Without such a bound it stays a `Loop`. |
 		## | `Ok(v)`, and any value of a nominal type | a `Tag` inside a `Wrap` of the nominal's name, for example `Builtin.Try`. A nominal is read with `Unwrap`, and `?`, `??` and `match` on a `Try` are a `Switch` on that. |
 		##
 		## A `Switch` with outputs is a value switch, whose arms end in `Value`;
@@ -24015,7 +24018,10 @@ Builtin :: [].{
 		##
 		## A node with several outputs has a `Tuple` type of them.
 		## `speculatable` is exact: a builtin not on the normal form's list is
-		## not speculatable, and neither is a node over one. A translator for a
+		## not speculatable, and neither is a node over one. A checked
+		## arithmetic node that tests in force prove cannot overflow, such as
+		## `x + 1` under `if x < 10`, is speculatable where it stands, but not
+		## outside those tests. A translator for a
 		## target without short-circuit evaluation, such as SQL's `AND`, reads
 		## it on the nodes of each operand to decide whether it may evaluate
 		## them eagerly.

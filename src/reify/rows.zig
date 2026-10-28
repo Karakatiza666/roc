@@ -24,6 +24,7 @@ const equal = @import("equal.zig");
 const types_mod = @import("types.zig");
 const builder_mod = @import("builder.zig");
 const provenance = @import("provenance.zig");
+const ranges = @import("ranges.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -198,6 +199,8 @@ pub const Finalizer = struct {
         defer self.gpa.free(wrappers);
         const all = try std.mem.concat(self.gpa, RowId, &.{ comp, wrappers });
         defer self.gpa.free(all);
+        // N8k: the result range each row's callers read, from its body.
+        for (all) |r| b.store.rows.items[r.index()].result_range = try ranges.resultRange(self.gpa, b.store, b.types, r);
         const g = try graph(self.gpa, b.store, .references);
         defer freeGraph(self.gpa, g);
         const comps = try components(self.gpa, g, all);
@@ -881,7 +884,7 @@ test "N8g: two recursive rows that call each other alike are bisimilar and meet 
         \\      n1 = Num.I64.is_lt(s4.0, n0) : Bool
         \\      n3 = switch n1 : !spec
         \\        arm 0
-        \\          n2 = Num.I64.minus(s4.0, n0) : I64 !spec
+        \\          n2 = Num.I64.minus(s4.0, n0) : I64
         \\          continue n2
         \\        arm 1
         \\          break s4.0

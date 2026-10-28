@@ -159,7 +159,7 @@ Checking commits nothing for a described function. The walk that builds the desc
 
 | Item | Rule |
 | --- | --- |
-| `Code.version` | The version of the normal form. It is 15 today ([../src/reify/mod.zig:37](../src/reify/mod.zig)). |
+| `Code.version` | The version of the normal form. It is 16 today ([../src/reify/mod.zig:38](../src/reify/mod.zig)). |
 | When the version changes | When the rules, the builtin table, or the speculatable lists change. A fingerprint test pins this. |
 | `==` and `to_hash` on a `Code` | They read the normal form and the version. They ignore the site key. Two sites with the same normal form are equal. |
 | A translator cache | Use `Code.version` and `Code.to_hash` as the key. |
@@ -204,10 +204,11 @@ Notes on accuracy:
 | --- | --- |
 | Where | The `reify` branch. Not merged into `main`. |
 | What works | Pure Roc as listed in [../roc-reify-design.md](../roc-reify-design.md): literals, operators, calls (helpers, generic, recursive, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods, and captured run-time values for a translator that returns a `Code.Bound`. |
-| Tests | 134 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 199 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 60 fixtures `test/cli/Staged*.roc`. 192 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
+| Tests | 134 staging cases in [../src/eval/test/eval_staging_tests.zig](../src/eval/test/eval_staging_tests.zig). 209 reifier tests in [../src/compile/test/code_reifier_test.zig](../src/compile/test/code_reifier_test.zig). 60 fixtures `test/cli/Staged*.roc`. 206 normal-form tests in [../src/reify](../src/reify). Fuzzers in `src/reify/fuzz_gen.zig` and `test/fuzzing/fuzz-reify.zig`. |
 | Node identities | `Code.Inlined.inline_digest` names a node of the `inline` view by its content (milestone M8). |
 | Rows the compiler chooses | A `Code.Outlined(f)` site gets the `outline` view (milestone M9). Places that differ in a value pass it as an argument (V3b), so the GLSL shader's two calls of `ripple` are one row ([../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 12). |
 | Laws of the builtins | A `Code.Lawful(f)` site gets the graph view under layer L (milestone M10). No example opts in: the SQL translator matches `List.sum(List.map(..))` and `len() > 0`, which the laws change. |
+| Literal intervals | Every integer value has an interval from literals, dominating tests against a literal, and range indices (milestone M11). A test that an interval decides is gone, and `while $i <= n` with a bounded `n` is the `for` over `0..=n`. The rules and their limits are in [../roc-reify-normal-form.md](../roc-reify-normal-form.md) section 3.13. |
 | Not done | The translator cannot yet declare which functions of another package it reads (`code_primitives`, milestone M13 of [../roc-reify-normalization-plan.md](../roc-reify-normalization-plan.md)). |
 
 ### What is refused today

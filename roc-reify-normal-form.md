@@ -114,7 +114,15 @@ that can crash on checked-integer overflow is never lost (C2).
 A checked integer `plus`, `minus` or `times` whose operands' intervals (N13u)
 prove that the result fits its type cannot crash in the regions those facts
 hold in, so it is speculatable there, and N5b hoists it no further out than
-those regions.
+those regions. The builder records the proof with the innermost region whose
+fact it read (`src/reify/ir.zig`, `NodeRange`; `Store.fitFloor`). Placement
+reads that region as one the node reads, for the node and for a node whose
+regions hold it (`src/reify/place.zig`, `readRegions`). Every other step that
+moves a node out of a region treats a proved node as not speculatable outside
+its facts: N13w (`match.speculatableWithin`), the invariant outputs of N11j
+(`loops.zig`, `invariant`), the rows of layer L (`laws.zig`, `settle`) and the
+holes of V3b (`views.zig`, `movable`). A proof that reads no fact, such as
+`f(x) + 1` where N8k bounds `f`, holds everywhere.
 
 The list is short and explicit, and a builtin not on it is not speculatable,
 which is exact rather than a guess: the only effect of leaving a builtin off
@@ -505,9 +513,13 @@ position the switch tests, and builds the switch on that position first. Each of
 its arms holds the inner arm for that constructor, or a copy of the arm that
 does not test it. The positions go in the order of the field index, then the tag
 name, then the payload index. It leaves alone two `Bool` switches (N7d and
-N13o own their order), switches on different roots (the parameter half of N15c
-orders them, at M11), a guard, which is not a position, and a switch with a
-join or with more than one output. It never copies an arm that holds a loop, an `Apply`, a `Lambda` or a `Closure` (`match.copyable`), because the measure counts those before the switches a copy adds. `match.inversions` counts the tests left
+N13o own their order), switches on two roots that are not both parameters of
+the root row, a guard, which is not a position, and a switch with a join or
+with more than one output. Two parameters of the root row are roots in
+parameter order, the parameter half of N15c (`match.rootedBefore`), so
+`match a { P => match t { .. }, .. }` and the match on `t` first meet when `a`
+and `t` are the root's parameters. Other roots have no order that no
+unrelated edit moves, so their switches stay as written. It never copies an arm that holds a loop, an `Apply`, a `Lambda` or a `Closure` (`match.copyable`), because the measure counts those before the switches a copy adds. `match.inversions` counts the tests left
 out of order in a switch whose arms it may copy, and the measure above uses it before it counts switches, because
 copying an arm adds switches. The walk builds a `match` as a cascade of switches in source
 order, where the first arm whose tests hold wins, and N7 rebuilds every
@@ -687,7 +699,12 @@ type records the union of N13u's intervals over its returns. Its callers are
 simplified after it (3.0), so N13u reads the recorded interval as the fact on
 each `Call` of the row. The interval is data the finalize step stores, computed
 from the finalized body; a caller never reads the callee's body for it. A function
-in the cut (N8h) records nothing.
+in the cut (N8h) records nothing. The returns are the body's value and each
+`Return` on the row's paths and in its loops, not in its lambdas. A returned
+literal is its value, a node has the interval N13u gave it when it was built,
+and anything else, a switch output among them, has the type's full range, as
+the source table of 3.13 states (`src/reify/ranges.zig`, `resultRange`). A row
+whose union is the full range records nothing.
 
 ### 3.9 N9: canonical order
 
@@ -909,6 +926,17 @@ overflows when `n` is the type's highest value, and the range does not, so the
 two mean different things in Roc, and it stays a general `Loop`. When N13u's
 interval of `n` is below the type's highest value, the step never overflows
 where the test holds, and the raising rule gives the inclusive `ForRange`.
+The same holds for `if $i > n { break }`, which is `is_lt(n, i)` with the arm
+for `True` leaving. The interval is the builder's at the place the loop is
+built (`loops.Where.below_max`), so a bound that the loop body computes, even
+one that does not change, has no interval yet, and the loop stays a general
+`Loop` (`src/reify/loops.zig`, `raiseCounter`).
+
+A counter read after the loop keeps the loop a general `Loop`, with either
+test. This includes a sum that starts at the counter's initial value and
+steps by 1: N11i merges it with the counter, so `var $s = 0` with
+`$s = $s + 1` in `while $i <= n` stays a `Loop`, while the same sum in a
+`for` over `0..=n` is a `ForRange` with two slots. They do not meet today.
 
 Slots are normalized like nodes:
 
@@ -1180,6 +1208,26 @@ Intervals decide nothing on their own. They are conditions that rules read:
 Bounds against a value that is not a literal, such as `i < List.len(xs)`,
 stay test facts for N13m. Intervals do not replace them.
 
+The builder holds the sources in `src/reify/ranges.zig` and
+`Builder.rangeOf`, and these readings fix what the table leaves open:
+
+| Question | Reading |
+|---|---|
+| a dominating arm of an `And` or `Or` | the arm where an `And` is `True`, or an `Or` is `False`, gives each operand's fact, as an earlier operand does inside it and as N13m reads a bound |
+| an arm of a literal switch on the node | the keyed arm is the point of its key; the default arm gives nothing |
+| where a node's interval holds | in the innermost region whose fact it read and below; one that read no fact holds everywhere (`ir.NodeRange.holds_in`) |
+| a node found again by hash-consing | it keeps the interval of its first construction, in a region that encloses the one it is read in, met with the facts where it is read |
+| a node placement moves | the rebuild builds it again where it goes, with the facts open there, so its interval is the one that holds there; placement does not move a checked op proved to fit out of the region of its facts (`Store.fitFloor`) |
+| facts that contradict | an empty interval: the region never runs, and it decides no comparison |
+| the comparisons a literal decides | `is_lt`, `is_lte` and `is_eq` with exactly one literal operand; `is_gt` and `is_gte` reach them through N1l |
+| a literal switch on an integer | a key outside the scrutinee's interval selects nothing, so its arm goes, and an interval that is one key's value selects that key's arm, as the comparison with the key would decide |
+| the value a fact compares | the node of the test, or a node of one projection or builtin op with the same payload, types and operands built in another region: the copy an `And` operand builds is not the copy its arm builds (`Builder.sameValue`) |
+
+L5 checks that the intervals only narrow: the reference evaluator, run on
+each fuzz case's input, checks every integer a node with an interval
+computes where that interval holds, and every result of a row with a result
+range (`src/reify/eval.zig`, `check_ranges`).
+
 ### 3.14 N14: scalar replacement
 
 A record or tuple that crosses a boundary the author controls is split into its
@@ -1237,6 +1285,15 @@ overflows, so the regrouped body fails where Roc does not, which C2 forbids.
 A `plus` chain whose operands' intervals prove that no grouping overflows is
 the exception (N13u). Float arithmetic is not associative.
 
+Such a chain is one `Prim` over its operands in order (`Builder.rangeChain`),
+and N15c, which reads two operands, does not apply to it. The chain flattens
+after N15c has put a literal last in each two-operand `plus` it is built
+from, so `(a + b) + c` and `a + (b + c)` meet, and `1 + (a + b)` is
+`plus(a, b, 1)` while `(1 + a) + b` is `plus(a, 1, b)`: a regrouping that also
+moves a literal stays apart, as it does for the chains of the table above. A
+chain of more than two operands is checked `plus` only where N13u proved it
+fits, which the verifier checks.
+
 Leaf order (N15c). Commutative operands are not sorted in general (7.2), but
 a literal and two leaves have an order that no unrelated edit can change. A
 two-operand call of integer `plus` or `times`, or of `is_eq` over a builtin
@@ -1252,7 +1309,11 @@ by position would change the order N8 reads, and a helper with reordered
 parameters would stop meeting itself. Floats are excluded, because the bits of
 a `NaN` result can depend on operand order. The root's order is its type, and
 a literal is not a parameter, so N9's numbering stays stable. `a + 1` and
-`1 + a` meet, and so do `x == y` and `y == x` over the root's parameters.
+`1 + a` meet, and so do `x == y` and `y == x` over the root's parameters
+(`Builder.paramOrder`). A root parameter means a parameter of the row whose
+parameters are fixed (`ir.Row.fixed_params`): the root, in every view, where
+an inlined helper's parameters stand for the root's values. A field of a
+record parameter is not a parameter, so `input.x == input.y` stays as written.
 
 `And` and `Or` flatten the same way, with their operands in order:
 `And(a, And(b, c))` and `And(And(a, b), c)` both become `And(a, b, c)`.

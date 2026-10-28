@@ -197,7 +197,8 @@ const View = struct {
                 try w.writeAll(")");
             },
             .crash, .derived, .tuple, .list, .wrap, .unwrap, .elem, .opt_field, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => {
-                try w.print("{s}(", .{opName(nd.op)});
+                // A range that includes its end says so.
+                try w.print("{s}{s}(", .{ opName(nd.op), if (nd.op == .for_range and nd.payload == 1) " inclusive" else "" });
                 try v.refs(w, args, "");
                 try w.writeAll(")");
             },

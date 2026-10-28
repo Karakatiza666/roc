@@ -143,8 +143,11 @@ pub const Prim = struct {
     speculatable: bool,
     associative: bool,
 
-    /// Whether a `Prim` of this builtin may have `n` operands.
+    /// Whether a `Prim` of this builtin may have `n` operands. A checked
+    /// integer `plus` takes more than two as a chain whose operands'
+    /// intervals prove that no grouping overflows (N13u, N15a).
     pub fn takes(self: Prim, n: usize) bool {
+        if (self.method == .plus and self.owner.int() != null) return n >= self.arity;
         return if (self.associative) n >= self.arity else n == self.arity;
     }
 };
@@ -369,10 +372,12 @@ pub fn foldInt(int: types.IntTy, method: Method, a: i256, b: i256) ?Folded {
         .is_gte => .{ .bool_ = a >= b },
         .plus => in.range(int, a + b),
         .minus => in.range(int, a - b),
-        .times => in.range(int, a * b),
+        // Two `U128` values multiply past `i256`; a product that far out
+        // leaves every type, and a wrapped one keeps its low bits.
+        .times => if (@mulWithOverflow(a, b)[1] == 1) null else in.range(int, a * b),
         .div_trunc => if (b == 0) null else in.range(int, @divTrunc(a, b)),
         .plus_wrap => .{ .int = wrapTo(int, a + b) },
-        .times_wrap => .{ .int = wrapTo(int, a * b) },
+        .times_wrap => .{ .int = wrapTo(int, a *% b) },
         .bitwise_and => .{ .int = wrapTo(int, a & b) },
         .bitwise_or => .{ .int = wrapTo(int, a | b) },
         .bitwise_xor => .{ .int = wrapTo(int, a ^ b) },

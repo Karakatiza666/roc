@@ -124,6 +124,22 @@ pub const Evaluator = struct {
     /// The value of each input slot of the store, by slot id (N18). A test
     /// that builds slots sets it before `run`.
     inputs: []const Value = &.{},
+    /// Where set, every integer the evaluation computes at a node N13u gave
+    /// an interval, in a region that interval holds in (`ir.NodeRange`), and
+    /// every integer a row with a result range (N8k) returns, must lie in
+    /// that interval. The first one that does not is kept in `range_miss`
+    /// (L2 on the L5 inputs, plan 5.10, M11: intervals only narrow).
+    check_ranges: bool = false,
+    range_miss: ?RangeMiss = null,
+
+    /// A value outside the interval N13u or N8k gave it.
+    pub const RangeMiss = struct {
+        /// The node, or `none` for a row's result.
+        node: NodeId,
+        row: RowId,
+        value: i256,
+        interval: ir.Interval,
+    };
 
     /// Index the store's regions. Call again after adding nodes.
     pub fn init(arena: Allocator, store: *const ir.Store, types: *const types_mod.Types, mode: Mode) Allocator.Error!Evaluator {
@@ -144,12 +160,14 @@ pub const Evaluator = struct {
     pub fn run(self: *Evaluator, row: RowId, args: []const Value) Error!Value {
         var frame = try self.newFrame(row, args);
         const out = try self.evalRegion(&frame, self.store.row(row).body);
-        return switch (out) {
+        const v: Value = switch (out) {
             .value => |vs| vs[0],
             .ret => |v| v,
             .bottom => .bottom,
             .jump, .cont, .brk => unreachable, // a row body ends in a value, ret or bottom; jumps and loop ends are consumed by their own region
         };
+        if (self.check_ranges and v == .int) if (self.store.row(row).result_range) |iv| self.checkRange(NodeId.none, row, v.int, iv);
+        return v;
     }
 
     fn newFrame(self: *Evaluator, row: RowId, args: []const Value) Allocator.Error!Frame {
@@ -266,7 +284,16 @@ pub const Evaluator = struct {
             .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .unwrap, .closure, .field, .index, .payload, .elem, .opt_field, .prim, .call, .lambda, .apply => try self.one(try self.evalSimple(frame, node)),
         };
         frame.nodes[n.index()] = out;
+        if (self.check_ranges and out.len == 1 and out[0] == .int) if (self.store.ranges.get(n)) |r| {
+            const holds = r.holds_in == RegionId.none or self.store.encloses(r.holds_in, node.region);
+            if (holds) self.checkRange(n, frame.row, out[0].int, r.interval);
+        };
         return out;
+    }
+
+    fn checkRange(self: *Evaluator, n: NodeId, row: RowId, v: i256, iv: ir.Interval) void {
+        if (self.range_miss != null or (iv.lo <= v and v <= iv.hi)) return;
+        self.range_miss = .{ .node = n, .row = row, .value = v, .interval = iv };
     }
 
     fn one(self: *Evaluator, v: Value) Allocator.Error![]const Value {
@@ -518,12 +545,14 @@ pub const Evaluator = struct {
     fn callRow(self: *Evaluator, row: RowId, args: []const Value) Error!Value {
         var callee = try self.newFrame(row, args);
         const out = try self.evalRegion(&callee, self.store.row(row).body);
-        return switch (out) {
+        const v: Value = switch (out) {
             .value => |vs| vs[0],
             .ret => |v| v,
             .bottom => .bottom,
             .jump, .cont, .brk => unreachable, // a called row body ends in a value, ret or bottom
         };
+        if (self.check_ranges and v == .int) if (self.store.row(row).result_range) |iv| self.checkRange(NodeId.none, row, v.int, iv);
+        return v;
     }
 
     /// The value of the function `f` over `args`: a closure calls its row

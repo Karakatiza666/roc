@@ -140,6 +140,18 @@ pub fn before(types: *const types_mod.Types, a: []const Step, b: []const Step) b
     return a.len < b.len;
 }
 
+/// Whether the position at root `a` with steps `a_steps` comes before the
+/// one at root `b` with `b_steps`, in a switch of row `row`: two positions of
+/// one root by `before`, and positions of two parameters of the root row by
+/// parameter order, the parameter half of N15c (normal-form 3.15). The
+/// root's parameters are its type, so no unrelated edit moves them. Two
+/// other roots have no order, so N7b leaves their switches as written.
+pub fn rootedBefore(store: *const ir.Store, types: *const types_mod.Types, row: ir.RowId, a: Ref, a_steps: []const Step, b: Ref, b_steps: []const Step) bool {
+    if (a == b) return before(types, a_steps, b_steps);
+    if (a.kind != .row_param or b.kind != .row_param or !store.row(row).fixed_params) return false;
+    return a.output < b.output;
+}
+
 /// Whether two paths are the same position.
 pub fn samePosition(types: *const types_mod.Types, a: []const Step, b: []const Step) bool {
     if (a.len != b.len) return false;
@@ -277,7 +289,7 @@ pub fn copyable(store: *const ir.Store, live: ?[]const bool, arm: RegionId) bool
 }
 
 /// How many arms of the single-output value switch `n` end in a switch on a
-/// position of the same root that comes before its own, which N7b hoists
+/// position that comes before its own (`rootedBefore`), which N7b hoists
 /// (normal-form 3.7). Two `Bool` switches are not counted: N7d and N13o own
 /// their order.
 pub fn inversions(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, live: ?[]const bool, n: NodeId) Allocator.Error!u32 {
@@ -302,7 +314,7 @@ pub fn inversions(gpa: Allocator, store: *const ir.Store, types: *const types_mo
         steps.clearRetainingCapacity();
         const root = try positionOf(gpa, store, q, &steps);
         const q_is_bool = types.get(store.refTy(row, q)) == .bool_;
-        if (root != p_root or !before(types, steps.items, p_steps.items) or (p_is_bool and q_is_bool)) continue;
+        if (!rootedBefore(store, types, row, root, steps.items, p_root, p_steps.items) or (p_is_bool and q_is_bool)) continue;
         if (readable(store, types, n, q)) count += 1;
     }
     return count;
@@ -879,6 +891,11 @@ fn speculatableWithin(gpa: Allocator, store: *const ir.Store, ref: Ref, regions:
             if ((try seen.getOrPut(gpa, n)).found_existing) continue;
             const nd = store.node(n);
             if (!nd.flags.speculatable) return false;
+            // A checked op N13u proved fits under the facts of an arm being
+            // dropped can fail outside it.
+            if (store.fitFloor(n)) |floor| for (regions) |reg| {
+                if (store.encloses(reg, floor)) return false;
+            };
             try stack.appendSlice(gpa, store.refSlice(nd.args));
             for (store.regionSlice(nd.regions)) |sub| {
                 const end = store.region(sub).end;
