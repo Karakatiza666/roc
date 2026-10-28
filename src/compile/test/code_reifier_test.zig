@@ -5394,15 +5394,17 @@ test "L3 V3b: a helper called with constants that fold differently shares only t
 // (static-dispatch.md). The walk runs the first stage by its definition where
 // the literal stands, because the segments are literals, and the literal is
 // the closure that stage hands back, applied to the list of the interpolated
-// values.
+// values. `Str`'s assembler folds over that list with `fold_with_index`, and
+// the literal fixes the list's length, so N17f, N17b and N13c over `ok_or`
+// make the fold the flat `Str.concat` chain of the segments and the values.
 
-test "an interpolated literal of a type that escapes its values describes as the escaped fold" {
+test "an interpolated literal of a type that escapes its values describes as the chain of the escaped values" {
     // The conversion rejects segments, so its first stage branches. The
     // program compiled, so that stage returned `Ok` for these segments: the
     // arm that only delivers `Err` is not taken, and nothing of the test it
     // would have made is described. `Str.from_interpolation` is walked too,
-    // so the literal is its fold over the values, which this conversion
-    // escapes first.
+    // so the literal is the chain of its segments and its values, which
+    // this conversion escapes first.
     const staged = try Staged.create(std.testing.allocator,
         \\Html := [Html(Str)].{
         \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
@@ -5426,42 +5428,27 @@ test "an interpolated literal of a type that escapes its values describes as the
 
     try staged.expectDump(
         \\row r0 ({ time : F32, uv : F32 }) -> F32
-        \\  n0 = field 1(p0) : F32
-        \\  n1 = Num.F32.to_str(n0) : Str !spec
-        \\  n2 = "<" : Str
-        \\  n3 = "&lt;" : Str
-        \\  n4 = Str.replace_each(n1, n2, n3) : Str !spec
-        \\  n5 = list(n4) : List(Str)
-        \\  n6 = "<p>" : Str
-        \\  n7 = tag Ok(n6) : [Err([ListWasEmpty]), Ok(Str)]
-        \\  n8 = wrap(n7) : Builtin.Try
-        \\  n9 = "" : Str
-        \\  n10 = Try.ok_or(n8, n9) : Str !spec
-        \\  n11 = "!</p>" : Str
-        \\  n12 = list(n6, n11) : List(Str)
-        \\  n13 = closure r1(n12) : (Str, Str, U64 -> Str)
-        \\  n14 = List.fold_with_index(n5, n10, n13) : Str !spec
-        \\  n15 = Str.is_empty(n14) : Bool !spec
-        \\  n17 = switch n15 : F32
+        \\  n0 = "<p>" : Str
+        \\  n1 = field 1(p0) : F32
+        \\  n2 = Num.F32.to_str(n1) : Str !spec
+        \\  n3 = "<" : Str
+        \\  n4 = "&lt;" : Str
+        \\  n5 = Str.replace_each(n2, n3, n4) : Str !spec
+        \\  n6 = "!</p>" : Str
+        \\  n7 = Str.concat(n0, n5, n6) : Str
+        \\  n8 = Str.is_empty(n7) : Bool !spec
+        \\  n10 = switch n8 : F32
         \\    arm 0
-        \\      value n0
+        \\      value n1
         \\    arm 1
-        \\      n16 = float 0x0 : F32
-        \\      value n16
-        \\  value n17
-        \\row r1 (List(Str), Str, Str, U64) -> Str
-        \\  n0 = 1 : U64
-        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
-        \\  n2 = List.get(p0, n1) : Builtin.Try
-        \\  n3 = "" : Str
-        \\  n4 = Try.ok_or(n2, n3) : Str !spec
-        \\  n5 = Str.concat(p1, p2, n4) : Str
-        \\  value n5
+        \\      n9 = float 0x0 : F32
+        \\      value n9
+        \\  value n10
         \\
     );
 }
 
-test "an interpolated literal of a type that only wraps the assembler of Str describes as the fold of Str" {
+test "an interpolated literal of a type that only wraps the assembler of Str describes as the chain of Str" {
     const staged = try Staged.create(std.testing.allocator,
         \\Label := { text : Str }.{
         \\    from_interpolation : List(Str) -> Try((List(Str) -> Label), [InvalidInterpolation(Str)])
@@ -5477,34 +5464,19 @@ test "an interpolated literal of a type that only wraps the assembler of Str des
 
     try staged.expectDump(
         \\row r0 ({ time : F32, uv : F32 }) -> F32
-        \\  n0 = field 1(p0) : F32
-        \\  n1 = Num.F32.to_str(n0) : Str !spec
-        \\  n2 = list(n1) : List(Str)
-        \\  n3 = "a" : Str
-        \\  n4 = tag Ok(n3) : [Err([ListWasEmpty]), Ok(Str)]
-        \\  n5 = wrap(n4) : Builtin.Try
-        \\  n6 = "" : Str
-        \\  n7 = Try.ok_or(n5, n6) : Str !spec
-        \\  n8 = "b" : Str
-        \\  n9 = list(n3, n8) : List(Str)
-        \\  n10 = closure r1(n9) : (Str, Str, U64 -> Str)
-        \\  n11 = List.fold_with_index(n2, n7, n10) : Str !spec
-        \\  n12 = Str.is_empty(n11) : Bool !spec
-        \\  n14 = switch n12 : F32
+        \\  n0 = "a" : Str
+        \\  n1 = field 1(p0) : F32
+        \\  n2 = Num.F32.to_str(n1) : Str !spec
+        \\  n3 = "b" : Str
+        \\  n4 = Str.concat(n0, n2, n3) : Str
+        \\  n5 = Str.is_empty(n4) : Bool !spec
+        \\  n7 = switch n5 : F32
         \\    arm 0
-        \\      value n0
+        \\      value n1
         \\    arm 1
-        \\      n13 = float 0x0 : F32
-        \\      value n13
-        \\  value n14
-        \\row r1 (List(Str), Str, Str, U64) -> Str
-        \\  n0 = 1 : U64
-        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
-        \\  n2 = List.get(p0, n1) : Builtin.Try
-        \\  n3 = "" : Str
-        \\  n4 = Try.ok_or(n2, n3) : Str !spec
-        \\  n5 = Str.concat(p1, p2, n4) : Str
-        \\  value n5
+        \\      n6 = float 0x0 : F32
+        \\      value n6
+        \\  value n7
         \\
     );
 }
@@ -5564,35 +5536,20 @@ test "an interpolated literal passed as an argument describes as the value it co
     try staged.expectDump(
         \\row r0 ({ time : F32, uv : F32 }) -> F32
         \\  n0 = 3 : U64
-        \\  n1 = field 1(p0) : F32
-        \\  n2 = Num.F32.to_str(n1) : Str !spec
-        \\  n3 = list(n2) : List(Str)
-        \\  n4 = "x" : Str
-        \\  n5 = tag Ok(n4) : [Err([ListWasEmpty]), Ok(Str)]
-        \\  n6 = wrap(n5) : Builtin.Try
-        \\  n7 = "" : Str
-        \\  n8 = Try.ok_or(n6, n7) : Str !spec
-        \\  n9 = "y" : Str
-        \\  n10 = list(n4, n9) : List(Str)
-        \\  n11 = closure r1(n10) : (Str, Str, U64 -> Str)
-        \\  n12 = List.fold_with_index(n3, n8, n11) : Str !spec
-        \\  n13 = Str.count_utf8_bytes(n12) : U64 !spec
-        \\  n14 = Num.U64.is_lt(n0, n13) : Bool
-        \\  n16 = switch n14 : F32
+        \\  n1 = "x" : Str
+        \\  n2 = field 1(p0) : F32
+        \\  n3 = Num.F32.to_str(n2) : Str !spec
+        \\  n4 = "y" : Str
+        \\  n5 = Str.concat(n1, n3, n4) : Str
+        \\  n6 = Str.count_utf8_bytes(n5) : U64 !spec
+        \\  n7 = Num.U64.is_lt(n0, n6) : Bool
+        \\  n9 = switch n7 : F32
         \\    arm 0
-        \\      n15 = float 0x0 : F32
-        \\      value n15
+        \\      n8 = float 0x0 : F32
+        \\      value n8
         \\    arm 1
-        \\      value n1
-        \\  value n16
-        \\row r1 (List(Str), Str, Str, U64) -> Str
-        \\  n0 = 1 : U64
-        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
-        \\  n2 = List.get(p0, n1) : Builtin.Try
-        \\  n3 = "" : Str
-        \\  n4 = Try.ok_or(n2, n3) : Str !spec
-        \\  n5 = Str.concat(p1, p2, n4) : Str
-        \\  value n5
+        \\      value n2
+        \\  value n9
         \\
     );
 }
@@ -5653,7 +5610,7 @@ fn interpolatingLib(comptime cut: []const u8) []const u8 {
 
 test "M13: an interpolated literal of another package's type whose conversion is outside the cut is walked by its definition" {
     // N8l: the cut names `size` only, so `from_interpolation` is walked as
-    // the site's own type's is, and the literal is the fold of `Str`.
+    // the site's own type's is, and the literal is the chain of `Str`.
     const staged = try Staged.createTranslated(std.testing.allocator,
         \\wobble : { a : F32, b : F32 } -> F32
         \\wobble = |input| Lib.size("x${input.a.to_str()}y")
@@ -5661,30 +5618,15 @@ test "M13: an interpolated literal of another package's type whose conversion is
     defer staged.destroy();
     try staged.expectDump(
         \\row r0 ({ a : F32, b : F32 }) -> F32
-        \\  n0 = field 0(p0) : F32
-        \\  n1 = Num.F32.to_str(n0) : Str !spec
-        \\  n2 = list(n1) : List(Str)
-        \\  n3 = "x" : Str
-        \\  n4 = tag Ok(n3) : [Err([ListWasEmpty]), Ok(Str)]
-        \\  n5 = wrap(n4) : Builtin.Try
-        \\  n6 = "" : Str
-        \\  n7 = Try.ok_or(n5, n6) : Str !spec
-        \\  n8 = "y" : Str
-        \\  n9 = list(n3, n8) : List(Str)
-        \\  n10 = closure r1(n9) : (Str, Str, U64 -> Str)
-        \\  n11 = List.fold_with_index(n2, n7, n10) : Str !spec
-        \\  n12 = record(n11) : { text : Str }
-        \\  n13 = wrap(n12) : Lib
-        \\  n14 = Lib.size(n13) : F32 !spec
-        \\  value n14
-        \\row r1 (List(Str), Str, Str, U64) -> Str
-        \\  n0 = 1 : U64
-        \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
-        \\  n2 = List.get(p0, n1) : Builtin.Try
-        \\  n3 = "" : Str
-        \\  n4 = Try.ok_or(n2, n3) : Str !spec
-        \\  n5 = Str.concat(p1, p2, n4) : Str
-        \\  value n5
+        \\  n0 = "x" : Str
+        \\  n1 = field 0(p0) : F32
+        \\  n2 = Num.F32.to_str(n1) : Str !spec
+        \\  n3 = "y" : Str
+        \\  n4 = Str.concat(n0, n2, n3) : Str
+        \\  n5 = record(n4) : { text : Str }
+        \\  n6 = wrap(n5) : Lib
+        \\  n7 = Lib.size(n6) : F32 !spec
+        \\  value n7
         \\
     );
 }
@@ -5740,31 +5682,29 @@ test "M13: an interpolated literal of a type in the site's own module is a Prim 
     defer walked.destroy();
     try walked.expectDump(
         \\row r0 ({ a : F32, b : F32 }) -> F32
-        \\  n0 = field 0(p0) : F32
-        \\  n1 = Num.F32.to_str(n0) : Str !spec
-        \\  n2 = field 1(p0) : F32
-        \\  n3 = Num.F32.to_str(n2) : Str !spec
-        \\  n4 = list(n1, n3) : List(Str)
-        \\  n5 = "x" : Str
-        \\  n6 = tag Ok(n5) : [Err([ListWasEmpty]), Ok(Str)]
-        \\  n7 = wrap(n6) : Builtin.Try
-        \\  n8 = "" : Str
-        \\  n9 = Try.ok_or(n7, n8) : Str !spec
-        \\  n10 = "y" : Str
-        \\  n11 = list(n5, n8, n10) : List(Str)
-        \\  n12 = closure r1(n11) : (Str, Str, U64 -> Str)
-        \\  n13 = List.fold_with_index(n4, n9, n12) : Str !spec
-        \\  n14 = record(n13) : { text : Str }
-        \\  n15 = wrap(n14) : Label
-        \\  n16 = Label.size(n15) : F32 !spec
-        \\  value n16
-        \\row r1 (List(Str), Str, Str, U64) -> Str
+        \\  n0 = "x" : Str
+        \\  n1 = field 0(p0) : F32
+        \\  n2 = Num.F32.to_str(n1) : Str !spec
+        \\  n3 = "" : Str
+        \\  n4 = "y" : Str
+        \\  n5 = list(n0, n3, n4) : List(Str)
+        \\  n6 = 0 : U64
+        \\  n7 = call r1(n0, n2, n5, n6) : Str !spec
+        \\  n8 = field 1(p0) : F32
+        \\  n9 = Num.F32.to_str(n8) : Str !spec
+        \\  n10 = 1 : U64
+        \\  n11 = call r1(n7, n9, n5, n10) : Str !spec
+        \\  n12 = record(n11) : { text : Str }
+        \\  n13 = wrap(n12) : Label
+        \\  n14 = Label.size(n13) : F32 !spec
+        \\  value n14
+        \\row r1 (Str, Str, List(Str), U64) -> Str
         \\  n0 = 1 : U64
         \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
-        \\  n2 = List.get(p0, n1) : Builtin.Try
+        \\  n2 = List.get(p2, n1) : Builtin.Try
         \\  n3 = "" : Str
         \\  n4 = Try.ok_or(n2, n3) : Str !spec
-        \\  n5 = Str.concat(p1, p2, n4) : Str
+        \\  n5 = Str.concat(p0, p1, n4) : Str
         \\  value n5
         \\
     );
@@ -7304,6 +7244,106 @@ test "L3 M17: a chain whose first operand always crashes flattens whether N17g u
         \\    $a + input
         \\}
     );
+}
+
+// After M17 (plan 4.2): an interpolated literal is walked through its type's
+// `from_interpolation`, and `Str.from_interpolation` folds over the list of
+// values with `fold_with_index`. The literal fixes the list's length, so N17f
+// makes the fold its calls, N17b reads each segment, N13c decides `ok_or`, and
+// N15a flattens the chain and drops the empty segments.
+
+/// `Label`, whose conversion only wraps the assembler of `Str`, and `wobble`,
+/// which gives the text of `literal` at `Label`.
+fn labelSource(comptime params: []const u8, comptime literal: []const u8) []const u8 {
+    return
+    \\Label := { text : Str }.{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Label), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| { text: assemble(values) })
+    \\    text_of : Label -> Str
+    \\    text_of = |l| l.text
+    \\}
+    \\
+    ++ "wobble : " ++ params ++ " -> Str\n" ++
+        "wobble = |input| " ++ literal ++ ".Label.text_of()\n";
+}
+
+test "L3 M17: an interpolated literal at Str, at a type that only wraps the assembler of Str, and the written concat are one flat chain" {
+    const at_str =
+        \\wobble : Str -> Str
+        \\wobble = |input| "a${input}b"
+    ;
+    try expectSameNormalForm(at_str, labelSource("Str", "\"a${input}b\""));
+    try expectSameNormalForm(at_str,
+        \\wobble : Str -> Str
+        \\wobble = |input| "a".concat(input).concat("b")
+    );
+    const gpa = std.testing.allocator;
+    const staged = try Staged.createRunning(gpa, at_str, "");
+    defer staged.destroy();
+    if (staged.outcome != .reified) return error.TestUnexpectedResult;
+    try expectDumpHas(staged, "Str.concat(", "fold");
+}
+
+test "L3 M17: an interpolated literal of several values is the flat chain in `inline`, without its empty segments" {
+    // The fold's function is one row, so in `graph` each value is a call of
+    // it (tier B), as N17f gives for any fold; `inline` is the chain.
+    const gpa = std.testing.allocator;
+    const label = try Staged.createRunning(gpa, labelSource("{ x : Str, y : Str }", "\"a${input.x}${input.y}c\""), "");
+    defer label.destroy();
+    const written = try Staged.createRunning(gpa,
+        \\wobble : { x : Str, y : Str } -> Str
+        \\wobble = |input| "a".concat(input.x).concat(input.y).concat("c")
+    , "");
+    defer written.destroy();
+    const at_str = try Staged.createRunning(gpa,
+        \\wobble : { x : Str, y : Str } -> Str
+        \\wobble = |input| "a${input.x}${input.y}c"
+    , "");
+    defer at_str.destroy();
+    if (label.outcome != .reified or written.outcome != .reified or at_str.outcome != .reified) return error.TestUnexpectedResult;
+    try expectSameView(label, written, .inline_);
+    try expectSameView(at_str, written, .inline_);
+    try std.testing.expectEqualStrings(at_str.dump.items, written.dump.items);
+    try expectDumpHas(label, "= call r", "fold");
+}
+
+/// `Html`, whose conversion rejects a segment with a script and escapes each
+/// value before `Str`'s assembler joins them, and `wobble`, which gives the
+/// text of `literal` at `Html`.
+fn escapingSource(comptime params: []const u8, comptime literal: []const u8) []const u8 {
+    return
+    \\Html := { text : Str }.{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments|
+    \\        if segments.any(|segment| segment.contains("<script")) {
+    \\            Err(InvalidInterpolation("no scripts"))
+    \\        } else {
+    \\            Str.from_interpolation(segments).map_ok(|assemble|
+    \\                |values| { text: assemble(values.map(|value| value.replace_each("<", "&lt;"))) })
+    \\        }
+    \\    text_of : Html -> Str
+    \\    text_of = |h| h.text
+    \\}
+    \\
+    ++ "wobble : " ++ params ++ " -> Str\n" ++
+        "wobble = |input| " ++ literal ++ ".Html.text_of()\n";
+}
+
+test "L3 M17: an interpolated literal of a type that escapes its values is the flat chain of the escaped values" {
+    try expectSameNormalForm(escapingSource("Str", "\"<p>${input}!</p>\""),
+        \\wobble : Str -> Str
+        \\wobble = |input| "<p>".concat(input.replace_each("<", "&lt;")).concat("!</p>")
+    );
+    const gpa = std.testing.allocator;
+    const escaped = try Staged.createRunning(gpa, escapingSource("{ x : Str, y : Str }", "\"<p>${input.x}${input.y}</p>\""), "");
+    defer escaped.destroy();
+    const written = try Staged.createRunning(gpa,
+        \\wobble : { x : Str, y : Str } -> Str
+        \\wobble = |input| "<p>".concat(input.x.replace_each("<", "&lt;")).concat(input.y.replace_each("<", "&lt;")).concat("</p>")
+    , "");
+    defer written.destroy();
+    if (escaped.outcome != .reified or written.outcome != .reified) return error.TestUnexpectedResult;
+    try expectSameView(escaped, written, .inline_);
 }
 
 // One recursive type has one `TyId` (roc-reify-normal-form.md 2.1). A cycle

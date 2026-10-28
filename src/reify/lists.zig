@@ -11,7 +11,7 @@
 //! | N17c | `List.get(List(e..), x)`, `x` not a literal | a literal switch on `x`, arm `k` giving `Ok(ek)`, the default `Err(OutOfBounds)` | `prim` |
 //! | N17d | `concat`, `append`, `prepend`, `single`, `with_capacity`, `set` and `drop_first`, `take_first` at a literal, `repeat` at a literal of at most B | the `List` node of the result | `prim` |
 //! | N17e | `map`, `map2`, `map_with_index` with a known function; `keep_if` whose every predicate value is a `Bool` literal | the `List` node of the calls; the kept elements | `prim` |
-//! | N17f | `fold`, `fold_rev`, `any`, `all` with a known function; `sum` over a builtin number type | the chain of calls; `Or`, `And` of the calls; the `plus` chain from the first element | `prim` |
+//! | N17f | `fold`, `fold_rev`, `fold_with_index`, `any`, `all` with a known function; `sum` over a builtin number type | the chain of calls; `Or`, `And` of the calls; the `plus` chain from the first element | `prim` |
 //! | N17g | `ForList(List(e..))` of at most B elements, whose every path ends in `Continue` | the body once per element, the slots threaded | `unrollable`, applied by `rebuild.zig` |
 //!
 //! A known function is a `Closure`; N8i makes each `Apply` of it a direct
@@ -56,6 +56,7 @@ pub const steps = [_][]const u8{
     "N17d: concat of adjacent List nodes, append, prepend, single, with_capacity, set, drop_first and take_first at a literal, repeat at a literal of at most B, are the List node of the result",
     "N17e: map, map2 and map_with_index of List nodes with a Closure are the List node of the calls; keep_if whose every inlined predicate value is a Bool literal is the kept elements",
     "N17f: fold and fold_rev with a Closure are the chain of calls, any and all the Or and And of the calls, sum over a builtin number type the plus chain from the first element and 0 for []",
+    "N17f: fold_with_index with a Closure is the chain of calls, each with its index as a U64 literal",
     "N17g: a ForList over a List node of at most B elements whose body ends in Continue and cannot return is its body once per element, the slots threaded",
 };
 
@@ -147,11 +148,11 @@ pub fn redex(store: *const ir.Store, types: *const Types, n: NodeId) ?Step {
         .repeat => if (intLit(store, args[1])) |k| (if (k <= max_unrolled) .build else null) else null,
         .map, .map_with_index => if (known(store, args[0]) != null and isClosure(store, args[1])) .map else null,
         .map2 => if (known(store, args[0]) != null and known(store, args[1]) != null and isClosure(store, args[2])) .map else null,
-        .fold, .fold_rev => if (known(store, args[0]) != null and isClosure(store, args[2])) .fold else null,
+        .fold, .fold_rev, .fold_with_index => if (known(store, args[0]) != null and isClosure(store, args[2])) .fold else null,
         .any, .all => if (known(store, args[0]) != null and isClosure(store, args[1])) .fold else null,
         .sum => if (known(store, args[0]) != null and numOf(types, store.tySlice(nd.tys)[0]) != null) .fold else null,
         .keep_if => null,
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .collect => null,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .collect, .ok_or => null,
     };
 }
 
@@ -281,7 +282,7 @@ pub fn prim(b: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
             return try b.listOf(ty, out);
         },
         .keep_if => return keepIf(b, args, ty),
-        .fold, .fold_rev => {
+        .fold, .fold_rev, .fold_with_index => {
             if (!isClosure(store, args[2])) return null;
             const xs = try dupeKnown(b, args[0]) orelse return null;
             defer b.gpa.free(xs);
@@ -289,6 +290,9 @@ pub fn prim(b: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
             var state = args[1];
             if (p.method == .fold) {
                 for (xs) |x| state = try b.apply(args[2], &.{ state, x }, ty);
+            } else if (p.method == .fold_with_index) {
+                const index_ty = try b.types.intTy(.u64);
+                for (xs, 0..) |x, i| state = try b.apply(args[2], &.{ state, x, try b.litInt(index_ty, @intCast(i)) }, ty);
             } else {
                 var i = xs.len;
                 while (i > 0) {
@@ -336,7 +340,7 @@ pub fn prim(b: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
             for (xs[1..]) |x| acc = try b.primOf(plus, &.{ acc, x }, ty);
             return acc;
         },
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .collect => return null,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .collect, .ok_or => return null,
     }
 }
 
@@ -593,6 +597,17 @@ const Fixture = struct {
             fn b(f: *Fixture) anyerror!Ref {
                 const twice = try f.b.call(.u64, .times, &.{ Ref.rowParam(0), try f.lit(2) });
                 return f.b.call(.u64, .plus, &.{ twice, Ref.rowParam(1) });
+            }
+        }.b);
+    }
+
+    // `|a, b, i| a * 2 + b + i`, which reads the index.
+    fn mixIndexed(self: *Fixture) !Ref {
+        return self.function(&.{ self.u64_ty, self.u64_ty, self.u64_ty }, self.u64_ty, struct {
+            fn b(f: *Fixture) anyerror!Ref {
+                const twice = try f.b.call(.u64, .times, &.{ Ref.rowParam(0), try f.lit(2) });
+                const sum = try f.b.call(.u64, .plus, &.{ twice, Ref.rowParam(1) });
+                return f.b.call(.u64, .plus, &.{ sum, Ref.rowParam(2) });
             }
         }.b);
     }
@@ -884,6 +899,26 @@ test "N17f: fold, fold_rev, sum, any and all over a known list are the chain of 
             return f.prim(.fold_rev, &.{ try f.k12(), try f.lit(4), try f.mix() }, f.u64_ty);
         }
     }.b }, .list_fold, "List.fold_rev(", &.{"call r"});
+    // Each call takes its element's index as a literal; `k * 2` overflows
+    // at the greatest `U64`, as the builtin's first call does.
+    const indexed = try expectCase(.{ .body = struct {
+        fn b(f: *Fixture) anyerror!Ref {
+            return f.prim(.fold_with_index, &.{ try f.k12(), try f.lit(4), try f.mixIndexed() }, f.u64_ty);
+        }
+    }.b }, null, &.{"call r"}, &.{"List.fold_with_index("});
+    defer testing.allocator.free(indexed);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, indexed, "= call r"));
+    try expectStep(.{ .body = struct {
+        fn b(f: *Fixture) anyerror!Ref {
+            return f.prim(.fold_with_index, &.{ try f.k12(), Ref.rowParam(0), try f.mixIndexed() }, f.u64_ty);
+        }
+    }.b }, .list_fold, "List.fold_with_index(", &.{"call r"});
+    // Over `[]` it is the initial state.
+    try expectStep(.{ .body = struct {
+        fn b(f: *Fixture) anyerror!Ref {
+            return f.prim(.fold_with_index, &.{ try f.list(&.{}), Ref.rowParam(0), try f.mixIndexed() }, f.u64_ty);
+        }
+    }.b }, .list_fold, "List.fold_with_index(", &.{"value p0"});
     // `k + 1 + 2` crashes where `k + 1` overflows, as the sum does.
     try expectStep(.{ .body = struct {
         fn b(f: *Fixture) anyerror!Ref {
@@ -1000,4 +1035,118 @@ test "N17 pairs: N17 with N13 and N15a" {
         }
     }.b }, null, &.{"list(p0, n"}, &.{"List.concat("});
     testing.allocator.free(chained);
+}
+
+test "N13c on Try.ok_or: ok_or of a known tag is its payload or the fallback, and the knockout stops it" {
+    inline for (.{ false, true }) |empty| {
+        try expectStep(.{ .body = struct {
+            fn b(f: *Fixture) anyerror!Ref {
+                const t = try f.prim(.first, &.{if (empty) try f.list(&.{}) else try f.k12()}, f.first_ty);
+                return f.b.primOf(prims.find(.try_, .ok_or).?, &.{ t, try f.lit(7) }, f.u64_ty);
+            }
+        }.b }, .known_ok_or, "Try.ok_or(", &.{if (empty) "= 7 : U64" else "value p0"});
+    }
+}
+
+// `Str.from_interpolation`'s assembler (`Builtin.roc`) over the known
+// `segments` and the values `values`: `segments.first().ok_or("")`, folded
+// over the values with `|acc, v, i| acc.concat(v).concat(segments.get(i + 1).ok_or(""))`.
+// The function's row builds the segments it captures in Roc.
+fn assemble(f: *Fixture, segments: []const []const u8, values: []const Ref) !Ref {
+    const b = &f.b;
+    const str = try f.types.strTy();
+    const oob = try f.types.tagUnionTy(&.{.{ .name = "OutOfBounds", .payload = &.{} }});
+    const empty = try f.types.tagUnionTy(&.{.{ .name = "ListWasEmpty", .payload = &.{} }});
+    const get_ty = try f.types.tagUnionTy(&.{ .{ .name = "Ok", .payload = &.{str} }, .{ .name = "Err", .payload = &.{oob} } });
+    const first_ty = try f.types.tagUnionTy(&.{ .{ .name = "Ok", .payload = &.{str} }, .{ .name = "Err", .payload = &.{empty} } });
+    const list_ty = try f.types.listTy(str);
+    const ok_or = prims.find(.try_, .ok_or).?;
+    const concat_str = prims.find(.str, .concat).?;
+    const segs = struct {
+        fn of(fx: *Fixture, ty: TyId, texts: []const []const u8) !Ref {
+            const items = try testing.allocator.alloc(Ref, texts.len);
+            defer testing.allocator.free(items);
+            for (items, texts) |*it, t| it.* = try fx.b.litStr(t);
+            return fx.b.listOf(ty, items);
+        }
+    };
+    const held = b.suspendRow();
+    const step = try b.beginRow(&.{ str, str, f.u64_ty }, str);
+    const at = try b.call(.u64, .plus, &.{ Ref.rowParam(2), try f.lit(1) });
+    const next = try b.primOf(prims.find(.list, .get).?, &.{ try segs.of(f, list_ty, segments), at }, get_ty);
+    const joined = try b.primOf(concat_str, &.{ Ref.rowParam(0), Ref.rowParam(1) }, str);
+    const out = try b.primOf(concat_str, &.{ joined, try b.primOf(ok_or, &.{ next, try b.litStr("") }, str) }, str);
+    try b.endRow(.{ .value = &.{out} });
+    b.resumeRow(held);
+    const clo = try b.closure(step, &.{}, try f.types.funcTy(&.{ str, str, f.u64_ty }, str));
+    const first = try b.primOf(prims.find(.list, .first).?, &.{try segs.of(f, list_ty, segments)}, first_ty);
+    const init = try b.primOf(ok_or, &.{ first, try b.litStr("") }, str);
+    return b.primOf(prims.find(.list, .fold_with_index).?, &.{ try b.listOf(list_ty, values), init, clo }, str);
+}
+
+test "N17 pairs: Str's assembler over known segments is the flat Str.concat chain without empty segments (N17f, N17b, N13c, N15a)" {
+    const cases = [_][]const []const u8{
+        &.{ "a", "b" },
+        &.{ "", "" },
+        &.{ "a", "", "c" },
+        &.{ "", "x", "" },
+        &.{ "", "", "", "" },
+    };
+    const inputs = [_][]const u8{ "", "<p>", "z" };
+    inline for (cases) |segments| {
+        const n = segments.len - 1;
+        var params: [n]TyId = undefined;
+        var values: [n]Ref = undefined;
+        var prints: [2][]u8 = undefined;
+        var raw: Fixture = undefined;
+        try raw.init(true);
+        defer raw.deinit();
+        for (&params, &values, 0..) |*p, *v, i| {
+            p.* = try raw.types.strTy();
+            v.* = Ref.rowParam(@intCast(i));
+        }
+        const raw_root = try raw.b.beginRow(&params, try raw.types.strTy());
+        try raw.b.endRow(.{ .value = &.{try assemble(&raw, segments, &values)} });
+        inline for (.{ false, true }, 0..) |written, w| {
+            var f: Fixture = undefined;
+            try f.init(false);
+            defer f.deinit();
+            const fx = &f;
+            const r = try fx.b.beginRow(&params, try fx.types.strTy());
+            const v = if (written) blk: {
+                // `"s0".concat(p0).concat("s1")...`, as the author writes it.
+                var acc = try fx.b.litStr(segments[0]);
+                for (values, segments[1..]) |x, s| {
+                    acc = try fx.b.call(.str, .concat, &.{ acc, x });
+                    acc = try fx.b.call(.str, .concat, &.{ acc, try fx.b.litStr(s) });
+                }
+                break :blk acc;
+            } else try assemble(fx, segments, &values);
+            try fx.b.endRow(.{ .value = &.{v} });
+            _ = try driver.runTo(testing.allocator, &fx.b, r, &.{}, .inline_);
+            var report = try verify.verifyAll(testing.allocator, &fx.store, &fx.types);
+            defer report.deinit();
+            try testing.expect(report.ok());
+            var out: std.Io.Writer.Allocating = .init(testing.allocator);
+            errdefer out.deinit();
+            try dump.dumpSite(&out.writer, testing.allocator, &fx.store, &fx.types, r);
+            prints[w] = try out.toOwnedSlice();
+            if (!written) {
+                // Soundness: every input, empty strings included, gives what
+                // the assembler gives without the rules.
+                var arena = std.heap.ArenaAllocator.init(testing.allocator);
+                defer arena.deinit();
+                for (inputs) |x0| for (inputs) |x1| {
+                    var args: [n]eval.Value = undefined;
+                    for (&args, 0..) |*a, i| a.* = .{ .str = if (i % 2 == 0) x0 else x1 };
+                    var e0 = try eval.Evaluator.init(arena.allocator(), &raw.store, &raw.types, .strict);
+                    var e1 = try eval.Evaluator.init(arena.allocator(), &fx.store, &fx.types, .strict);
+                    try testing.expect((try e0.run(raw_root, &args)).eql(try e1.run(r, &args)));
+                };
+            }
+        }
+        defer for (prints) |p| testing.allocator.free(p);
+        try testing.expectEqualStrings(prints[1], prints[0]);
+        for ([_][]const u8{ "fold", "ok_or", "List.", "\"\" : Str" }) |gone| try testing.expect(std.mem.find(u8, prints[0], gone) == null);
+    }
 }

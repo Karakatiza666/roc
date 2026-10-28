@@ -345,7 +345,7 @@ const Verifier = struct {
         else switch (p.owner) {
             .bool_ => try self.types.boolTy(),
             .str => try self.types.strTy(),
-            .list, .iter => null,
+            .list, .iter, .try_ => null,
             .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => unreachable, // int and float owners are handled by the branches above
         };
         if (operand) |o| for (0..self.store.refSlice(nd.args).len) |k| if (self.argTy(nd, k) != o) return false;
@@ -358,7 +358,8 @@ const Verifier = struct {
             .append, .keep_if => result == self.argTy(nd, 0),
             .fold => result == self.argTy(nd, 1),
             .prepend, .drop_first, .take_first => result == self.argTy(nd, 0),
-            .fold_rev => result == self.argTy(nd, 1),
+            .fold_rev, .fold_with_index => result == self.argTy(nd, 1),
+            .ok_or => result == self.argTy(nd, 1),
             .any, .all => result == bool_ty,
             .get, .map, .collect, .first, .last, .single, .with_capacity, .set, .repeat, .map2, .map_with_index, .sum => true,
         };

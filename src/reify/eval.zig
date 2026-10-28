@@ -598,6 +598,19 @@ pub const Evaluator = struct {
                 }
                 break :blk state;
             },
+            .fold_with_index => blk: {
+                var state = args[1];
+                for (args[0].list, 0..) |x, i| {
+                    state = try self.apply(args[2], &.{ state, x, .{ .int = @intCast(i) } });
+                    if (state == .bottom) break :blk .bottom;
+                }
+                break :blk state;
+            },
+            // `Ok(v)` gives `v`, `Err(_)` the fallback (`Builtin.roc`).
+            .ok_or => blk: {
+                const ok = self.types.findName("Ok") orelse return error.Unsupported;
+                break :blk if (args[0].tag.name == ok) args[0].tag.payload[0] else args[1];
+            },
             // `any` stops at the first `True`, `all` at the first `False`.
             .any, .all => blk: {
                 const stop = p.method == .any;
@@ -716,7 +729,7 @@ fn floatResult(comptime F: type, method: prims.Method, a: F, b: F) Error!Value {
         .plus => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a + b))) },
         .minus => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a - b))) },
         .times => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a * b))) },
-        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // float prims admit no other methods (prims.admits)
+        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => unreachable, // float prims admit no other methods (prims.admits)
     };
 }
 

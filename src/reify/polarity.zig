@@ -74,7 +74,7 @@ fn collect(store: *const ir.Store, types: *const types_mod.Types, ref: Ref, l: *
                 .not => l.add(true, .negated),
                 .is_lte => if (p.owner.int() != null) l.add(true, .lte) else l.add(false, .plain),
                 .is_lt => if (p.owner.int() != null) l.add(false, .lt) else l.add(false, .plain),
-                .is_eq, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => l.add(false, .plain),
+                .is_eq, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => l.add(false, .plain),
             }
         },
         .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .call, .for_range, .for_list, .loop, .lambda, .apply => l.add(false, .plain),

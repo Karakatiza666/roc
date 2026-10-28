@@ -118,6 +118,8 @@ pub const Algorithm = enum {
     rejected_arm,
     bounded_get,
     decided_not,
+    /// N13c over `Try.ok_or`: `ok_or` of a known tag.
+    known_ok_or,
     scalar_call,
     /// The laws of layer L (`laws.zig`), N16a to N16f.
     law_map,
@@ -1386,6 +1388,7 @@ pub const Builder = struct {
         }
         if (self.rulesActive() and spec.op == .prim) {
             if (try self.decidedNot(spec)) |r| return r;
+            if (try self.knownOkOr(spec)) |r| return r;
             // N13m inside a loop over the list before N17, so the element
             // of a `ForList` over a known list is its element parameter.
             if (try self.boundedGet(spec)) |r| return r;
@@ -1950,6 +1953,24 @@ pub const Builder = struct {
         const key = self.knownKey(spec.args[0]) orelse return null;
         self.algorithmFired(.decided_not);
         return try self.litBool(key == 0);
+    }
+
+    // N13c over `Try.ok_or` (normal-form 3.13): `ok_or` is a `match` on its
+    // `Try` (`Builtin.roc`), so `ok_or(Ok(v), d)` is `v` and `ok_or(Err(e), d)`
+    // is `d`. The `Try` is a nominal, so its tag is read through one `Wrap`.
+    // What the rule drops is a value, so it is dead (C2).
+    fn knownOkOr(self: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
+        const p = prims.lookup(ir.PrimId.of(spec.payload)) orelse return null;
+        if (p.owner != .try_ or p.method != .ok_or or !self.algorithmOn(.known_ok_or)) return null;
+        var t = spec.args[0];
+        if (t.kind != .node) return null;
+        if (self.store.node(t.nodeId()).op == .wrap) t = self.store.refSlice(self.store.node(t.nodeId()).args)[0];
+        if (t.kind != .node) return null;
+        const nd = self.store.node(t.nodeId());
+        if (nd.op != .tag) return null;
+        const ok = self.types.findName("Ok") orelse @import("base").invariant("reify N13c: a Try has no Ok tag", .{});
+        self.algorithmFired(.known_ok_or);
+        return if (nd.payload == ok.index()) self.store.refSlice(nd.args)[0] else spec.args[1];
     }
 
     // N13d over a `Bool` or tag switch (normal-form 3.13): a scrutinee that a
@@ -2621,7 +2642,7 @@ pub const Builder = struct {
             .is_empty => self.types.boolTy(),
             .append, .keep_if => self.store.refTy(self.row, args[0]),
             .fold => self.store.refTy(self.row, args[1]),
-            .get, .map, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // their result types are not derivable from their arguments, and they are never built through `call`
+            .get, .map, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => unreachable, // their result types are not derivable from their arguments, and they are never built through `call`
         };
     }
 
@@ -2954,7 +2975,7 @@ pub const Builder = struct {
                         .str => |text| text.len == 0,
                         .int, .float, .bool_, .dec, .bytes => false,
                     },
-                    .bool_, .iter, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => false,
+                    .bool_, .iter, .try_, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => false,
                 };
                 if (n.op != .lit) return false;
                 const want = prims.identityInt(p.owner.int() orelse return false, p.method) orelse return false;
@@ -3138,7 +3159,7 @@ pub const Builder = struct {
             .bool_ => switch (p.method) {
                 .not => .{ .bool_ = !lits[0].value.bool_ },
                 .is_eq => .{ .bool_ = lits[0].value.bool_ == lits[1].value.bool_ },
-                .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // bool owners only have the not and is_eq folds
+                .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => unreachable, // bool owners only have the not and is_eq folds
             },
             .str => switch (p.method) {
                 .is_eq => .{ .bool_ = std.mem.eql(u8, self.store.byteSlice(lits[0].value.str), self.store.byteSlice(lits[1].value.str)) },
@@ -3149,11 +3170,11 @@ pub const Builder = struct {
                     for (lits) |l| try out.appendSlice(self.gpa, self.store.byteSlice(l.value.str));
                     break :blk .{ .str = try out.toOwnedSlice(self.gpa) };
                 },
-                .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // str owners only have the is_eq and concat folds
+                .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => unreachable, // str owners only have the is_eq and concat folds
             },
             // A list literal is the embedded bytes of a file, whose elements
-            // the rules do not read, and an iterator is never a literal.
-            .list, .iter => null,
+            // the rules do not read, and an iterator or a `Try` is never a literal.
+            .list, .iter, .try_ => null,
             .f32, .f64, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => unreachable, // number owners fold above
         };
     }

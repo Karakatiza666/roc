@@ -400,10 +400,10 @@ pub fn prim(b: *Builder, spec: NodeSpec) Allocator.Error!?Ref {
         .list => switch (p.method) {
             .fold => return fold(b, spec),
             .map => return fused(b, spec),
-            .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .keep_if, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => return null,
+            .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .keep_if, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => return null,
         },
         .iter => return collected(b, spec),
-        .bool_, .str, .u8, .i8, .u16, .i16, .u32, .i32, .i64, .u128, .i128, .f32, .f64 => return null,
+        .bool_, .str, .try_, .u8, .i8, .u16, .i16, .u32, .i32, .i64, .u128, .i128, .f32, .f64 => return null,
     }
 }
 
@@ -422,10 +422,10 @@ pub fn matchPrim(store: *const ir.Store, types: *const Types, nd: ir.Node, sole:
         .list => switch (p.method) {
             .fold => if (closureAt(store, args[2]) != null) return .fold,
             .map => if (sole and fusable(store, args) != null) return .fusion,
-            .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .keep_if, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => {},
+            .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .keep_if, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => {},
         },
         .iter => if (mappedList(store, types, store.tySlice(nd.tys)[0], args[0]) != null) return .iter_map,
-        .bool_, .str, .u8, .i8, .u16, .i16, .u32, .i32, .i64, .u128, .i128, .f32, .f64 => {},
+        .bool_, .str, .try_, .u8, .i8, .u16, .i16, .u32, .i32, .i64, .u128, .i128, .f32, .f64 => {},
     }
     return null;
 }
@@ -482,7 +482,7 @@ fn emptyTest(store: *const ir.Store, method: prims.Method, args: []const Ref) ?E
             if (!isIntLit(store, args[1], 0)) return null;
             return .{ .list = store.refSlice(len.args)[0], .negated = false };
         },
-        .not, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => {},
+        .not, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => {},
     }
     return null;
 }

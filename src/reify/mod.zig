@@ -36,7 +36,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 23;
+pub const normal_form_version: u32 = 24;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -208,6 +208,10 @@ const recorded = [_]Recorded{
     // name it expands again, and a type whose T1 tree is infinite, such as
     // `Pair(a, b) := [Leaf(a), Node(Pair(b, a))]`, is refused.
     .{ .version = 23, .fingerprint = 0x8737202fc6def1b1 },
+    // After M17: interpolated literals. N17f takes `List.fold_with_index`
+    // with a known function, and N13c decides `Try.ok_or` of a known tag.
+    // The builtin table holds both, with the owner `Try`.
+    .{ .version = 24, .fingerprint = 0x9898752b433f4708 },
 };
 
 const std = @import("std");

@@ -427,7 +427,11 @@ pub const Constants = struct {
     /// 188: A staged argument relates the call's own `Code(f)` parameter and
     ///      takes no copy of it, so a `where` receiver in `f` is not copied,
     ///      and checked results of modules with such calls change.
-    pub const CACHE_VERSION = 188;
+    /// 189: Normal form 24: N17f takes `List.fold_with_index` and N13c decides
+    ///      `Try.ok_or` of a known tag, so an interpolated literal of a type
+    ///      that wraps `Str`'s assembler describes as its `Str.concat` chain,
+    ///      and the builtin table's `PrimId`s change.
+    pub const CACHE_VERSION = 189;
 };
 
 /// Configuration for the Roc cache system.

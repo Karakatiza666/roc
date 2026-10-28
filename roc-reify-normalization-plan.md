@@ -529,7 +529,7 @@ walk and in every later rebuild, or a pass.
 | N11m | exits and joins, when a switch or region is closed: T2, a join with one jump inlined there; T3, an exiting switch whose paths end in one kind of terminator to a value switch and one terminator; T4, a join without nodes substituted into its jumps; T5, an exiting switch that reaches no terminator to a value switch; T6, a `Return` in tail position to `Value` | 3.11 |
 | N13a | `Field(Record(...))`, `Index(Tuple(...))`, `Payload(Tag(...))` to the component; the siblings are dropped | 3.13 |
 | N13b | `Unwrap(Wrap(v))` to `v` | 3.13 |
-| N13c | `Switch` on a known `Tag` or `Lit` to the arm | 3.13 |
+| N13c | `Switch` on a known `Tag` or `Lit` to the arm; `Try.ok_or` of a known tag to its payload or the fallback (`Builder.knownOkOr`, normal form version 24) | 3.13 |
 | N13d | `Switch` at a position a dominating arm decided to that arm | 3.13 |
 | N13e | `Switch` on `Bool` with arms `False`, `True` to the scrutinee | 3.13 |
 | N13f | `Switch` on `Bool` with arms `True`, `False` to `Bool.not` | 3.13 |
@@ -555,7 +555,7 @@ walk and in every later rebuild, or a pass.
 | N17c, done | `List.get` of a known list at an index that is not a literal to a literal switch on the index (`lists.get`); N13m keeps the element of a `ForList` over the list at its own index | 3.17 |
 | N17d, done | list builtins whose result's elements follow from known lists and literals to the `List` node of the result; `List.repeat` only at a length of at most B. A `concat` chain merges each run of adjacent known lists, as N13j folds adjacent literals (`lists.concat`) | 3.17 |
 | N17e, done | `map`, `map2`, `map_with_index` over known lists with a known function to the `List` node of the calls; `keep_if` whose every predicate result is a literal to the kept elements. A known function is a `Closure`, and a predicate's result is its row inlined over the element (`Builder.inliner`, `lists.keepIf`) | 3.17 |
-| N17f, done | `fold`, `fold_rev`, `sum`, `any`, `all` over a known list to the chain of calls, `plus`, `Or` or `And`; `sum` over the builtin integer and float types and `Dec` (`lists.prim`) | 3.17 |
+| N17f, done | `fold`, `fold_rev`, `fold_with_index`, `sum`, `any`, `all` over a known list to the chain of calls, `plus`, `Or` or `And`; `sum` over the builtin integer and float types and `Dec` (`lists.prim`). `fold_with_index` was added with the check of interpolated literals after M17 (normal form version 24) | 3.17 |
 | N13u, done within its limits | integer intervals with literal bounds on the fact stack (`ranges.zig`, `Builder.rangeOf`); comparisons they decide (`Builder.rangeCompare`); checked arithmetic they prove speculatable within the region of their facts (`Builder.nodeRange`, `Store.fitFloor`, `place.zig`); the `plus` chains N15a may flatten (`Builder.rangeChain`), where an operand with an empty interval adds nothing to the bounds, so the condition is monotone in the facts; `while $i <= n` under a bounded `n` (N11l, `loops.zig`). The interval conditions of tier F rows wait for the rule-derivation tool's phase D4. Limits: a switch output and a loop slot have the type's full range, as 3.13 states; a node found again by hash-consing in an enclosing region keeps the interval of its first construction; a bound of `while $i <= n` that the loop body computes has no interval where the loop is built | 3.13 |
 
 ### 3.4 Structure: passes over whole rows
@@ -747,7 +747,8 @@ site's own module. In the cut, the literal is
 `T.from_interpolation(list(segments), list(values))`, where the n + 1
 segments include the empty ones and both lists keep source order
 (`src/check/code_reifier.zig` `interpolationExpr`). Outside the cut, the
-conversion is walked to the fold of `Str`. These tests in
+conversion is walked to the fold of `Str`, which after M17 is its
+`Str.concat` chain (see the check after M17 below). These tests in
 `src/compile/test/code_reifier_test.zig` pin it:
 
 | Type's module | In the cut | Outside the cut |
@@ -799,6 +800,26 @@ meet as one flat `Str.concat` chain:
 
 A conversion that also transforms the values, such as escaping, must give the
 same chain with the transform applied to each value. Pin both with L3 pairs.
+Done (normal form version 24; `CACHE_VERSION` 189). Two steps were missing
+after M17, and both are now built:
+
+| Missing step | Built as | Why it is in the plan |
+|---|---|---|
+| `List.fold_with_index` over a known list | N17f, one more builtin of the row (`src/reify/lists.zig`) | the assembler of `Str` folds with it, and N17f is the fold over a known list |
+| `Try.ok_or(Ok(v), d)` | N13c over the body of `ok_or`, a `match` on its `Try` (`Builder.knownOkOr`), as `Builder.decidedNot` is N13d over `Bool.not` | N17b gives `Ok(ei)`, which the assembler reads through `ok_or` |
+
+N15a already flattened the chain and dropped `""`. The builtin table holds
+both builtins, with the new owner `Try`. With one value, the three sources
+are one dump in `graph`. With two or more values, the fold's function is one
+row called once per value in `graph`, as N17f gives for any fold (tier B),
+and the chain is in `inline`. The tests:
+
+| Test | File |
+|---|---|
+| "L3 M17: an interpolated literal at Str, at a type that only wraps the assembler of Str, and the written concat are one flat chain" | `src/compile/test/code_reifier_test.zig` |
+| "L3 M17: an interpolated literal of several values is the flat chain in `inline`, without its empty segments" | the same |
+| "L3 M17: an interpolated literal of a type that escapes its values is the flat chain of the escaped values" | the same |
+| "N17f: fold, fold_rev, sum, any and all over a known list ..." (now with `fold_with_index`), "N13c on Try.ok_or ...", "N17 pairs: Str's assembler over known segments is the flat Str.concat chain without empty segments ..." | `src/reify/lists.zig` |
 
 Each extension changes normal forms, so after a first release each one ships
 as a language-version change.

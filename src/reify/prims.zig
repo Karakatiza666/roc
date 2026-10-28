@@ -20,6 +20,8 @@ pub const Owner = enum(u8) {
     list,
     /// `Iter`, whose `collect` layer L reads (N16e).
     iter,
+    /// `Try`, whose `ok_or` N13c decides on a known tag.
+    try_,
     u8,
     i8,
     u16,
@@ -46,7 +48,7 @@ pub const Owner = enum(u8) {
             .i64 => .i64,
             .u128 => .u128,
             .i128 => .i128,
-            .bool_, .str, .list, .iter, .f32, .f64 => null,
+            .bool_, .str, .list, .iter, .try_, .f32, .f64 => null,
         };
     }
 
@@ -71,7 +73,7 @@ pub const Owner = enum(u8) {
         return switch (self) {
             .f32 => .f32,
             .f64 => .f64,
-            .bool_, .str, .list, .iter, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => null,
+            .bool_, .str, .list, .iter, .try_, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => null,
         };
     }
 
@@ -87,6 +89,7 @@ pub const Owner = enum(u8) {
             .str => "Str",
             .list => "List",
             .iter => "Iter",
+            .try_ => "Try",
             .u8 => "Num.U8",
             .i8 => "Num.I8",
             .u16 => "Num.U16",
@@ -147,6 +150,9 @@ pub const Method = enum(u8) {
     sum,
     any,
     all,
+    fold_with_index,
+    /// The builtin of `Try` N13c decides on a known tag.
+    ok_or,
 };
 
 /// One builtin's entry.
@@ -176,16 +182,17 @@ fn methodApplies(owner: Owner, method: Method) bool {
         .not => owner == .bool_,
         .concat => owner == .str or owner == .list,
         .len, .get, .is_empty, .append, .map, .keep_if, .fold => owner == .list,
-        .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => owner == .list,
+        .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index => owner == .list,
         .collect => owner == .iter,
+        .ok_or => owner == .try_,
     };
 }
 
 fn arityOf(method: Method) u8 {
     return switch (method) {
         .not, .len, .is_empty, .collect, .first, .last, .single, .with_capacity, .sum => 1,
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .get, .append, .map, .keep_if, .prepend, .drop_first, .take_first, .repeat, .map_with_index, .any, .all => 2,
-        .fold, .set, .map2, .fold_rev => 3,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .get, .append, .map, .keep_if, .prepend, .drop_first, .take_first, .repeat, .map_with_index, .any, .all, .ok_or => 2,
+        .fold, .set, .map2, .fold_rev, .fold_with_index => 3,
     };
 }
 
@@ -201,7 +208,7 @@ fn speculatableOf(owner: Owner, method: Method) bool {
         .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty => true,
         .plus, .minus, .times => owner.float() != null,
         .div_trunc, .append, .map, .keep_if, .fold, .collect => false,
-        .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => false,
+        .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => false,
     };
 }
 
@@ -212,7 +219,7 @@ pub fn ordersLiteralLast(owner: Owner, method: Method) bool {
     return switch (method) {
         .plus, .times => owner.int() != null,
         .is_eq => owner.int() != null or owner == .str,
-        .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .is_lt, .is_lte, .is_gt, .is_gte, .not, .minus, .div_trunc, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => false,
+        .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .is_lt, .is_lte, .is_gt, .is_gte, .not, .minus, .div_trunc, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => false,
     };
 }
 
@@ -220,7 +227,7 @@ pub fn ordersLiteralLast(owner: Owner, method: Method) bool {
 pub fn associativeOf(method: Method) bool {
     return switch (method) {
         .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat => true,
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => false,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => false,
     };
 }
 
@@ -302,7 +309,7 @@ pub fn lookup(id: PrimId) ?Prim {
 pub fn methodName(method: Method) []const u8 {
     return switch (method) {
         .div_trunc => "div_trunc_by",
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => @tagName(method),
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => @tagName(method),
     };
 }
 
@@ -350,7 +357,7 @@ pub fn identityInt(int: types.IntTy, method: Method) ?i256 {
         .plus_wrap, .bitwise_or, .bitwise_xor => 0,
         .times_wrap => 1,
         .bitwise_and => if (int.signed()) -1 else int.max(),
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => null,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => null,
     };
 }
 
@@ -362,7 +369,7 @@ pub fn absorbingInt(int: types.IntTy, method: Method) ?i256 {
     return switch (method) {
         .times_wrap, .bitwise_and => 0,
         .bitwise_or => if (int.signed()) -1 else int.max(),
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => null,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => null,
     };
 }
 
@@ -400,7 +407,7 @@ pub fn foldInt(int: types.IntTy, method: Method, a: i256, b: i256) ?Folded {
         .bitwise_and => .{ .int = wrapTo(int, a & b) },
         .bitwise_or => .{ .int = wrapTo(int, a | b) },
         .bitwise_xor => .{ .int = wrapTo(int, a ^ b) },
-        .not, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // integer prims admit no other methods (methodApplies)
+        .not, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => unreachable, // integer prims admit no other methods (methodApplies)
     };
 }
 
@@ -434,7 +441,7 @@ fn floatFold(comptime F: type, method: Method, a: F, b: F) ?Folded {
         .plus => arith.bits(a + b),
         .minus => arith.bits(a - b),
         .times => arith.bits(a * b),
-        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => null,
+        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => null,
     };
 }
 

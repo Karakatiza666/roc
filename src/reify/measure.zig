@@ -166,7 +166,7 @@ pub fn ofRow(gpa: std.mem.Allocator, store: *const ir.Store, types: *const types
                 switch (p.method) {
                     .is_gt, .is_gte => m.add(.flipped_comparisons, mult),
                     .not => if (isConnective(store, store.refSlice(nd.args)[0])) m.add(.negated_connectives, mult),
-                    .is_eq, .is_lt, .is_lte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => {},
+                    .is_eq, .is_lt, .is_lte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => {},
                 }
             }
         }

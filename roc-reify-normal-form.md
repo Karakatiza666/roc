@@ -1173,6 +1173,7 @@ already known from the graph:
 | `Str.is_eq` or `Str.concat` over `Str` literals | the `Bool` or `Str` literal | none |
 | a chain of `plus_wrap`, `times_wrap`, `bitwise_and`, `bitwise_or`, `bitwise_xor` or `Str.concat` with two literals side by side | the chain with the two replaced by the literal they compute | none: the order of the other operands is kept |
 | `Bool.not(x)` where a dominating arm or an earlier `And` or `Or` operand decided `x` | the opposite `Lit` | the same fact rule as for `Switch` (`Builder.decidedNot`) |
+| `Try.ok_or(Tag(Ok, v), d)`, `Try.ok_or(Tag(Err, e), d)`, the tag read through one `Wrap` | `v`, `d` | none: `ok_or` is a `match` on its `Try` (`Builtin.roc:5643-5647`), so this is the `Switch` on a known `Tag` above, over the builtin's body (`Builder.knownOkOr`) |
 | a `Bool` that ends an arm or an operand, where a dominating arm or an earlier operand decided it | the `Lit` it decided | the same fact rule as for `Switch` (`Builder.decidedRefs`): `if c a else c` ends its `False` arm in `False` |
 | `Prim(p)` over `Lit` arguments, `p` not speculatable | the `Lit` it computes | only when this evaluation does not fail: `7 // 2` folds, `1 // 0` stays, because folding it into a `Crash` would evaluate where the body might not |
 | `List.get(xs, i)` under a dominating `is_lt(i, List.len(xs))`, `i` a `U64` | `Tag(Ok, Elem(xs, i))` | the index is in bounds. The bound comes from a dominating arm, from an `And` operand or `Or` operand, from `Bool.not` of the inverse test, or from `is_lte(List.len(xs), i)` in the other arm (`Builder.boundedGet`) |
@@ -1528,7 +1529,7 @@ replaced by what their bodies in `Builtin.roc` compute:
 | N17c | `List.get(List(e0..en-1), x)` with `x` not a literal | a literal switch on `x` with keys `0` to `n - 1`, arm `k` giving `Ok(ek)`, and the default giving `Err(OutOfBounds)` | the same body, with `index < len` decided per key |
 | N17d | `concat`, `append`, `prepend`, `single`, `with_capacity`, `set` at a literal index, `drop_first` and `take_first` with a literal count, over known lists | the `List` node of the result's elements | each builtin's body |
 | N17e | `map`, `map2`, `map_with_index` over known lists with a known function; `keep_if` where every `p(ei)` is a `Bool` literal | the `List` node of the calls, in element order, and N8i makes each a direct call; for `keep_if`, the kept elements | the builtins' loops, which call the function once per element, in order |
-| N17f | `fold`, `fold_rev`, `sum`, `any`, `all` over a known list | the chain of calls; `sum` as the `plus` chain from the first element, `(e1 + e2) + e3`, and `default()` for `[]`; `any` and `all` as n-ary `Or` and `And` of the calls | `Builtin.roc:4747-4754`, `:3300-3310`, `:4884`, `:4912` |
+| N17f | `fold`, `fold_rev`, `fold_with_index`, `sum`, `any`, `all` over a known list | the chain of calls, `fold_with_index` with each element's index as a `U64` literal; `sum` as the `plus` chain from the first element, `(e1 + e2) + e3`, and `default()` for `[]`; `any` and `all` as n-ary `Or` and `And` of the calls | `Builtin.roc:4747-4754`, `:3300-3310`, `:4884`, `:4912`, `:4943-4954` |
 | N17g | `ForList(List(e1..en))` with `n` at most B, whose every path ends in `Continue` | the body once per element, in order, with the slots threaded from one copy to the next | the loop's own semantics |
 
 Each row is exact in Roc under C2. A `List` node evaluates all of its
@@ -1549,6 +1550,7 @@ With N17 on, the list refactors below meet:
 | `[c.r, c.g, c.b].map2(weights, \|a, w\| a * w).sum()` with `weights` a known list, and `c.r * w0 + c.g * w1 + c.b * w2` | one `plus` chain in `inline`. In `graph`, the lambda is a row called three times (tier B) |
 | `for x in [a, b, c] { $s = f($s, x) }` and `[a, b, c].fold(s0, f)` | the same three calls |
 | `[a, b].concat([c])` and `[a, b, c]` | one `List` node |
+| `"a${x}b"` at `Str`, the same literal at a type whose `from_interpolation` only wraps `Str.from_interpolation`, and `"a".concat(x).concat("b")` | one flat `Str.concat("a", x, "b")`: N17f makes the assembler's `fold_with_index` its calls, N17b reads each segment, N13c decides `ok_or`, and N15a flattens the chain and drops `""`. A conversion that transforms each value has the transform on each value. With two or more values, the fold's function is one row called per value in `graph` (tier B), and the chain is in `inline` |
 
 What stays apart, or unchanged:
 

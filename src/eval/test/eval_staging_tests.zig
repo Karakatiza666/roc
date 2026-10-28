@@ -1526,7 +1526,9 @@ const staged_interpolation = stage ++
 // segments, so the walk runs it by its definition where the literal stands;
 // the literal is the closure it hands back, applied to the list of the
 // interpolated values. A conversion that wraps the assembler of `Str` is
-// walked through `Str.from_interpolation`, so the translator sees its fold.
+// walked through `Str.from_interpolation`, whose fold over the values the
+// literal fixes the length of, so the translator sees the `Str.concat` chain
+// the literal at `Str` describes as.
 const staged_custom_interpolation = stage ++
     \\Label := { text : Str }.{
     \\    from_interpolation : List(Str) -> Try((List(Str) -> Label), [InvalidInterpolation(Str)])
@@ -1543,7 +1545,7 @@ const staged_custom_interpolation = stage ++
 // A conversion that rejects segments branches in its first stage. The program
 // compiled, so the stage returned `Ok` for these segments, and the arm that
 // only delivers `Err` is not described. A conversion that also transforms
-// the values has the transform on each value, inside the fold.
+// the values has the transform on each value, inside the chain.
 const staged_escaping_interpolation = stage ++
     \\Html := [Html(Str)].{
     \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
@@ -2689,22 +2691,22 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(Str.concat('p', Num.F32.to_str(p0), 'q')) { False => 0 | True => p0 } | r0 = |F32| -> F32 switch Str.is_empty(Num.F32.to_str(p0)) { False => 0 | True => p0 }\"" },
     },
     .{
-        .name = "staging - an interpolated literal of the author's own type describes as the fold its conversion hands back",
+        .name = "staging - an interpolated literal of the author's own type describes as the concatenation its conversion hands back",
         .source_kind = .module,
         .source = staged_custom_interpolation,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(List.fold_with_index([Num.F32.to_str(p0)], Try.ok_or(Builtin.Try.(Ok('a')), ''), closure r1(['a', 'b']))) { False => p0 | True => 0 } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(Str.concat('a', Num.F32.to_str(p0), 'b')) { False => p0 | True => 0 }\"" },
     },
     .{
-        .name = "staging - an interpolated literal of a type that escapes its values has the escape inside the fold",
+        .name = "staging - an interpolated literal of a type that escapes its values has the escape inside the concatenation",
         .source_kind = .module,
         .source = staged_escaping_interpolation,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(List.fold_with_index([Str.replace_each(Num.F32.to_str(p0), '<', '&lt;')], Try.ok_or(Builtin.Try.(Ok('<p>')), ''), closure r1(['<p>', '!</p>']))) { False => p0 | True => 0 } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(Str.concat('<p>', Str.replace_each(Num.F32.to_str(p0), '<', '&lt;'), '!</p>')) { False => p0 | True => 0 }\"" },
     },
     .{
         .name = "staging - an interpolated literal of the author's own type describes as an argument",
         .source_kind = .module,
         .source = staged_interpolation_argument,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.U64.is_lt(3, Str.count_utf8_bytes(List.fold_with_index([Num.F32.to_str(p0)], Try.ok_or(Builtin.Try.(Ok('x')), ''), closure r1(['x', 'y'])))) { False => 0 | True => p0 } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.U64.is_lt(3, Str.count_utf8_bytes(Str.concat('x', Num.F32.to_str(p0), 'y'))) { False => 0 | True => p0 }\"" },
     },
     .{
         .name = "staging - a top-level value folds at the wider union its use reads",
