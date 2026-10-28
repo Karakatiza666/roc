@@ -203,6 +203,35 @@ What stays, because it is interface rather than spelling:
 | literal values and their types | they are the computation |
 | `Derived(method, ty)` | it has no body to normalize |
 
+### 2.1 One spelling per type
+
+A type is a tree. A recursive type is infinite, so the tree closes it with
+`Recursive(name)`, a reference to the nearest enclosing `Named` of that name.
+One infinite type has many such trees. A cycle through two nominals can close
+at either nominal, and a tree can unroll the cycle any number of times before
+it closes. The normal form keeps one tree for each type, so one type has one
+`TyId` and type equality stays integer equality.
+
+| Rule | Statement |
+|---|---|
+| T1 | A nominal is `Recursive(name)` exactly where the nearest enclosing `Named` of its name is the same type. Everywhere else it is `Named(name, backing)`. |
+| T2 | The type of a node is spelled from its own root. A field, element, payload, parameter or result of that type is spelled from its own root too, because a record, list, tuple, union or function adds no enclosing `Named`. The backing of a nominal is not: `Unwrap` and `Wrap` use the backing spelled again from its own root. |
+
+For `Person := { links : List(Link) }` and `Link := { row : Person }`:
+
+| Type | Its one tree |
+|---|---|
+| `Person` | `Named(Person, { links : List(Named(Link, { row : Recursive(Person) })) })` |
+| `Link` | `Named(Link, { row : Named(Person, { links : List(Recursive(Link)) }) })` |
+| the backing of `Link`, which `Unwrap` gives | `{ row : P }`, where `P` is the `Person` tree above |
+
+Without T1, the `Person` that a `Link` holds and the `Person` that a walk
+starts at were two `TyId`s. The verifier and the rebuild compare types by
+`TyId`, so they refused or misread equal types. `Types.canonical` and
+`Types.unfold` (`src/reify/types.zig:346`, `:366`) spell a type by T1, and the
+reifier spells each type it gives a node by T1 (`tyOf`,
+`src/check/code_reifier.zig:6322`).
+
 ---
 
 ## 3. Normalization steps

@@ -23666,6 +23666,11 @@ Builtin :: [].{
 			## reaches itself at other type arguments gets a `Named` of its own
 			## at those arguments, so the nearest enclosing `Named` of that
 			## name is always the type meant.
+			##
+			## A type has one description. A nominal is `Recursive` exactly
+			## where the nearest enclosing `Named` of its name is the same type,
+			## so two equal types are equal `Ty` values, wherever a cycle
+			## through two nominals is entered.
 			Recursive(Str),
 
 			## A tag union, each variant by name with the types of its payloads.

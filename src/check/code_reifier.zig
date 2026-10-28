@@ -2533,7 +2533,9 @@ pub const Reifier = struct {
             .{ .name = "Err", .payload = &.{err_ty} },
             .{ .name = "Ok", .payload = &.{ok_ty} },
         });
-        return types.nominalTy(try_type_name, backing);
+        // `ok` can hold this very `Try` in a cycle, so the type is spelled
+        // canonically as a whole (roc-reify-normal-form.md 2.1).
+        return types.canonical(try types.nominalTy(try_type_name, backing));
     }
 
     /// The name the type table gives the builtin `Try`: the registry entry
@@ -6318,6 +6320,18 @@ pub const Reifier = struct {
     /// is inside is `Recursive(name)`; a builtin the normal form has no shape
     /// for, and an opaque nominal, is `Opaque(name, args)`.
     fn tyOf(self: *Reifier, type_id: CheckedTypeId, region: base.Region) Error!TyId {
+        const ty = try self.tyInNominals(type_id, region);
+        // Outside every nominal the type is closed, and a recursive one gets
+        // its one spelling there (roc-reify-normal-form.md 2.1). Inside one,
+        // a part may still name a nominal around it, and the cache can hand
+        // back a part spelled at its own root, so a part is left as built.
+        if (self.nominal_in_progress.count() != 0) return ty;
+        return self.rt().canonical(ty);
+    }
+
+    /// `tyOf` while the walk may be inside a nominal: a correct spelling,
+    /// not yet the canonical one.
+    fn tyInNominals(self: *Reifier, type_id: CheckedTypeId, region: base.Region) Error!TyId {
         // Resolving at the leaf is enough: a composite holding a variable is
         // reached by recursion into the variable itself.
         if (self.fixedType(type_id)) |fixed| {

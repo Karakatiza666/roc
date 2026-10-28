@@ -414,7 +414,9 @@ pub const Constants = struct {
     /// 183: Normal form 20: known lists (N17, M17). List builtins over a
     ///      `List` node are their results and a loop over one of at most B
     ///      elements is unrolled, so described bodies change.
-    pub const CACHE_VERSION = 183;
+    /// 184: Normal form 21: one spelling per recursive type (2.1), so the
+    ///      types of described bodies over a cycle of two nominals change.
+    pub const CACHE_VERSION = 184;
 };
 
 /// Configuration for the Roc cache system.

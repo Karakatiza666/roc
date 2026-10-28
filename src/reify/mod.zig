@@ -36,7 +36,7 @@ pub const fuzz_gen = @import("fuzz_gen.zig");
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 20;
+pub const normal_form_version: u32 = 21;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -84,6 +84,8 @@ pub fn fingerprint() u64 {
     // M17: known lists (N17), and B.
     for (lists.steps) |step| h.update(step);
     h.update(std.mem.asBytes(&lists.max_unrolled));
+    // 2.1: one spelling per type.
+    h.update("T1: a nominal is Recursive exactly where the nearest enclosing Named of its name is the same type; T2: a node's type, and the backing an Unwrap gives, are spelled from their own root");
     return h.final();
 }
 
@@ -188,6 +190,11 @@ const recorded = [_]Recorded{
     // B = 16 elements whose every path continues is its body once per
     // element. The builtin table holds the list builtins N17 reads.
     .{ .version = 20, .fingerprint = 0x8a67c5235ae7e495 },
+    // Fix: one recursive type has one spelling (2.1, T1 and T2). A cycle
+    // through two nominals closes where the nearest enclosing nominal of the
+    // name is the same type, however the walk entered the cycle, and the
+    // backing an `Unwrap` gives is spelled from its own root.
+    .{ .version = 21, .fingerprint = 0x36f06b3039448e99 },
 };
 
 const std = @import("std");

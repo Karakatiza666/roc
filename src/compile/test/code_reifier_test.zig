@@ -7270,3 +7270,152 @@ test "L3 M17: the builtins of a known list are their results" {
         \\wobble = |input| 3 + input + 3 + 4
     );
 }
+
+// One recursive type has one `TyId` (roc-reify-normal-form.md 2.1). A cycle
+// through two nominals has a tree for each nominal it can be closed at, and
+// these three sites compared two of those trees as two types.
+
+/// `wobble` over `C`, a row whose optional field reaches `C` again through
+/// the type `nick` is written as.
+fn optionalReadOf(comptime nick: []const u8) []const u8 {
+    return
+    \\Wrap(a) := { items : List(a) }
+    \\
+    ++ "C := { name : Str, nick ?: " ++ nick ++ " }\n\n" ++
+        \\wobble : C -> Bool
+        \\wobble = |input| input.?nick.is_ok()
+    ;
+}
+
+test "a `.?` read of a field that reaches its row again through a second nominal has the type of the whole path" {
+    // The field's `Try` is built from the record's field type, and the path's
+    // from the checker's type of the whole read. Both are one type, so they
+    // are one `TyId`.
+    const staged = try Staged.createRunning(std.testing.allocator, optionalReadOf("Wrap(C)"), "");
+    defer staged.destroy();
+    try staged.expectDump(
+        \\row r0 (C) -> Bool
+        \\  n0 = unwrap(p0) : { name : Str, nick ? Wrap }
+        \\  n1 = opt_field(n0) : Builtin.Try
+        \\  n2 = Try.is_ok(n1) : Bool !spec
+        \\  value n2
+        \\
+    );
+}
+
+test "a `.?` read of a field that reaches its row without a second nominal, or not at all, reifies alike" {
+    inline for (.{ "Wrap(Str)", "List(C)", "[Has(C), No]" }) |nick| {
+        const staged = try Staged.createRunning(std.testing.allocator, optionalReadOf(nick), "");
+        defer staged.destroy();
+        if (staged.outcome != .reified) return error.TestUnexpectedResult;
+    }
+}
+
+/// `wobble` comparing a `Link(Customer)` with one it builds, where
+/// `Customer` holds `referrer`.
+fn linkCompareOf(comptime referrer: []const u8) []const u8 {
+    return
+    \\Link(row) := { key : Str, row : List(row) }.{
+    \\    is_eq : Link(row), Link(row) -> Bool
+    \\    is_eq = |Link.(a), Link.(b)| a.key == b.key
+    \\}
+    \\
+    \\link : Str -> Link(row)
+    \\link = |key| Link.({ key, row: [] })
+    \\
+    ++ "Customer := { name : Str, referrer : " ++ referrer ++ " }\n\n" ++
+        \\wobble : { customer : Link(Customer) } -> Bool
+        \\wobble = |input| input.customer == link("ada")
+    ;
+}
+
+test "an inlined method over a nominal whose argument reaches the nominal again is read at the type it gives" {
+    // `is_eq` is inlined, and the call's type and the inlined row's result
+    // are one type, so its ends need no widening.
+    const staged = try Staged.createRunning(std.testing.allocator, linkCompareOf("Link(Customer)"), "");
+    defer staged.destroy();
+    try staged.expectDump(
+        \\row r0 ({ customer : Link }) -> Bool
+        \\  n0 = field 0(p0) : Link
+        \\  n1 = unwrap(n0) : { key : Str, row : List(Customer) }
+        \\  n2 = field 0(n1) : Str
+        \\  n3 = "ada" : Str
+        \\  n4 = Str.is_eq(n2, n3) : Bool
+        \\  value n4
+        \\
+    );
+}
+
+test "an inlined method over a nominal whose argument reaches it through a union, or not at all, reifies alike" {
+    inline for (.{ "[Nobody, Referred(Link(Customer))]", "Str", "List(Customer)" }) |referrer| {
+        const staged = try Staged.createRunning(std.testing.allocator, linkCompareOf(referrer), "");
+        defer staged.destroy();
+        if (staged.outcome != .reified) return error.TestUnexpectedResult;
+    }
+}
+
+test "an inlined method that unwraps one nominal of a cycle to the other gives the type spelled at the other's root" {
+    // `get` is walked by its body: its `Unwrap` of `Link` gives the backing
+    // that holds `Person`, and the row's result is `Person` itself.
+    const staged = try Staged.createRunning(std.testing.allocator,
+        \\Person := { links : List(Link) }
+        \\
+        \\Link := { row : Person }.{
+        \\    get : Link -> Person
+        \\    get = |Link.(l)| l.row
+        \\}
+        \\
+        \\wobble : Link -> Bool
+        \\wobble = |input| input.get().links.is_empty()
+    , "");
+    defer staged.destroy();
+    try staged.expectDump(
+        \\row r0 (Link) -> Bool
+        \\  n0 = unwrap(p0) : { row : Person }
+        \\  n1 = field 0(n0) : Person
+        \\  n2 = unwrap(n1) : { links : List(Link) }
+        \\  n3 = field 0(n2) : List(Link)
+        \\  n4 = List.is_empty(n3) : Bool
+        \\  value n4
+        \\
+    );
+}
+
+test "an inlined unwrap in a cycle through a union, a generic link, or self recursion alone reifies alike" {
+    inline for (.{
+        // The cycle runs through a tag union.
+        \\Person := { referrer : [Nobody, Referred(Link)] }
+        \\
+        \\Link := { row : Person }.{
+        \\    get : Link -> Person
+        \\    get = |Link.(l)| l.row
+        \\}
+        \\
+        \\wobble : Link -> Bool
+        \\wobble = |input| match input.get().referrer { Nobody => Bool.True, Referred(_) => Bool.False }
+        ,
+        // The link is generic.
+        \\Person := { links : List(Link(Person)) }
+        \\
+        \\Link(row) := { row : row }.{
+        \\    get : Link(row) -> row
+        \\    get = |Link.(l)| l.row
+        \\}
+        \\
+        \\wobble : Link(Person) -> Bool
+        \\wobble = |input| input.get().links.is_empty()
+        ,
+        // One nominal reaches itself.
+        \\Person := { links : List(Person) }.{
+        \\    links_of : Person -> List(Person)
+        \\    links_of = |Person.(p)| p.links
+        \\}
+        \\
+        \\wobble : Person -> Bool
+        \\wobble = |input| input.links_of().is_empty()
+    }) |source| {
+        const staged = try Staged.createRunning(std.testing.allocator, source, "");
+        defer staged.destroy();
+        if (staged.outcome != .reified) return error.TestUnexpectedResult;
+    }
+}
