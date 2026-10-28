@@ -91,7 +91,7 @@ The tests, in layers. The counts were taken at the time of writing.
 | Layer | Where | What it catches |
 |---|---|---|
 | Normal-form unit tests | `src/reify/` (221 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
-| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (234 tests) | a walk that describes a body wrongly |
+| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (247 tests) | a walk that describes a body wrongly, and a row of the safety matrix (`roc-reify-normalization-plan.md` 5.12, M14) that meets where it must stay apart, or the reverse |
 | Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (134 cases) | the same, for calls into other modules and builtins |
 | CLI fixtures | `test/cli/Staged*.roc` (61 files) and `test/cli/StagedCut/`, run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
 | Fuzzers | `src/reify/fuzz_gen.zig`, `src/compile/reify_fuzz.zig`, `test/fuzzing/fuzz-reify.zig` | two spellings of one term that differ, or a normal form that computes what Roc does not |

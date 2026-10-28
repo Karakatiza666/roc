@@ -695,7 +695,7 @@ made breaks a translator.
 | 4 | M3, done | N8d to N8g, N8i, N8j, V1, P1 | rows are digests and are finalized before their callers. These rows of R hold: helper renames, moves, generic helpers, parameter order, extraction of a helper with one use, and two identical helpers. A component that stops being recursive is treated as not recursive. A function chosen by an `if` or read from a record literal is called directly | 4.1: extract or inline a helper with one use; reorder top-level definitions |
 | 5 | M8a, done | I9, V2, V6 | a translator refuses a node through `refuse_at`, and the compiler reports it at every source region of that node. A `Code.Inlined(f)` site gets the `inline` view. In it, every non-recursive helper is inlined, however many calls it has, and a `Closure` of a non-recursive row is a `Lambda` region | 4.1: extract or inline a helper with many uses. 4.2: `refuse_at` |
 | 6 | M13, done | I14, N8h with the declared cut, N8l; the edits of `roc-reify-refactor-safety.md` 6 | a translator declares its cut, and the site carries it. A function in the cut is a primitive (N8h). Every other function is walked by its body, in any package (N8l). The GLSL example declares `Glsl.roc`'s primitives as its cut and keeps its output. `roc-reify-proposal.md` states R, the cut, the policy of 1.9 for dependency bodies, and the table of safety section 5 | 4.3, replaced by the policy of 1.9. 6: the proposal edits |
-| 7 | M14 | no new steps; tests only | each row of the safety document's R table (its 4.1), and each row of its section 2 that R absorbs, has an L3 pair that names the row and meets. Each row of its section 5 has an L3 pair that stays apart. Section 5.12 here records the matrix | 4.2: the guarantee is a test |
+| 7 | M14, done | no new steps; tests only | each row of the safety document's R table (its 4.1), and each row of its section 2 that R absorbs, has an L3 pair that names the row and meets. Each row of its section 5 has an L3 pair that stays apart. Section 5.12 here records the matrix | 4.2: the guarantee is a test |
 | 8 | M6, done | N12, N11g to N11l, V7 | there are three canonical loop forms, with the slot, exit and raising rules. The three `sum_to` bodies of normal-form 11.1 meet as one `ForRange`. `for x in xs` meets `for x in xs.iter()` and an index `while`. Translators read what a loop iterates over | none. It is the first extension, because loop form is the refactor that section 2 there shows breaking the GLSL translator. Built as normal form version 8, with limits: (1) the slots keep their order, so the N9 loop-slot rule below is still not a fixpoint question, because no rule reorders slots; (2) a bounded loop keeps one output per slot and narrows by whole slots; (3) the return-to-break rule needs a general `Loop` with one output of the row's type; (4) the language has no `continue` yet (`docs/langref/statements.md`), so the L3 pair for `continue` is the update in each branch against one update of the `if`; (5) `exits_early` counts a `Break` of the loop itself and a `Return`, and not a `Break` of a loop nested in it |
 | 9 | M15 | the rule-derivation phase D5 | S1 and S2 reach an empty report at k = 6 (`roc-reify-rule-derivation.md` 5). The admitted rows enter the table through `--admit`, and criterion 1 of 6.1 there is run again, for rows whose left side has a size of 6 or less | none: completeness of the rule set up to size 6 |
 | 10 | M16 | the rule-derivation phase D6 | S1 and S2 reach an empty report at k = 7. The switch-over-switch terms of G6 are enumerated. The groups that only N13r joins are filed against N13r, which lands in M5 | none: completeness of the rule set up to size 7 |
@@ -1052,27 +1052,33 @@ fills in the last column. Rows marked "meets" must give one normal form. Rows
 marked "apart" must give two, and each is a row of `roc-reify-refactor-safety.md`
 5 that R leaves out on purpose.
 
+M14 is done. The matrix has 20 rows: 15 meet, 5 stay apart, and 0 are
+deferred. Every test is in `src/compile/test/code_reifier_test.zig`, except the
+CLI case of the last row. A row that an earlier milestone pinned keeps that
+test; M14 wrote the 10 tests whose names start with "L3 M14". No row that must
+meet failed to meet, so M14 changed no rule and no version.
+
 | Refactor | Safety document | Absorbed by | Milestone | Expected | Test |
 |---|---|---|---|---|---|
-| rename a local or a parameter | 4.1, 2 | N2 | M1 | meets | |
-| reorder independent bindings | 4.1, 2 | N4, N9 | M2 | meets | |
-| bind a value once or write it twice | 4.1 | N5a, N5c | M2 | meets | |
-| drop a binding nothing reads | 4.1 | N6 | M2 | meets | |
-| extract or inline a helper with one use | 4.1, 2 | N8d to N8g, V1 | M3 | meets | |
-| extract or inline a helper with many uses, in `inline` | 4.1, 2 | V2 | M8a | meets | |
-| destructure or read fields | 4.1 | N1f | M1 | meets | |
-| `and`, `or` and the `if` they mean | 4.1 | N1c | M1 | meets | |
-| `?`, `??`, early `return` and the `match` they mean | 4.1 | N1d, N11m | M1 | meets | |
-| move code, reformat, comment | 4.1, 2 | N10 | M1 | meets | |
-| add or remove a type annotation | 4.1 | types from the checker | M1 | meets | |
-| reorder unrelated top-level definitions | 4.1 | N8g, N9 | M3 | meets | |
-| reorder two calls to one generic function | 2 | N8d, N8g | M3 | meets | |
+| rename a local or a parameter | 4.1, 2 | N2 | M1 | meets | "L3 M14: rename a local or a parameter meets (N2)" |
+| reorder independent bindings | 4.1, 2 | N4, N9 | M2 | meets | "L3 M2: independent bindings in either order are one normal form" |
+| bind a value once or write it twice | 4.1 | N5a, N5c | M2 | meets | "L3 M2: a value bound twice is the value bound once"; "L3 M2: a binding before a match is the binding in every arm" |
+| drop a binding nothing reads | 4.1 | N6 | M2 | meets | "L3 M2: a dead failing binding is dropped" |
+| extract or inline a helper with one use | 4.1, 2 | N8d to N8g, V1 | M3 | meets | "L3 M14: extract or inline a helper with one use meets (N8d to N8g, V1)" |
+| extract or inline a helper with many uses, in `inline` | 4.1, 2 | V2 | M8a | meets | "L3 M14: extract or inline a helper with many uses meets in `inline` (V2)"; in `graph` the pair stays apart, which the test also checks |
+| destructure or read fields | 4.1 | N1f | M1 | meets | "L3 M14: destructure or read fields meets (N1f)"; a destructuring parameter: "L3 M7: a record parameter written as a destructuring pattern is the record" |
+| `and`, `or` and the `if` they mean | 4.1 | N1c | M1 | meets | "L3: `a and b` is `if a b else Bool.False`"; "L3: `a or b` is `if a Bool.True else b`" |
+| `?`, `??`, early `return` and the `match` they mean | 4.1 | N1d, N11m | M1 | meets | "L3: `?` is the match it means"; "L3: `??` describes as the match it means"; "L3: an early `return` in a branch is the value of that branch" |
+| move code, reformat, comment | 4.1, 2 | N10 | M1 | meets | "L3 M14: move code, reformat, comment meets (N10)" |
+| add or remove a type annotation | 4.1 | types from the checker | M1 | meets | "L3 M14: add or remove a type annotation meets (types from the checker)" |
+| reorder unrelated top-level definitions | 4.1 | N8g, N9 | M3 | meets | "L3 M14: reorder unrelated top-level definitions meets (N8g, N9)" |
+| reorder two calls to one generic function | 2 | N8d, N8g | M3 | meets | "L3 M14: reorder two calls to one generic function meets (N8d, N8g)" |
 | a refactor inside a function in the translator's cut | 2, 4.3 | N8h | M1 | meets | "L7: a refactor inside a function in the translator's cut leaves the caller's normal form unchanged" |
 | a refactor inside a dependency's function outside the cut that keeps its normal form | 4.3 | N8l | M13 | meets | "L3 M13: a refactor inside a dependency's function outside the cut meets the same refactor inside the package" |
-| `x * 2` or `x + x`; `(a + b) + c` or `a + (b + c)` | 5 | none | none | apart | |
-| `x.len() > 0` or `!x.is_empty()` | 2, 5 | none without layer L; N16f at a `Code.Lawful(f)` site, where it meets (`L3 M10`) | M10 | apart | |
-| a fold or a `for` loop with a `var` | 2 | none without layer L; N16c at a `Code.Lawful(f)` site, where it meets (`L3 M10`) | M10 | apart | |
-| a recursive function or a fold | 5 | none | none | apart | |
+| `x * 2` or `x + x`; `(a + b) + c` or `a + (b + c)` | 5 | none | none | apart | "L3 M14: `x * 2` or `x + x`, and `(a + b) + c` or `a + (b + c)`, stay apart (safety 5)". With operands a test bounds, the grouping meets (M11: "L3 M11: a `plus` chain whose operands a test bounds is one sum in either grouping") |
+| `x.len() > 0` or `!x.is_empty()` | 2, 5 | none without layer L; N16f at a `Code.Lawful(f)` site, where it meets (`L3 M10`) | M10 | apart | "L3 M10: a length above 0 is not is_empty": apart in `graph`, one normal form in `lawful` |
+| a fold or a `for` loop with a `var` | 2 | none without layer L; N16c at a `Code.Lawful(f)` site, where it meets (`L3 M10`) | M10 | apart | "L3 M10: a fold of a known function is the loop written by hand": apart in `graph`, one normal form in `lawful` |
+| a recursive function or a fold | 5 | none | none | apart | "L3 M14: a recursive function or a fold stays apart (safety 5)" |
 | a dependency upgrade whose function outside the cut changes its operations: non-tail recursion, a list of input-dependent length, a builtin the target lacks | 4.3, replaced by 1.9 here | none | M13 | apart; the build stops at the site | "M13: a dependency upgrade that changes the operations of a function outside the cut changes the normal form"; the CLI case "a dependency's function outside the cut that the translator has no form for stops the build at the site" (`test/cli/StagedCut/stops.roc`) |
 
 ---

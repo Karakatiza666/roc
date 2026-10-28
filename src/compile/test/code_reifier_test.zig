@@ -6832,3 +6832,234 @@ test "L3 M12: a literal written in a loop of one arm and before it merges alike 
         \\}
     );
 }
+
+// M14: the safety matrix (`roc-reify-normalization-plan.md` 5.12). One L3
+// pair per row of `roc-reify-refactor-safety.md` 4.1, per row of its
+// section 2 that R absorbs, and per row of its section 5. A row an earlier
+// milestone pinned keeps that test, and 5.12 names it.
+
+test "L3 M14: rename a local or a parameter meets (N2)" {
+    // The site's own parameter, a local and a helper's parameter, renamed.
+    const gpa = std.testing.allocator;
+    const written = try Staged.createNamed(gpa,
+        \\grow : U64 -> U64
+        \\grow = |k| k * 3 + 1
+        \\
+        \\wobble : { x : U64, y : U64 } -> U64
+        \\wobble = |input| {
+        \\    wave = grow(input.x)
+        \\    wave * input.y
+        \\}
+    , "", "input");
+    defer written.destroy();
+    const renamed = try Staged.createNamed(gpa,
+        \\grow : U64 -> U64
+        \\grow = |seed| seed * 3 + 1
+        \\
+        \\wobble : { x : U64, y : U64 } -> U64
+        \\wobble = |args| {
+        \\    ripple = grow(args.x)
+        \\    ripple * args.y
+        \\}
+    , "", "args");
+    defer renamed.destroy();
+    if (written.outcome != .reified or renamed.outcome != .reified) return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(written.dump.items, renamed.dump.items);
+}
+
+test "L3 M14: extract or inline a helper with one use meets (N8d to N8g, V1)" {
+    try expectSameNormalForm(
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| (input.a * 3 + input.b) * input.b
+    ,
+        \\mix : U64, U64 -> U64
+        \\mix = |x, y| (x * 3 + y) * y
+        \\
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| mix(input.a, input.b)
+    );
+}
+
+test "L3 M14: extract or inline a helper with many uses meets in `inline` (V2)" {
+    // In `graph` the helper with two calls stays a row (N8e), so only the
+    // `inline` view of a `Code.Inlined(f)` site meets.
+    const gpa = std.testing.allocator;
+    const extracted = try Staged.createRunning(gpa,
+        \\mix : U64, U64 -> U64
+        \\mix = |x, y| (x * 3 + y) * y
+        \\
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| mix(input.a, input.b) + mix(input.b, input.a)
+    , "");
+    defer extracted.destroy();
+    const written = try Staged.createRunning(gpa,
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| (input.a * 3 + input.b) * input.b + (input.b * 3 + input.a) * input.a
+    , "");
+    defer written.destroy();
+    if (extracted.outcome != .reified or written.outcome != .reified) return error.TestUnexpectedResult;
+    try std.testing.expect(!std.mem.eql(u8, extracted.dump.items, written.dump.items));
+    try expectSameView(extracted, written, .inline_);
+}
+
+test "L3 M14: destructure or read fields meets (N1f)" {
+    try expectSameNormalForm(
+        \\wobble : { a : U64, c : U64 } -> U64
+        \\wobble = |input| {
+        \\    { a, c } = input
+        \\    a * c + a
+        \\}
+    ,
+        \\wobble : { a : U64, c : U64 } -> U64
+        \\wobble = |input| input.a * input.c + input.a
+    );
+}
+
+test "L3 M14: move code, reformat, comment meets (N10)" {
+    // The helper moves from after the site to before it, the body is
+    // reformatted, and comments are added.
+    try expectSameNormalForm(
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| if input.a > input.b { step(input.a) } else { input.b }
+        \\
+        \\step : U64 -> U64
+        \\step = |x| x * 2 + 1
+    ,
+        \\# The step every branch may take.
+        \\step : U64 -> U64
+        \\step = |x|
+        \\    x * 2 # doubled
+        \\    + 1
+        \\
+        \\
+        \\
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input|
+        \\    # Take the step only from the larger field.
+        \\    if input.a > input.b {
+        \\        step(input.a)
+        \\    } else {
+        \\        input.b
+        \\    }
+    );
+}
+
+test "L3 M14: add or remove a type annotation meets (types from the checker)" {
+    try expectSameNormalForm(
+        \\scale : U64, U64 -> U64
+        \\scale = |v, k| v * k
+        \\
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| {
+        \\    p : U64
+        \\    p = scale(input.a, input.b)
+        \\    p + 1
+        \\}
+    ,
+        \\scale = |v, k| v * k
+        \\
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| {
+        \\    p = scale(input.a, input.b)
+        \\    p + 1
+        \\}
+    );
+}
+
+test "L3 M14: reorder unrelated top-level definitions meets (N8g, N9)" {
+    // Two helpers with two calls each stay rows in `graph`, so their order
+    // in the module could reach the row numbering.
+    const call =
+        \\wobble : { a : U64, b : U64 } -> U64
+        \\wobble = |input| inc(input.a) * dbl(input.b) + inc(input.b) * dbl(input.a)
+        \\
+    ;
+    const inc =
+        \\inc : U64 -> U64
+        \\inc = |x| x * x + 1
+        \\
+    ;
+    const dbl =
+        \\dbl : U64 -> U64
+        \\dbl = |x| x * 2 + x
+        \\
+    ;
+    try expectSameNormalForm(inc ++ "\n" ++ dbl ++ "\n" ++ call, call ++ "\n" ++ dbl ++ "\n" ++ inc);
+    try expectRows(inc ++ "\n" ++ dbl ++ "\n" ++ call, 3);
+}
+
+test "L3 M14: reorder two calls to one generic function meets (N8d, N8g)" {
+    // `count` is one generic function at two types, and each instantiation
+    // has two calls, so each stays a row. The calls are made in the other
+    // order on the right.
+    const count =
+        \\count : List(a) -> U64
+        \\count = |xs| xs.len() * 2 + 1
+        \\
+        \\
+    ;
+    try expectSameNormalForm(count ++
+        \\wobble : { xs : List(U64), ys : List(U64), ss : List(Str), ts : List(Str) } -> U64
+        \\wobble = |input| {
+        \\    n = count(input.xs) + count(input.ys)
+        \\    m = count(input.ss) + count(input.ts)
+        \\    n * m
+        \\}
+    , count ++
+        \\wobble : { xs : List(U64), ys : List(U64), ss : List(Str), ts : List(Str) } -> U64
+        \\wobble = |input| {
+        \\    m = count(input.ss) + count(input.ts)
+        \\    n = count(input.xs) + count(input.ys)
+        \\    n * m
+        \\}
+    );
+    try expectRows(count ++
+        \\wobble : { xs : List(U64), ys : List(U64), ss : List(Str), ts : List(Str) } -> U64
+        \\wobble = |input| count(input.xs) + count(input.ys) + count(input.ss) + count(input.ts)
+    , 3);
+}
+
+/// `source`'s `wobble` describes as `count` rows, its root's included.
+fn expectRows(source: []const u8, count: usize) !void {
+    const staged = try Staged.createRunning(std.testing.allocator, source, "");
+    defer staged.destroy();
+    if (staged.outcome != .reified) return error.TestUnexpectedResult;
+    try std.testing.expectEqual(count, std.mem.count(u8, staged.dump.items, "row r"));
+}
+
+test "L3 M14: `x * 2` or `x + x`, and `(a + b) + c` or `a + (b + c)`, stay apart (safety 5)" {
+    // Integer `+` crashes on overflow, so neither is an equation of Roc.
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| input * 2
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| input + input
+    );
+    // No test bounds the operands, so N13u proves no sum fits (compare
+    // "L3 M11: a `plus` chain whose operands a test bounds is one sum in
+    // either grouping").
+    try expectOtherNormalForm(
+        \\wobble : { a : U64, b : U64, c : U64 } -> U64
+        \\wobble = |input| (input.a + input.b) + input.c
+    ,
+        \\wobble : { a : U64, b : U64, c : U64 } -> U64
+        \\wobble = |input| input.a + (input.b + input.c)
+    );
+}
+
+test "L3 M14: a recursive function or a fold stays apart (safety 5)" {
+    try expectOtherNormalForm(
+        \\total : List(U64) -> U64
+        \\total = |xs| match xs {
+        \\    [x, .. as rest] => x + total(rest)
+        \\    [] => 0
+        \\}
+        \\
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| total(input)
+    ,
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| input.fold(0, |s, x| s + x)
+    );
+}
