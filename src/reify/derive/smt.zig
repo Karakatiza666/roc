@@ -190,7 +190,7 @@ const Encoder = struct {
                     .bitwise_xor => "bvxor",
                     .plus, .minus, .times, .div_trunc => null,
                     .not, .concat, .len, .get => unreachable, // these methods are not total bit-vector ops and are handled by earlier prongs
-                    .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // the builtins of layer L are not enumerated signature symbols
+                    .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // the builtins of layer L are not enumerated signature symbols
                 };
                 if (total) |op| return self.val(sort, d, &.{try self.print("({s} {s})", .{ op, parts.items })}, sd);
                 std.debug.assert(x.args.len == 2);
@@ -199,7 +199,7 @@ const Encoder = struct {
                     .minus => "bvsub",
                     .times => "bvmul",
                     .div_trunc => if (s) "bvsdiv" else "bvudiv",
-                    .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // the total ops were handled above, leaving only these four
+                    .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // the total ops were handled above, leaving only these four
                 };
                 const value = try self.print("({s} {s} {s})", .{ op, a.parts[0], b.parts[0] });
                 // Checked arithmetic fails where the result leaves the type, which
@@ -212,7 +212,7 @@ const Encoder = struct {
                     .times => try self.print("(bv{s}mulo {s} {s})", .{ sign, a.parts[0], b.parts[0] }),
                     // An unsigned quotient never leaves its type.
                     .div_trunc => if (s) try self.print("(bvsdivo {s} {s})", .{ a.parts[0], b.parts[0] }) else "false",
-                    .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // the overflow check applies only to plus, minus, times and div_trunc
+                    .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // the overflow check applies only to plus, minus, times and div_trunc
                 };
                 const in_range = try self.print("(not {s})", .{overflows});
                 const ok = try self.define("Bool", if (m == .div_trunc) try self.print("(and (not (= {s} {s})) {s})", .{ b.parts[0], try self.lit(0), in_range }) else in_range);

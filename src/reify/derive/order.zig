@@ -113,7 +113,7 @@ pub fn count(t: Term, c: Component, ctx: Context, kinds: Kinds) u64 {
     if (ctx == .scrutinee) switch (c) {
         .is_lte_scrutinees => n += lteLeaves(t),
         .flipping_scrutinees => n += @intFromBool(term.polarityFlips(t)),
-        .self_tail_calls, .loops, .general_loops, .aggregate_slots, .split_calls, .loop_slots, .loop_returns, .applies, .switches, .negated_connectives, .forwarding_calls, .nodes, .flipped_comparisons, .unordered_leaves, .terminators, .joins, .arms_and_operands, .graph_nodes, .unhoisted_tests, .list_gets, .law_redexes => {},
+        .self_tail_calls, .loops, .general_loops, .aggregate_slots, .split_calls, .loop_slots, .loop_returns, .applies, .switches, .negated_connectives, .forwarding_calls, .nodes, .flipped_comparisons, .unordered_leaves, .terminators, .joins, .arms_and_operands, .graph_nodes, .unhoisted_tests, .list_gets, .law_redexes, .list_redexes => {},
     };
     return n;
 }
@@ -142,6 +142,8 @@ fn countIn(t: Term, c: Component, kinds: Kinds) u64 {
         .self_tail_calls, .aggregate_slots, .split_calls, .loop_slots, .loop_returns, .applies, .forwarding_calls, .terminators, .joins, .graph_nodes, .unhoisted_tests, .list_gets => 0,
         // Signature terms hold no closure and no `List.len` (layer L).
         .law_redexes => 0,
+        // Signature terms build no list, so no builtin reads a known one.
+        .list_redexes => 0,
     };
     for (x.args) |a| n += countIn(a, c, kinds);
     return n;

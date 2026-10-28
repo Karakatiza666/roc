@@ -355,7 +355,7 @@ pub const Evaluator = struct {
                 for (args) |a| if (a == .bottom) return .bottom;
                 // A primitive the table does not hold has no semantics here.
                 const p = prims.lookup(ir.PrimId.of(node.payload)) orelse return .bottom;
-                return self.evalPrim(p, args);
+                return self.evalPrim(p, args, self.store.tySlice(node.tys)[0]);
             },
             .switch_, .for_range, .for_list, .loop, .and_, .or_ => unreachable, // control-flow ops are evaluated by evalNode's own prongs, not here
         }
@@ -465,7 +465,7 @@ pub const Evaluator = struct {
         }
     }
 
-    fn evalPrim(self: *Evaluator, p: prims.Prim, args: []const Value) Error!Value {
+    fn evalPrim(self: *Evaluator, p: prims.Prim, args: []const Value, result: ir.TyId) Error!Value {
         if (p.owner.int()) |int| return self.evalInt(int, p.method, args);
         if (p.owner.float()) |float| return evalFloat(float, p.method, args);
         return switch (p.method) {
@@ -537,6 +537,98 @@ pub const Evaluator = struct {
             },
             // An iterator has no value here.
             .collect => error.Unsupported,
+            // The builtins N17 reads, as their bodies in `Builtin.roc` compute them.
+            .first, .last => blk: {
+                const xs = args[0].list;
+                if (xs.len == 0) break :blk try self.errTag("ListWasEmpty");
+                break :blk try self.okTag(if (p.method == .first) xs[0] else xs[xs.len - 1]);
+            },
+            .prepend => blk: {
+                const out = try self.arena.alloc(Value, args[0].list.len + 1);
+                out[0] = args[1];
+                @memcpy(out[1..], args[0].list);
+                break :blk .{ .list = out };
+            },
+            .single => .{ .list = try self.arena.dupe(Value, args[0..1]) },
+            .with_capacity => .{ .list = &.{} },
+            .set => blk: {
+                const xs = args[0].list;
+                const at = args[1].int;
+                if (at < 0 or at >= xs.len) break :blk try self.errTag("OutOfBounds");
+                const out = try self.arena.dupe(Value, xs);
+                out[@intCast(at)] = args[2];
+                break :blk try self.okTag(.{ .list = out });
+            },
+            .drop_first, .take_first => blk: {
+                const xs = args[0].list;
+                const k: usize = @intCast(@min(args[1].int, @as(i256, @intCast(xs.len))));
+                break :blk .{ .list = if (p.method == .drop_first) xs[k..] else xs[0..k] };
+            },
+            .repeat => blk: {
+                // A list longer than the fuel would be the evaluation of a long loop.
+                if (args[1].int > self.fuel) return error.OutOfFuel;
+                const out = try self.arena.alloc(Value, @intCast(args[1].int));
+                @memset(out, args[0]);
+                break :blk .{ .list = out };
+            },
+            .map2 => blk: {
+                const n = @min(args[0].list.len, args[1].list.len);
+                const out = try self.arena.alloc(Value, n);
+                for (args[0].list[0..n], args[1].list[0..n], out) |a, b, *o| {
+                    o.* = try self.apply(args[2], &.{ a, b });
+                    if (o.* == .bottom) break :blk .bottom;
+                }
+                break :blk .{ .list = out };
+            },
+            .map_with_index => blk: {
+                const out = try self.arena.alloc(Value, args[0].list.len);
+                for (args[0].list, out, 0..) |x, *o, i| {
+                    o.* = try self.apply(args[1], &.{ x, .{ .int = @intCast(i) } });
+                    if (o.* == .bottom) break :blk .bottom;
+                }
+                break :blk .{ .list = out };
+            },
+            .fold_rev => blk: {
+                var state = args[1];
+                var i = args[0].list.len;
+                while (i > 0) {
+                    i -= 1;
+                    state = try self.apply(args[2], &.{ args[0].list[i], state });
+                    if (state == .bottom) break :blk .bottom;
+                }
+                break :blk state;
+            },
+            // `any` stops at the first `True`, `all` at the first `False`.
+            .any, .all => blk: {
+                const stop = p.method == .any;
+                for (args[0].list) |x| switch (try self.apply(args[1], &.{x})) {
+                    .bool_ => |v| if (v == stop) break :blk .{ .bool_ = stop },
+                    .bottom => break :blk .bottom,
+                    .int, .float, .str, .agg, .tag, .list, .closure => unreachable, // a predicate gives a Bool by the typing of the body
+                };
+                break :blk .{ .bool_ = !stop };
+            },
+            // The first element, then `plus` of each next one; `default()`,
+            // which is 0, for `[]`.
+            .sum => blk: {
+                const xs = args[0].list;
+                for (xs) |x| if (x == .bottom) break :blk .bottom;
+                switch (self.types.get(result)) {
+                    .int => |int| {
+                        if (xs.len == 0) break :blk .{ .int = 0 };
+                        var acc = xs[0];
+                        for (xs[1..]) |x| acc = try self.evalInt(int, .plus, &.{ acc, x });
+                        break :blk acc;
+                    },
+                    .float => |float| {
+                        if (xs.len == 0) break :blk .{ .float = 0 };
+                        var acc = xs[0];
+                        for (xs[1..]) |x| acc = try evalFloat(float, .plus, &.{ acc, x });
+                        break :blk acc;
+                    },
+                    .bool_, .str, .dec, .record, .tuple, .tag_union, .list, .nominal, .func, .opaque_, .recursive => return error.Unsupported,
+                }
+            },
             .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => error.Unsupported,
         };
     }
@@ -553,6 +645,19 @@ pub const Evaluator = struct {
         };
         if (self.check_ranges and v == .int) if (self.store.row(row).result_range) |iv| self.checkRange(NodeId.none, row, v.int, iv);
         return v;
+    }
+
+    /// `Ok(v)`, with the tag found by name, as `get` finds it.
+    fn okTag(self: *Evaluator, v: Value) Error!Value {
+        const ok = self.types.findName("Ok") orelse return error.Unsupported;
+        return .{ .tag = .{ .name = ok, .payload = try self.arena.dupe(Value, &.{v}) } };
+    }
+
+    /// `Err(name)` of a payload-free tag `name`.
+    fn errTag(self: *Evaluator, name: []const u8) Error!Value {
+        const err = self.types.findName("Err") orelse return error.Unsupported;
+        const why = self.types.findName(name) orelse return error.Unsupported;
+        return .{ .tag = .{ .name = err, .payload = try self.arena.dupe(Value, &.{.{ .tag = .{ .name = why, .payload = &.{} } }}) } };
     }
 
     /// The value of the function `f` over `args`: a closure calls its row
@@ -611,7 +716,7 @@ fn floatResult(comptime F: type, method: prims.Method, a: F, b: F) Error!Value {
         .plus => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a + b))) },
         .minus => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a - b))) },
         .times => .{ .float = canonicalNan(F, @as(Bits, @bitCast(a * b))) },
-        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // float prims admit no other methods (prims.admits)
+        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // float prims admit no other methods (prims.admits)
     };
 }
 

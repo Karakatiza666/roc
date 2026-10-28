@@ -1,6 +1,11 @@
 //! The measure of normal-form 3.0: every simplify round must lower it.
 //!
-//! The components, in lexicographic order. `law_redexes` counts, at a site
+//! The components, in lexicographic order. `list_redexes` counts the nodes
+//! an N17 step that is on applies to (`lists.redex`): each step removes its
+//! node, and what it builds over a known list is built under the same
+//! smart constructors, so the nodes it makes known are rewritten in the same
+//! round. It comes first, because N17c adds a switch, N17e and N17f add calls,
+//! and N17g copies a loop body. `law_redexes` counts, at a site
 //! that opts into layer L, the `List.fold`s of a known function, which N16c
 //! makes loops, so it comes before `loops`, and the literal switches on
 //! `List.len` that N16f makes `Bool` switches; elsewhere it is 0. The raising
@@ -54,6 +59,7 @@ const live_mod = @import("live.zig");
 const loops = @import("loops.zig");
 const scalar = @import("scalar.zig");
 const laws_mod = @import("laws.zig");
+const lists = @import("lists.zig");
 
 const NodeId = ir.NodeId;
 const RegionId = ir.RegionId;
@@ -61,6 +67,7 @@ const RowId = ir.RowId;
 
 /// One component of the measure.
 pub const Component = enum(u8) {
+    list_redexes,
     self_tail_calls,
     law_redexes,
     loops,
@@ -114,8 +121,9 @@ pub const Measure = struct {
 /// The measure of `row`, over the nodes `live` marks (`live.zig`): a node
 /// the row no longer reaches, such as the old body a rebuild copied, counts
 /// nowhere.
-/// `laws` says whether the site opts into layer L.
-pub fn ofRow(gpa: std.mem.Allocator, store: *const ir.Store, types: *const types_mod.Types, live: live_mod.Live, calls: *scalar.Cache, row: RowId, laws: bool) std.mem.Allocator.Error!Measure {
+/// `laws` says whether the site opts into layer L, and `list_rules` which
+/// steps of N17 are on.
+pub fn ofRow(gpa: std.mem.Allocator, store: *const ir.Store, types: *const types_mod.Types, live: live_mod.Live, calls: *scalar.Cache, row: RowId, laws: bool, list_rules: lists.Rules) std.mem.Allocator.Error!Measure {
     var m: Measure = .{};
     const node_mult = try gpa.alloc(u64, store.nodeCount());
     defer gpa.free(node_mult);
@@ -146,6 +154,7 @@ pub fn ofRow(gpa: std.mem.Allocator, store: *const ir.Store, types: *const types
         if (nd.op == .loop) m.add(.general_loops, mult);
         if (nd.op == .apply) m.add(.applies, mult);
         if (laws and laws_mod.isLawRedex(store, nd)) m.add(.law_redexes, mult);
+        if (lists.redex(store, types, NodeId.of(@intCast(i)))) |step| if (list_rules.contains(step)) m.add(.list_redexes, mult);
         if (nd.op == .call and store.forwardingCall(RowId.of(nd.payload)) != null) m.add(.forwarding_calls, mult);
         if (nd.op == .call) m.add(.split_calls, mult *| try calls.layersOf(RowId.of(nd.payload)));
         if (nd.op == .prim) {
@@ -157,7 +166,7 @@ pub fn ofRow(gpa: std.mem.Allocator, store: *const ir.Store, types: *const types
                 switch (p.method) {
                     .is_gt, .is_gte => m.add(.flipped_comparisons, mult),
                     .not => if (isConnective(store, store.refSlice(nd.args)[0])) m.add(.negated_connectives, mult),
-                    .is_eq, .is_lt, .is_lte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => {},
+                    .is_eq, .is_lt, .is_lte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => {},
                 }
             }
         }
@@ -311,7 +320,7 @@ test "a node read twice counts twice in the unfolding, a parameter counts at eac
     defer live.deinit(testing.allocator);
     var calls = scalar.Cache.init(testing.allocator, &store, &types, live);
     defer calls.deinit();
-    const m = try ofRow(testing.allocator, &store, &types, live, &calls, row, false);
+    const m = try ofRow(testing.allocator, &store, &types, live, &calls, row, false, .full);
     // times(plus(p, p), plus(p, p)): three operations and four reads of p.
     try testing.expectEqual(@as(u64, 7), m.get(.nodes));
     try testing.expectEqual(@as(u64, 2), m.get(.graph_nodes));

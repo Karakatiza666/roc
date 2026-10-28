@@ -357,7 +357,10 @@ const Verifier = struct {
             .is_empty => result == bool_ty,
             .append, .keep_if => result == self.argTy(nd, 0),
             .fold => result == self.argTy(nd, 1),
-            .get, .map, .collect => true,
+            .prepend, .drop_first, .take_first => result == self.argTy(nd, 0),
+            .fold_rev => result == self.argTy(nd, 1),
+            .any, .all => result == bool_ty,
+            .get, .map, .collect, .first, .last, .single, .with_capacity, .set, .repeat, .map2, .map_with_index, .sum => true,
         };
     }
 

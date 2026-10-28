@@ -21,6 +21,7 @@ const provenance = @import("provenance.zig");
 const loops = @import("loops.zig");
 const scalar = @import("scalar.zig");
 const laws = @import("laws.zig");
+const known_lists = @import("lists.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -507,6 +508,9 @@ const Rebuild = struct {
     skipped: std.AutoHashMapUnmanaged(NodeId, void) = .empty,
     /// Per old loop body being copied under a rewrite: that rewrite.
     rewrites: collections.DenseMapUnmanaged(RegionId, *Active) = .empty,
+    /// Per old `ForList` body N17g is copying once per element: the values
+    /// its parameters stand for in the copy being built.
+    unrolling: collections.DenseMapUnmanaged(RegionId, []const Ref) = .empty,
     /// The loops being copied, innermost last: null for one copied as it is,
     /// and for a lambda, whose paths are not the loop's.
     frames: std.ArrayList(?*Active) = .empty,
@@ -532,6 +536,7 @@ const Rebuild = struct {
     fn deinit(self: *Rebuild) void {
         self.skipped.deinit(self.gpa);
         self.rewrites.deinit(self.gpa);
+        self.unrolling.deinit(self.gpa);
         self.frames.deinit(self.gpa);
         if (self.arena_impl) |*impl| impl.deinit();
         if (self.aliases) |*map| {
@@ -570,6 +575,7 @@ const Rebuild = struct {
             else
                 ref,
             .region_param => blk: {
+                if (self.unrolling.get(ref.regionId())) |values| break :blk values[ref.output];
                 if (self.rewrites.get(ref.regionId())) |act| break :blk self.paramRef(act, ref.output);
                 break :blk Ref.regionParam(self.regions.get(ref.regionId()).?, ref.output);
             },
@@ -967,6 +973,11 @@ const Rebuild = struct {
             .for_range, .for_list, .loop, .lambda => blk: {
                 // The loop rules (`loops.zig`): the loop is copied as a rewrite says.
                 if (nd.op != .lambda and !self.opts.raw) {
+                    // N17g: a loop over a known list of at most B elements
+                    // whose every path continues is its body once per element.
+                    if (nd.op == .for_list and self.b.algorithmOn(.list_unroll)) {
+                        if (try self.unrolled(n, nd, args)) |built| break :blk built;
+                    }
                     const where: loops.Where = .{
                         .row_body = if (self.inside) null else self.row_body,
                         .usage = try self.usage(),
@@ -1029,6 +1040,71 @@ const Rebuild = struct {
             },
         };
         try self.nodes.put(self.gpa, n, built);
+    }
+
+    // N17g: the `ForList` `n` over the known list `args[0]` of at most B
+    // elements, whose body ends in `Continue` and cannot return, built as its
+    // body once per element in order: the copy for element `k` reads the
+    // literal `k` for the index, the element for the element, and the slots
+    // as the copy before it left them, and the loop's outputs are the slots
+    // as the last copy leaves them. That is what the loop computes, turn by
+    // turn: each turn runs the whole body, and the slots it continues with
+    // are the next turn's. The old body's nodes are built again for each
+    // copy. Null where the loop is not one N17g unrolls.
+    fn unrolled(self: *Rebuild, n: NodeId, nd: ir.Node, args: []const Ref) Allocator.Error!?Built {
+        const s = self.store();
+        if (!known_lists.unrollable(s, n)) return null;
+        const elems = try self.gpa.dupe(Ref, known_lists.known(s, args[0]) orelse return null);
+        defer self.gpa.free(elems);
+        if (elems.len > known_lists.max_unrolled) return null;
+        const body = s.regionSlice(nd.regions)[0];
+        const index_ty = s.tySlice(s.region(body).params)[0];
+        const slots = try self.gpa.dupe(Ref, args[1..]);
+        errdefer self.gpa.free(slots);
+        var inner: std.ArrayList(NodeId) = .empty;
+        defer inner.deinit(self.gpa);
+        try self.bodyNodes(body, &inner);
+        const values = try self.gpa.alloc(Ref, 2 + slots.len);
+        defer self.gpa.free(values);
+        // The copies are on the paths of the region the loop stands in, and
+        // no rewrite of an enclosing loop reads their ends.
+        try self.frames.append(self.gpa, null);
+        defer _ = self.frames.pop();
+        defer _ = self.unrolling.remove(body);
+        for (elems, 0..) |e, k| {
+            self.mark();
+            values[0] = try self.b.litInt(index_ty, @intCast(k));
+            values[1] = e;
+            @memcpy(values[2..], slots);
+            try self.unrolling.put(self.gpa, body, values);
+            try self.fill(body);
+            const ends = try self.gpa.dupe(Ref, s.refSlice(s.region(body).end.refs));
+            defer self.gpa.free(ends);
+            for (ends, slots) |x, *o| o.* = self.mapRef(x);
+            self.forget(inner.items);
+        }
+        self.b.algorithmFired(.list_unroll);
+        const outs = try self.gpa.alloc(u32, slots.len);
+        @memset(outs, Built.no_output);
+        return .{ .ref = slots[0], .outs = outs, .repl = slots, .width = @intCast(slots.len) };
+    }
+
+    // The old nodes the plan places in region `r` and in the regions they
+    // own, which N17g builds again for each copy of a loop body.
+    fn bodyNodes(self: *Rebuild, r: RegionId, out: *std.ArrayList(NodeId)) Allocator.Error!void {
+        for (self.p.membersOf(r)) |m| {
+            try out.append(self.gpa, m);
+            for (self.store().regionSlice(self.store().node(m).regions)) |sub| try self.bodyNodes(sub, out);
+        }
+    }
+
+    // Drop what the copy of a loop body built for `old`, so the next copy
+    // builds those nodes again.
+    fn forget(self: *Rebuild, old: []const NodeId) void {
+        for (old) |m| if (self.nodes.fetchRemove(m)) |e| {
+            self.gpa.free(e.value.outs);
+            self.gpa.free(e.value.repl);
+        };
     }
 
     // N16a, N16b: the loop `found` describes as a builtin call over a closure

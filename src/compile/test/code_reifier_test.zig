@@ -5432,31 +5432,28 @@ test "an interpolated literal of a type that escapes its values describes as the
         \\row r0 ({ time : F32, uv : F32 }) -> F32
         \\  n0 = field 1(p0) : F32
         \\  n1 = Num.F32.to_str(n0) : Str !spec
-        \\  n2 = list(n1) : List(Str)
-        \\  n3 = closure r1() : (Str -> Str)
-        \\  n4 = List.map(n2, n3) : List(Str) !spec
-        \\  n5 = "<p>" : Str
-        \\  n6 = "!</p>" : Str
-        \\  n7 = list(n5, n6) : List(Str)
-        \\  n8 = List.first(n7) : Builtin.Try !spec
+        \\  n2 = "<" : Str
+        \\  n3 = "&lt;" : Str
+        \\  n4 = Str.replace_each(n1, n2, n3) : Str !spec
+        \\  n5 = list(n4) : List(Str)
+        \\  n6 = "<p>" : Str
+        \\  n7 = tag Ok(n6) : [Err([ListWasEmpty]), Ok(Str)]
+        \\  n8 = wrap(n7) : Builtin.Try
         \\  n9 = "" : Str
         \\  n10 = Try.ok_or(n8, n9) : Str !spec
-        \\  n11 = closure r2(n7) : (Str, Str, U64 -> Str)
-        \\  n12 = List.fold_with_index(n4, n10, n11) : Str !spec
-        \\  n13 = Str.is_empty(n12) : Bool !spec
-        \\  n15 = switch n13 : F32
+        \\  n11 = "!</p>" : Str
+        \\  n12 = list(n6, n11) : List(Str)
+        \\  n13 = closure r1(n12) : (Str, Str, U64 -> Str)
+        \\  n14 = List.fold_with_index(n5, n10, n13) : Str !spec
+        \\  n15 = Str.is_empty(n14) : Bool !spec
+        \\  n17 = switch n15 : F32
         \\    arm 0
         \\      value n0
         \\    arm 1
-        \\      n14 = float 0x0 : F32
-        \\      value n14
-        \\  value n15
-        \\row r1 (Str) -> Str
-        \\  n0 = "<" : Str
-        \\  n1 = "&lt;" : Str
-        \\  n2 = Str.replace_each(p0, n0, n1) : Str !spec
-        \\  value n2
-        \\row r2 (List(Str), Str, Str, U64) -> Str
+        \\      n16 = float 0x0 : F32
+        \\      value n16
+        \\  value n17
+        \\row r1 (List(Str), Str, Str, U64) -> Str
         \\  n0 = 1 : U64
         \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
         \\  n2 = List.get(p0, n1) : Builtin.Try
@@ -5488,21 +5485,22 @@ test "an interpolated literal of a type that only wraps the assembler of Str des
         \\  n1 = Num.F32.to_str(n0) : Str !spec
         \\  n2 = list(n1) : List(Str)
         \\  n3 = "a" : Str
-        \\  n4 = "b" : Str
-        \\  n5 = list(n3, n4) : List(Str)
-        \\  n6 = List.first(n5) : Builtin.Try !spec
-        \\  n7 = "" : Str
-        \\  n8 = Try.ok_or(n6, n7) : Str !spec
-        \\  n9 = closure r1(n5) : (Str, Str, U64 -> Str)
-        \\  n10 = List.fold_with_index(n2, n8, n9) : Str !spec
-        \\  n11 = Str.is_empty(n10) : Bool !spec
-        \\  n13 = switch n11 : F32
+        \\  n4 = tag Ok(n3) : [Err([ListWasEmpty]), Ok(Str)]
+        \\  n5 = wrap(n4) : Builtin.Try
+        \\  n6 = "" : Str
+        \\  n7 = Try.ok_or(n5, n6) : Str !spec
+        \\  n8 = "b" : Str
+        \\  n9 = list(n3, n8) : List(Str)
+        \\  n10 = closure r1(n9) : (Str, Str, U64 -> Str)
+        \\  n11 = List.fold_with_index(n2, n7, n10) : Str !spec
+        \\  n12 = Str.is_empty(n11) : Bool !spec
+        \\  n14 = switch n12 : F32
         \\    arm 0
         \\      value n0
         \\    arm 1
-        \\      n12 = float 0x0 : F32
-        \\      value n12
-        \\  value n13
+        \\      n13 = float 0x0 : F32
+        \\      value n13
+        \\  value n14
         \\row r1 (List(Str), Str, Str, U64) -> Str
         \\  n0 = 1 : U64
         \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
@@ -5533,21 +5531,19 @@ test "an interpolated literal of a conversion that reads its segments carries th
         \\row r0 ({ time : F32, uv : F32 }) -> F32
         \\  n0 = "a" : Str
         \\  n1 = "b" : Str
-        \\  n2 = list(n0, n1) : List(Str)
-        \\  n3 = field 1(p0) : F32
-        \\  n4 = Num.F32.to_str(n3) : Str !spec
-        \\  n5 = list(n4) : List(Str)
-        \\  n6 = List.concat(n2, n5) : List(Str)
-        \\  n7 = "-" : Str
-        \\  n8 = Str.join_with(n6, n7) : Str !spec
-        \\  n9 = Str.is_empty(n8) : Bool !spec
-        \\  n11 = switch n9 : F32
+        \\  n2 = field 1(p0) : F32
+        \\  n3 = Num.F32.to_str(n2) : Str !spec
+        \\  n4 = list(n0, n1, n3) : List(Str)
+        \\  n5 = "-" : Str
+        \\  n6 = Str.join_with(n4, n5) : Str !spec
+        \\  n7 = Str.is_empty(n6) : Bool !spec
+        \\  n9 = switch n7 : F32
         \\    arm 0
-        \\      value n3
+        \\      value n2
         \\    arm 1
-        \\      n10 = float 0x0 : F32
-        \\      value n10
-        \\  value n11
+        \\      n8 = float 0x0 : F32
+        \\      value n8
+        \\  value n9
         \\
     );
 }
@@ -5576,22 +5572,23 @@ test "an interpolated literal passed as an argument describes as the value it co
         \\  n2 = Num.F32.to_str(n1) : Str !spec
         \\  n3 = list(n2) : List(Str)
         \\  n4 = "x" : Str
-        \\  n5 = "y" : Str
-        \\  n6 = list(n4, n5) : List(Str)
-        \\  n7 = List.first(n6) : Builtin.Try !spec
-        \\  n8 = "" : Str
-        \\  n9 = Try.ok_or(n7, n8) : Str !spec
-        \\  n10 = closure r1(n6) : (Str, Str, U64 -> Str)
-        \\  n11 = List.fold_with_index(n3, n9, n10) : Str !spec
-        \\  n12 = Str.count_utf8_bytes(n11) : U64 !spec
-        \\  n13 = Num.U64.is_lt(n0, n12) : Bool
-        \\  n15 = switch n13 : F32
+        \\  n5 = tag Ok(n4) : [Err([ListWasEmpty]), Ok(Str)]
+        \\  n6 = wrap(n5) : Builtin.Try
+        \\  n7 = "" : Str
+        \\  n8 = Try.ok_or(n6, n7) : Str !spec
+        \\  n9 = "y" : Str
+        \\  n10 = list(n4, n9) : List(Str)
+        \\  n11 = closure r1(n10) : (Str, Str, U64 -> Str)
+        \\  n12 = List.fold_with_index(n3, n8, n11) : Str !spec
+        \\  n13 = Str.count_utf8_bytes(n12) : U64 !spec
+        \\  n14 = Num.U64.is_lt(n0, n13) : Bool
+        \\  n16 = switch n14 : F32
         \\    arm 0
-        \\      n14 = float 0x0 : F32
-        \\      value n14
+        \\      n15 = float 0x0 : F32
+        \\      value n15
         \\    arm 1
         \\      value n1
-        \\  value n15
+        \\  value n16
         \\row r1 (List(Str), Str, Str, U64) -> Str
         \\  n0 = 1 : U64
         \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
@@ -5672,17 +5669,18 @@ test "M13: an interpolated literal of another package's type whose conversion is
         \\  n1 = Num.F32.to_str(n0) : Str !spec
         \\  n2 = list(n1) : List(Str)
         \\  n3 = "x" : Str
-        \\  n4 = "y" : Str
-        \\  n5 = list(n3, n4) : List(Str)
-        \\  n6 = List.first(n5) : Builtin.Try !spec
-        \\  n7 = "" : Str
-        \\  n8 = Try.ok_or(n6, n7) : Str !spec
-        \\  n9 = closure r1(n5) : (Str, Str, U64 -> Str)
-        \\  n10 = List.fold_with_index(n2, n8, n9) : Str !spec
-        \\  n11 = record(n10) : { text : Str }
-        \\  n12 = wrap(n11) : Lib
-        \\  n13 = Lib.size(n12) : F32 !spec
-        \\  value n13
+        \\  n4 = tag Ok(n3) : [Err([ListWasEmpty]), Ok(Str)]
+        \\  n5 = wrap(n4) : Builtin.Try
+        \\  n6 = "" : Str
+        \\  n7 = Try.ok_or(n5, n6) : Str !spec
+        \\  n8 = "y" : Str
+        \\  n9 = list(n3, n8) : List(Str)
+        \\  n10 = closure r1(n9) : (Str, Str, U64 -> Str)
+        \\  n11 = List.fold_with_index(n2, n7, n10) : Str !spec
+        \\  n12 = record(n11) : { text : Str }
+        \\  n13 = wrap(n12) : Lib
+        \\  n14 = Lib.size(n13) : F32 !spec
+        \\  value n14
         \\row r1 (List(Str), Str, Str, U64) -> Str
         \\  n0 = 1 : U64
         \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
@@ -5752,17 +5750,18 @@ test "M13: an interpolated literal of a type in the site's own module is a Prim 
         \\  n3 = Num.F32.to_str(n2) : Str !spec
         \\  n4 = list(n1, n3) : List(Str)
         \\  n5 = "x" : Str
-        \\  n6 = "" : Str
-        \\  n7 = "y" : Str
-        \\  n8 = list(n5, n6, n7) : List(Str)
-        \\  n9 = List.first(n8) : Builtin.Try !spec
-        \\  n10 = Try.ok_or(n9, n6) : Str !spec
-        \\  n11 = closure r1(n8) : (Str, Str, U64 -> Str)
-        \\  n12 = List.fold_with_index(n4, n10, n11) : Str !spec
-        \\  n13 = record(n12) : { text : Str }
-        \\  n14 = wrap(n13) : Label
-        \\  n15 = Label.size(n14) : F32 !spec
-        \\  value n15
+        \\  n6 = tag Ok(n5) : [Err([ListWasEmpty]), Ok(Str)]
+        \\  n7 = wrap(n6) : Builtin.Try
+        \\  n8 = "" : Str
+        \\  n9 = Try.ok_or(n7, n8) : Str !spec
+        \\  n10 = "y" : Str
+        \\  n11 = list(n5, n8, n10) : List(Str)
+        \\  n12 = closure r1(n11) : (Str, Str, U64 -> Str)
+        \\  n13 = List.fold_with_index(n4, n9, n12) : Str !spec
+        \\  n14 = record(n13) : { text : Str }
+        \\  n15 = wrap(n14) : Label
+        \\  n16 = Label.size(n15) : F32 !spec
+        \\  value n16
         \\row r1 (List(Str), Str, Str, U64) -> Str
         \\  n0 = 1 : U64
         \\  n1 = Num.U64.plus(p3, n0) : U64 !spec
@@ -6782,6 +6781,26 @@ test "L4 and L5 M13: a helper in another package, outside every cut, keeps every
     try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
 }
 
+test "L4 and L5 M17: builtins and loops over literal lists keep every seed's two prints one normal form" {
+    // The generator's M17 choices are on: a builtin over a literal list as
+    // the call or as its result (N17a, N17b, N17f), and a `for` over a
+    // literal list as the loop or as its statements written out (N17g).
+    var prng = std.Random.DefaultPrng.init(0x0e17);
+    const random = prng.random();
+    var bytes: [96]u8 = undefined;
+    var verdicts = std.EnumArray(reify_fuzz.Verdict, u32).initFill(0);
+    for (0..250) |_| {
+        random.bytes(&bytes);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const ctx = CoreCtx.default(std.testing.allocator, arena.allocator(), std.testing.io);
+        verdicts.getPtr(try reify_fuzz.runCaseWith(ctx, try sharedBuiltinModules(), tmp.dir, &bytes, .{ .m7 = false, .m17 = true })).* += 1;
+    }
+    try std.testing.expect(verdicts.get(.agree) > 0 and verdicts.get(.reference_crashed) > 0);
+}
+
 test "L3 M12: a counter `while` with a second slot only its body reads is the `for` over the range (N11l)" {
     try expectSameNormalForm(
         \\wobble : U64 -> U64
@@ -7061,5 +7080,193 @@ test "L3 M14: a recursive function or a fold stays apart (safety 5)" {
     ,
         \\wobble : List(U64) -> U64
         \\wobble = |input| input.fold(0, |s, x| s + x)
+    );
+}
+
+// M17: known lists (N17, normal-form 3.17). The three meeting pairs of 3.17,
+// then the rows it keeps apart.
+
+/// The fixture's site dump, which must hold `want` and not `unwanted`.
+fn expectDumpHas(staged: *Staged, want: []const u8, unwanted: []const u8) !void {
+    if (std.mem.find(u8, staged.dump.items, want) == null or (unwanted.len > 0 and std.mem.find(u8, staged.dump.items, unwanted) != null)) {
+        std.debug.print("expected {s} and not {s} in:\n{s}\n", .{ want, unwanted, staged.dump.items });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "L3 M17: `map2` then `sum` over known lists is the written sum in `inline`, and a row called three times in `graph`" {
+    const gpa = std.testing.allocator;
+    const mapped = try Staged.createRunning(gpa,
+        \\wobble : { r : F32, g : F32, b : F32 } -> F32
+        \\wobble = |input| {
+        \\    weights = [0.25.F32, 0.5, 0.125]
+        \\    [input.r, input.g, input.b].map2(weights, |x, w| x * w).sum()
+        \\}
+    , "");
+    defer mapped.destroy();
+    const written = try Staged.createRunning(gpa,
+        \\wobble : { r : F32, g : F32, b : F32 } -> F32
+        \\wobble = |input| input.r * 0.25 + input.g * 0.5 + input.b * 0.125
+    , "");
+    defer written.destroy();
+    if (mapped.outcome != .reified or written.outcome != .reified) return error.TestUnexpectedResult;
+    try expectSameView(mapped, written, .inline_);
+    // Tier B in `graph`: the lambda is one row, called once per element.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, mapped.dump.items, "= call r"));
+    try expectDumpHas(mapped, "Num.F32.plus(", "List.");
+}
+
+test "L3 M17: a `for` over a known list is the `fold` over it, three calls of the step" {
+    try expectSameNormalForm(
+        \\step : U64, U64 -> U64
+        \\step = |s, x| s * 3 + x
+        \\
+        \\wobble : { a : U64, b : U64, c : U64 } -> U64
+        \\wobble = |input| {
+        \\    var $s = 1
+        \\    for x in [input.a, input.b, input.c] {
+        \\        $s = step($s, x)
+        \\    }
+        \\    $s
+        \\}
+    ,
+        \\step : U64, U64 -> U64
+        \\step = |s, x| s * 3 + x
+        \\
+        \\wobble : { a : U64, b : U64, c : U64 } -> U64
+        \\wobble = |input| [input.a, input.b, input.c].fold(1, step)
+    );
+}
+
+test "L3 M17: `[a, b].concat([c])` is the list `[a, b, c]`" {
+    try expectSameNormalForm(
+        \\wobble : { a : U64, b : U64, c : U64 } -> List(U64)
+        \\wobble = |input| [input.a, input.b].concat([input.c])
+    ,
+        \\wobble : { a : U64, b : U64, c : U64 } -> List(U64)
+        \\wobble = |input| [input.a, input.b, input.c]
+    );
+}
+
+test "L3 M17: a lookup in a known list is a literal switch on the index, apart from the `match` on the month" {
+    const gpa = std.testing.allocator;
+    const looked_up = try Staged.createRunning(gpa,
+        \\wobble : U64 -> U64
+        \\wobble = |input| [31, 28, 31, 30].get(input - 1) ?? 31
+    , "");
+    defer looked_up.destroy();
+    if (looked_up.outcome != .reified) return error.TestUnexpectedResult;
+    try expectDumpHas(looked_up, "default", "List.get(");
+    try expectOtherNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| [31, 28, 31, 30].get(input - 1) ?? 31
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| match input {
+        \\    2 => 28
+        \\    4 => 30
+        \\    _ => 31
+        \\}
+    );
+}
+
+test "L3 M17: a list whose length depends on the input keeps its builtins" {
+    const gpa = std.testing.allocator;
+    inline for (.{
+        \\wobble : List(U64) -> U64
+        \\wobble = |input| input.len() + input.sum()
+        ,
+        \\wobble : { xs : List(U64), k : U64 } -> U64
+        \\wobble = |input| [input.k, 1].concat(input.xs).len()
+        ,
+        \\wobble : { xs : List(U64), k : U64 } -> U64
+        \\wobble = |input| [input.k, 5].keep_if(|x| x > 3).len()
+    }, .{ "List.sum(", "List.len(", "List.keep_if(" }) |source, kept| {
+        const staged = try Staged.createRunning(gpa, source, "");
+        defer staged.destroy();
+        if (staged.outcome != .reified) return error.TestUnexpectedResult;
+        try expectDumpHas(staged, kept, "");
+    }
+}
+
+test "L3 M17: a `keep_if` whose every predicate value is known is the kept list" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> List(U64)
+        \\wobble = |input| [1, 5, 2, 9].keep_if(|x| x > 3).concat([input])
+    ,
+        \\wobble : U64 -> List(U64)
+        \\wobble = |input| [5, 9, input]
+    );
+}
+
+test "L3 M17: an `Iter` pipeline over a known list keeps its `Iter` builtins" {
+    const gpa = std.testing.allocator;
+    const staged = try Staged.createRunning(gpa,
+        \\wobble : U64 -> List(U64)
+        \\wobble = |input| [input, 2, 3].iter().map(|x| x + 1).collect()
+    , "");
+    defer staged.destroy();
+    if (staged.outcome != .reified) return error.TestUnexpectedResult;
+    try expectDumpHas(staged, "Iter.", "");
+}
+
+test "L3 M17: a loop over a known list with a `break`, or longer than B, stays a `ForList`" {
+    const gpa = std.testing.allocator;
+    inline for (.{
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $s = 0
+        \\    for x in [input, 7, 2] {
+        \\        if x == 7 {
+        \\            break
+        \\        }
+        \\        $s = $s + x
+        \\    }
+        \\    $s
+        \\}
+        ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $s = 0
+        \\    for x in [input, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
+        \\        $s = $s + x
+        \\    }
+        \\    $s
+        \\}
+    }) |source| {
+        const staged = try Staged.createRunning(gpa, source, "");
+        defer staged.destroy();
+        if (staged.outcome != .reified) return error.TestUnexpectedResult;
+        try expectDumpHas(staged, "for_list(", "");
+    }
+    // At B elements it is the sum written out.
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    var $s = 0
+        \\    for x in [input, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+        \\        $s = $s + x
+        \\    }
+        \\    $s
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| 0 + input + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15
+    );
+}
+
+test "L3 M17: the builtins of a known list are their results" {
+    try expectSameNormalForm(
+        \\wobble : U64 -> U64
+        \\wobble = |input| {
+        \\    xs = [input, 2, 3]
+        \\    n = xs.len()
+        \\    first = xs.first() ?? 0
+        \\    last = xs.last() ?? 0
+        \\    n + first + last + (xs.append(4).get(3) ?? 0)
+        \\}
+    ,
+        \\wobble : U64 -> U64
+        \\wobble = |input| 3 + input + 3 + 4
     );
 }

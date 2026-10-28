@@ -224,6 +224,7 @@ const staged_generic_where = stage ++
 // A lambda written in a generic callee is part of that callee, so it
 // describes under the instantiation the call fixed: one row per type, a
 // nested lambda and one that captures a parameter of the callee included.
+// The nested list has a length the stage does not know, so N17 keeps its map.
 const staged_generic_lambdas = stage ++
     \\firsts : List((a, b)) -> List(a)
     \\firsts = |xs| xs.map(|p| p.0)
@@ -235,7 +236,7 @@ const staged_generic_lambdas = stage ++
     \\nested = |xss| xss.map(|xs| xs.map(|x| (x, x)))
     \\
     \\mix : List(F32), List(Str) -> U64
-    \\mix = |a, b| firsts(pairs(a, "k")).len() + firsts(pairs(b, 1.0.F32)).len() + nested([a]).len()
+    \\mix = |a, b| firsts(pairs(a, "k")).len() + firsts(pairs(b, 1.0.F32)).len() + nested(List.repeat(a, b.len())).len()
     \\main = Stage.describe(mix)
 ;
 
@@ -708,7 +709,8 @@ const staged_recursive_changing_argument =
 // `Node.children` hands back a node's arguments and the regions it owns,
 // whatever kind it is, so a pass with nothing to say about kinds walks with it
 // instead of writing an arm per kind. A guard's test is in an arm of its
-// `Switch`, and a loop's body is the region of its `ForList`.
+// `Switch`, and a loop's body is the region of its `ForList`. The loop's list
+// has a length the stage does not know, so N17g does not unroll it.
 const staged_ir_children =
     \\Shape :: {}.{
     \\    walk : Code(f) -> Str
@@ -734,7 +736,7 @@ const staged_ir_children =
     \\grade : U16, F32 -> F32
     \\grade = |n, t| {
     \\    var $total = t * 2.0
-    \\    for step in [1.0, 2.0] {
+    \\    for step in List.repeat(1.0, n.to_u64()) {
     \\        $total = $total + step
     \\    }
     \\    match n {
@@ -861,10 +863,11 @@ const staged_template_many = stage ++
 
 // A list a staged body writes is a `List` node, which is also what lets a
 // template take one: a compile-time argument is written into the description,
-// so every part of it has to be something the normal form can hold.
+// so every part of it has to be something the normal form can hold. The
+// predicate reads the input, so `keep_if` stays a builtin over the list (N17).
 const staged_list = stage ++
     \\scaled : List(F32) -> Code(F32 -> F32)
-    \\scaled = |steps| |x| x * steps.len().to_f32()
+    \\scaled = |steps| |x| x * steps.keep_if(|s| s > x).len().to_f32()
     \\main = Stage.describe(scaled([2.0.F32, 4.0.F32]))
 ;
 
@@ -2117,7 +2120,7 @@ pub const tests = [_]TestCase{
         .name = "staging - a lambda in a generic callee describes at each instantiation",
         .source_kind = .module,
         .source = staged_generic_lambdas,
-        .expected = .{ .inspect_str = "\"r0 = |List(F32), List(Str)| -> U64 Num.U64.plus(Num.U64.plus(List.len(List.map(List.map(p0, closure r1('k')), closure r2())), List.len(List.map(List.map(p1, closure r3(1)), closure r4()))), List.len(List.map([p0], closure r5()))) ; r1 = |Str, F32| -> (F32, Str) (p1, p0) ; r2 = |(F32, Str)| -> F32 p0.0 ; r3 = |F32, Str| -> (Str, F32) (p1, p0) ; r4 = |(Str, F32)| -> Str p0.0 ; r5 = |List(F32)| -> List((F32, F32)) List.map(p0, closure r6()) ; r6 = |F32| -> (F32, F32) (p0, p0)\"" },
+        .expected = .{ .inspect_str = "\"r0 = |List(F32), List(Str)| -> U64 Num.U64.plus(Num.U64.plus(List.len(List.map(List.map(p0, closure r1('k')), closure r2())), List.len(List.map(List.map(p1, closure r3(1)), closure r4()))), List.len(List.map(List.repeat(p0, List.len(p1)), closure r5()))) ; r1 = |Str, F32| -> (F32, Str) (p1, p0) ; r2 = |(F32, Str)| -> F32 p0.0 ; r3 = |F32, Str| -> (Str, F32) (p1, p0) ; r4 = |(Str, F32)| -> Str p0.0 ; r5 = |List(F32)| -> List((F32, F32)) List.map(p0, closure r6()) ; r6 = |F32| -> (F32, F32) (p0, p0)\"" },
     },
     .{
         .name = "staging - a lambda in a where-constrained generic callee dispatches at the fixed type",
@@ -2141,13 +2144,13 @@ pub const tests = [_]TestCase{
         .name = "staging - a lambda written at the site calls unannotated helpers at the types it fixes",
         .source_kind = .module,
         .source = staged_inline_unannotated_calls,
-        .expected = .{ .inspect_str = "\"r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) List.map([Str.count_utf8_bytes(p0)], closure r1()) ; r1 = |U64| -> U64 Num.U64.plus(p0, 1) | r0 = |Str| -> U64 r1(r1(Str.count_utf8_bytes(p0))) ; r1 = |U64| -> U64 Num.U64.plus(p0, 1)\"" },
+        .expected = .{ .inspect_str = "\"r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) [Num.U64.plus(Str.count_utf8_bytes(p0), 1)] | r0 = |Str| -> U64 r1(r1(Str.count_utf8_bytes(p0))) ; r1 = |U64| -> U64 Num.U64.plus(p0, 1)\"" },
     },
     .{
         .name = "staging - an unannotated helper calls another at the evidence its caller supplied",
         .source_kind = .module,
         .source = staged_generic_calls_generic,
-        .expected = .{ .inspect_str = "\"r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) List.map([Str.count_utf8_bytes(p0)], closure r1()) ; r1 = |U64| -> U64 Num.U64.times(p0, 2) | r0 = |Str| -> List(U64) List.map([Str.count_utf8_bytes(p0)], closure r1()) ; r1 = |U64| -> U64 Num.U64.times(p0, 2) | r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) List.map([Str.count_utf8_bytes(p0)], closure r1()) ; r1 = |U64| -> U64 Num.U64.times(p0, 2)\"" },
+        .expected = .{ .inspect_str = "\"r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) [Num.U64.times(Str.count_utf8_bytes(p0), 2)] | r0 = |Str| -> List(U64) [Num.U64.times(Str.count_utf8_bytes(p0), 2)] | r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) [Num.U64.times(Str.count_utf8_bytes(p0), 2)]\"" },
     },
     .{
         .name = "staging - a lambda that captures a fixed function parameter names its definition",
@@ -2267,7 +2270,7 @@ pub const tests = [_]TestCase{
         .name = "staging - children hands back every region, so a walk reaches guards and loop bodies",
         .source_kind = .module,
         .source = staged_ir_children,
-        .expected = .{ .inspect_str = "\"15 nodes, Num.F32.times Num.F32.plus Num.U16.min Num.U16.is_lt Num.F32.plus Num.U16.to_f32 Num.F32.min\"" },
+        .expected = .{ .inspect_str = "\"16 nodes, Num.U16.to_u64 List.repeat Num.F32.times Num.F32.plus Num.U16.min Num.U16.is_lt Num.F32.plus Num.U16.to_f32 Num.F32.min\"" },
     },
     .{
         .name = "staging - numeric answers what a number is and name spells any type",
@@ -2441,7 +2444,7 @@ pub const tests = [_]TestCase{
         .name = "staging - a template takes a list, and a staged body writes one",
         .source_kind = .module,
         .source = staged_list,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, Num.U64.to_f32(List.len([2, 4])))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, Num.U64.to_f32(List.len(List.keep_if([2, 4], closure r1(p0))))) ; r1 = |F32, F32| -> Bool Num.F32.is_lt(p0, p1)\"" },
     },
     .{
         .name = "staging - a template takes a record, and a field read of it folds",
@@ -2510,7 +2513,7 @@ pub const tests = [_]TestCase{
         .name = "staging - a computed top-level value reads another one through its definition",
         .source_kind = .module,
         .source = staged_constant_from_constant,
-        .expected = .{ .inspect_str = "\"r0 = |U64| -> U64 Num.U64.plus(p0, List.len([1, 2, 3]))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |U64| -> U64 Num.U64.plus(p0, 3)\"" },
     },
     .{
         .name = "staging - a computed value another module exports folds the same way",
@@ -2658,19 +2661,19 @@ pub const tests = [_]TestCase{
         .name = "staging - an interpolated literal of the author's own type describes as the fold its conversion hands back",
         .source_kind = .module,
         .source = staged_custom_interpolation,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n4 = ['a', 'b']; switch Str.is_empty(List.fold_with_index([Num.F32.to_str(p0)], Try.ok_or(List.first(n4), ''), closure r1(n4))) { False => p0 | True => 0 } } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(List.fold_with_index([Num.F32.to_str(p0)], Try.ok_or(Builtin.Try.(Ok('a')), ''), closure r1(['a', 'b']))) { False => p0 | True => 0 } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
     },
     .{
         .name = "staging - an interpolated literal of a type that escapes its values has the escape inside the fold",
         .source_kind = .module,
         .source = staged_escaping_interpolation,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n6 = ['<p>', '!</p>']; switch Str.is_empty(List.fold_with_index(List.map([Num.F32.to_str(p0)], closure r1()), Try.ok_or(List.first(n6), ''), closure r2(n6))) { False => p0 | True => 0 } } ; r1 = |Str| -> Str Str.replace_each(p0, '<', '&lt;') ; r2 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(List.fold_with_index([Str.replace_each(Num.F32.to_str(p0), '<', '&lt;')], Try.ok_or(Builtin.Try.(Ok('<p>')), ''), closure r1(['<p>', '!</p>']))) { False => p0 | True => 0 } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
     },
     .{
         .name = "staging - an interpolated literal of the author's own type describes as an argument",
         .source_kind = .module,
         .source = staged_interpolation_argument,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n5 = ['x', 'y']; switch Num.U64.is_lt(3, Str.count_utf8_bytes(List.fold_with_index([Num.F32.to_str(p0)], Try.ok_or(List.first(n5), ''), closure r1(n5)))) { False => 0 | True => p0 } } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.U64.is_lt(3, Str.count_utf8_bytes(List.fold_with_index([Num.F32.to_str(p0)], Try.ok_or(Builtin.Try.(Ok('x')), ''), closure r1(['x', 'y'])))) { False => 0 | True => p0 } ; r1 = |List(Str), Str, Str, U64| -> Str Str.concat(p1, p2, Try.ok_or(List.get(p0, Num.U64.plus(p3, 1)), ''))\"" },
     },
     .{
         .name = "staging - a top-level value folds at the wider union its use reads",

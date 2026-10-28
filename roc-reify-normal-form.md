@@ -1474,8 +1474,9 @@ dead, which C2 allows (3.6).
 
 Two steps grow the graph beyond what the author wrote: `List.repeat(x, Lit(n))`
 in N17d, and N17g, which copies a loop body. Each applies only when `n` is at
-most B, a constant of the language version, like K in `outline`. Every other
-step is linear in the list the author wrote.
+most B, a constant of the language version, like K in `outline`. B is 16,
+the elements of a 4 by 4 matrix (`src/reify/lists.zig` `max_unrolled`). Every
+other step is linear in the list the author wrote.
 
 With N17 on, the list refactors below meet:
 

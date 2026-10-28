@@ -213,7 +213,7 @@ pub fn sortOf(vars: Vars, t: Term) Sort {
                 .concat => .str,
                 .len => .i64,
                 .get => unreachable, // `get` is not an enumerated signature symbol
-                .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // the builtins of layer L are not enumerated signature symbols
+                .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // the builtins of layer L are not enumerated signature symbols
             },
             .and_, .or_ => .bool,
             .switch_ => sortOf(vars, x.args[1 + (term.litKeys(x) orelse 0)]),
@@ -379,7 +379,7 @@ pub fn checkSort(vars: Vars, t: Term) ?Sort {
             const result: Sort = switch (x.sym.method.?) {
                 .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not => .bool,
                 .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => operand,
-                .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => return null,
+                .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => return null,
             };
             for (args) |a| if (a != operand) return null;
             return result;

@@ -16,6 +16,7 @@
 //! | M11 | a literal operand of `+`, `*` and `==` first or last; a sum over `0..=n` under a test that bounds `n`, as a `for` over the range or a `while $i <= n` |
 //! | M12 | a sum over `0..<n` as a `for` over the range, a `while $i < n`, or a `while !$done` whose `else` sets the flag; a second counter from `j0` as a `var` stepped by 1 with the index, or as `i + j0` |
 //! | M13 | an M7 helper defined in the app's own module, or in a module `Lib` of another package that the app calls it through, outside every cut (N8l) |
+//! | M17 | a builtin over a literal list, `len`, `sum`, `get` at a literal index, `first` or `last`, as the builtin or as its result; a `for` over a literal list that adds a step per element, as the loop or as its statements written out |
 //!
 //! The two prints must describe as one normal form (L4), and the normal form
 //! must compute what Roc computes wherever Roc does not crash (L5, C2).
@@ -50,6 +51,9 @@ pub const Options = struct {
     /// The choice of M13: an M7 helper in the app, or in a package `lib`,
     /// which the walk reads by its body because no cut lists it (N8l).
     m13: bool = false,
+    /// The constructs of M17 (a builtin over a literal list, a loop over a
+    /// literal list), whose spellings meet through N17.
+    m17: bool = false,
 };
 
 /// Bytes the generator reads its choices from. Past the end it reads zeros,
@@ -111,7 +115,18 @@ const Node = union(enum) {
     /// `n` a `U64` field or literal; `step` sees `i` at scope index `slot`
     /// and the second counter `j = i + j0` at `slot + 1`.
     counted: struct { bound: *const Node, limit: u64, init: u64, j0: u64, step: *const Node, slot: u16, other: *const Node },
+    /// A builtin over the literal list of the first `len` of `elems`: its
+    /// length, its sum, its element at the literal `index` or its first or
+    /// last element, the last three with `?? fallback` (N17a, N17b, N17f).
+    known: struct { elems: [3]*const Node, len: u8, op: KnownOp, index: u8, fallback: *const Node },
+    /// `start` plus `step` for each of the first `len` of `elems`, as a `for`
+    /// over their literal list or written out (N17g); `step` sees the
+    /// element at scope index `slot`.
+    unrolled: struct { start: *const Node, elems: [3]*const Node, len: u8, step: *const Node, slot: u16 },
 };
+
+/// What `known` reads off its list.
+const KnownOp = enum { len, sum, get, first, last };
 
 /// One generated case: the module text and the input it is run on.
 pub const Case = struct {
@@ -219,6 +234,12 @@ const Builder = struct {
         if (self.options.m11 and self.extra.pick(8) == 0) return self.uptoTerm(scope, d);
         // M12: a counted sum with a second counter, from the extra stream.
         if (self.options.m12 and self.extra.pick(6) == 0) return self.countedTerm(scope, d);
+        // M17: a builtin or a loop over a literal list, from the extra stream.
+        if (self.options.m17) switch (self.extra.pick(8)) {
+            0, 1 => return self.knownTerm(scope, d),
+            2 => return self.unrolledTerm(scope, d),
+            else => {},
+        };
         return switch (self.reader.pick(9)) {
             0 => self.leaf(.u64_, &scope),
             1 => self.node(.{ .plus = .{ try self.term(.u64_, scope, d), try self.term(.u64_, scope, d) } }),
@@ -323,6 +344,34 @@ const Builder = struct {
         return self.node(.{ .counted = .{ .bound = bound, .limit = limit, .init = init, .j0 = j0, .step = step, .slot = scope.len, .other = try self.term(.u64_, scope, depth) } });
     }
 
+    fn knownTerm(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
+        var elems: [3]*const Node = undefined;
+        for (&elems) |*e| e.* = try self.term(.u64_, scope, @max(depth, max_depth - 2));
+        const op: KnownOp = @enumFromInt(self.extra.pick(5));
+        // `sum` and `len` read a list of any length; the others read the
+        // fallback where the list is empty or the index is past its end.
+        return self.node(.{ .known = .{
+            .elems = elems,
+            .len = self.extra.pick(4),
+            .op = op,
+            .index = self.extra.pick(4),
+            .fallback = try self.term(.u64_, scope, @max(depth, max_depth - 2)),
+        } });
+    }
+
+    fn unrolledTerm(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
+        if (scope.len >= max_scope) return self.leaf(.u64_, &scope);
+        var elems: [3]*const Node = undefined;
+        for (&elems) |*e| e.* = try self.term(.u64_, scope, @max(depth, max_depth - 2));
+        const start = try self.term(.u64_, scope, depth);
+        var inner = scope;
+        inner.types[inner.len] = .u64_;
+        inner.len += 1;
+        // The step is small: it runs once per element and nests no deeper.
+        const step = try self.term(.u64_, inner, max_depth - 1);
+        return self.node(.{ .unrolled = .{ .start = start, .elems = elems, .len = self.extra.pick(4), .step = step, .slot = scope.len } });
+    }
+
     fn sumTerm(self: *Builder, scope: Scope, depth: u8) Allocator.Error!*const Node {
         if (scope.len >= max_scope) return self.leaf(.u64_, &scope);
         const start = try self.term(.u64_, scope, depth);
@@ -367,6 +416,8 @@ fn reads(n: *const Node, slot: u16) bool {
         .empty => false,
         .upto => |u| reads(u.bound, slot) or reads(u.step, slot) or reads(u.other, slot),
         .counted => |u| reads(u.bound, slot) or reads(u.step, slot) or reads(u.other, slot),
+        .known => |k| reads(k.elems[0], slot) or reads(k.elems[1], slot) or reads(k.elems[2], slot) or reads(k.fallback, slot),
+        .unrolled => |u| reads(u.start, slot) or reads(u.elems[0], slot) or reads(u.elems[1], slot) or reads(u.elems[2], slot) or reads(u.step, slot),
     };
 }
 
@@ -676,6 +727,8 @@ const Printer = struct {
             .twice => |t| try self.twice(t.args, t.k),
             .upto => |u| try self.upto(u.bound, u.limit, u.init, u.step, u.slot, u.other),
             .counted => |u| try self.counted(u.bound, u.limit, u.init, u.j0, u.step, u.slot, u.other),
+            .known => |k| try self.known(k.elems[0..k.len], k.op, k.index, k.fallback),
+            .unrolled => |u| try self.unrolled(u.start, u.elems[0..u.len], u.step, u.slot),
             .empty => |e| {
                 const list = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ self.names.param, self.names.fields[3] });
                 defer self.gpa.free(list);
@@ -692,6 +745,96 @@ const Printer = struct {
                 }
             },
         }
+    }
+
+    /// The literal list of `elems`. An empty one is bound with its type, which
+    /// nothing else may fix.
+    fn literalList(self: *Printer, elems: []const *const Node) Allocator.Error!void {
+        if (elems.len == 0) {
+            const name = try self.symbols.fresh("lc");
+            try self.print("{{\n{s} : List(U64)\n{s} = []\n{s}\n}}", .{ name, name, name });
+            return;
+        }
+        try self.write("[");
+        for (elems, 0..) |e, i| {
+            if (i > 0) try self.write(", ");
+            try self.expr(e);
+        }
+        try self.write("]");
+    }
+
+    /// A builtin over the literal list of `elems`, in some prints as the
+    /// builtin call and in others as the result its body in `Builtin.roc`
+    /// computes: the length, the sum from the first element, or the element
+    /// that `get`, `first` or `last` reads, else the fallback.
+    fn known(self: *Printer, elems: []const *const Node, op: KnownOp, index: u8, fallback: *const Node) Allocator.Error!void {
+        const n = elems.len;
+        if (self.extra.pick(2) == 0) {
+            try self.write("(");
+            try self.literalList(elems);
+            switch (op) {
+                .len => try self.write(".len()"),
+                .sum => try self.write(".sum()"),
+                .get => try self.print(".get({d})", .{index}),
+                .first => try self.write(".first()"),
+                .last => try self.write(".last()"),
+            }
+            switch (op) {
+                .len, .sum => {},
+                .get, .first, .last => {
+                    try self.write(" ?? ");
+                    try self.expr(fallback);
+                },
+            }
+            try self.write(")");
+            return;
+        }
+        switch (op) {
+            .len => try self.print("{d}.U64", .{n}),
+            .sum => if (n == 0) try self.write("0.U64") else {
+                // `(e1 + e2) + e3`, the chain from the first element.
+                for (0..n - 1) |_| try self.write("(");
+                try self.expr(elems[0]);
+                for (elems[1..]) |e| {
+                    try self.write(" + ");
+                    try self.expr(e);
+                    try self.write(")");
+                }
+            },
+            .get => if (index < n) try self.expr(elems[index]) else try self.expr(fallback),
+            .first => if (n > 0) try self.expr(elems[0]) else try self.expr(fallback),
+            .last => if (n > 0) try self.expr(elems[n - 1]) else try self.expr(fallback),
+        }
+    }
+
+    /// `start` plus `step` per element of the literal list of `elems`, in
+    /// some prints as a `for` over the list and in others as one statement
+    /// per element, with the element bound by name.
+    fn unrolled(self: *Printer, start: *const Node, elems: []const *const Node, step: *const Node, slot: u16) Allocator.Error!void {
+        const acc = try self.symbols.fresh("$ac");
+        try self.print("{{\nvar {s} = ", .{acc});
+        try self.expr(start);
+        try self.write("\n");
+        if (self.extra.pick(2) == 0) {
+            const item = try self.symbols.fresh("lc");
+            try self.print("for {s} in ", .{item});
+            try self.literalList(elems);
+            self.names.locals[slot] = item;
+            self.names.twins[slot] = null;
+            try self.print(" {{\n{s} = {s} + ", .{ acc, acc });
+            try self.expr(step);
+            try self.write("\n}\n");
+        } else for (elems) |e| {
+            const item = try self.symbols.fresh("lc");
+            try self.print("{s} = ", .{item});
+            try self.expr(e);
+            self.names.locals[slot] = item;
+            self.names.twins[slot] = null;
+            try self.print("\n{s} = {s} + ", .{ acc, acc });
+            try self.expr(step);
+            try self.write("\n");
+        }
+        try self.print("{s}\n}}", .{acc});
     }
 
     /// `if n < limit { sum } else other`, the sum over `i` in `0..=n` written
@@ -988,7 +1131,7 @@ const Printer = struct {
                 try self.write(" })");
                 return;
             },
-            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice, .empty, .upto, .counted => {},
+            .lit_u64, .lit_bool, .field_u64, .field_bool, .local, .plus, .minus, .times, .is_lt, .is_eq, .is_ne, .and_, .or_, .not, .default, .sum, .twice, .empty, .upto, .counted, .known, .unrolled => {},
         }
         try self.write("{\n");
         try self.bind(value, slot);

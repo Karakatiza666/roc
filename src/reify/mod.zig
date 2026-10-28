@@ -29,13 +29,14 @@ pub const loops = @import("loops.zig");
 pub const scalar = @import("scalar.zig");
 pub const ranges = @import("ranges.zig");
 pub const laws = @import("laws.zig");
+pub const lists = @import("lists.zig");
 pub const fuzz_gen = @import("fuzz_gen.zig");
 
 /// The normal-form version (I11). The rules, the speculatable lists and the
 /// builtin table change only with it, so a `Code` value carries it and a
 /// translator can put it in a cache key. `recorded` pins the fingerprint
 /// each version was recorded with.
-pub const normal_form_version: u32 = 19;
+pub const normal_form_version: u32 = 20;
 
 /// A fingerprint of what the normal-form version covers: the rule table,
 /// the builtin table with its speculatable list, the speculatable list of
@@ -80,6 +81,9 @@ pub fn fingerprint() u64 {
     // I14: the translator of a site is the function the call it is an
     // argument of names, a direct call's callee or a method call's target.
     h.update("I14: a site's translator is the callee of the direct call or the target of the method call the site is an argument of");
+    // M17: known lists (N17), and B.
+    for (lists.steps) |step| h.update(step);
+    h.update(std.mem.asBytes(&lists.max_unrolled));
     return h.final();
 }
 
@@ -176,6 +180,14 @@ const recorded = [_]Recorded{
     // Fix: a site passed to a translator called as a method takes the cut
     // of the method's type, as its direct call does (I14).
     .{ .version = 19, .fingerprint = 0x9c643e7520951391 },
+    // M17 of the plan: known lists (N17). A list builtin over a `List` node
+    // is what its body in `Builtin.roc` computes: a literal length, the
+    // element or the `Err` tag, a literal switch on an index that is not a
+    // literal, the `List` node of the result, the calls of a known function,
+    // or the `plus` chain of a sum. A `ForList` over a `List` node of at most
+    // B = 16 elements whose every path continues is its body once per
+    // element. The builtin table holds the list builtins N17 reads.
+    .{ .version = 20, .fingerprint = 0x8a67c5235ae7e495 },
 };
 
 const std = @import("std");
@@ -217,5 +229,6 @@ test "reify tests" {
     std.testing.refAllDecls(@import("scalar.zig"));
     std.testing.refAllDecls(@import("ranges.zig"));
     std.testing.refAllDecls(@import("laws.zig"));
+    std.testing.refAllDecls(@import("lists.zig"));
     std.testing.refAllDecls(@import("fuzz_gen.zig"));
 }

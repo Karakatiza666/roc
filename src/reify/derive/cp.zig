@@ -471,7 +471,7 @@ const Materializer = struct {
                             .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not => self.types.boolTy(),
                             .len => self.types.intTy(.u64),
                             .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .get => operand,
-                            .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // the table's rows name no builtin of layer L
+                            .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // the table's rows name no builtin of layer L
                         };
                     },
                     .field, .index, .payload => {

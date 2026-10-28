@@ -51,12 +51,13 @@ Section 4 defines it; section 11 covers where its output executes.
 | Part | State |
 |---|---|
 | What it describes | Pure Roc as section 10 states it: literals, operators, calls (helpers, generic and recursive functions, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods. A construct it does not describe stops with a report that names the construct |
-| What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 18 (`src/reify/mod.zig:38`) |
+| What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 20 (`src/reify/mod.zig:39`) |
 | How a translator names a node | `Code.Inlined.inline_digest` gives a node of the `inline` view a content digest that survives the refactors above and helper extraction (`roc-reify-normalization-plan.md`, M8) |
 | Rows the compiler chooses | A `Code.Outlined(f)` site gets the `outline` view: each computation of at least four operations that repeats is one row (`roc-reify-normalization-plan.md`, M9). Places that differ in a value pass it as an argument, so `step(input.a)` and `step(input.b)` call one row (V3b). The rows do not depend on how the author split the code into helpers |
 | Laws of the builtins | A `Code.Lawful(f)` site gets the `graph` view under layer L: a loop that appends meets `List.map` or `List.keep_if`, a `List.fold` meets its loop, two `map`s meet one, and `len() > 0` meets `!is_empty()` (`roc-reify-normalization-plan.md`, M10). A site of any other type keeps each form as written |
 | Literal intervals | Every integer value has an interval from literals, from the tests that dominate it and from the index of a range loop. A test it decides is gone, `while $i <= n` with `n` bounded below the type's highest value meets `for i in 0..=n`, a checked `+` proved to fit can leave a loop, and a bounded `(a + b) + c` meets `a + (b + c)`. `1 + a` meets `a + 1`, and two parameters of the root are in parameter order (`roc-reify-normalization-plan.md`, M11) |
 | Facts across loop turns | A loop controlled by a `$done` flag meets the same loop with `break`, and a second counter stepped with the index meets `i + j0` (`roc-reify-normalization-plan.md`, M12) |
+| Known lists | A list builtin over a list the graph holds is its result: `[a, b].len()` is `2`, `[a, b].concat([c])` is `[a, b, c]`, a `fold` or a `map` with a known function is its calls, and a lookup at an index that is not a literal is a literal switch on the index. A `for` over such a list of at most 16 elements is its body once per element, so `[c.r, c.g, c.b].map2(weights, \|x, w\| x * w).sum()` meets the sum written out in `inline` (`roc-reify-normalization-plan.md`, M17) |
 | How a translator refuses | It returns an `Err`, or calls `Code.refuse_at`, which the compiler reports at the source of the node (section 13) |
 | What a translator reads by name | Its cut: the functions the item `code_primitives` of its type lists, each a `Prim` named by its qualified name. Every other function, in any package, arrives as its body, and so does a computed value of any package (section 7.10, `roc-reify-normalization-plan.md`, M13) |
 
@@ -90,8 +91,8 @@ The tests, in layers. The counts were taken at the time of writing.
 
 | Layer | Where | What it catches |
 |---|---|---|
-| Normal-form unit tests | `src/reify/` (221 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
-| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (247 tests) | a walk that describes a body wrongly, and a row of the safety matrix (`roc-reify-normalization-plan.md` 5.12, M14) that meets where it must stay apart, or the reverse |
+| Normal-form unit tests | `src/reify/` (234 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
+| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (257 tests) | a walk that describes a body wrongly, and a row of the safety matrix (`roc-reify-normalization-plan.md` 5.12, M14) that meets where it must stay apart, or the reverse |
 | Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (134 cases) | the same, for calls into other modules and builtins |
 | CLI fixtures | `test/cli/Staged*.roc` (61 files) and `test/cli/StagedCut/`, run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
 | Fuzzers | `src/reify/fuzz_gen.zig`, `src/compile/reify_fuzz.zig`, `test/fuzzing/fuzz-reify.zig` | two spellings of one term that differ, or a normal form that computes what Roc does not |

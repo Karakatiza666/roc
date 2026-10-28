@@ -411,7 +411,10 @@ pub const Constants = struct {
     ///      function of another package outside the cut is walked (N8l).
     /// 182: Normal form 19: a site passed to a translator called as a
     ///      method records that call, and takes its method's cut (I14).
-    pub const CACHE_VERSION = 182;
+    /// 183: Normal form 20: known lists (N17, M17). List builtins over a
+    ///      `List` node are their results and a loop over one of at most B
+    ///      elements is unrolled, so described bodies change.
+    pub const CACHE_VERSION = 183;
 };
 
 /// Configuration for the Roc cache system.

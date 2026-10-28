@@ -40,7 +40,7 @@ fn isCommutative(sym: term.Sym) bool {
     if (sym.op != .prim) return false;
     return switch (sym.method.?) {
         .is_eq, .plus, .times, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => true,
-        .is_lt, .is_lte, .is_gt, .is_gte, .not, .minus, .div_trunc, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => false,
+        .is_lt, .is_lte, .is_gt, .is_gte, .not, .minus, .div_trunc, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => false,
     };
 }
 
@@ -131,16 +131,16 @@ pub fn run(arena: Allocator, prover: *prove.Prover, vars: sig_mod.Vars, eq: Equa
 // Whether every operand of `m` has its owner's type.
 fn operandsAreOwner(m: prims.Method) bool {
     return switch (m) {
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .is_empty, .collect => true,
-        .len, .get, .append, .map, .keep_if, .fold => false,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .is_empty, .collect, .first, .last, .sum => true,
+        .len, .get, .append, .map, .keep_if, .fold, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .any, .all => false,
     };
 }
 
 // Whether `m`'s result has its owner's type.
 fn resultIsOwner(m: prims.Method) bool {
     return switch (m) {
-        .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .append, .map, .keep_if => true,
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .len, .get, .is_empty, .fold, .collect => false,
+        .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .append, .map, .keep_if, .prepend, .single, .with_capacity, .drop_first, .take_first, .repeat, .map2, .map_with_index => true,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .len, .get, .is_empty, .fold, .collect, .first, .last, .set, .fold_rev, .sum, .any, .all => false,
     };
 }
 

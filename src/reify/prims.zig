@@ -131,6 +131,22 @@ pub const Method = enum(u8) {
     keep_if,
     fold,
     collect,
+    /// The builtins whose results N17 reads off a known list (normal-form 3.17).
+    first,
+    last,
+    prepend,
+    single,
+    with_capacity,
+    set,
+    drop_first,
+    take_first,
+    repeat,
+    map2,
+    map_with_index,
+    fold_rev,
+    sum,
+    any,
+    all,
 };
 
 /// One builtin's entry.
@@ -160,15 +176,16 @@ fn methodApplies(owner: Owner, method: Method) bool {
         .not => owner == .bool_,
         .concat => owner == .str or owner == .list,
         .len, .get, .is_empty, .append, .map, .keep_if, .fold => owner == .list,
+        .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => owner == .list,
         .collect => owner == .iter,
     };
 }
 
 fn arityOf(method: Method) u8 {
     return switch (method) {
-        .not, .len, .is_empty, .collect => 1,
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .get, .append, .map, .keep_if => 2,
-        .fold => 3,
+        .not, .len, .is_empty, .collect, .first, .last, .single, .with_capacity, .sum => 1,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .get, .append, .map, .keep_if, .prepend, .drop_first, .take_first, .repeat, .map_with_index, .any, .all => 2,
+        .fold, .set, .map2, .fold_rev => 3,
     };
 }
 
@@ -177,12 +194,14 @@ fn arityOf(method: Method) u8 {
 // `List.is_empty` is `List.len(list) == 0` (`Builtin.roc`), so it cannot
 // crash. A builtin that calls a function it is given can crash where the
 // function does, and `append`, `collect` stay off the list, as any builtin
-// can, since leaving one off is sound (normal-form 1.1).
+// can, since leaving one off is sound (normal-form 1.1). The builtins N17
+// reads stay off it as they were before the table held them.
 fn speculatableOf(owner: Owner, method: Method) bool {
     return switch (method) {
         .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty => true,
         .plus, .minus, .times => owner.float() != null,
         .div_trunc, .append, .map, .keep_if, .fold, .collect => false,
+        .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => false,
     };
 }
 
@@ -193,7 +212,7 @@ pub fn ordersLiteralLast(owner: Owner, method: Method) bool {
     return switch (method) {
         .plus, .times => owner.int() != null,
         .is_eq => owner.int() != null or owner == .str,
-        .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .is_lt, .is_lte, .is_gt, .is_gte, .not, .minus, .div_trunc, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => false,
+        .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .is_lt, .is_lte, .is_gt, .is_gte, .not, .minus, .div_trunc, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => false,
     };
 }
 
@@ -201,7 +220,7 @@ pub fn ordersLiteralLast(owner: Owner, method: Method) bool {
 pub fn associativeOf(method: Method) bool {
     return switch (method) {
         .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat => true,
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => false,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => false,
     };
 }
 
@@ -283,7 +302,7 @@ pub fn lookup(id: PrimId) ?Prim {
 pub fn methodName(method: Method) []const u8 {
     return switch (method) {
         .div_trunc => "div_trunc_by",
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => @tagName(method),
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => @tagName(method),
     };
 }
 
@@ -331,7 +350,7 @@ pub fn identityInt(int: types.IntTy, method: Method) ?i256 {
         .plus_wrap, .bitwise_or, .bitwise_xor => 0,
         .times_wrap => 1,
         .bitwise_and => if (int.signed()) -1 else int.max(),
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => null,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => null,
     };
 }
 
@@ -343,7 +362,7 @@ pub fn absorbingInt(int: types.IntTy, method: Method) ?i256 {
     return switch (method) {
         .times_wrap, .bitwise_and => 0,
         .bitwise_or => if (int.signed()) -1 else int.max(),
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => null,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => null,
     };
 }
 
@@ -381,7 +400,7 @@ pub fn foldInt(int: types.IntTy, method: Method, a: i256, b: i256) ?Folded {
         .bitwise_and => .{ .int = wrapTo(int, a & b) },
         .bitwise_or => .{ .int = wrapTo(int, a | b) },
         .bitwise_xor => .{ .int = wrapTo(int, a ^ b) },
-        .not, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // integer prims admit no other methods (methodApplies)
+        .not, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // integer prims admit no other methods (methodApplies)
     };
 }
 
@@ -415,7 +434,7 @@ fn floatFold(comptime F: type, method: Method, a: F, b: F) ?Folded {
         .plus => arith.bits(a + b),
         .minus => arith.bits(a - b),
         .times => arith.bits(a * b),
-        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => null,
+        .not, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => null,
     };
 }
 

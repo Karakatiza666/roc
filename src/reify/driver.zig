@@ -41,6 +41,7 @@ const match = @import("match.zig");
 const loops = @import("loops.zig");
 const scalar = @import("scalar.zig");
 const laws = @import("laws.zig");
+const lists = @import("lists.zig");
 
 const Allocator = std.mem.Allocator;
 const RowId = ir.RowId;
@@ -141,6 +142,8 @@ pub fn runToWith(gpa: Allocator, b: *Builder, root: RowId, passes: []const Pass,
     defer b.scalarizer = null;
     if (options.laws) b.laws = .{ .ctx = &special, .close = Specialize.lawClose, .inline_row = Specialize.lawInline };
     defer b.laws = null;
+    b.inliner = .{ .ctx = &special, .run = Specialize.lawInline };
+    defer b.inliner = null;
     for (comps) |comp| {
         try component(gpa, b, passes, &fin, comp, &stats);
         if (special.failed) |err| return err;
@@ -650,7 +653,7 @@ const State = struct {
     }
 };
 
-fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, comp: []const RowId, with_laws: bool) Allocator.Error!State {
+fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, comp: []const RowId, with_laws: bool, list_rules: lists.Rules) Allocator.Error!State {
     var returns = try live.Returns.init(gpa, store);
     defer returns.deinit(gpa);
     var reached = try live.ofStore(gpa, store);
@@ -667,7 +670,7 @@ fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types
         defer numbering.deinit(gpa);
         p.* = number.fingerprint(store, &returns, &numbering, r);
         f.* = store.row(r).speculatable;
-        const m = try measure.ofRow(gpa, store, types, reached, &calls, r, with_laws);
+        const m = try measure.ofRow(gpa, store, types, reached, &calls, r, with_laws, list_rules);
         for (&total.counts, m.counts) |*t, c| t.* +|= c;
     }
     return .{ .prints = prints, .flags = flags, .measure = total };
@@ -676,7 +679,7 @@ fn stateOf(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types
 fn simplify(gpa: Allocator, b: *Builder, passes: []const Pass, comp: []const RowId) Error!u32 {
     const store = b.store;
     var rounds: u32 = 0;
-    var before = try stateOf(gpa, store, b.types, comp, b.laws != null);
+    var before = try stateOf(gpa, store, b.types, comp, b.laws != null, lists.rulesOf(b));
     defer before.deinit(gpa);
     while (true) {
         {
@@ -700,7 +703,7 @@ fn simplify(gpa: Allocator, b: *Builder, passes: []const Pass, comp: []const Row
         for (passes) |p| {
             if (try p.run(p.ctx, store, b.types, comp)) passed = true;
         }
-        var after = try stateOf(gpa, store, b.types, comp, b.laws != null);
+        var after = try stateOf(gpa, store, b.types, comp, b.laws != null, lists.rulesOf(b));
         const content = passed or !std.mem.eql(u128, before.prints, after.prints);
         const flags = !std.mem.eql(bool, before.flags, after.flags);
         if (!content and !flags) {
@@ -820,6 +823,10 @@ fn checkInvariants(gpa: Allocator, b: *const Builder, root: RowId, outlined: []c
         if (!try loops.noneRewritable(gpa, store, types, &p, .{ .decided_test = b.algorithmOn(.decided_test), .derived_counter = b.algorithmOn(.derived_counter) })) return error.InvariantBroken;
         // L2: at a site that opts into layer L, no law applies to a finished row.
         if (with_laws and !try lawsNoneRewritable(gpa, b, &p)) return error.InvariantBroken;
+        // L2: no step of N17 that is on applies to a node of a finished row.
+        const on = lists.rulesOf(b);
+        var nodes = p.info.constKeyIterator();
+        while (nodes.next()) |n| if (lists.redex(store, types, n)) |step| if (on.contains(step)) return error.InvariantBroken;
     }
 }
 

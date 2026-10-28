@@ -24,6 +24,7 @@ const provenance = @import("provenance.zig");
 const scalar = @import("scalar.zig");
 const laws_mod = @import("laws.zig");
 const ranges = @import("ranges.zig");
+const lists_mod = @import("lists.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -129,6 +130,14 @@ pub const Algorithm = enum {
     decided_test,
     /// N11o: a derived counter of a bounded loop.
     derived_counter,
+    /// N17 over known lists (`lists.zig`), one switch per step: N17a to N17g.
+    list_len,
+    list_get,
+    list_lookup,
+    list_build,
+    list_map,
+    list_fold,
+    list_unroll,
 };
 
 /// The rules on exits and joins (normal-form 3.11), which run when an
@@ -255,6 +264,16 @@ pub const Laws = struct {
     inline_row: *const fn (ctx: *anyopaque, b: *Builder, row: RowId, args: []const Ref, ty: TyId) Allocator.Error!?Ref,
 };
 
+/// Builds the body of `row` in the current region over `args` for its
+/// parameters, at the type `ty`: a known function inlined where its value is
+/// read (N17e reads a predicate's value so). Returns null for a row that
+/// cannot be inlined, a recursive one or one whose body can end in `Return`
+/// in a nested region (V1).
+pub const Inliner = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque, b: *Builder, row: RowId, args: []const Ref, ty: TyId) Allocator.Error!?Ref,
+};
+
 /// Why a specialization stopped: the driver's errors, which the builder
 /// hands back through the call it was building.
 pub const SpecializeError = error{ MeasureDidNotFall, RoundBoundExceeded, InvariantBroken } || Allocator.Error;
@@ -299,6 +318,9 @@ pub const Builder = struct {
     /// and a row a law builds is simplified and finalized through it. The
     /// driver sets it for a `Code.Lawful(f)` site only.
     laws: ?Laws = null,
+    /// Where set, a known function's body can be built where its value is
+    /// read (`Inliner`). The driver sets it for every site.
+    inliner: ?Inliner = null,
     /// The value switch output that the switch being built is the only reader
     /// of, which the rebuild knows from the placement's uses: N13r moves the
     /// switch into the arms of the value switch only then, so the value switch
@@ -1363,9 +1385,12 @@ pub const Builder = struct {
             if (try self.decidedOperands(spec)) |r| return r;
         }
         if (self.rulesActive() and spec.op == .prim) {
-            if (self.laws != null) if (try laws_mod.prim(self, spec)) |r| return r;
             if (try self.decidedNot(spec)) |r| return r;
+            // N13m inside a loop over the list before N17, so the element
+            // of a `ForList` over a known list is its element parameter.
             if (try self.boundedGet(spec)) |r| return r;
+            if (try lists_mod.prim(self, spec)) |r| return r;
+            if (self.laws != null) if (try laws_mod.prim(self, spec)) |r| return r;
             if (try self.rangeCompare(spec)) |r| return r;
             if (try self.paramOrder(spec)) |r| return r;
         }
@@ -2594,7 +2619,7 @@ pub const Builder = struct {
             .is_empty => self.types.boolTy(),
             .append, .keep_if => self.store.refTy(self.row, args[0]),
             .fold => self.store.refTy(self.row, args[1]),
-            .get, .map, .collect => unreachable, // their result types are not derivable from their arguments, and they are never built through `call`
+            .get, .map, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // their result types are not derivable from their arguments, and they are never built through `call`
         };
     }
 
@@ -3111,7 +3136,7 @@ pub const Builder = struct {
             .bool_ => switch (p.method) {
                 .not => .{ .bool_ = !lits[0].value.bool_ },
                 .is_eq => .{ .bool_ = lits[0].value.bool_ == lits[1].value.bool_ },
-                .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // bool owners only have the not and is_eq folds
+                .is_lt, .is_lte, .is_gt, .is_gte, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // bool owners only have the not and is_eq folds
             },
             .str => switch (p.method) {
                 .is_eq => .{ .bool_ = std.mem.eql(u8, self.store.byteSlice(lits[0].value.str), self.store.byteSlice(lits[1].value.str)) },
@@ -3122,7 +3147,7 @@ pub const Builder = struct {
                     for (lits) |l| try out.appendSlice(self.gpa, self.store.byteSlice(l.value.str));
                     break :blk .{ .str = try out.toOwnedSlice(self.gpa) };
                 },
-                .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect => unreachable, // str owners only have the is_eq and concat folds
+                .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all => unreachable, // str owners only have the is_eq and concat folds
             },
             // A list literal is the embedded bytes of a file, whose elements
             // the rules do not read, and an iterator is never a literal.
