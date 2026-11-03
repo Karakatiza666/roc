@@ -238,11 +238,6 @@ reference, and a DSL predicate was never a function.
 `roc test examples/reifying/dbsp/main.roc` passes 19 expects and
 `roc test examples/reifying/dbsp/refactored.roc` passes one. `roc
 examples/reifying/dbsp/main.roc` prints the program. The whole program is a
-compile-time constant, so `roc check` reports
-
-```
-● unconditional condition
-This match value is known at compile time
-```
-
-on the driver's `match`, which is the point.
+compile-time constant. `roc check`, `roc test` and `roc build` exit with status
+0 and print no warning for the driver's `match`: the result of a translator is
+known at compile time by design, and a `match` is how a program reads it.

@@ -5,7 +5,7 @@ another compiler can read, and which of their ideas could work within Roc's
 constraints. It is separate from `roc-reify-proposal.md` section 8, which covers
 the closest prior art (C#, F#, Julia, Swift macros, Scala 3). Each idea here
 addresses a specific open problem of that proposal or of its checklist,
-`roc-reify-design.md`.
+`roc-reify-design-checklist.md`.
 
 Roc's constraints, which decide every verdict below:
 
@@ -25,7 +25,7 @@ Roc's constraints, which decide every verdict below:
 
 | # | Idea | From | Open problem it addresses | Fit |
 |---|---|---|---|---|
-| 1 | A runtime capture becomes a typed parameter slot | C# with Entity Framework, Unison, Spark | a capture of a name nothing fixes is refused (`roc-reify-design.md:76`) | high |
+| 1 | A runtime capture becomes a typed parameter slot | C# with Entity Framework, Unison, Spark | a capture of a name nothing fixes is refused (`roc-reify-design-checklist.md:76`) | high |
 | 2 | A `Code` remembers the function it describes | Swift `@differentiable` function types | rule 5, inert `Code`; no reference implementation next to the translation | high |
 | 3 | A derivable method lifts a value into a description | Template Haskell `Lift`, Lean `ToExpr`, Scala 3 `ToExpr` | lists, opaque values have no chosen representation (proposal section 13) | high |
 | 4 | Rows keyed by content hash, names as metadata | Unison, Dhall | row serials such as `Test.id#1` depend on walk order | medium-high |
@@ -54,9 +54,9 @@ same principle: the code is fixed and addressable, and the environment is data
 sent beside it.
 
 The problem it addresses. The checklist now describes a value the block around
-the lambda binds, by replaying the binding statement (`roc-reify-design.md:69`),
+the lambda binds, by replaying the binding statement (`roc-reify-design-checklist.md:69`),
 and still refuses a name nothing fixes: "a function parameter, a branch or loop
-binder, or a `var`" (`roc-reify-design.md:76`). The proposal names captures the
+binder, or a `var`" (`roc-reify-design-checklist.md:76`). The proposal names captures the
 one remaining item that "needs a representation chosen" (proposal section 10). Rule 3
 justifies the refusal by timing: a captured runtime value "could only arrive as
 an opaque pointer". Entity Framework shows a third option. The value arrives as
@@ -133,7 +133,7 @@ What it buys a library author:
 What it costs. Equality and hashing (rule 6) must skip `original`, because
 functions have no `is_eq`. It is an open question whether the const store
 accepts a function value inside a build-time constant. The checklist folds
-top-level values into descriptions (`roc-reify-design.md:68`), and whether a
+top-level values into descriptions (`roc-reify-design-checklist.md:68`), and whether a
 function value survives that path has not been measured.
 
 This is not splice: `call` returns the function that was written, never one
@@ -191,7 +191,7 @@ alpha-normalized expression for its integrity checks.
 
 The problem it addresses. A generic callee today yields rows named by walk
 order: "`Test.id` and `Test.id#1`: the walk counts rows per name and every row
-after the first takes its count as a serial" (`roc-reify-design.md:156-165`).
+after the first takes its count as a serial" (`roc-reify-design-checklist.md:156-165`).
 Adding an unrelated call earlier in a body renumbers rows, and a translator
 that caches by row name then misses or, worse, reuses the wrong artifact.
 
@@ -304,8 +304,8 @@ Triton marks a kernel parameter `tl.constexpr` and compiles one kernel per
 value. Taichi's `ti.static` forces an `if` or `for` to be resolved at compile
 time, and AnyDSL annotates a function with filters that decide when a call is
 specialized. Roc covers most of this already: template arguments fold to
-literals (`roc-reify-design.md:66`), top-level values fold
-(`roc-reify-design.md:68`), and monomorphization specializes every generic
+literals (`roc-reify-design-checklist.md:66`), top-level values fold
+(`roc-reify-design-checklist.md:68`), and monomorphization specializes every generic
 callee. The remaining piece, unrolling a loop over a fixed range, belongs to a
 translator that sees `Ir.For` over a literal `Range`, not to the compiler.
 

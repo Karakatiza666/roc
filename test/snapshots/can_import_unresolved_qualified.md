@@ -32,7 +32,7 @@ client = Http.invalidMethod
 parser = Json.Parser.Advanced.NonExistent.create
 ~~~
 # EXPECTED
-DUPLICATE DEFINITION - can_import_unresolved_qualified.md:1:1:1:17
+BUILTIN TYPE SHADOWED - can_import_unresolved_qualified.md:1:1:1:17
 UNUSED VARIABLE - can_import_unresolved_qualified.md:13:19:13:22
 DOES NOT EXIST - can_import_unresolved_qualified.md:19:10:19:28
 DOES NOT EXIST - can_import_unresolved_qualified.md:5:8:5:31
@@ -49,25 +49,16 @@ DOES NOT EXIST - can_import_unresolved_qualified.md:25:10:25:49
 (reports
 	(report
 		(severity warning)
-		(title "Duplicate Definition")
+		(title "Builtin Type Shadowed")
 		(region (start 1 1) (end 1 17))
 		(headline
-			(reflow "The name ")
+			(text "The type ")
 			(annotated symbol-unqualified "Json")
-			(reflow " is being redeclared here."))
+			(text " shadows a builtin type."))
 		(document
-			(source-region (file "can_import_unresolved_qualified.md") (start 1 1) (end 1 17) (annotation error) (line-text "import json.Json"))
+			(reflow "This may make the builtin type inaccessible in this scope.")
 			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Json")
-			(reflow " was already defined in ")
-			(source-location
-				(file "can_import_unresolved_qualified.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "can_import_unresolved_qualified.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import json.Json"))))
+			(source-region (file "can_import_unresolved_qualified.md") (start 1 1) (end 1 17) (annotation warning) (line-text "import json.Json"))))
 	(report
 		(severity warning)
 		(title "Unused Variable")

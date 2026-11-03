@@ -1568,7 +1568,7 @@ const State = struct {
                     site.update(&class_digest);
                     hashU32(&site, try self.nextOrdinal(ordinals, class_digest));
                 },
-                .numeral_conversion, .quote_conversion => {
+                .numeral_conversion, .quote_conversion, .interpolation_conversion => {
                     const text = self.regionText(env.store.getExprRegion(expr));
                     hashBytes(&value, text);
                     value.update(&try self.literalTargetsDigest(@backingInt(expr)));

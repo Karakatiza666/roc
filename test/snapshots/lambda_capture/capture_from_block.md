@@ -60,14 +60,14 @@ EndOfFile,
 		(e-num (value "10")))
 	(s-let
 		(p-assign (ident "b"))
-		(e-call (constraint-fn-var 396)
+		(e-call (constraint-fn-var 477)
 			(e-closure
 				(captures
 					(capture (ident "a")))
 				(e-lambda
 					(args
 						(p-underscore))
-					(e-dispatch-call (method "times") (constraint-fn-var 387)
+					(e-dispatch-call (method "times") (constraint-fn-var 468)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "a"))))

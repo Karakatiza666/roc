@@ -1334,11 +1334,17 @@ pub const SyntaxChecker = struct {
 
         defer if (documentation) |doc| self.allocator.free(doc);
 
+        // An intrinsic has no Roc body; its hover says so after the type.
+        const badge = if (hoveredIntrinsic(env, module_env, build.absolute_path, lookup_result_opt, target_offset))
+            "\n\n" ++ intrinsic_badge
+        else
+            "";
+
         // Create markdown-formatted output with type and optional documentation
         const markdown = if (documentation) |doc|
-            try std.fmt.allocPrint(self.allocator, "{s}\n\n```roc\n{s}\n```", .{ doc, type_str })
+            try std.fmt.allocPrint(self.allocator, "{s}\n\n```roc\n{s}\n```{s}", .{ doc, type_str, badge })
         else
-            try std.fmt.allocPrint(self.allocator, "```roc\n{s}\n```", .{type_str});
+            try std.fmt.allocPrint(self.allocator, "```roc\n{s}\n```{s}", .{ type_str, badge });
 
         // Convert the region back to LSP positions
         const range = cir_queries.regionToRange(module_env, result.region);
@@ -1347,6 +1353,85 @@ pub const SyntaxChecker = struct {
             .type_str = markdown,
             .range = range,
         };
+    }
+
+    /// The badge that hover and documentation show on an intrinsic.
+    const intrinsic_badge = "intrinsic: no Roc body";
+
+    /// Whether the declaration that hover names is an intrinsic: the
+    /// declaration of the name at `offset`, or the target of the lookup or
+    /// method call there. Canonicalization marks an intrinsic, and the mark
+    /// is the only thing read.
+    fn hoveredIntrinsic(
+        env: *BuildEnv,
+        module_env: *ModuleEnv,
+        doc_path: []const u8,
+        lookup_result_opt: ?cir_queries.LookupResult,
+        offset: u32,
+    ) bool {
+        const lookup_result = lookup_result_opt orelse {
+            for (module_env.store.sliceDefs(module_env.all_defs)) |def_idx| {
+                const def = module_env.store.getDef(def_idx);
+                if (!cir_queries.regionContainsOffset(module_env.store.getPatternRegion(def.pattern), offset)) continue;
+                return module_env.isIntrinsicDef(def);
+            }
+            return false;
+        };
+        const expr_idx = switch (lookup_result) {
+            .expr => |idx| idx,
+            .field_access => return false,
+        };
+        const expr = module_env.store.getSourceExpr(expr_idx);
+        if (expr == .e_lookup_local) {
+            const lookup = expr.e_lookup_local;
+            for (module_env.store.sliceDefs(module_env.all_defs)) |def_idx| {
+                const def = module_env.store.getDef(def_idx);
+                if (def.pattern == lookup.pattern_idx) return module_env.isIntrinsicDef(def);
+            }
+            return false;
+        }
+        if (expr == .e_lookup_external) {
+            const lookup = expr.e_lookup_external;
+            const target_env = importedEnvForImport(env, module_env, doc_path, lookup.module_idx) orelse return false;
+            const node_idx: CIR.Node.Idx = @fromBackingInt(@intCast(lookup.target_node_idx));
+            if (target_env.store.nodes.get(node_idx).tag != .def) return false;
+            const def_idx: CIR.Def.Idx = @fromBackingInt(lookup.target_node_idx);
+            return target_env.isIntrinsicDef(target_env.store.getDef(def_idx));
+        }
+        if (expr == .e_lookup_associated_resolved) {
+            const resolved = expr.e_lookup_associated_resolved;
+            const target_env = moduleEnvForIdentity(env, module_env, resolved.module_identity) orelse return false;
+            return target_env.isIntrinsicDef(target_env.store.getDef(resolved.target_def_idx));
+        }
+        if (expr == .e_dispatch_call) {
+            const call = expr.e_dispatch_call;
+            return methodIsIntrinsic(env, module_env, call.receiver, call.method_name);
+        }
+        if (expr == .e_method_call) {
+            const call = expr.e_method_call;
+            return methodIsIntrinsic(env, module_env, call.receiver, call.method_name);
+        }
+        return false;
+    }
+
+    /// Whether the method `method_name` that a call on `receiver` dispatches
+    /// to is an intrinsic.
+    fn methodIsIntrinsic(
+        env: *BuildEnv,
+        module_env: *ModuleEnv,
+        receiver: CIR.Expr.Idx,
+        method_name: base.Ident.Idx,
+    ) bool {
+        const method_owner = resolveMethodOwnerForLookup(module_env, ModuleEnv.varFrom(receiver)) orelse return false;
+        const owner_env = methodOwnerModuleEnv(env, module_env, method_owner) orelse return false;
+        const owner_method_name = owner_env.common.findIdentFrom(&module_env.common, method_name) orelse return false;
+        const qualified_ident = owner_env.lookupMethodIdentForOwnerConst(method_owner.owner, owner_method_name) orelse return false;
+        for (owner_env.store.sliceDefs(owner_env.all_defs)) |def_idx| {
+            const def = owner_env.store.getDef(def_idx);
+            const ident_idx = module_lookup.extractIdentFromPattern(&owner_env.store, def.pattern) orelse continue;
+            if (ident_idx.eql(qualified_ident)) return owner_env.isIntrinsicDef(def);
+        }
+        return false;
     }
 
     /// Documentation of the declaration whose name is at `offset`: a binding

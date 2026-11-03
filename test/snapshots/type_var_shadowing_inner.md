@@ -109,7 +109,7 @@ main! = |_| {}
 							(p-assign (ident "y")))
 						(e-lookup-local
 							(p-assign (ident "y")))))
-				(e-call (constraint-fn-var 391)
+				(e-call (constraint-fn-var 472)
 					(e-lookup-local
 						(p-assign (ident "inner")))
 					(e-lookup-local

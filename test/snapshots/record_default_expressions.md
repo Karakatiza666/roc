@@ -345,7 +345,7 @@ cycle_val = Cycle.{}
 			(e-if
 				(if-branches
 					(if-branch
-						(e-dispatch-call (method "is_gt") (constraint-fn-var 528)
+						(e-dispatch-call (method "is_gt") (constraint-fn-var 609)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "n"))))

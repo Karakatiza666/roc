@@ -164,6 +164,7 @@ test "expected shape preserves sharing without copying dispatch-only graphs" {
         const method_arg = try env.types.freshFromContentWithRank(.{ .flex = Flex.init() }, .generalized);
         const method = try env.types.freshFromContentWithRank(try env.mkFuncPure(&.{method_arg}, method_arg), .generalized);
         const constraints = try env.types.appendStaticDispatchConstraints(&.{.{
+            .runs = true,
             .fn_name = method_name,
             .fn_var = method,
             .origin = .method_call,
@@ -744,6 +745,7 @@ test "instantiate - markers in a constraint signature get their own choices" {
     const ret_union = try env.types.freshFromContentWithRank((try env.mkTagUnion(&.{try env.mkTag("A", &.{})}, ret_marker)).content, .generalized);
     const method = try env.types.freshFromContentWithRank(try env.mkFuncPure(&.{arg_union}, ret_union), .generalized);
     const constraints = try env.types.appendStaticDispatchConstraints(&.{.{
+        .runs = true,
         .fn_name = try env.idents.insert(gpa, Ident.for_text("method")),
         .fn_var = method,
         .origin = .method_call,
@@ -786,6 +788,7 @@ test "instantiate - markers in interpolation metadata get their own choices" {
     const region = base.Region{ .start = .{ .offset = 0 }, .end = .{ .offset = 1 } };
     const parts = try env.types.appendInterpolationParts(&.{.{ .var_ = part_union, .region = region }});
     const constraints = try env.types.appendStaticDispatchConstraints(&.{.{
+        .runs = true,
         .fn_name = try env.idents.insert(gpa, Ident.for_text("from_interpolation")),
         .fn_var = method,
         .origin = .method_call,
@@ -830,6 +833,7 @@ test "instantiate - markers reached through a record presence var get their own 
     const ret_union = try env.types.freshFromContentWithRank((try env.mkTagUnion(&.{try env.mkTag("A", &.{})}, ret_marker)).content, .generalized);
     const method = try env.types.freshFromContentWithRank(try env.mkFuncPure(&.{}, ret_union), .generalized);
     const constraints = try env.types.appendStaticDispatchConstraints(&.{.{
+        .runs = true,
         .fn_name = try env.idents.insert(gpa, Ident.for_text("method")),
         .fn_var = method,
         .origin = .method_call,

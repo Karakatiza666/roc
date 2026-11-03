@@ -160,6 +160,12 @@ pub const CommonIdents = extern struct {
     builtin_numeral: Ident.Idx,
     builtin_code: Ident.Idx,
     builtin_code_inlined: Ident.Idx,
+    builtin_code_outlined: Ident.Idx,
+    builtin_code_lawful: Ident.Idx,
+    builtin_code_binds: Ident.Idx,
+    builtin_code_bound: Ident.Idx,
+    builtin_code_prim_id: Ident.Idx,
+    builtin_code_proxy: Ident.Idx,
     builtin_str: Ident.Idx,
     builtin_list: Ident.Idx,
     builtin_box: Ident.Idx,
@@ -212,6 +218,8 @@ pub const CommonIdents = extern struct {
     builtin_box_box: Ident.Idx,
     builtin_box_unbox: Ident.Idx,
     to_inspect: Ident.Idx,
+    /// The well-known item that declares a translator's cut (I14).
+    code_primitives: Ident.Idx,
     ok: Ident.Idx,
     err: Ident.Idx,
     from_numeral: Ident.Idx,
@@ -322,6 +330,12 @@ pub const CommonIdents = extern struct {
             .builtin_numeral = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("numeral_type").qualified_name)),
             .builtin_code = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_type").qualified_name)),
             .builtin_code_inlined = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_inlined_type").qualified_name)),
+            .builtin_code_outlined = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_outlined_type").qualified_name)),
+            .builtin_code_lawful = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_lawful_type").qualified_name)),
+            .builtin_code_binds = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_binds_type").qualified_name)),
+            .builtin_code_bound = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_bound_type").qualified_name)),
+            .builtin_code_prim_id = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_prim_id_type").qualified_name)),
+            .builtin_code_proxy = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("code_proxy_type").qualified_name)),
             .builtin_str = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("str_type").qualified_name)),
             .builtin_list = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("list_type").qualified_name)),
             .builtin_box = try common.insertIdent(gpa, Ident.for_text(CIR.builtinTypeSpec("box_type").qualified_name)),
@@ -372,6 +386,7 @@ pub const CommonIdents = extern struct {
             .builtin_box_box = try common.insertIdent(gpa, Ident.for_text("Builtin.Box.box")),
             .builtin_box_unbox = try common.insertIdent(gpa, Ident.for_text("Builtin.Box.unbox")),
             .to_inspect = try common.insertIdent(gpa, Ident.for_text("to_inspect")),
+            .code_primitives = try common.insertIdent(gpa, Ident.for_text("code_primitives")),
             .ok = try common.insertIdent(gpa, Ident.for_text("Ok")),
             .err = try common.insertIdent(gpa, Ident.for_text("Err")),
             .from_numeral = try common.insertIdent(gpa, Ident.for_text(Ident.FROM_NUMERAL_METHOD_NAME)),
@@ -509,6 +524,30 @@ pub const ForLoopDispatchPlan = extern struct {
     /// The method that pulls each step: `next` for `for`, `next!` for `for!`.
     next_method_ident: u32,
     step_topology: IteratorStepTopology,
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
+/// One capture read of a lambda at a `Code.Binds(code, fmt)` position (rule
+/// "Bound Capture Encoding", design.md "Code Reification"): the checker
+/// required `encoder_for` in `fmt` of the read's type and `default` of
+/// `fmt`. Publication plans the two dispatches as the expressions
+/// `fmt.default()` and `T.encoder_for(..)` of the read, and lowering calls
+/// them to encode a captured value of an opaque type.
+pub const BoundCaptureEncoding = extern struct {
+    /// The node of the lambda at the `Code.Binds` position.
+    site_node: u32,
+    /// The capture read: `x`, `x.a`, `x.a.b`, `x.0`, where `x` is a capture.
+    read_expr: u32,
+    /// `fmt`, the dispatcher of `default`.
+    format_var: u32,
+    /// The callable `() -> fmt` of `fmt.default`.
+    default_fn_var: u32,
+    /// The callable `fmt -> (t, List(U8) -> Try(List(U8), []))` of
+    /// `t.encoder_for`, dispatched on the read's type.
+    encoder_fn_var: u32,
+    /// The encoder `encoder_for` returns.
+    encoder_var: u32,
 
     pub const SafeList = collections.SafeList(@This());
 };
@@ -872,6 +911,75 @@ pub const CallableCheckingFact = extern struct {
     pub const SafeList = collections.SafeList(@This());
 };
 
+/// The reference that made a top-level definition reify-only (design.md
+/// "Reify-Only Definitions"): the first run-time reference of the definition,
+/// in the breadth-first fixpoint, whose target is an intrinsic or a reify-only
+/// definition. The target is always either an intrinsic or a definition that
+/// became reify-only in an earlier round, so the chain of witnesses ends at an
+/// intrinsic and has no cycle.
+pub const ReifyOnlyWitness = extern struct {
+    kind: Kind,
+    /// The reference, in this module's source.
+    region_start: u32,
+    region_end: u32,
+    /// The module of the target definition, in this module's identity table.
+    target_module: base.ModuleIdentity.Idx,
+    /// The target definition, in the target module.
+    target_def: CIR.Def.Idx,
+    /// The method name of a dispatch, in this module's identifiers.
+    /// `Ident.Idx.NONE` for another kind.
+    method_name: Ident.Idx,
+
+    pub const Kind = enum(u32) {
+        /// A use of the target as a value.
+        lookup,
+        /// A call whose callee names the target.
+        call,
+        /// A static dispatch that selected the target.
+        dispatch,
+    };
+
+    pub fn region(self: ReifyOnlyWitness) Region {
+        return Region.from_raw_offsets(self.region_start, self.region_end);
+    }
+};
+
+/// One reify-only top-level definition, its witness, and its full chain.
+/// Checking publishes these in ascending order of definition id. Importers
+/// read them.
+pub const ReifyOnlyDef = extern struct {
+    def: CIR.Def.Idx,
+    witness: ReifyOnlyWitness,
+    /// The frames of the chain from this definition to the intrinsic, the
+    /// intrinsic last, in `reify_only_frames`.
+    frames_start: u32,
+    frames_len: u32,
+    /// The qualified name of the intrinsic at the end of the chain, in
+    /// `reify_only_text`.
+    intrinsic: ReifyOnlyText,
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
+/// A range of bytes in `reify_only_text`.
+pub const ReifyOnlyText = extern struct {
+    start: u32,
+    len: u32,
+};
+
+/// One frame of an exported reify-only chain: its text, and the path, line
+/// and column (1-based) of its place. An importer reports each frame as it
+/// is, so the chain is complete when the importer sees no module of it but
+/// the one it imports.
+pub const ReifyOnlyFrame = extern struct {
+    text: ReifyOnlyText,
+    path: ReifyOnlyText,
+    line: u32,
+    column: u32,
+
+    pub const SafeList = collections.SafeList(@This());
+};
+
 /// Checking's import-facing identity and the current content identities that
 /// bind its owner parameters. The digest never substitutes for an implementation
 /// identity. Canonicalized environments have an unpublished dependency.
@@ -1026,6 +1134,12 @@ qualified_module_name: []const u8,
 /// Empty for a module no coordinator placed in a package. Reification reads it
 /// to tell a function of another package (N8h).
 package_name: []const u8,
+/// The path of the file the module was read from, as diagnostics name it.
+/// Workspace information like `qualified_module_name`: runtime-only, and the
+/// coordinator records it beside that name on every environment it installs.
+/// Empty for an environment built outside the coordinator. A report of a
+/// reification refusal inside this module's source names it (F4).
+source_path: []const u8 = "",
 /// Env-local module identity table: dense `base.ModuleIdentity.Idx` -> 32-byte
 /// deep content hash (see `base.module_identity`). Entry ids are the
 /// `origin_module` values stored on nominal/alias types in this env's type
@@ -1056,6 +1170,16 @@ top_level_demand_dependencies_ready: bool,
 /// Demand"): functions whose bodies can, and definitions holding values.
 /// Checking produces it with the strict-demand relation; importers read it.
 invoking_defs: collections.SafeList(CIR.Def.Idx),
+/// The top-level definitions that only reified code can use, in ascending
+/// order of definition id, each with its witness (design.md "Reify-Only
+/// Definitions"). Checking produces it after the module is checked;
+/// importers read it.
+reify_only_defs: ReifyOnlyDef.SafeList,
+/// The frames of the chains of `reify_only_defs`.
+reify_only_frames: ReifyOnlyFrame.SafeList,
+/// The text of `reify_only_frames` and the intrinsic names of
+/// `reify_only_defs`.
+reify_only_text: collections.SafeList(u8),
 /// Exact stored-constant eligibility of each global or method callable, published after
 /// checking settles its body. Importers consume this instead of scanning CIR.
 callable_checking_facts: CallableCheckingFact.SafeList,
@@ -1087,6 +1211,8 @@ provided_low_level_defs: ProvidedLowLevelDef.SafeList,
 
 /// Dispatch plans attached by checking to source `for` loop nodes.
 for_loop_dispatch_plans: ForLoopDispatchPlan.SafeList,
+/// The capture reads of lambdas at `Code.Binds` positions, recorded by checking.
+bound_capture_encodings: BoundCaptureEncoding.SafeList,
 /// Base-256 bytes referenced by `numeral_literals`.
 numeral_digit_bytes: collections.SafeList(u8),
 /// Exact numeric literals attached to source expression and pattern nodes.
@@ -1453,6 +1579,9 @@ pub fn initCIRFields(self: *Self, module_name: []const u8) Allocator.Error!void 
     self.top_level_demand_dependencies = .{};
     self.top_level_demand_dependencies_ready = false;
     self.invoking_defs = .{};
+    self.reify_only_defs = .{};
+    self.reify_only_frames = .{};
+    self.reify_only_text = .{};
     self.callable_checking_facts = .{};
     self.checking_dependency = .{};
     self.runtime_prepared = false;
@@ -1507,6 +1636,9 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .top_level_demand_dependencies = .{},
         .top_level_demand_dependencies_ready = false,
         .invoking_defs = .{},
+        .reify_only_defs = .{},
+        .reify_only_frames = .{},
+        .reify_only_text = .{},
         .callable_checking_facts = .{},
         .checking_dependency = .{},
         .runtime_prepared = false,
@@ -1516,6 +1648,7 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .method_defs = MethodDefs.init(),
         .provided_low_level_defs = try ProvidedLowLevelDef.SafeList.initCapacity(gpa, 4),
         .for_loop_dispatch_plans = try ForLoopDispatchPlan.SafeList.initCapacity(gpa, 4),
+        .bound_capture_encodings = try BoundCaptureEncoding.SafeList.initCapacity(gpa, 0),
         .numeral_digit_bytes = try collections.SafeList(u8).initCapacity(gpa, 32),
         .numeral_literals = try NumeralLiteral.SafeList.initCapacity(gpa, 8),
         .numeric_suffix_targets = try NumericSuffixTarget.SafeList.initCapacity(gpa, 8),
@@ -1555,6 +1688,7 @@ pub fn deinit(self: *Self) void {
     self.method_defs.deinit(self.gpa);
     self.provided_low_level_defs.deinit(self.gpa);
     self.for_loop_dispatch_plans.deinit(self.gpa);
+    self.bound_capture_encodings.deinit(self.gpa);
     self.numeral_digit_bytes.deinit(self.gpa);
     self.numeral_literals.deinit(self.gpa);
     self.numeric_suffix_targets.deinit(self.gpa);
@@ -1572,6 +1706,9 @@ pub fn deinit(self: *Self) void {
     self.inspect_override_instances.deinit(self.gpa);
     self.top_level_demand_dependencies.deinit(self.gpa);
     self.invoking_defs.deinit(self.gpa);
+    self.reify_only_defs.deinit(self.gpa);
+    self.reify_only_frames.deinit(self.gpa);
+    self.reify_only_text.deinit(self.gpa);
     self.callable_checking_facts.deinit(self.gpa);
     self.checking_dependency.deinit(self.gpa);
     // diagnostics are stored in the NodeStore, no need to free separately
@@ -1618,6 +1755,85 @@ pub fn defInvokes(self: *const Self, def_idx: CIR.Def.Idx) bool {
         }
     }
     return false;
+}
+
+/// Replace the checked record of the module's reify-only definitions.
+/// `defs` must be in ascending order of definition id, and their frame and
+/// text ranges must be in `frames` and `text`.
+pub fn setReifyOnlyDefs(
+    self: *Self,
+    defs: []const ReifyOnlyDef,
+    frames: []const ReifyOnlyFrame,
+    text: []const u8,
+) std.mem.Allocator.Error!void {
+    var list = try ReifyOnlyDef.SafeList.initCapacity(self.gpa, defs.len);
+    errdefer list.deinit(self.gpa);
+    for (defs, 0..) |entry, index| {
+        std.debug.assert(index == 0 or @backingInt(defs[index - 1].def) < @backingInt(entry.def));
+        std.debug.assert(entry.frames_len != 0 and @as(u64, entry.frames_start) + entry.frames_len <= frames.len);
+        std.debug.assert(@as(u64, entry.intrinsic.start) + entry.intrinsic.len <= text.len);
+        _ = try list.append(self.gpa, entry);
+    }
+    var frame_list = try ReifyOnlyFrame.SafeList.initCapacity(self.gpa, frames.len);
+    errdefer frame_list.deinit(self.gpa);
+    for (frames) |frame| {
+        std.debug.assert(@as(u64, frame.text.start) + frame.text.len <= text.len);
+        std.debug.assert(@as(u64, frame.path.start) + frame.path.len <= text.len);
+        _ = try frame_list.append(self.gpa, frame);
+    }
+    var text_list = try collections.SafeList(u8).initCapacity(self.gpa, text.len);
+    errdefer text_list.deinit(self.gpa);
+    _ = try text_list.appendSlice(self.gpa, text);
+    self.reify_only_defs.deinit(self.gpa);
+    self.reify_only_defs = list;
+    self.reify_only_frames.deinit(self.gpa);
+    self.reify_only_frames = frame_list;
+    self.reify_only_text.deinit(self.gpa);
+    self.reify_only_text = text_list;
+}
+
+/// The witness of top-level `def_idx` when it is reify-only, else null.
+pub fn reifyOnlyWitness(self: *const Self, def_idx: CIR.Def.Idx) ?ReifyOnlyWitness {
+    const entry = self.reifyOnlyDef(def_idx) orelse return null;
+    return entry.witness;
+}
+
+/// Whether `def` is an intrinsic: canonicalization marked its expression
+/// `AnnotationOnlyKind.intrinsic`. This is the only marker; tools read it
+/// here and never guess from names or shapes.
+pub fn isIntrinsicDef(self: *const Self, def: CIR.Def) bool {
+    if (self.store.nodes.fieldItem(.tag, nodeIdxFrom(def.expr)) != .expr_anno_only) return false;
+    return self.store.getExpr(def.expr).e_anno_only.kind == .intrinsic;
+}
+
+/// The record of top-level `def_idx` when it is reify-only, else null.
+pub fn reifyOnlyDef(self: *const Self, def_idx: CIR.Def.Idx) ?ReifyOnlyDef {
+    const entries = self.reify_only_defs.items.items;
+    const wanted: u32 = @backingInt(def_idx);
+    var low: usize = 0;
+    var high: usize = entries.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const candidate: u32 = @backingInt(entries[mid].def);
+        if (candidate < wanted) {
+            low = mid + 1;
+        } else if (candidate > wanted) {
+            high = mid;
+        } else {
+            return entries[mid];
+        }
+    }
+    return null;
+}
+
+/// The frames of the exported chain of a reify-only definition.
+pub fn reifyOnlyFrames(self: *const Self, entry: ReifyOnlyDef) []const ReifyOnlyFrame {
+    return self.reify_only_frames.items.items[entry.frames_start..][0..entry.frames_len];
+}
+
+/// A range of the exported reify-only text.
+pub fn reifyOnlyText(self: *const Self, range: ReifyOnlyText) []const u8 {
+    return self.reify_only_text.items.items[range.start..][0..range.len];
 }
 
 /// Import-facing stored-constant eligibility. Every global definition and every
@@ -1712,6 +1928,7 @@ pub fn deinitCachedModule(self: *Self) void {
     self.import_mapping.deinit();
     self.provided_low_level_defs.deinit(self.gpa);
     self.for_loop_dispatch_plans.deinit(self.gpa);
+    self.bound_capture_encodings.deinit(self.gpa);
     self.numeral_digit_bytes.deinit(self.gpa);
     self.numeral_literals.deinit(self.gpa);
     self.numeric_suffix_targets.deinit(self.gpa);
@@ -3945,11 +4162,6 @@ pub fn calcRegionInfo(self: *const Self, region: Region) RegionInfo {
     return self.common.calcRegionInfo(region);
 }
 
-/// The lines and columns of a region, counted in the file the author wrote.
-/// See `CommonEnv.prepended_line_count`.
-pub fn calcAuthoredRegionInfo(self: *const Self, region: Region) RegionInfo {
-    return self.common.calcAuthoredRegionInfo(region);
-}
 /// Get the source line for a given region
 pub fn getSourceLine(self: *const Self, region: Region) error{ BeginTooLarge, EndTooLarge, InvalidPosition, NoLineStarts, OutOfOrder }![]const u8 {
     return self.common.getSourceLine(region);
@@ -3995,6 +4207,9 @@ pub const Serialized = extern struct {
     store: NodeStore.Serialized,
     top_level_demand_dependencies: DependencyGraph.Dependency.SafeList.Serialized,
     invoking_defs: collections.SafeList(CIR.Def.Idx).Serialized,
+    reify_only_defs: ReifyOnlyDef.SafeList.Serialized,
+    reify_only_frames: ReifyOnlyFrame.SafeList.Serialized,
+    reify_only_text: collections.SafeList(u8).Serialized,
     callable_checking_facts: CallableCheckingFact.SafeList.Serialized,
     checking_dependency: CheckingDependency.Serialized,
     top_level_demand_dependencies_ready: bool,
@@ -4007,6 +4222,7 @@ pub const Serialized = extern struct {
     method_defs: MethodDefs.Serialized,
     provided_low_level_defs: ProvidedLowLevelDef.SafeList.Serialized,
     for_loop_dispatch_plans: ForLoopDispatchPlan.SafeList.Serialized,
+    bound_capture_encodings: BoundCaptureEncoding.SafeList.Serialized,
     numeral_digit_bytes: collections.SafeList(u8).Serialized,
     numeral_literals: NumeralLiteral.SafeList.Serialized,
     numeric_suffix_targets: NumericSuffixTarget.SafeList.Serialized,
@@ -4031,6 +4247,7 @@ pub const Serialized = extern struct {
         .owner_only_fields = &.{
             "qualified_module_name", // Workspace information, recorded by the coordinator.
             "package_name", // Workspace information, recorded by the coordinator.
+            "source_path", // Workspace information, recorded by the coordinator.
         },
         .serialized_only_fields = &.{
             "display_module_name_idx_padding", // Fixed-width padding after the display name slot.
@@ -4101,6 +4318,9 @@ pub const Serialized = extern struct {
             writer,
         );
         try self.invoking_defs.serialize(&env.invoking_defs, allocator, writer);
+        try self.reify_only_defs.serialize(&env.reify_only_defs, allocator, writer);
+        try self.reify_only_frames.serialize(&env.reify_only_frames, allocator, writer);
+        try self.reify_only_text.serialize(&env.reify_only_text, allocator, writer);
         try self.callable_checking_facts.serialize(&env.callable_checking_facts, allocator, writer);
         try self.checking_dependency.serialize(&env.checking_dependency, allocator, writer);
 
@@ -4132,6 +4352,7 @@ pub const Serialized = extern struct {
         try self.method_defs.serialize(&env.method_defs, allocator, writer);
         try self.provided_low_level_defs.serialize(&env.provided_low_level_defs, allocator, writer);
         try self.for_loop_dispatch_plans.serialize(&env.for_loop_dispatch_plans, allocator, writer);
+        try self.bound_capture_encodings.serialize(&env.bound_capture_encodings, allocator, writer);
         try self.numeral_digit_bytes.serialize(&env.numeral_digit_bytes, allocator, writer);
         try self.numeral_literals.serialize(&env.numeral_literals, allocator, writer);
         try self.numeric_suffix_targets.serialize(&env.numeric_suffix_targets, allocator, writer);
@@ -4203,6 +4424,9 @@ pub const Serialized = extern struct {
             .top_level_demand_dependencies = self.top_level_demand_dependencies.deserializeInto(base_addr),
             .top_level_demand_dependencies_ready = self.top_level_demand_dependencies_ready,
             .invoking_defs = self.invoking_defs.deserializeInto(base_addr),
+            .reify_only_defs = self.reify_only_defs.deserializeInto(base_addr),
+            .reify_only_frames = self.reify_only_frames.deserializeInto(base_addr),
+            .reify_only_text = self.reify_only_text.deserializeInto(base_addr),
             .callable_checking_facts = self.callable_checking_facts.deserializeInto(base_addr),
             .checking_dependency = self.checking_dependency.deserializeInto(base_addr),
             .runtime_prepared = self.runtime_prepared,
@@ -4212,6 +4436,7 @@ pub const Serialized = extern struct {
             .method_defs = self.method_defs.deserializeInto(base_addr),
             .provided_low_level_defs = self.provided_low_level_defs.deserializeInto(base_addr),
             .for_loop_dispatch_plans = self.for_loop_dispatch_plans.deserializeInto(base_addr),
+            .bound_capture_encodings = self.bound_capture_encodings.deserializeInto(base_addr),
             .numeral_digit_bytes = self.numeral_digit_bytes.deserializeInto(base_addr),
             .numeral_literals = self.numeral_literals.deserializeInto(base_addr),
             .numeric_suffix_targets = self.numeric_suffix_targets.deserializeInto(base_addr),
@@ -4289,6 +4514,9 @@ pub const Serialized = extern struct {
             .top_level_demand_dependencies = self.top_level_demand_dependencies.deserializeInto(base_addr),
             .top_level_demand_dependencies_ready = self.top_level_demand_dependencies_ready,
             .invoking_defs = self.invoking_defs.deserializeInto(base_addr),
+            .reify_only_defs = self.reify_only_defs.deserializeInto(base_addr),
+            .reify_only_frames = self.reify_only_frames.deserializeInto(base_addr),
+            .reify_only_text = self.reify_only_text.deserializeInto(base_addr),
             .callable_checking_facts = self.callable_checking_facts.deserializeInto(base_addr),
             .checking_dependency = self.checking_dependency.deserializeInto(base_addr),
             .runtime_prepared = self.runtime_prepared,
@@ -4298,6 +4526,7 @@ pub const Serialized = extern struct {
             .method_defs = self.method_defs.deserializeInto(base_addr),
             .provided_low_level_defs = try self.provided_low_level_defs.deserializeWithCopy(base_addr, gpa),
             .for_loop_dispatch_plans = try self.for_loop_dispatch_plans.deserializeWithCopy(base_addr, gpa),
+            .bound_capture_encodings = try self.bound_capture_encodings.deserializeWithCopy(base_addr, gpa),
             .numeral_digit_bytes = try self.numeral_digit_bytes.deserializeWithCopy(base_addr, gpa),
             .numeral_literals = try self.numeral_literals.deserializeWithCopy(base_addr, gpa),
             .numeric_suffix_targets = try self.numeric_suffix_targets.deserializeWithCopy(base_addr, gpa),
@@ -4387,6 +4616,9 @@ pub const Serialized = extern struct {
             .top_level_demand_dependencies = try self.top_level_demand_dependencies.deserializeWithCopy(base_addr, gpa),
             .top_level_demand_dependencies_ready = self.top_level_demand_dependencies_ready,
             .invoking_defs = try self.invoking_defs.deserializeWithCopy(base_addr, gpa),
+            .reify_only_defs = try self.reify_only_defs.deserializeWithCopy(base_addr, gpa),
+            .reify_only_frames = try self.reify_only_frames.deserializeWithCopy(base_addr, gpa),
+            .reify_only_text = try self.reify_only_text.deserializeWithCopy(base_addr, gpa),
             .callable_checking_facts = try self.callable_checking_facts.deserializeWithCopy(base_addr, gpa),
             .checking_dependency = try self.checking_dependency.deserializeWithCopy(base_addr, gpa),
             .runtime_prepared = self.runtime_prepared,
@@ -4396,6 +4628,7 @@ pub const Serialized = extern struct {
             .method_defs = try self.method_defs.deserializeWithCopy(base_addr, gpa),
             .provided_low_level_defs = try self.provided_low_level_defs.deserializeWithCopy(base_addr, gpa),
             .for_loop_dispatch_plans = try self.for_loop_dispatch_plans.deserializeWithCopy(base_addr, gpa),
+            .bound_capture_encodings = try self.bound_capture_encodings.deserializeWithCopy(base_addr, gpa),
             .numeral_digit_bytes = try self.numeral_digit_bytes.deserializeWithCopy(base_addr, gpa),
             .numeral_literals = try self.numeral_literals.deserializeWithCopy(base_addr, gpa),
             .numeric_suffix_targets = try self.numeric_suffix_targets.deserializeWithCopy(base_addr, gpa),
@@ -4441,6 +4674,33 @@ pub fn nodeIdxFrom(idx: anytype) Node.Idx {
 /// Convert a type into a type var
 pub fn varFrom(idx: anytype) TypeVar {
     return @fromBackingInt(@intCast(@backingInt(idx)));
+}
+
+/// Record one capture read of a lambda at a `Code.Binds` position.
+pub fn recordBoundCaptureEncoding(self: *Self, encoding: BoundCaptureEncoding) std.mem.Allocator.Error!void {
+    _ = try self.bound_capture_encodings.append(self.gpa, encoding);
+}
+
+/// Drop the record whose `encoder_for` requirement is `encoder_fn_var`, if
+/// there is one: the requirement was satisfied because the read's type is a
+/// function, which is described as code, not bound. True when one was dropped.
+pub fn removeBoundCaptureEncoding(self: *Self, encoder_fn_var: u32) bool {
+    for (self.bound_capture_encodings.items.items, 0..) |encoding, index| {
+        if (encoding.encoder_fn_var != encoder_fn_var) continue;
+        _ = self.bound_capture_encodings.items.orderedRemove(index);
+        return true;
+    }
+    return false;
+}
+
+/// The capture reads recorded for the lambda at `site_node`, in source order.
+pub fn boundCaptureEncodingsForSite(self: *const Self, site_node: u32) []const BoundCaptureEncoding {
+    const all = self.bound_capture_encodings.items.items;
+    var start: usize = 0;
+    while (start < all.len and all[start].site_node != site_node) start += 1;
+    var end = start;
+    while (end < all.len and all[end].site_node == site_node) end += 1;
+    return all[start..end];
 }
 
 /// Record the checked iterator dispatch functions for a semantic `for` loop.
@@ -4772,8 +5032,21 @@ pub fn recordCodeReificationSite(
     fn_var: TypeVar,
     kind: NodeStore.CodeReificationSite.Kind,
     view: NodeStore.CodeReificationSite.View,
+    translator: ?Node.Idx,
 ) std.mem.Allocator.Error!void {
-    try self.store.recordCodeReificationSite(node_idx, fn_var, kind, view);
+    try self.store.recordCodeReificationSite(node_idx, fn_var, kind, view, translator);
+}
+
+/// Record that the call at `call_idx` binds the run-time reads of the lambda
+/// site at `node_idx` as input slots.
+pub fn markCodeSiteBound(self: *Self, node_idx: Node.Idx, call_idx: Node.Idx) void {
+    self.store.markCodeSiteBound(node_idx, call_idx);
+}
+
+/// Whether the call at `call_idx` binds the run-time reads of a lambda site
+/// as input slots.
+pub fn codeSiteBindsCall(self: *const Self, call_idx: Node.Idx) bool {
+    return self.store.codeSiteBindsCall(call_idx);
 }
 
 /// The reification recorded for this expression, if it has one.
@@ -5181,6 +5454,15 @@ pub fn getIdentText(self: *const Self, idx: Ident.Idx) []const u8 {
 pub fn qualifiedModuleName(self: *const Self) []const u8 {
     if (self.qualified_module_name.len == 0) return self.module_name;
     return self.qualified_module_name;
+}
+
+/// The name a diagnostic gives this module's source in a `path:line:col`
+/// place: the path of its file (`source_path`). A module no file holds, the
+/// builtin module or an environment built outside the coordinator, has no
+/// path, and its qualified name stands in its place.
+pub fn diagnosticSourceName(self: *const Self) []const u8 {
+    if (self.source_path.len == 0) return self.qualifiedModuleName();
+    return self.source_path;
 }
 
 /// Helper function to generate the S-expression node for the entire module.

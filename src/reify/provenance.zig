@@ -12,7 +12,7 @@
 //! | hash-consing finds it again (N5a) | its origins and the new ones |
 //! | a rebuild copies it | the old node's |
 //! | a view inlines a call or a closure (V1, V2) | the callee node's, each reached through the call's or closure's |
-//! | two rows merge (N8g) | each node's and its partner's |
+//! | two rows merge (N8g) | its own, and those of every node of the dropped row the row comparison paired with it (`rows.zig` `mergeInto`) |
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -125,17 +125,29 @@ pub const Provenance = struct {
 /// writes the graph (`number.siteRows`, then each row's numbering): per row,
 /// its nodes; per node, its origins; per origin, its sources, the node's
 /// own first and then each call that reached it.
+///
+/// Per node also, in the order of `nodes`: the intrinsics its `Prim` names,
+/// its own and each one its evidence names, each once, as `owner.method` in
+/// `text`. A refusal's report names them (`ir.NamedPrim.intrinsic`).
 pub const Emitted = struct {
     rows: std.ArrayList(ir.Span) = .empty,
     nodes: std.ArrayList(ir.Span) = .empty,
     chains: std.ArrayList(ir.Span) = .empty,
     links: std.ArrayList(SourceId) = .empty,
+    /// Per node: its span of `intrinsics`.
+    node_intrinsics: std.ArrayList(ir.Span) = .empty,
+    /// Per intrinsic a node names: its span of `text`.
+    intrinsics: std.ArrayList(ir.Span) = .empty,
+    text: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *Emitted, gpa: Allocator) void {
         self.rows.deinit(gpa);
         self.nodes.deinit(gpa);
         self.chains.deinit(gpa);
         self.links.deinit(gpa);
+        self.node_intrinsics.deinit(gpa);
+        self.intrinsics.deinit(gpa);
+        self.text.deinit(gpa);
     }
 
     pub fn clone(self: *const Emitted, gpa: Allocator) Allocator.Error!Emitted {
@@ -145,7 +157,43 @@ pub const Emitted = struct {
         try out.nodes.appendSlice(gpa, self.nodes.items);
         try out.chains.appendSlice(gpa, self.chains.items);
         try out.links.appendSlice(gpa, self.links.items);
+        try out.node_intrinsics.appendSlice(gpa, self.node_intrinsics.items);
+        try out.intrinsics.appendSlice(gpa, self.intrinsics.items);
+        try out.text.appendSlice(gpa, self.text.items);
         return out;
+    }
+
+    /// The text of one entry of `intrinsics`.
+    pub fn intrinsicText(self: *const Emitted, span: ir.Span) []const u8 {
+        return self.text.items[span.start..][0..span.len];
+    }
+
+    // Append the intrinsics node `n` of `store` names, each once, and its
+    // span of `intrinsics`.
+    fn appendIntrinsics(self: *Emitted, gpa: Allocator, store: *const ir.Store, n: NodeId) Allocator.Error!void {
+        const start: u32 = @intCast(self.intrinsics.items.len);
+        const nd = store.node(n);
+        if (nd.op == .prim) {
+            try self.appendIntrinsic(gpa, store, ir.PrimId.of(nd.payload), start);
+            var it = ir.EvidenceWords.of(store.wordSlice(nd.aux));
+            while (it.next()) |e| if (e.kind == .prim) try self.appendIntrinsic(gpa, store, ir.PrimId.of(e.target), start);
+        }
+        try self.node_intrinsics.append(gpa, .{ .start = start, .len = @as(u32, @intCast(self.intrinsics.items.len)) - start });
+    }
+
+    // Append `id` where it is an intrinsic that the node's entries from
+    // `start` do not name yet.
+    fn appendIntrinsic(self: *Emitted, gpa: Allocator, store: *const ir.Store, id: ir.PrimId, start: u32) Allocator.Error!void {
+        const name = store.primName(id);
+        if (!name.intrinsic) return;
+        const text_start: u32 = @intCast(self.text.items.len);
+        try self.text.print(gpa, "{s}.{s}", .{ name.owner, name.method });
+        const written = self.text.items[text_start..];
+        for (self.intrinsics.items[start..]) |have| if (std.mem.eql(u8, self.intrinsicText(have), written)) {
+            self.text.shrinkRetainingCapacity(text_start);
+            return;
+        };
+        try self.intrinsics.append(gpa, .{ .start = text_start, .len = @intCast(written.len) });
     }
 
     /// The origins of node `node` of row `row`, each a span of `links`.
@@ -182,6 +230,7 @@ pub fn emitted(gpa: Allocator, store: *const ir.Store, root: ir.RowId) Allocator
                 try out.chains.append(gpa, .{ .start = link_start, .len = @as(u32, @intCast(out.links.items.len)) - link_start });
             }
             try out.nodes.append(gpa, .{ .start = node_start, .len = @as(u32, @intCast(out.chains.items.len)) - node_start });
+            try out.appendIntrinsics(gpa, store, n);
         }
         try out.rows.append(gpa, .{ .start = row_start, .len = @as(u32, @intCast(out.nodes.items.len)) - row_start });
     }

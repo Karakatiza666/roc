@@ -27,6 +27,7 @@ problems: []const problem.Problem = &.{},
 pending: []const problem.Store.PendingStaticExhaustiveness = &.{},
 extra_strings: []const u8 = &.{},
 missing_patterns: []const problem.ExtraStringIdx = &.{},
+refusal_calls: []const problem.RefusalCall = &.{},
 regions: []const base.Region = &.{},
 contents: []const snapshot.SnapshotContent = &.{},
 content_indexes: []const snapshot.SnapshotContentIdx = &.{},
@@ -44,6 +45,7 @@ pub const Serialized = extern struct {
     pending: serde.SerializedSlice(problem.Store.PendingStaticExhaustiveness) = .{},
     extra_strings: serde.SerializedSlice(u8) = .{},
     missing_patterns: serde.SerializedSlice(problem.ExtraStringIdx) = .{},
+    refusal_calls: serde.SerializedSlice(problem.RefusalCall) = .{},
     regions: serde.SerializedSlice(base.Region) = .{},
     contents: serde.SerializedSlice(snapshot.SnapshotContent) = .{},
     content_indexes: serde.SerializedSlice(snapshot.SnapshotContentIdx) = .{},
@@ -105,6 +107,7 @@ pub fn capture(allocator: Allocator, checker: anytype, scope: *const dependencie
         .pending = checker.problems.pending_static_exhaustiveness.items,
         .extra_strings = checker.problems.extra_strings_backing.items,
         .missing_patterns = checker.problems.missing_patterns_backing.items,
+        .refusal_calls = checker.problems.refusal_calls_backing.items,
         .regions = checker.regions.items.items,
         .contents = snapshots.contents.items.items,
         .content_indexes = snapshots.content_indexes.items.items,
@@ -137,9 +140,25 @@ pub fn validate(self: Self) error{CorruptArtifact}!void {
         if (@backingInt(formatted.snapshot) >= self.contents.len) return error.CorruptArtifact;
         try self.validateText(formatted.text);
     }
-    for (self.missing_patterns) |range| {
-        if (range.start > self.extra_strings.len or range.count > self.extra_strings.len - range.start) return error.CorruptArtifact;
+    for (self.missing_patterns) |range| try self.validateExtraString(range);
+    for (self.refusal_calls) |call| {
+        try self.validateExtraString(call.text);
+        switch (call.place) {
+            .local => {},
+            .foreign => |place| try self.validateExtraString(place.path),
+        }
     }
+    // Only this problem holds a range of refusal calls in the checking
+    // outcome. A translation refusal is an evaluation diagnostic.
+    for (self.problems) |entry| {
+        if (entry != .exists_only_in_reified_code) continue;
+        const chain = entry.exists_only_in_reified_code.chain;
+        if (chain.start > self.refusal_calls.len or chain.count > self.refusal_calls.len - chain.start) return error.CorruptArtifact;
+    }
+}
+
+fn validateExtraString(self: Self, range: problem.ExtraStringIdx) error{CorruptArtifact}!void {
+    if (range.start > self.extra_strings.len or range.count > self.extra_strings.len - range.start) return error.CorruptArtifact;
 }
 
 fn validateText(self: Self, range: Text) error{CorruptArtifact}!void {
@@ -154,6 +173,7 @@ pub fn install(self: Self, checker: anytype) Allocator.Error!void {
     try checker.problems.pending_static_exhaustiveness.appendSlice(allocator, self.pending);
     try checker.problems.extra_strings_backing.appendSlice(self.extra_strings);
     try checker.problems.missing_patterns_backing.appendSlice(self.missing_patterns);
+    try checker.problems.refusal_calls_backing.appendSlice(checker.problems.gpa, self.refusal_calls);
     checker.regions.items.clearRetainingCapacity();
     _ = try checker.regions.appendSlice(allocator, self.regions);
     const snapshots = &checker.snapshots;

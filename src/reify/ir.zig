@@ -195,7 +195,8 @@ pub const Span = struct {
     pub const empty: Span = .{ .start = 0, .len = 0 };
 };
 
-/// A value reference: a row parameter, a region parameter, or one output of a node.
+/// A value reference: a row parameter, a region parameter, one output of a
+/// node, or an input slot of the root (N18).
 ///
 /// Region parameters are loop slots, a `ForRange` index, a `ForList` element,
 /// and join parameters. A reference names what it reads positionally; no
@@ -206,7 +207,7 @@ pub const Ref = packed struct(u64) {
     target: u32,
 
     /// What a reference reads.
-    pub const Kind = enum(u2) { node, row_param, region_param };
+    pub const Kind = enum(u2) { node, row_param, region_param, input };
 
     /// Output `output` of node `n`.
     pub fn node(n: NodeId, output: u30) Ref {
@@ -228,11 +229,16 @@ pub const Ref = packed struct(u64) {
         return .{ .kind = .region_param, .output = k, .target = r.index() };
     }
 
-    /// The node this reference reads, or `none` for a parameter.
+    /// Input slot `s` of the store's slot table (N18).
+    pub fn input(s: SlotId) Ref {
+        return .{ .kind = .input, .output = 0, .target = s.index() };
+    }
+
+    /// The node this reference reads, or `none` for a parameter or a slot.
     pub fn nodeId(self: Ref) NodeId {
         return switch (self.kind) {
             .node => NodeId.of(self.target),
-            .row_param, .region_param => NodeId.none,
+            .row_param, .region_param, .input => NodeId.none,
         };
     }
 
@@ -240,9 +246,75 @@ pub const Ref = packed struct(u64) {
     pub fn regionId(self: Ref) RegionId {
         return switch (self.kind) {
             .region_param => RegionId.of(self.target),
-            .node, .row_param => RegionId.none,
+            .node, .row_param, .input => RegionId.none,
         };
     }
+
+    /// The slot this reference reads.
+    pub fn slotId(self: Ref) SlotId {
+        std.debug.assert(self.kind == .input);
+        return SlotId.of(self.target);
+    }
+};
+
+/// An input slot of the root (N18): a value the program supplies at run time.
+pub const SlotId = enum(u32) {
+    _,
+
+    /// The slot with this index.
+    pub fn of(i: u32) SlotId {
+        return @fromBackingInt(@intCast(i));
+    }
+
+    /// This slot's index.
+    pub fn index(self: SlotId) u32 {
+        return @backingInt(self);
+    }
+};
+
+/// One input slot: a run-time name the walk cannot replay, or a projection of
+/// another slot (N18b). `leaf` names the run-time name for the walk, which
+/// keeps what each leaf stands for; the normal form reads only `ty`.
+pub const Slot = struct {
+    ty: TyId,
+    source: Source,
+    /// Whether the root reads this slot whole and also reads a projection of
+    /// it (N18e). A projection of a whole slot is a node, not a slot.
+    whole: bool = false,
+
+    pub const Source = union(enum) {
+        /// The run-time name the walk numbered `leaf`.
+        leaf: u32,
+        /// A read of slot `of`: field `k` in the record type's order, element
+        /// `k` of a tuple, or the backing of a nominal.
+        field: struct { of: SlotId, k: u32 },
+        index: struct { of: SlotId, k: u32 },
+        unwrap: SlotId,
+
+        /// The slot this source is a projection of, or null for a leaf.
+        pub fn parent(self: Source) ?SlotId {
+            return switch (self) {
+                .leaf => null,
+                .field => |f| f.of,
+                .index => |f| f.of,
+                .unwrap => |of| of,
+            };
+        }
+    };
+};
+
+/// Who wrote a `crash` node, its payload. A translator sees both kinds as one
+/// `Crash`; only the rules tell them apart.
+pub const CrashKind = enum(u32) {
+    /// A `crash` the author wrote, which stays where it was written
+    /// (normal-form 1.1).
+    written = 0,
+    /// The `Err` arm of a literal's conversion (`T.from_numeral`,
+    /// `T.from_quote`, `T.from_interpolation`): the crash the program reaches
+    /// where the conversion rejected the literal. The compiler wrote it, and
+    /// the conversion runs while the compiler runs, so the rejection is a
+    /// compile-time error. C2 lets N13w drop the branches that reach it.
+    rejected_literal = 1,
 };
 
 /// The operation of a node. The declaration order is the op precedence the
@@ -292,6 +364,16 @@ pub const Op = enum(u8) {
             .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => false,
         };
     }
+};
+
+/// How a `record` node says which members of its type it sets. A node that
+/// sets every member holds one argument per member, in the type's order. A
+/// node that leaves an optional member unset holds one argument per member it
+/// sets, and `aux` lists those members' positions in the type's order. A value
+/// has one form, so a node never lists the members when it sets all of them.
+pub const RecordForm = enum {
+    every_member,
+    listed_members,
 };
 
 /// Why a region exists; the verifier and the evaluator read it.
@@ -352,14 +434,17 @@ pub const Node = struct {
     /// | `switch_` | number of arms; the remaining regions are joins. A tag switch has one arm per member of its scrutinee's own type, in name order. |
     /// | `derived` | the method's name (`types.NameId`); the subject type is `aux[0]` |
     /// | `for_range` | 1 when the range includes its end, else 0 |
+    /// | `crash` | who wrote the crash (`CrashKind`) |
     /// | every other op | 0 |
     ///
     /// A `crash` reads its message as its one argument, a `closure` its
     /// captured values as its arguments, and an `apply` the function value
     /// and then the call's arguments.
     ///
-    /// Loops read their arguments and give their body parameters this way; a
-    /// loop has one output per slot:
+    /// Loops read their arguments and give their body parameters this way. A
+    /// `for_range` or `for_list` has one output per slot; a `loop` has the
+    /// outputs its `Break`s carry, which are its `tys` and need not be its
+    /// slots:
     ///
     /// | op | args | body params |
     /// |---|---|---|
@@ -409,6 +494,29 @@ pub const Row = struct {
     /// the root, whose parameters are the type in `Code(fn)`, and a row
     /// that gives a closure its type's calling convention.
     fixed_params: bool = false,
+    /// The result range N8k recorded when the row was finalized: the union
+    /// of the intervals of the values it returns, for a row whose result is
+    /// a builtin integer. N13u reads it on each `Call` of the row.
+    result_range: ?Interval = null,
+};
+
+/// An integer interval with literal bounds (N13u, normal-form 3.13), empty
+/// where `lo > hi`. The bounds are wide enough for every builtin integer type.
+pub const Interval = struct {
+    lo: i256,
+    hi: i256,
+};
+
+/// The interval N13u gave a node of a builtin integer type when it was built
+/// (`ranges.zig`): it holds wherever `holds_in` encloses the node's place,
+/// or everywhere when `holds_in` is `none`, because its sources are the facts
+/// of `holds_in` and of the regions around it. `fits` says that the node is a
+/// checked `plus`, `minus` or `times` whose operands' intervals prove that it
+/// fits its type, so it is speculatable there and no further out (1.1).
+pub const NodeRange = struct {
+    interval: Interval,
+    holds_in: RegionId,
+    fits: bool,
 };
 
 /// A literal's value. Floats and integers are compared by their bits.
@@ -421,21 +529,178 @@ pub const LitValue = union(enum) {
     dec: u128,
     /// The contents of an embedded file, as a `List(U8)`.
     bytes: Span,
+    /// The `Num.Numeral` the compiler hands to a `from_numeral` conversion.
+    numeral: NumeralValue,
+};
+
+/// A `Num.Numeral`, as `Builtin.roc` declares it: the sign, the base-256
+/// digits before the point and after it, and the count of decimal digits
+/// the source wrote after the point. `digits` holds the digits before the
+/// point, then the digits after it, in the byte pool.
+pub const NumeralValue = struct {
+    digits: Span,
+    before_len: u32,
+    after_count: u64,
+    negative: bool,
+
+    /// The base-256 digits before the point.
+    pub fn before(self: NumeralValue, store: *const Store) []const u8 {
+        return store.byteSlice(self.digits)[0..self.before_len];
+    }
+
+    /// The base-256 digits after the point.
+    pub fn after(self: NumeralValue, store: *const Store) []const u8 {
+        return store.byteSlice(self.digits)[self.before_len..];
+    }
+};
+
+/// The role the checker gave a builtin iterator procedure (N11k), which the
+/// walk records on the primitive it names. A rule that reads an iterator
+/// loop reads this role and never the name of the type, so a function of
+/// another package with the same names has no role.
+pub const IteratorRole = enum(u8) {
+    /// Any other primitive.
+    none,
+    /// `Iter.iter`: an iterator is its own iterator.
+    identity,
+    /// `Iter.next`: the iterator protocol's step.
+    next,
+    /// `List.iter`: an iterator that yields every element of a list in index
+    /// order, one per step, and never skips.
+    list_iter,
+    /// `Iter.map`: an iterator that yields the function's value of each item
+    /// of the iterator it maps, in order, and skips where that one skips
+    /// (N16e).
+    map,
+};
+
+/// The exact identity of a definition in a module: the artifact key of the
+/// module that declares it, and the definition there. Two packages can give
+/// two definitions one name, but never one identity (F2).
+pub const Definition = struct {
+    module: [32]u8,
+    def: u32,
+};
+
+/// What a primitive is, apart from its names: a builtin, whose export name
+/// is unique, or a function of a package, which only its definition
+/// identifies (N8h).
+pub const PrimOrigin = union(enum) {
+    builtin,
+    declared: Definition,
 };
 
 /// A primitive the builtin table does not hold, by the names its owner gives
-/// it: a builtin such as `Num.F32` and `sin`, or a function of another
-/// package that does not expose its body (N8h), such as `Glsl.Vec3` and
-/// `scale`. Its `PrimId` is `prims.table.len` plus its index here.
+/// it: a builtin such as `Num.F32` and `sin`, or a function of a package
+/// that does not expose its body (N8h), such as `Glsl.Vec3` and `scale`. Its
+/// `PrimId` is `prims.table.len` plus its index here.
 pub const NamedPrim = struct {
     owner: Span,
     method: Span,
+    role: IteratorRole = .none,
+    origin: PrimOrigin = .builtin,
+    /// Whether its definition is an intrinsic, a declaration with no body.
+    /// Only a refusal's report reads it (`provenance.Emitted`): no rule,
+    /// digest, numbering or view does, so the `Prim` of an intrinsic is the
+    /// `Prim` of any other function.
+    intrinsic: bool = false,
 };
 
-/// A primitive's owner and method names.
+/// What one `where` requirement of a primitive's scheme was discharged with
+/// at one call (D7), as `Code.Target` names it.
+pub const EvidenceKind = enum(u32) {
+    /// A primitive, with its own evidence nested.
+    prim,
+    /// A row of the store, the body the walk read for the method.
+    row,
+    /// A method the compiler derives, named by the requirement's method.
+    derived,
+    /// No value of the requirement's type reaches the dispatch.
+    unreachable_,
+};
+
+/// The evidence of a `prim` node, in its `aux` words (D7). A prim that
+/// carries none has no `aux`. Otherwise `aux` is a count, then that many
+/// entries, each `[method, ty, kind]` and then by kind:
+///
+/// | kind | words |
+/// |---|---|
+/// | `prim` | the `PrimId`, a count, and that many nested entries |
+/// | `row` | the `RowId` |
+/// | `derived` | the method's name (`types.NameId`) |
+/// | `unreachable_` | none |
+///
+/// `method` is the required method's name (`types.NameId`) and `ty` the
+/// type it dispatches on at the call. The entries are in the callee
+/// scheme's requirement order, and a nested list in its target's.
+pub const EvidenceWords = struct {
+    words: []const u32,
+    at: u32 = 0,
+    /// Entries still to read, nested ones included.
+    left: u32 = 0,
+
+    /// One entry, as `next` reads it. `at` is where its kind-specific words
+    /// start, so a pass that renames rows can write `words[at]`.
+    pub const Entry = struct {
+        method: u32,
+        ty: TyId,
+        kind: EvidenceKind,
+        /// The `PrimId`, `RowId` or name of the target; 0 for `unreachable_`.
+        target: u32,
+        /// For `prim`, how many nested entries follow it.
+        nested: u32,
+        /// The index of `target` in the words.
+        at: u32,
+    };
+
+    /// A reader of `aux`, which is empty or a prim's evidence.
+    pub fn of(aux: []const u32) EvidenceWords {
+        return .{ .words = aux, .at = if (aux.len == 0) 0 else 1, .left = if (aux.len == 0) 0 else aux[0] };
+    }
+
+    /// The next entry in pre-order, nested entries after their target, or
+    /// null at the end.
+    pub fn next(self: *EvidenceWords) ?Entry {
+        if (self.left == 0) {
+            std.debug.assert(self.at == self.words.len);
+            return null;
+        }
+        self.left -= 1;
+        const w = self.words;
+        const kind: EvidenceKind = @fromBackingInt(@intCast(w[self.at + 2]));
+        var entry: Entry = .{ .method = w[self.at], .ty = TyId.of(w[self.at + 1]), .kind = kind, .target = 0, .nested = 0, .at = self.at + 3 };
+        self.at += 3;
+        switch (kind) {
+            .prim => {
+                entry.target = w[self.at];
+                entry.nested = w[self.at + 1];
+                self.left += entry.nested;
+                self.at += 2;
+            },
+            .row, .derived => {
+                entry.target = w[self.at];
+                self.at += 1;
+            },
+            .unreachable_ => {},
+        }
+        return entry;
+    }
+};
+
+/// The index, in a prim's `aux`, of each `RowId` its evidence names.
+pub fn evidenceRowAt(aux: []const u32, out: *std.ArrayList(u32), gpa: Allocator) Allocator.Error!void {
+    var it = EvidenceWords.of(aux);
+    while (it.next()) |e| if (e.kind == .row) try out.append(gpa, e.at);
+}
+
+/// A primitive's owner and method names, the role of an iterator procedure,
+/// and what it is apart from its names.
 pub const PrimName = struct {
     owner: []const u8,
     method: []const u8,
+    role: IteratorRole = .none,
+    origin: PrimOrigin = .builtin,
+    intrinsic: bool = false,
 };
 
 /// One literal's entry: its type and value.
@@ -457,8 +722,16 @@ pub const Store = struct {
     words: std.ArrayList(u32) = .empty,
     bytes: std.ArrayList(u8) = .empty,
     named_prims: std.ArrayList(NamedPrim) = .empty,
+    /// The input slots the walk made (N18), in the order it made them.
+    slots: std.ArrayList(Slot) = .empty,
     /// Per node, where it came from (N10). Nothing in the normal form reads it.
     provenance: provenance.Provenance = .{},
+    /// Per region, by id: the nodes built in it, in id order. A node never
+    /// moves to another region, so this is true at every point of a build.
+    region_members: std.ArrayList(std.ArrayList(NodeId)) = .empty,
+    /// Per node of a builtin integer type that N13u gave an interval narrower
+    /// than its type, or that it proved fits: that interval (`NodeRange`).
+    ranges: collections.DenseMapUnmanaged(NodeId, NodeRange) = .empty,
 
     pub fn init(gpa: Allocator) Store {
         return .{ .gpa = gpa };
@@ -475,7 +748,19 @@ pub const Store = struct {
         self.words.deinit(self.gpa);
         self.bytes.deinit(self.gpa);
         self.named_prims.deinit(self.gpa);
+        self.slots.deinit(self.gpa);
         self.provenance.deinit(self.gpa);
+        for (self.region_members.items) |*m| m.deinit(self.gpa);
+        self.region_members.deinit(self.gpa);
+        self.ranges.deinit(self.gpa);
+    }
+
+    /// The region a node that N13u proved fits its type may not be hoisted
+    /// out of (normal-form 1.1), or null where nothing limits it.
+    pub fn fitFloor(self: *const Store, n: NodeId) ?RegionId {
+        const r = self.ranges.get(n) orelse return null;
+        if (!r.fits or r.holds_in == RegionId.none) return null;
+        return r.holds_in;
     }
 
     /// Append `items` to the ref pool.
@@ -557,7 +842,7 @@ pub const Store = struct {
     pub fn primName(self: *const Store, id: PrimId) PrimName {
         if (prims.lookup(id)) |p| return .{ .owner = p.owner.text(), .method = prims.methodName(p.method) };
         const named = self.named_prims.items[id.index() - prims.table.len];
-        return .{ .owner = self.byteSlice(named.owner), .method = self.byteSlice(named.method) };
+        return .{ .owner = self.byteSlice(named.owner), .method = self.byteSlice(named.method), .role = named.role, .origin = named.origin, .intrinsic = named.intrinsic };
     }
 
     /// The literal with id `l`.
@@ -578,6 +863,8 @@ pub const Store = struct {
     /// Append a node and return its id.
     pub fn appendNode(self: *Store, n: Node) Allocator.Error!NodeId {
         const id = NodeId.of(@intCast(self.nodes.len));
+        try self.region_members.items[n.region.index()].append(self.gpa, id);
+        errdefer _ = self.region_members.items[n.region.index()].pop();
         try self.nodes.append(self.gpa, n);
         return id;
     }
@@ -585,8 +872,16 @@ pub const Store = struct {
     /// Append a region and return its id.
     pub fn appendRegion(self: *Store, r: Region) Allocator.Error!RegionId {
         const id = RegionId.of(@intCast(self.regions.len));
+        try self.region_members.append(self.gpa, .empty);
+        errdefer _ = self.region_members.pop();
         try self.regions.append(self.gpa, r);
         return id;
+    }
+
+    /// The nodes built in region `r`, in id order. The slice is valid until
+    /// the next node is built.
+    pub fn members(self: *const Store, r: RegionId) []const NodeId {
+        return self.region_members.items[r.index()].items;
     }
 
     /// Set the terminator of region `r`.
@@ -636,7 +931,34 @@ pub const Store = struct {
             .node => self.tySlice(self.nodes.items(.tys)[ref.target])[ref.output],
             .row_param => self.tySlice(self.row(row_id).params)[ref.output],
             .region_param => self.tySlice(self.regions.items(.params)[ref.target])[ref.output],
+            .input => self.slots.items[ref.target].ty,
         };
+    }
+
+    /// The outermost slot that slot `s` is a projection of and that the root
+    /// reads whole (N18e), or null when `s` is a projection of no such slot.
+    pub fn wholeAncestor(self: *const Store, s: SlotId) ?SlotId {
+        var found: ?SlotId = null;
+        var at = s;
+        while (self.slots.items[at.index()].source.parent()) |of| {
+            if (self.slots.items[of.index()].whole) found = of;
+            at = of;
+        }
+        return found;
+    }
+
+    /// The slot `source` names, made the first time it is asked for, so one
+    /// leaf or one projection of a slot is one slot.
+    pub fn slot(self: *Store, ty: TyId, source: Slot.Source) Allocator.Error!SlotId {
+        for (self.slots.items, 0..) |existing, i| {
+            if (std.meta.eql(existing.source, source)) {
+                std.debug.assert(existing.ty == ty);
+                return SlotId.of(@intCast(i));
+            }
+        }
+        const id = SlotId.of(@intCast(self.slots.items.len));
+        try self.slots.append(self.gpa, .{ .ty = ty, .source = source });
+        return id;
     }
 };
 

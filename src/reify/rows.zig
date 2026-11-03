@@ -24,6 +24,7 @@ const equal = @import("equal.zig");
 const types_mod = @import("types.zig");
 const builder_mod = @import("builder.zig");
 const provenance = @import("provenance.zig");
+const ranges = @import("ranges.zig");
 
 const Allocator = std.mem.Allocator;
 const Ref = ir.Ref;
@@ -55,19 +56,32 @@ pub fn graph(gpa: Allocator, store: *const ir.Store, edges: Edges) Allocator.Err
     var live = try live_mod.ofStore(gpa, store);
     defer live.deinit(gpa);
     const regions = store.nodes.items(.region);
-    for (store.nodes.items(.op), store.nodes.items(.payload), regions, live.nodes) |op, payload, r, l| {
+    for (store.nodes.items(.op), store.nodes.items(.payload), store.nodes.items(.aux), regions, live.nodes) |op, payload, aux, r, l| {
         if (!l) continue;
         switch (op) {
             .call => {},
             .closure => if (edges == .calls) continue,
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => continue,
+            // A row the evidence of a `Prim` names (D7) is referred to as a
+            // closure is, and never called.
+            .prim => {
+                if (edges == .calls or aux.len == 0) continue;
+                const from = store.region(r).row;
+                if (store.row(from).merged_into != null) continue;
+                var it = ir.EvidenceWords.of(store.wordSlice(aux));
+                while (it.next()) |e| if (e.kind == .row) try addEdge(gpa, &out[from.index()], RowId.of(e.target));
+                continue;
+            },
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => continue,
         }
         const from = store.region(r).row;
         if (store.row(from).merged_into != null) continue;
-        const list = &out[from.index()];
-        if (std.mem.findScalar(RowId, list.items, RowId.of(payload)) == null) try list.append(gpa, RowId.of(payload));
+        try addEdge(gpa, &out[from.index()], RowId.of(payload));
     }
     return out;
+}
+
+fn addEdge(gpa: Allocator, list: *std.ArrayList(RowId), to: RowId) Allocator.Error!void {
+    if (std.mem.findScalar(RowId, list.items, to) == null) try list.append(gpa, to);
 }
 
 /// Free a graph that `graph` built.
@@ -198,6 +212,8 @@ pub const Finalizer = struct {
         defer self.gpa.free(wrappers);
         const all = try std.mem.concat(self.gpa, RowId, &.{ comp, wrappers });
         defer self.gpa.free(all);
+        // N8k: the result range each row's callers read, from its body.
+        for (all) |r| b.store.rows.items[r.index()].result_range = try ranges.resultRange(self.gpa, b.store, b.types, r);
         const g = try graph(self.gpa, b.store, .references);
         defer freeGraph(self.gpa, g);
         const comps = try components(self.gpa, g, all);
@@ -253,14 +269,21 @@ pub const Finalizer = struct {
         if (orders.count() == 0) return &.{};
         for (orders.keys(), orders.values()) |r, o| try self.orders.put(gpa, r, try gpa.dupe(u32, o));
 
-        // The closures that name a renumbered row, read before anything changes.
+        // The closures that name a renumbered row, read before anything
+        // changes, and the places in a `Prim`'s evidence that name one (D7).
         var closures: std.ArrayList(NodeId) = .empty;
         defer closures.deinit(gpa);
+        var evidence: std.ArrayList(u32) = .empty;
+        defer evidence.deinit(gpa);
         {
             var live = try live_mod.ofStore(gpa, store);
             defer live.deinit(gpa);
-            for (store.nodes.items(.op), store.nodes.items(.payload), live.nodes, 0..) |op, payload, l, i| {
-                if (l and op == .closure and orders.contains(RowId.of(payload))) try closures.append(gpa, NodeId.of(@intCast(i)));
+            for (store.nodes.items(.op), store.nodes.items(.payload), store.nodes.items(.aux), live.nodes, 0..) |op, payload, aux, l, i| {
+                if (!l) continue;
+                if (op == .closure and orders.contains(RowId.of(payload))) try closures.append(gpa, NodeId.of(@intCast(i)));
+                if (op != .prim) continue;
+                var it = ir.EvidenceWords.of(store.wordSlice(aux));
+                while (it.next()) |e| if (e.kind == .row and orders.contains(RowId.of(e.target))) try evidence.append(gpa, aux.start + e.at);
             }
         }
         // Old parameter types, which a closure's convention keeps.
@@ -328,6 +351,18 @@ pub const Finalizer = struct {
             store.nodes.items(.payload)[c.index()] = target.index();
             store.nodes.items(.args)[c.index()] = try store.addRefs(args);
         }
+        // A row a `Prim`'s evidence names keeps the method's convention, as
+        // a closure that captures nothing does: it names a row that calls
+        // the renumbered one.
+        for (evidence.items) |word| {
+            const r = RowId.of(store.words.items[word]);
+            const gop = try made.getOrPut(gpa, .{ r.index(), 0 });
+            if (!gop.found_existing) {
+                gop.value_ptr.* = try self.conventionRow(b, r, orders.get(r).?, old_params.get(r).?, 0, &.{});
+                try wrappers.append(gpa, gop.value_ptr.*);
+            }
+            store.words.items[word] = gop.value_ptr.index();
+        }
 
         // The bodies read their parameters by their new indices.
         for (orders.keys(), orders.values()) |r, order| {
@@ -347,7 +382,7 @@ pub const Finalizer = struct {
     // The row a closure of `r` calls through: the captures `r` reads, in
     // `r`'s order, then the function's own parameters in their order, and a
     // body that calls `r` over them.
-    fn conventionRow(self: *Finalizer, b: *Builder, r: RowId, order: []const u32, old: []const TyId, captures: u32, kept: []const u32) Error!RowId {
+    pub fn conventionRow(self: *Finalizer, b: *Builder, r: RowId, order: []const u32, old: []const TyId, captures: u32, kept: []const u32) Error!RowId {
         const gpa = self.gpa;
         const own = old.len - captures;
         const tys = try gpa.alloc(TyId, kept.len + own);
@@ -389,8 +424,10 @@ pub const Finalizer = struct {
             }
             for (part[i..], digests[i..]) |q, e| {
                 if (e != d or q == rep) continue;
-                if (!try sameRow(gpa, store, rep, q, classes.pairing())) return error.InvariantBroken;
-                try mergeInto(gpa, store, q, rep);
+                var matched: Correspondence = .empty;
+                defer matched.deinit(gpa);
+                if (!try sameRow(gpa, store, q, rep, classes.pairing(), &matched)) return error.InvariantBroken;
+                try mergeInto(gpa, store, q, rep, matched.items);
             }
             try reps.append(gpa, rep);
         }
@@ -409,10 +446,16 @@ pub const Finalizer = struct {
         } else true;
         if (all_hit) {
             const pairing: MapPairing = .{ .from = reps.items, .to = hits };
-            for (reps.items, hits) |r, h| {
-                if (!try sameRow(gpa, store, r, h.?, pairing.pairing())) return error.InvariantBroken;
+            const matched = try gpa.alloc(Correspondence, reps.items.len);
+            @memset(matched, .empty);
+            defer {
+                for (matched) |*m| m.deinit(gpa);
+                gpa.free(matched);
             }
-            for (reps.items, hits) |r, h| if (r != self.root) try mergeInto(gpa, store, r, h.?);
+            for (reps.items, hits, matched) |r, h, *m| {
+                if (!try sameRow(gpa, store, r, h.?, pairing.pairing(), m)) return error.InvariantBroken;
+            }
+            for (reps.items, hits, matched) |r, h, m| if (r != self.root) try mergeInto(gpa, store, r, h.?, m.items);
             if (std.mem.findScalar(RowId, reps.items, self.root) == null) return;
             // The root now calls the finalized part, so its digest is its own.
             var d: [1]Digest = undefined;
@@ -525,45 +568,61 @@ const MapPairing = struct {
     }
 };
 
+// The nodes a comparison of two rows found equal, the first row's first.
+const Correspondence = std.ArrayList([2]NodeId);
+
 // Whether rows `a` and `b` compute one thing: equal parameter and result
 // types, and bodies that end alike over equal values, with a row that
 // `pairing` pairs taken as one. A digest collision never merges two rows.
-fn sameRow(gpa: Allocator, store: *const ir.Store, a: RowId, b: RowId, pairing: equal.RowPairing) Allocator.Error!bool {
+// Where it holds, `matched` holds the correspondence it found.
+fn sameRow(gpa: Allocator, store: *const ir.Store, a: RowId, b: RowId, pairing: equal.RowPairing, matched: *Correspondence) Allocator.Error!bool {
     const x = store.row(a);
     const y = store.row(b);
     if (x.result != y.result) return false;
     if (!std.mem.eql(TyId, store.tySlice(x.params), store.tySlice(y.params))) return false;
-    var cmp: equal.Comparison = .{ .gpa = gpa, .store = store, .rows = pairing };
+    var cmp: equal.Comparison = .{ .gpa = gpa, .store = store, .rows = pairing, .matched = matched };
     defer cmp.deinit();
     return cmp.regions(x.body, y.body);
 }
 
-// Row `from` merges into `into`: every `Call` and `Closure` that names it
-// names `into`.
 // Row `from` merges into `into`, which `sameRow` found equal to it: every
 // call and closure of `from` names `into`, and each node of `into` takes the
-// origins of the node of `from` its numbering pairs it with (N10).
-fn mergeInto(gpa: Allocator, store: *ir.Store, from: RowId, into: RowId) Error!void {
-    {
+// origins of every node of `from` that `matched` pairs it with (N10). The
+// pairs come from the comparison, not from the two numberings: equal rows
+// can share an equal node differently until the number stage (N5d), so
+// their numberings need not pair position by position.
+fn mergeInto(gpa: Allocator, store: *ir.Store, from: RowId, into: RowId, matched: []const [2]NodeId) Error!void {
+    if (std.debug.runtime_safety) {
+        // Equality was just found, so every node of `from` has a partner.
         var returns = try live_mod.Returns.init(gpa, store);
         defer returns.deinit(gpa);
         var a = try number.ofRow(gpa, store, &returns, from);
         defer a.deinit(gpa);
-        var b = try number.ofRow(gpa, store, &returns, into);
-        defer b.deinit(gpa);
-        if (a.order.items.len != b.order.items.len) return error.InvariantBroken;
-        for (a.order.items, b.order.items) |x, y| {
-            const origins = try gpa.dupe(provenance.OriginId, store.provenance.of(x));
-            defer gpa.free(origins);
-            try store.provenance.add(gpa, y, origins);
-        }
+        var partnered: collections.DenseMapUnmanaged(NodeId, void) = .empty;
+        defer partnered.deinit(gpa);
+        for (matched) |m| try partnered.put(gpa, m[0], {});
+        for (a.order.items) |n| std.debug.assert(partnered.contains(n));
     }
-    for (store.nodes.items(.op), store.nodes.items(.payload)) |op, *payload| {
+    for (matched) |m| {
+        const origins = try gpa.dupe(provenance.OriginId, store.provenance.of(m[0]));
+        defer gpa.free(origins);
+        try store.provenance.add(gpa, m[1], origins);
+    }
+    for (store.nodes.items(.op), store.nodes.items(.payload), store.nodes.items(.aux)) |op, *payload, aux| {
         switch (op) {
             .call, .closure => if (payload.* == from.index()) {
                 payload.* = into.index();
             },
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => {},
+            // The rows a `Prim`'s evidence names (D7), in place: the words
+            // are the node's own.
+            .prim => {
+                const words = store.words.items[aux.start..][0..aux.len];
+                var it = ir.EvidenceWords.of(words);
+                while (it.next()) |e| if (e.kind == .row and e.target == from.index()) {
+                    words[e.at] = into.index();
+                };
+            },
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => {},
         }
     }
     store.rows.items[from.index()].merged_into = into;
@@ -605,6 +664,25 @@ pub fn walkedDigest(gpa: Allocator, store: *const ir.Store, types: *const types_
     var out: [32]u8 = undefined;
     h.final(&out);
     return std.mem.readInt(u128, out[0..16], .little);
+}
+
+/// The content digest of every node of the rows the site of `root` reaches
+/// (V5a): one slice per row, root first, in the order the emitter writes the
+/// rows, with one digest per node in the order it numbers them. Free it with
+/// `digest_mod.freeSite`.
+pub fn siteDigests(gpa: Allocator, store: *const ir.Store, types: *const types_mod.Types, root: RowId) Allocator.Error![]const []const Digest {
+    var returns = try live_mod.Returns.init(gpa, store);
+    defer returns.deinit(gpa);
+    var reached: ir.RowTable(number.Numbering) = .empty;
+    defer {
+        for (reached.values()) |*n| n.deinit(gpa);
+        reached.deinit(gpa);
+    }
+    try number.siteRows(gpa, store, &returns, root, &reached);
+    const orders = try gpa.alloc([]const ir.NodeId, reached.count());
+    defer gpa.free(orders);
+    for (reached.values(), orders) |*numbering, *o| o.* = numbering.order.items;
+    return digest_mod.ofSite(gpa, store, types, reached.keys(), orders);
 }
 
 /// Whether a row the site of `root` reaches holds an `Apply` (N8j): a call
@@ -745,6 +823,39 @@ test "N8g: two helpers written alike are one row, and the calls of them one call
     );
 }
 
+test "N8g: two equal rows that evidence names merge, and each evidence names the kept row (D7)" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const i64_ty = try f.i64Ty();
+    const list_ty = try f.types.listTy(i64_ty);
+    // Two written `order_relative_to` methods with one body, a stand-in that gives I64.
+    const h1 = try minusRow(&f, false);
+    const h2 = try minusRow(&f, false);
+    const method = (try f.types.name("order_relative_to")).index();
+    const sort = try f.b.namedPrim("List", "sort");
+    const row_kind = @backingInt(ir.EvidenceKind.row);
+    // root(xs, ys) = (List.sort(xs) where [-> h1], List.sort(ys) where [-> h2])
+    const root = try f.b.beginRow(&.{ list_ty, list_ty }, try f.types.tupleTy(&.{ list_ty, list_ty }));
+    const first = try f.b.primWith(sort, &.{Ref.rowParam(0)}, list_ty, &.{ 1, method, i64_ty.index(), row_kind, h1.index() });
+    const second = try f.b.primWith(sort, &.{Ref.rowParam(1)}, list_ty, &.{ 1, method, i64_ty.index(), row_kind, h2.index() });
+    try f.b.endRow(.{ .value = &.{try f.b.tuple(try f.types.tupleTy(&.{ list_ty, list_ty }), &.{ first, second })} });
+    try expectSite(&f, root,
+        \\row r0 (List(I64), List(I64)) -> (List(I64), List(I64))
+        \\  n0 = List.sort(p0) where [order_relative_to @ I64 -> r1] : List(I64) !spec
+        \\  n1 = List.sort(p1) where [order_relative_to @ I64 -> r1] : List(I64) !spec
+        \\  n2 = tuple(n0, n1) : (List(I64), List(I64))
+        \\  value n2
+        \\row r1 (I64, I64) -> I64
+        \\  n0 = Num.I64.minus(p0, p1) : I64 !spec
+        \\  value n0
+        \\
+    );
+    // The merged row is named nowhere: every evidence word names the kept row.
+    try testing.expectEqual(@as(?[]const u8, null), try check(testing.allocator, &f.store, root));
+    try testing.expect(f.store.row(h1).merged_into != null or f.store.row(h2).merged_into != null);
+}
+
 test "N8f: a helper's parameter order is its first-read order, so swapping it and its arguments changes nothing" {
     var dumps: [2][]u8 = .{ &.{}, &.{} };
     defer for (dumps) |d| testing.allocator.free(d);
@@ -817,7 +928,7 @@ fn countdown(f: *Fixture, callee: Callee) Allocator.Error!RowId {
     };
     try f.b.close(.{ .value = &.{try f.b.callRow(target, &.{next})} });
     const arm1 = try f.b.openArm(c, 1);
-    try f.b.close(.{ .value = &.{try f.b.litInt(i64_ty, 0)} });
+    try f.b.close(.{ .value = &.{Ref.rowParam(0)} });
     try f.b.endRow(.{ .value = &.{try f.b.switchOn(c, &.{ arm0, arm1 }, &.{}, &.{i64_ty}, &.{})} });
     return r;
 }
@@ -840,18 +951,19 @@ test "N8g: two recursive rows that call each other alike are bisimilar and meet 
         \\row r0 (I64) -> I64
         \\  n0 = call r1(p0) : I64 !spec
         \\  value n0
-        \\row r1 (I64) -> I64 recursive
+        \\row r1 (I64) -> I64
         \\  n0 = 1 : I64
-        \\  n1 = Num.I64.is_lt(p0, n0) : Bool
-        \\  n5 = switch n1 : I64 !spec
-        \\    arm 0
-        \\      n2 = Num.I64.minus(p0, n0) : I64 !spec
-        \\      n3 = call r1(n2) : I64 !spec
-        \\      value n3
-        \\    arm 1
-        \\      n4 = 0 : I64
-        \\      value n4
-        \\  value n5
+        \\  n4 = loop(p0) : I64 !spec
+        \\    body (s4.0: I64)
+        \\      n1 = Num.I64.is_lt(s4.0, n0) : Bool
+        \\      n3 = switch n1 : !spec
+        \\        arm 0
+        \\          n2 = Num.I64.minus(s4.0, n0) : I64
+        \\          continue n2
+        \\        arm 1
+        \\          break s4.0
+        \\      branch n3
+        \\  value n4
         \\
     , dumps[0]);
 }
@@ -1169,4 +1281,153 @@ test "N8g: a forced digest collision merges nothing, and finalize reports it" {
     try fin.registry.put(testing.allocator, d[0], doubled);
     try testing.expectError(error.InvariantBroken, fin.finalize(&f.b, &.{bumped}));
     try testing.expectEqual(@as(?RowId, null), f.store.row(bumped).merged_into);
+}
+
+// `for _ in 0..<n { t = t + b * 3 }` from `t = k`, in the open region.
+fn tripleLoop(f: *Fixture, k: Ref, b: Ref, n: Ref) Allocator.Error!Ref {
+    const i64_ty = try f.i64Ty();
+    const body = try f.b.openRegion(.loop_body, &.{ i64_ty, i64_ty });
+    const step = try f.b.call(.i64, .times_wrap, &.{ b, try f.b.litInt(i64_ty, 3) });
+    try f.b.close(.{ .continue_ = &.{try f.b.call(.i64, .plus_wrap, &.{ ir.Ref.regionParam(body, 1), step })} });
+    return f.b.loopOf(.for_range, &.{ try f.b.litInt(i64_ty, 0), n, k }, body, &.{i64_ty});
+}
+
+// `|c, a, b, n| if c a * 3 else { t = 36; for _ in 0..<n { t = t + b * 3 }; t }`.
+// Where `hoisted`, the row first builds `12 * 3`, which folds to 36 and
+// leaves the literal 3 at the body, where both arms read it; otherwise each
+// arm builds its own 3, as an inlined helper does (N5d).
+fn tripleRow(f: *Fixture, hoisted: bool) Allocator.Error!RowId {
+    const i64_ty = try f.i64Ty();
+    const r = try f.b.beginRow(&.{ try f.types.boolTy(), i64_ty, i64_ty, i64_ty }, i64_ty);
+    const c = Ref.rowParam(0);
+    if (hoisted) _ = try f.b.call(.i64, .times_wrap, &.{ try f.b.litInt(i64_ty, 12), try f.b.litInt(i64_ty, 3) });
+    const arm0 = try f.b.openArm(c, 0);
+    try f.b.close(.{ .value = &.{try tripleLoop(f, try f.b.litInt(i64_ty, 36), Ref.rowParam(2), Ref.rowParam(3))} });
+    const arm1 = try f.b.openArm(c, 1);
+    try f.b.close(.{ .value = &.{try f.b.call(.i64, .times_wrap, &.{ Ref.rowParam(1), try f.b.litInt(i64_ty, 3) })} });
+    try f.b.endRow(.{ .value = &.{try f.b.switchOn(c, &.{ arm0, arm1 }, &.{}, &.{i64_ty}, &.{})} });
+    return r;
+}
+
+// Two `tripleRow`s, the first `hoisted`, each built at a source of its own
+// (1 and 2), called from a root built at source 0.
+fn tripleSite(f: *Fixture, sources: *[3]provenance.OriginId) Allocator.Error![3]RowId {
+    for (sources, 0..) |*o, k| o.* = try f.store.provenance.intern(testing.allocator, .{ .source = provenance.SourceId.of(@intCast(k)), .via = .none });
+    const i64_ty = try f.i64Ty();
+    f.b.origins = sources[1..2];
+    const h1 = try tripleRow(f, true);
+    f.b.origins = sources[2..3];
+    const h2 = try tripleRow(f, false);
+    f.b.origins = sources[0..1];
+    const root = try f.b.beginRow(&.{ try f.types.boolTy(), i64_ty, i64_ty, i64_ty }, i64_ty);
+    const params: [4]Ref = .{ Ref.rowParam(0), Ref.rowParam(1), Ref.rowParam(2), Ref.rowParam(3) };
+    const c1 = try f.b.callRow(h1, &params);
+    const c2 = try f.b.callRow(h2, &params);
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .times_wrap, &.{ c1, c2 })} });
+    f.b.origins = &.{};
+    return .{ h1, h2, root };
+}
+
+test "N8g: two rows that compute one value but share a literal differently merge into one row" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    var sources: [3]provenance.OriginId = undefined;
+    const h1, const h2, const root = try tripleSite(&f, &sources);
+    // The first row reads one 3 from both arms and the second one 3 per
+    // arm, so their numberings do not pair position by position, but the
+    // rows are equal and merge (N5d is not built).
+    const got = try f.site(root);
+    defer testing.allocator.free(got);
+    try testing.expect(try check(testing.allocator, &f.store, root) == null);
+    try testing.expectEqual(@as(?RowId, null), f.store.row(h1).merged_into);
+    try testing.expectEqual(@as(?RowId, h1), f.store.row(h2).merged_into);
+    try testing.expect(std.mem.find(u8, got, "row r2") == null);
+}
+
+test "N10: a node of a row that another row merged into has the origins of every node the comparison paired with it" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    var sources: [3]provenance.OriginId = undefined;
+    _, _, const root = try tripleSite(&f, &sources);
+    const got = try f.site(root);
+    defer testing.allocator.free(got);
+    var emitted = try provenance.emitted(testing.allocator, &f.store, root);
+    defer emitted.deinit(testing.allocator);
+    // Row 1 is the helper both rows became: each of its nodes, the one 3
+    // that both arms read among them, came from source 1 and from source 2.
+    try testing.expectEqual(@as(usize, 2), emitted.rows.items.len);
+    const helper = emitted.rows.items[1];
+    try testing.expect(helper.len > 0);
+    for (0..helper.len) |k| {
+        var seen: [3]bool = @splat(false);
+        for (emitted.of(1, @intCast(k)).?) |chain| {
+            for (emitted.links.items[chain.start..][0..chain.len]) |s| seen[s.index()] = true;
+        }
+        try testing.expect(!seen[0] and seen[1] and seen[2]);
+    }
+}
+
+// `|n, k| { for i in 0..<n { if i == k { return i } }; n + k }` where
+// `looped`, and `|n, k| n + k` otherwise. Nothing reads the loop.
+fn exitRow(f: *Fixture, looped: bool) Allocator.Error!RowId {
+    const i64_ty = try f.i64Ty();
+    const r = try f.b.beginRow(&.{ i64_ty, i64_ty }, i64_ty);
+    if (looped) {
+        const zero = try f.b.litInt(i64_ty, 0);
+        const body = try f.b.openRegion(.loop_body, &.{i64_ty});
+        const i = Ref.regionParam(body, 0);
+        const c = try f.b.call(.i64, .is_eq, &.{ i, Ref.rowParam(1) });
+        const arm0 = try f.b.openArm(c, 0);
+        try f.b.close(.{ .continue_ = &.{} });
+        const arm1 = try f.b.openArm(c, 1);
+        try f.b.close(.{ .return_ = i });
+        const sw = try f.b.exitingSwitch(c, &.{ arm0, arm1 }, &.{}, &.{});
+        try f.b.close(.{ .branch = sw });
+        _ = try f.b.forRange(false, &.{ zero, Ref.rowParam(0) }, body, &.{});
+    }
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .plus_wrap, &.{ Ref.rowParam(0), Ref.rowParam(1) })} });
+    return r;
+}
+
+// A root that multiplies the calls of `first` and `second` over its two parameters.
+fn exitSite(f: *Fixture, first: RowId, second: RowId) Allocator.Error!RowId {
+    const i64_ty = try f.i64Ty();
+    const root = try f.b.beginRow(&.{ i64_ty, i64_ty }, i64_ty);
+    const c1 = try f.b.callRow(first, &.{ Ref.rowParam(0), Ref.rowParam(1) });
+    const c2 = try f.b.callRow(second, &.{ Ref.rowParam(0), Ref.rowParam(1) });
+    try f.b.endRow(.{ .value = &.{try f.b.call(.i64, .times_wrap, &.{ c1, c2 })} });
+    return root;
+}
+
+test "N8g: two helpers alike with a loop that can return and that nothing reads are one row" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const h1 = try exitRow(&f, true);
+    const h2 = try exitRow(&f, true);
+    const root = try exitSite(&f, h1, h2);
+    const got = try f.site(root);
+    defer testing.allocator.free(got);
+    try testing.expect(try check(testing.allocator, &f.store, root) == null);
+    try testing.expectEqual(@as(?RowId, h1), f.store.row(h2).merged_into);
+}
+
+test "N8g: a loop that can return and that nothing reads keeps a helper apart from one without it, in either call order" {
+    for ([_]bool{ false, true }) |swapped| {
+        var f: Fixture = undefined;
+        f.init();
+        defer f.deinit();
+        const looped = try exitRow(&f, true);
+        const plain = try exitRow(&f, false);
+        const root = if (swapped) try exitSite(&f, plain, looped) else try exitSite(&f, looped, plain);
+        const got = try f.site(root);
+        defer testing.allocator.free(got);
+        try testing.expect(try check(testing.allocator, &f.store, root) == null);
+        try testing.expectEqual(@as(?RowId, null), f.store.row(looped).merged_into);
+        try testing.expectEqual(@as(?RowId, null), f.store.row(plain).merged_into);
+        try testing.expect(f.store.row(looped).digest.? != f.store.row(plain).digest.?);
+        try testing.expect(std.mem.find(u8, got, "row r2") != null);
+    }
 }

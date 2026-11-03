@@ -88,8 +88,18 @@ pub const Lookup = struct {
         asked.context = self;
         asked.resolve_method = resolveMethod;
         asked.resolve_exported = resolveExported;
+        asked.resolve_exported_computed = resolveExportedComputed;
+        asked.resolve_constant = resolveConstant;
         asked.resolve_inspect_override = resolveInspectOverride;
+        asked.resolve_builtin_module = resolveBuiltinModule;
         return asked;
+    }
+
+    /// Whether `module` is the content identity of the builtin artifact.
+    fn resolveBuiltinModule(context: *const anyopaque, module: *const [32]u8) bool {
+        const self: *const Lookup = @ptrCast(@alignCast(context));
+        const builtins = check.CheckedArtifact.importedView(self.builtins);
+        return std.mem.eql(u8, &builtins.module_identity.stable_hash, module);
     }
 
     fn resolveExported(
@@ -103,6 +113,29 @@ pub const Lookup = struct {
         }
         for (self.imports) |view| {
             if (std.meta.eql(view.key.bytes, artifact.bytes)) return check.CheckedArtifact.exportedDefinition(view, def);
+        }
+        return null;
+    }
+
+    fn resolveExportedComputed(
+        context: *const anyopaque,
+        artifact: check.CanonicalNames.ArtifactRef,
+        def: can.CIR.Def.Idx,
+    ) ?CodeReifier.ForeignComputed {
+        const self: *const Lookup = @ptrCast(@alignCast(context));
+        for (self.imports) |view| {
+            if (std.meta.eql(view.key.bytes, artifact.bytes)) return check.CheckedArtifact.exportedComputed(view, def);
+        }
+        return null;
+    }
+
+    fn resolveConstant(
+        context: *const anyopaque,
+        const_ref: check.CheckedArtifact.ConstRef,
+    ) ?CodeReifier.ForeignConstant {
+        const self: *const Lookup = @ptrCast(@alignCast(context));
+        for (self.imports) |view| {
+            if (std.meta.eql(view.key.bytes, const_ref.artifact.bytes)) return check.CheckedArtifact.exportedConstant(view, const_ref);
         }
         return null;
     }
@@ -139,9 +172,9 @@ pub const Lookup = struct {
     }
 };
 
-/// The lambda whose one parameter is named `param`. The
-/// source-node map is build-only, so the test reads the pattern's region the
-/// same way the reifier does.
+/// The lambda whose first parameter is named `param`, so a site may take
+/// more than one. The source-node map is build-only, so the test reads the
+/// pattern's region the same way the reifier does.
 pub fn lambdaByParam(
     artifact: *const check.CheckedArtifact.CheckedModuleArtifact,
     env: *const ModuleEnv,
@@ -152,7 +185,7 @@ pub fn lambdaByParam(
         const data = artifact.checked_bodies.expr(expr_id).data;
         if (data != .lambda) continue;
         const lambda = data.lambda;
-        if (lambda.args.len != 1) continue;
+        if (lambda.args.len == 0) continue;
         const pattern = artifact.checked_bodies.pattern(lambda.args[0]);
         if (pattern.data != .assign) continue;
         if (!std.mem.eql(u8, env.getSource(pattern.source_region), param)) continue;
@@ -210,6 +243,7 @@ pub const Error = Allocator.Error ||
         NormalFormsDiffer,
         RefusalsDiffer,
         ValuesDiffer,
+        IntervalMissed,
     };
 
 /// How a case ended where nothing disagreed.
@@ -234,11 +268,17 @@ const Site = struct {
 
     /// Walk the site in place, since the walk keeps a pointer to the store.
     fn describe(self: *Site, gpa: Allocator, lookup: *const Lookup, env: *const ModuleEnv, param: []const u8) Error!void {
+        return self.describeIn(gpa, lookup, env, param, .graph);
+    }
+
+    /// `describe`, for a site whose declared type selects `view`.
+    fn describeIn(self: *Site, gpa: Allocator, lookup: *const Lookup, env: *const ModuleEnv, param: []const u8, view: @TypeOf(@as(CodeReifier.Walk, undefined).view)) Error!void {
         const artifact = lookup.artifact;
         self.gpa = gpa;
         self.dump = .empty;
         self.store = ConstStore.init(gpa);
         self.walk = CodeReifier.Walk.init(gpa, &self.store, lookup.lookup());
+        self.walk.view = view;
         const lambda = lambdaByParam(artifact, env, param) orelse return error.SiteNotFound;
         const reifier = try self.walk.reader(.{ .sources = CodeReifier.Reifier.artifactSources(artifact), .env = env });
         self.outcome = try reifier.reifyLambda(lambda, .{
@@ -275,10 +315,15 @@ const Site = struct {
 /// Run the case `bytes` generates, writing its app into `dir`. The
 /// coordinator allocates from `ctx.arena`, which the caller releases.
 pub fn runCase(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, bytes: []const u8) Error!Verdict {
-    var case = try reify.fuzz_gen.generate(ctx.gpa, bytes);
+    return runCaseWith(ctx, builtins, dir, bytes, .{});
+}
+
+/// `runCase` on the case `bytes` generates with the constructs `options` allows.
+pub fn runCaseWith(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, bytes: []const u8, options: reify.fuzz_gen.Options) Error!Verdict {
+    var case = try reify.fuzz_gen.generateWith(ctx.gpa, bytes, options);
     defer case.deinit(ctx.gpa);
     return runGenerated(ctx, builtins, dir, &case) catch |err| {
-        std.debug.print("{t} on the generated case:\n{s}\n", .{ err, case.source });
+        std.debug.print("{t} on the generated case:\n{s}\nLib:\n{s}\n", .{ err, case.source, case.lib_source });
         return err;
     };
 }
@@ -290,16 +335,29 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
     try dir.createDirPath(io, ".roc_echo_platform");
     try dir.writeFile(io, .{ .sub_path = ".roc_echo_platform/main.roc", .data = platform_main });
     try dir.writeFile(io, .{ .sub_path = ".roc_echo_platform/Echo.roc", .data = platform_echo });
+    // M13: the helpers the case put in another package, in its module `Lib`.
+    const has_lib = case.lib_source.len != 0;
+    if (has_lib) {
+        try dir.createDirPath(io, "lib");
+        try dir.writeFile(io, .{ .sub_path = "lib/main.roc", .data = "package [Lib] {}\n\nimport /Lib as Lib\n" });
+        const lib_source = try std.fmt.allocPrint(gpa, "Lib := {{}}.{{\n{s}}}\n", .{case.lib_source});
+        defer gpa.free(lib_source);
+        try dir.writeFile(io, .{ .sub_path = "lib/Lib.roc", .data = lib_source });
+    }
     const app_source = try std.fmt.allocPrint(gpa,
-        \\app [main!] {{ pf: platform "./.roc_echo_platform/main.roc" }}
+        \\app [main!] {{ pf: platform "./.roc_echo_platform/main.roc"{s} }}
         \\
-        \\import pf.Echo
+        \\import pf.Echo{s}
         \\
         \\{s}
         \\
         \\main! = |_args| Ok({{}})
         \\
-    , .{case.source});
+    , .{
+        if (has_lib) ", lib: \"./lib/main.roc\"" else "",
+        if (has_lib) "\nimport lib.Lib" else "",
+        case.source,
+    });
     defer gpa.free(app_source);
     try dir.writeFile(io, .{ .sub_path = "main.roc", .data = app_source });
     const app_path = try dir.realPathFileAlloc(io, "main.roc", gpa);
@@ -328,12 +386,19 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
 
     const artifact = coord.appRootCheckedArtifact();
     const env = artifact.module_env.env();
-    const lookup: Lookup = .{ .artifact = artifact, .builtins = &builtins.checked_artifact };
+    const lookup: Lookup = .{
+        .artifact = artifact,
+        .builtins = &builtins.checked_artifact,
+        .imports = try coord.collectImportedArtifactViews(arena, artifact),
+    };
+    // A case with the constructs of M10 meets in the `lawful` view, where
+    // layer L applies (L4, loop to builtin).
+    const view: @TypeOf(@as(CodeReifier.Walk, undefined).view) = if (case.lawful) .lawful else .graph;
     var left: Site = undefined;
-    try left.describe(gpa, &lookup, env, case.left_param);
+    try left.describeIn(gpa, &lookup, env, case.left_param, view);
     defer left.deinit();
     var right: Site = undefined;
-    try right.describe(gpa, &lookup, env, case.right_param);
+    try right.describeIn(gpa, &lookup, env, case.right_param, view);
     defer right.deinit();
 
     // L4: one normal form, or one refusal.
@@ -361,6 +426,20 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
         },
     }
 
+    // The other views are compared on cases without M10's constructs, whose
+    // spellings meet only under layer L.
+    var left_inline: Site = undefined;
+    var left_outline: Site = undefined;
+    var left_graph: Site = undefined;
+    if (case.lawful) {
+        // L5 for laws: the graph the site describes without layer L.
+        try left_graph.describe(gpa, &lookup, env, case.left_param);
+    } else try compareViews(gpa, &lookup, env, case, &left_inline, &left_outline);
+    defer if (case.lawful) left_graph.deinit() else {
+        left_inline.deinit();
+        left_outline.deinit();
+    };
+
     // L5: the normal form's value is the one Roc computed at compile time.
     try coord.finishCheckedProgram(.executable_artifacts);
     if (errorsBesideCrashes(&coord)) {
@@ -368,8 +447,10 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
         return error.GeneratedCaseDidNotCheck;
     }
     const expected = try storedAnswer(&coord, case.answer) orelse return .reference_crashed;
-    // The answer is the only definition Roc evaluates, so no other crashed.
-    if (coord.hasUserErrors()) {
+    // A constant inside a function body that crashes is reported as a
+    // compile-time crash although the answer does not read it. Every other
+    // error means the case did not check.
+    if (errorsBesideCrashes(&coord)) {
         printReports(&coord);
         return error.GeneratedCaseDidNotCheck;
     }
@@ -381,14 +462,80 @@ fn runGenerated(ctx: CoreCtx, builtins: *eval.BuiltinModules, dir: std.Io.Dir, c
     for (items, case.input.items) |*item, value| item.* = .{ .int = value };
     const fields = [_]reify.eval.Value{ .{ .int = case.input.a }, .{ .int = case.input.b }, .{ .bool_ = case.input.flag }, .{ .list = items } };
     const args = [_]reify.eval.Value{.{ .agg = &fields }};
-    const site = left.walk.site.?;
-    var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
-    const computed = try evaluator.run(left.walk.root.?, &args);
-    if (!computed.eql(.{ .int = expected })) {
-        std.debug.print("the normal form computes {any}, and Roc computes {d}\n{s}\n", .{ computed, expected, left.dump.items });
-        return error.ValuesDiffer;
+    // Views agree: `graph`, `inline` and `outline` each compute Roc's
+    // answer, or `lawful` and `graph` for a case with M10's constructs.
+    const views: [3]?*const Site = if (case.lawful) .{ &left, &left_graph, null } else .{ &left, &left_inline, &left_outline };
+    for (views) |maybe| {
+        const each = maybe orelse continue;
+        if (each.outcome != .reified) continue;
+        const site = each.walk.site.?;
+        var evaluator = try reify.eval.Evaluator.init(values, &site.store, &site.types, .strict);
+        // L2 for N13u and N8k: every interval holds every value computed.
+        evaluator.check_ranges = true;
+        const computed = try evaluator.run(each.walk.root.?, &args);
+        if (!computed.eql(.{ .int = expected })) {
+            std.debug.print("the normal form computes {any}, and Roc computes {d}\n{s}\n", .{ computed, expected, each.dump.items });
+            return error.ValuesDiffer;
+        }
+        if (evaluator.range_miss) |miss| {
+            std.debug.print("node {d} of row {d} computes {d}, outside its interval [{d}, {d}]\n{s}\n", .{ miss.node.index(), miss.row.index(), miss.value, miss.interval.lo, miss.interval.hi, each.dump.items });
+            return error.IntervalMissed;
+        }
     }
     return .agree;
+}
+
+// L4 for V5a and V3: the prints meet in the `inline` and `outline` views,
+// and in `inline` every node of them has one digest. The left print's sites
+// are left in `left_inline` and `left_outline`.
+fn compareViews(gpa: Allocator, lookup: *const Lookup, env: *const ModuleEnv, case: *const reify.fuzz_gen.Case, left_inline: *Site, left_outline: *Site) Error!void {
+    try left_inline.describeIn(gpa, lookup, env, case.left_param, .inline_);
+    errdefer left_inline.deinit();
+    {
+        var right_inline: Site = undefined;
+        try right_inline.describeIn(gpa, lookup, env, case.right_param, .inline_);
+        defer right_inline.deinit();
+        if (left_inline.outcome == .reified and right_inline.outcome == .reified) {
+            if (!std.mem.eql(u8, left_inline.dump.items, right_inline.dump.items)) {
+                std.debug.print("the prints describe as two normal forms in the inline view:\n{s}\n{s}\n", .{ left_inline.dump.items, right_inline.dump.items });
+                return error.NormalFormsDiffer;
+            }
+            const ls = left_inline.walk.site.?;
+            const rs = right_inline.walk.site.?;
+            const ld = try reify.rows.siteDigests(gpa, &ls.store, &ls.types, left_inline.walk.root.?);
+            defer reify.digest.freeSite(gpa, ld);
+            const rd = try reify.rows.siteDigests(gpa, &rs.store, &rs.types, right_inline.walk.root.?);
+            defer reify.digest.freeSite(gpa, rd);
+            var equal_digests = ld.len == rd.len;
+            if (equal_digests) for (ld, rd) |a, b| {
+                if (!std.mem.eql(reify.digest.Digest, a, b)) equal_digests = false;
+            };
+            if (!equal_digests) {
+                std.debug.print("the prints meet in the inline view and their nodes have different digests:\n{s}\n", .{left_inline.dump.items});
+                return error.NormalFormsDiffer;
+            }
+        } else if ((left_inline.outcome == .reified) != (right_inline.outcome == .reified)) {
+            // One print is refused in this view and the other is not.
+            return error.RefusalsDiffer;
+        }
+    }
+
+    // L4 for V3: in the `outline` view, the prints meet.
+    try left_outline.describeIn(gpa, lookup, env, case.left_param, .outline);
+    errdefer left_outline.deinit();
+    {
+        var right_outline: Site = undefined;
+        try right_outline.describeIn(gpa, lookup, env, case.right_param, .outline);
+        defer right_outline.deinit();
+        if (left_outline.outcome == .reified and right_outline.outcome == .reified) {
+            if (!std.mem.eql(u8, left_outline.dump.items, right_outline.dump.items)) {
+                std.debug.print("the prints describe as two normal forms in the outline view:\n{s}\n{s}\n", .{ left_outline.dump.items, right_outline.dump.items });
+                return error.NormalFormsDiffer;
+            }
+        } else if ((left_outline.outcome == .reified) != (right_outline.outcome == .reified)) {
+            return error.RefusalsDiffer;
+        }
+    }
 }
 
 // Whether a report other than a warning or a compile-time crash was made.

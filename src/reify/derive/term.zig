@@ -169,8 +169,8 @@ pub fn instances(arena: Allocator, rule: table.Rule) Allocator.Error![]const Rul
     for (rule.conds) |c| switch (c) {
         .polarity_flips => |k| polar = k,
         .lit_bool_switch => |k| lit_bool = k,
-        .int_owner, .not_float_owner, .is_lit, .speculatable, .nonzero_lit, .movable, .movable_rest, .speculatable_rest, .same_ty, .not_lit => {},
-        .folds => unreachable,
+        .int_owner, .key_owner, .not_float_owner, .is_lit, .speculatable, .nonzero_lit, .movable, .movable_rest, .speculatable_rest, .same_ty, .not_lit => {},
+        .folds, .folds_pair => unreachable, // only an evaluation row folds
     };
     const shapes: []const ?Term = if (polar != null) try polarityShapes(arena) else &.{null};
     // A literal switch with `Bool` arms reads as one over one key, the literal 0.
@@ -347,7 +347,32 @@ fn ofArgs(arena: Allocator, pats: []const table.Pat, ctx: *Ctx, sym: Sym) Alloca
     for (pats) |p| switch (p) {
         .rest => |k| try args.appendSlice(arena, ctx.seqs[k]),
         // At `I64`, the type step 1 instantiates owner variables at.
-        .identity => try args.append(arena, .{ .app = .{ .sym = .{ .op = .lit, .int = @intCast(prims.identityInt(.i64, sym.method.?).?) }, .args = &.{} } }),
+        // The identity of `Str.concat` is the empty string, a literal with no integer,
+        // and of `List.concat` the empty `List` node.
+        .identity => try args.append(arena, switch (switch (sym.owner.?) {
+            .fixed => |o| o,
+            .bind => prims.Owner.i64,
+        }) {
+            .str => .{ .app = .{ .sym = .{ .op = .lit }, .args = &.{} } },
+            .list => .{ .app = .{ .sym = .{ .op = .list }, .args = &.{} } },
+            .bool_,
+            .iter,
+            .try_,
+            .numeral,
+            .u8,
+            .i8,
+            .u16,
+            .i16,
+            .u32,
+            .i32,
+            .u64,
+            .i64,
+            .u128,
+            .i128,
+            .f32,
+            .f64,
+            => .{ .app = .{ .sym = .{ .op = .lit, .int = @intCast(prims.identityInt(.i64, sym.method.?).?) }, .args = &.{} } },
+        }),
         // The variable stands for the literal wherever the result reads it.
         .absorbing => |k| {
             const lit: Term = .{ .app = .{ .sym = .{ .op = .lit, .int = @intCast(prims.absorbingInt(.i64, sym.method.?).?) }, .args = &.{} } };
@@ -370,7 +395,7 @@ fn ofPat(arena: Allocator, p: table.Pat, ctx: *Ctx) Allocator.Error!Term {
             break :blk .{ .app = .{ .sym = sym, .args = try ofArgs(arena, pp.args, ctx, sym) } };
         },
         // `ofArgs` reads these among a chain's arguments.
-        .rest, .identity, .absorbing => unreachable,
+        .rest, .identity, .absorbing => unreachable, // ofArgs reads these among a chain's arguments
         .op => |op| blk: {
             const args = try arena.alloc(Term, op.args.len);
             for (op.args, args) |sub, *a| a.* = try ofPat(arena, sub, ctx);
@@ -442,14 +467,14 @@ fn ofTmpl(arena: Allocator, t: table.Tmpl, ctx: *Ctx) Allocator.Error!Term {
             var args: std.ArrayList(Term) = .empty;
             for (pp.args) |sub| switch (sub) {
                 .rest => |k| try args.appendSlice(arena, ctx.seqs[k]),
-                .var_, .prim, .bool_switch, .and_, .or_, .region_value, .lit_bool, .lit_int, .folded, .negation, .lit_switch => try args.append(arena, try ofTmpl(arena, sub, ctx)),
+                .var_, .prim, .bool_switch, .and_, .or_, .region_value, .lit_bool, .lit_int, .folded, .folded_pair, .negation, .lit_switch => try args.append(arena, try ofTmpl(arena, sub, ctx)),
             };
             if (args.items.len == 0) ctx.empty = true;
             // A one-operand chain is its operand, as the builder builds it.
             if (args.items.len == 1 and prims.associativeOf(pp.method)) break :blk args.items[0];
             break :blk .{ .app = .{ .sym = .{ .op = .prim, .method = pp.method, .owner = pp.owner }, .args = args.items } };
         },
-        .rest => unreachable,
+        .rest => unreachable, // rest is expanded among a chain's arguments above
         .bool_switch => |bs| blk: {
             const args = try arena.alloc(Term, 3);
             args[0] = try ofTmpl(arena, bs.scrutinee.*, ctx);
@@ -487,7 +512,7 @@ fn ofTmpl(arena: Allocator, t: table.Tmpl, ctx: *Ctx) Allocator.Error!Term {
             };
             break :blk .{ .app = .{ .sym = .{ .op = .switch_, .index = 1 }, .args = args } };
         },
-        .folded => unreachable,
+        .folded, .folded_pair => unreachable, // folded templates occur only in results of evaluation rows, not in term patterns
     };
 }
 
@@ -667,7 +692,7 @@ pub fn writeRenamed(w: *std.Io.Writer, t: Term, order: ?[]const Var) std.Io.Writ
 pub fn readBack(arena: Allocator, store: *const reify.ir.Store, types: *const reify.types.Types, ref: reify.ir.Ref) Allocator.Error!Term {
     switch (ref.kind) {
         .row_param => return .{ .var_ = @intCast(ref.output) },
-        .region_param => return .{ .var_ = std.math.maxInt(Var) },
+        .region_param, .input => return .{ .var_ = std.math.maxInt(Var) },
         .node => {},
     }
     const nd = store.node(ref.nodeId());
@@ -695,7 +720,7 @@ pub fn readBack(arena: Allocator, store: *const reify.ir.Store, types: *const re
         .lit => switch (store.lit(reify.ir.LitId.of(nd.payload)).value) {
             .bool_ => |v| sym.lit = v,
             .int => |bits| sym.int = @truncate(@as(i128, @bitCast(bits))),
-            .float, .str, .dec, .bytes => {},
+            .float, .str, .dec, .bytes, .numeral => {},
         },
         .field, .index => sym.index = nd.payload,
         .tag => sym.index = types.memberIndex(store.tySlice(nd.tys)[0], reify.types.NameId.of(nd.payload)).?,

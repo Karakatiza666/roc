@@ -27,8 +27,11 @@ const ByteListRange = struct { start: u64, count: u64 };
 /// Alias into the Store.extra_strings_backing array
 pub const ExtraStringIdx = ByteListRange;
 
+/// A range of extra strings in the Store's missing_patterns_backing array
+pub const ExtraStringsRange = struct { start: u64, count: u64 };
+
 /// A range of patterns
-pub const MissingPatternsRange = struct { start: u64, count: u64 };
+pub const MissingPatternsRange = ExtraStringsRange;
 
 /// The checker relation that recorded a problem, or whose unification queued
 /// a dispatch obligation whose problems then belong to it, unless the
@@ -83,6 +86,7 @@ pub const Problem = union(enum) {
     cannot_access_opaque_nominal: CannotAccessOpaqueNominal,
     nominal_type_resolution_failed: NominalTypeResolutionFailed,
     recursive_alias: RecursiveAlias,
+    record_extension_not_record: RecordExtensionNotRecord,
     not_a_where_alias: NotAWhereAlias,
     where_alias_in_type_position: WhereAliasInTypePosition,
     recursive_where_alias: RecursiveWhereAlias,
@@ -102,6 +106,7 @@ pub const Problem = union(enum) {
     effectful_function_name: EffectfulFunctionName,
     annotation_only_value: AnnotationOnlyValue,
     annotation_only_value_use: AnnotationOnlyValueUse,
+    exists_only_in_reified_code: ExistsOnlyInReifiedCode,
     hosted_where_requirement: HostedWhereRequirement,
     derived_method_value_use: DerivedMethodValueUse,
     capturing_method: CapturingMethod,
@@ -227,6 +232,21 @@ pub const AnnotationOnlyValue = struct {
 /// nothing to evaluate.
 pub const AnnotationOnlyValueUse = struct {
     region: base.Region,
+};
+
+/// Code that runs reaches an intrinsic, directly or through reify-only
+/// definitions (design.md "Reify-Only Definitions"). Only reified code can
+/// use an intrinsic, because it has no Roc body.
+pub const ExistsOnlyInReifiedCode = struct {
+    /// The reference: a call, a dispatch, or a use as a value.
+    region: base.Region,
+    /// For a use as a value, the name of the definition used.
+    value_use: ?ExtraStringIdx,
+    /// The name of the intrinsic at the end of the chain.
+    intrinsic: ExtraStringIdx,
+    /// One frame for each witness from the target to the intrinsic, then the
+    /// intrinsic itself, each with its place.
+    chain: RefusalCallsRange,
 };
 
 /// A hosted declaration was selected to satisfy a `where` requirement whose
@@ -370,6 +390,46 @@ pub const StagedCode = struct {
     /// Names the construct, binding or type that stopped the walk, as the walk
     /// recorded it. Empty for a reason that names nothing beyond itself.
     detail: ExtraStringIdx = .{ .start = 0, .count = 0 },
+    /// For `unresolved_type` at a type variable: why the variable stayed
+    /// open and where it stands, which picks the fix the report gives. Null
+    /// for every other refusal.
+    open: ?Open = null,
+    /// Where the walk stopped, when that is outside the site's own source: a
+    /// callee or a constant the walk entered in another module (F4), or one
+    /// this module defines outside the site (D9). `region` is then the site.
+    /// Null when the walk stopped inside the site.
+    foreign: ?Foreign = null,
+
+    /// A place outside the site's own source, as the report shows it: the
+    /// path of its module's file, the text of the lines the place spans, and
+    /// its 1-based start and end.
+    pub const Foreign = struct {
+        path: ExtraStringIdx,
+        line_text: ExtraStringIdx,
+        start_line: u32,
+        start_column: u32,
+        end_line: u32,
+        end_column: u32,
+    };
+
+    /// Why a type variable stayed open, and the kind of place it stands in.
+    pub const Open = struct {
+        cause: Cause,
+        place: Place,
+
+        pub const Cause = enum {
+            /// An annotation wrote the variable, and the use does not fix it.
+            use_leaves_open,
+            /// An annotation wrote the variable, and nothing fixes it.
+            annotation_leaves_open,
+            /// Checking inferred the variable, and nothing fixes it.
+            inferred,
+            /// Checking inferred the variable, and the use does not fix it.
+            inferred_use_leaves_open,
+        };
+
+        pub const Place = enum { parameter, result, expression, use };
+    };
 
     pub const Reason = enum {
         /// Only a function the compiler can see the definition of may be
@@ -404,6 +464,59 @@ pub const StagedCode = struct {
         /// returns, and nothing else. It has no runtime representation, so a
         /// record field or a list element holding one has nothing to hold.
         outside_staged_position,
+        /// The staged lambda reads a value that exists only when the program
+        /// runs, its translator returns a `Code.Bound`, and the site cannot
+        /// bind the value as an input slot.
+        input_not_bound,
+        /// The staged function reads a `Code` value, or a value computed from
+        /// one, such as a constant built by a function that takes a `Code`.
+        /// A description has no form for a description (D7).
+        reads_a_code_value,
+        /// A site whose translator returns a `Code.Bound` is inside a generic
+        /// function, and its `f` mentions the function's type variables. Each
+        /// use of the function describes such a site at its own types, and a
+        /// site that binds inputs has one slot order at its one call (D1).
+        bound_instance,
+        /// A use supplies, through a `where` requirement, a method that
+        /// holds a `Code` site at the method's own type variables. The
+        /// compiler describes such a site at each use that calls the method
+        /// directly, and not through a requirement (D1, Q14).
+        instance_through_evidence,
+        /// A function that holds a `Code` site at its own type variables is
+        /// used inside a lambda that a block made generic, at that lambda's
+        /// type variables (D1, Q5).
+        instance_in_local_generic,
+        /// A `Code` site is at the type variables of a method the compiler
+        /// calls with no written use: `to_inspect` for inspection, and
+        /// `is_eq`, `to_hash`, `encoder_for` or `parser_for`, which a
+        /// derived method over a structure that holds the type calls. No
+        /// written use fixes the method's types (D1, Q17).
+        instance_in_implicit_method,
+        /// An entry of a type's `code_primitives` item is no `Code.prim` of a
+        /// top-level function defined as a lambda or of a top-level constant
+        /// (I14).
+        primitive_not_a_function,
+        /// A type's `code_primitives` item is no list of `Code.prim` entries,
+        /// and no name of a constant of this module that is one, so it lists
+        /// no reference `moduleCuts` can read (D3).
+        primitives_not_a_list,
+        /// A type's `code_primitives` item lists one function twice (I14).
+        primitive_listed_twice,
+        /// An entry of a type's `code_primitives` item names a builtin or an
+        /// operation of an opaque type, which is a primitive already (D3).
+        primitive_already_primitive,
+        /// The argument of `Code.prim` is no reference to a top-level or an
+        /// imported function or constant, so it names no definition (D6).
+        prim_not_a_definition,
+        /// `Code.prim` or `Code.type_id` is used other than as the callee of
+        /// a call. Each call is a constant the compiler computes (D6).
+        identity_not_called,
+        /// The type `Code.type_id` reads off its `Code.Proxy` is no nominal
+        /// type the call fixes (D6).
+        type_id_not_nominal,
+        /// The type `Code.ty_of` reads off its `Code.Proxy` holds a type
+        /// variable the call leaves open (structural D6).
+        ty_of_not_closed,
     };
 };
 
@@ -457,14 +570,44 @@ pub const TranslationRefused = struct {
     /// The source, when it is in this module; else the compile-time root.
     region: base.Region,
     /// The source, when it is in another module.
-    origin: ?ComptimeOrigin = null,
-    /// The calls the source was inlined through, innermost first, one per
-    /// line. Empty when the source is in the translated function itself.
-    path: ExtraStringIdx,
+    origin: ?SourcePlace = null,
+    /// The calls the source was inlined through, innermost first. Empty when
+    /// the source is in the translated function itself.
+    path: RefusalCallsRange,
     /// The translator named a node that its graph does not have, so no
     /// source holds it.
     unplaced: bool = false,
+    /// The names of the intrinsics the refused node's `Prim` names, its own
+    /// and those in its evidence (`CodeProvenanceTable.intrinsicsOf`).
+    intrinsics: ExtraStringsRange = .{ .start = 0, .count = 0 },
 };
+
+/// One call a refused source was inlined through: the call's text and where
+/// it is. A call in the reporting module keeps its region, so the report
+/// places it the way it places every other region of that module; a call in
+/// another module names the path of that module's file and its line and
+/// column.
+pub const RefusalCall = struct {
+    text: ExtraStringIdx,
+    place: Place,
+
+    pub const Place = union(enum) {
+        local: base.Region,
+        foreign: SourcePlace,
+    };
+};
+
+/// A place in another module's source, shown as `path:line:col`: the path of
+/// that module's file (`ModuleEnv.diagnosticSourceName`) and the 1-based line
+/// and column.
+pub const SourcePlace = struct {
+    path: ExtraStringIdx,
+    line: u32,
+    column: u32,
+};
+
+/// A range of `RefusalCall`s in the store's `refusal_calls_backing`.
+pub const RefusalCallsRange = struct { start: u64, count: u64 };
 
 /// An error that occurred during compile-time evaluation
 pub const ComptimeEvalError = struct {
@@ -724,6 +867,10 @@ pub const TypeMismatch = struct {
     /// Set when the relation failed because it required one type to have two
     /// different methods of the same name.
     method_conflict: ?MethodConflict = null,
+    /// Set when one side stands in a record extension slot (`..r`), which
+    /// accepts only a record row (design.md "Record Extension
+    /// Well-Formedness").
+    record_row: bool = false,
     /// How the report suggests turning the actual value into the expected
     /// builtin `Str`.
     str_conversion: StrConversion = .none,
@@ -1024,6 +1171,17 @@ pub const DispatcherDoesNotImplMethod = struct {
     /// Set when the obligation is a copy a use made out of another
     /// definition's type.
     copied: ?CopiedRequirement = null,
+    /// Set when the failed obligation is a requirement of the rule "Bound
+    /// Capture Encoding" (design.md "Code Reification"), or one that a derived
+    /// encoder of such a requirement needs: the report names the captured
+    /// value's type and the translator's format.
+    bound_capture: ?BoundCapture = null,
+
+    pub const BoundCapture = struct {
+        /// The type of the captured value; null for the format's `default`.
+        value_snapshot: ?SnapshotContentIdx,
+        format_snapshot: SnapshotContentIdx,
+    };
 
     /// Type of the dispatcher
     pub const DispatcherType = enum { nominal, rigid };
@@ -1121,6 +1279,16 @@ pub const TypeApplyArityMismatch = struct {
 pub const RecursiveAlias = struct {
     type_name: base.Ident.Idx,
     region: base.Region,
+};
+
+/// A type that stands in a record extension slot (`{ ..r }`, or the record-row
+/// argument of an alias or nominal application) and is not a record row
+/// (design.md "Record Extension Well-Formedness").
+pub const RecordExtensionNotRecord = struct {
+    snapshot: SnapshotContentIdx,
+    region: base.Region,
+    /// The type is a `::` opaque nominal, which hides its fields.
+    is_opaque: bool,
 };
 
 /// Error when a where clause names something that is not a where alias, such as

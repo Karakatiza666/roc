@@ -136,7 +136,6 @@ MOD NOT FOUND - everything.md:2:1:5:2
 MOD NOT FOUND - everything.md:6:1:9:2
 NOT A WHERE ALIAS - everything.md:60:4:60:6
 NOT A WHERE ALIAS - everything.md:61:4:61:6
-DECLARATION HAS NO VALUE - everything.md:58:1:62:3
 NON EXHAUSTIVE MATCH - everything.md:90:2:90:7
 # PROBLEMS
 ~~~clojure
@@ -357,17 +356,6 @@ NON EXHAUSTIVE MATCH - everything.md:90:2:90:7
 			(reflow "and written in a where clause as")
 			(reflow " ")
 			(annotated code "where [a.Sortable]")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 58 1) (end 62 3))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "everything.md") (start 58 1) (end 62 3) (annotation error) (line-text "g : e -> e\n\twhere [\n\t\te.A,\n\t\te.B\n\t]"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
 	(report
 		(severity runtime_error)
 		(title "Non Exhaustive Match")
@@ -771,7 +759,7 @@ h = |x, y| {
 												(p-assign (ident "y"))))))))))
 				(s-let
 					(p-assign (ident "h2"))
-					(e-call (constraint-fn-var 519)
+					(e-call (constraint-fn-var 600)
 						(e-lookup-local
 							(p-assign (ident "h")))
 						(e-lookup-local

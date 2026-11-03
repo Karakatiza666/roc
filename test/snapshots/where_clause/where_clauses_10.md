@@ -16,7 +16,6 @@ decode_things # After member name
 # EXPECTED
 MOD NOT FOUND - where_clauses_10.md:1:1:1:32
 MOD NOT FOUND - where_clauses_10.md:7:7:7:14
-DECLARATION HAS NO VALUE - where_clauses_10.md:3:1:7:15
 # PROBLEMS
 ~~~clojure
 (reports
@@ -41,18 +40,7 @@ DECLARATION HAS NO VALUE - where_clauses_10.md:3:1:7:15
 			(annotated code "Decode")
 			(reflow ", which does not exist."))
 		(document
-			(source-region (file "where_clauses_10.md") (start 7 7) (end 7 14) (annotation error) (line-text "\t\t\t\t[a.Decode]"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 3 1) (end 7 15))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "where_clauses_10.md") (start 3 1) (end 7 15) (annotation error) (line-text "decode_things # After member name\n\t: # After colon\n\t\tList(List(U8)) -> List(a) # After anno\n\t\t\twhere # after where\n\t\t\t\t[a.Decode]"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "where_clauses_10.md") (start 7 7) (end 7 14) (annotation error) (line-text "\t\t\t\t[a.Decode]")))))
 ~~~
 # TOKENS
 ~~~zig

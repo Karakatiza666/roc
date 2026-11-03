@@ -44,6 +44,16 @@ pub const Var = enum {
     /// family of functions of at most this many bytes of code each, so every
     /// program exercises wasm function splitting.
     wasm_split_bytes,
+    /// For each reified site, print the size of its `outline` view at each K
+    /// of the comma-separated list, which measures K (normal-form 5.3).
+    reify_outline_stats,
+    /// Print each closing use of a generic function with a Code instance
+    /// site, and the instance table the use gives it (D1).
+    reify_instances,
+    /// After a module is checked, print each top-level definition's
+    /// generalized requirements and whether code that runs at run time uses
+    /// each one (the `runs` bit).
+    reify_only,
 
     /// The variable's name in the environment.
     pub fn envName(comptime self: Var) [:0]const u8 {
@@ -61,6 +71,9 @@ pub const Var = enum {
             .test_llvm_object_compile_count_file => "ROC_TEST_LLVM_OBJECT_COMPILE_COUNT_FILE",
             .test_command_work => "ROC_TEST_COMMAND_WORK",
             .wasm_split_bytes => "ROC_WASM_SPLIT_BYTES",
+            .reify_outline_stats => "ROC_REIFY_OUTLINE_STATS",
+            .reify_instances => "ROC_REIFY_INSTANCES",
+            .reify_only => "ROC_REIFY_ONLY",
         };
     }
 };
@@ -94,6 +107,14 @@ pub fn testWorkCount(counter: TestWork) u64 {
 pub inline fn get(comptime variable: Var) ?[:0]const u8 {
     if (comptime !available) return null;
     return std.mem.span(Cached(variable).read() orelse return null);
+}
+
+/// The comma-separated items of the variable's value, with empty items
+/// skipped, or null when it is unset or this compiler does not read
+/// developer diagnostics.
+pub inline fn items(comptime variable: Var) ?std.mem.TokenIterator(u8, .scalar) {
+    const value = get(variable) orelse return null;
+    return std.mem.tokenizeScalar(u8, value, ',');
 }
 
 /// Whether the variable is set. Always false in a compiler that does not read

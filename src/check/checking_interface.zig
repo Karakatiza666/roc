@@ -21,6 +21,8 @@ const CompactWriter = collections.CompactWriter;
 pub const Definition = union(enum) {
     derived_method: @FieldType(CIR.Expr, "e_derived_method"),
     valueless,
+    /// A bodyless annotated binding outside the builtin and platform modules.
+    intrinsic,
     non_effectful_hosted,
     value,
 };
@@ -276,7 +278,15 @@ const Publication = struct {
         const def = self.env.store.getDef(id);
         try self.node(def.pattern);
         try self.node(def.expr);
-        try self.value(classify(self.env, def));
+        const kind = classify(self.env, def);
+        try self.value(kind);
+        // An importer's chain names the place of an intrinsic as a line and
+        // a column (design.md "Reify-Only Definitions").
+        if (kind == .intrinsic) {
+            const info = self.env.calcRegionInfo(self.env.store.getPatternRegion(def.pattern));
+            try self.value(info.start_line_idx);
+            try self.value(info.start_col_idx);
+        }
         try self.value(def.annotation != null);
         if (def.annotation) |annotation_id| {
             try self.node(annotation_id);
@@ -291,6 +301,30 @@ const Publication = struct {
         try self.scheme(ModuleEnv.nodeIdxFrom(id));
         try self.ty(ModuleEnv.varFrom(def.expr));
         try self.value(self.env.defInvokes(id));
+        // Whether the definition is reify-only, its witness, and its chain.
+        // The bit decides whether an importer's references to it are
+        // reify-only, and an importer reports the chain as it is. The target
+        // definition is not encoded, because it can be in a third module
+        // whose nodes have no slot in this publication.
+        const reify_only = self.env.reifyOnlyDef(id);
+        try self.value(reify_only != null);
+        if (reify_only) |reify_only_def| {
+            const witness = reify_only_def.witness;
+            try self.value(witness.kind);
+            try self.value(witness.region_start);
+            try self.value(witness.region_end);
+            try self.value(witness.target_module);
+            try self.value(witness.method_name);
+            const frames = self.env.reifyOnlyFrames(reify_only_def);
+            dependencies.hashU32(&self.hasher, std.math.cast(u32, frames.len) orelse return error.OutOfMemory);
+            for (frames) |frame| {
+                try self.bytes(self.env.reifyOnlyText(frame.text));
+                try self.bytes(self.env.reifyOnlyText(frame.path));
+                try self.value(frame.line);
+                try self.value(frame.column);
+            }
+            try self.bytes(self.env.reifyOnlyText(reify_only_def.intrinsic));
+        }
         try self.value(self.env.callableAllowsStoredConst(id));
         try self.value(self.env.diagnosticHostedReturn(id));
     }

@@ -1,799 +1,1152 @@
-# Code reification: the pure-function surface a description covers
+# Code reification in Roc: the design
 
-A translator is a compiler written in ordinary Roc that runs during `roc build`.
-It receives a `Code(f)`: a reified, typed, closed, monomorphic description of a
-pure Roc function, shaped like the `Ir`, `Ty`, `Lit` and `Pattern` unions
-declared in `src/build/roc/Builtin.roc:23625`.
+This article explains the design of code reification. It is for a reader who
+knows Roc but has not followed this feature. It covers what the feature does,
+the model a translator sees, how the compiler builds that model, and why the
+design has the shape it has.
 
-This file is the checklist for that surface. Every box is a feature of pure Roc
-that a description could carry. A ticked box is one the compiler carries today.
+It is not a list of every construct a description covers. That list is the
+checklist, `roc-reify-design-checklist.md`. The user guide is
+`docs/langref/reifying.md`. The compiler-side rules and invariants are in
+`design.md`, sections "Code Reification", "The Runs Bit" and "Reify-Only
+Definitions". Where this article and the code disagree, the code, the tests,
+design.md and the user guide are correct.
 
-Effects stay out of scope by design. An effectful function, `dbg`, a hosted
-lambda and `x!` are refused, and nothing here proposes describing them.
+## 1. What reification is
 
-A construct a target cannot run is still described, because a named node costs
-one translator a rejection, and a refusal costs every author the construct.
+Roc's platforms answer one question about a program: where and how do its
+effects run? Nothing in Roc answered the next question: where and how does a
+pure computation run? The answer was always "here, as machine code that the
+Roc backend wrote".
 
-**Legend**
+Some pure computations must run somewhere else. A fragment shader runs on a
+GPU. A query predicate runs in a database. An incremental view runs in a
+dataflow engine. To send a Roc function there, a library must read the
+function. A compiled Roc function is a function pointer, and a function
+pointer cannot be read, translated or fused.
 
-- `[x]` the compiler describes it, proven by a probe or a test
-- `[ ]` the compiler refuses it, and the quoted text is the diagnostic's own
-  reason line, or, where the box says so, the compiler panics on it: a defect
-  rather than a designed refusal
+Reification gives the library a description of the function in place of the
+pointer. The feature is one type and one rule:
 
----
-
-## 1 Literals
-
-- [x] Integer literal of every width, in decimal, `0x`, `0o` and `0b`, with or
-      without a type suffix. Reified as `Lit.Int(I128, Ty)`.
-- [x] Fractional literal at `F32` and `F64`. `Lit.Frac(F64, Ty)`.
-- [x] `Dec` literal. `Lit.Fixed(Dec)`.
-- [x] String literal of one segment. `Lit.Str(Str)`.
-- [x] `Bool.True` and `Bool.False`, as `Lit.Bool`. Bool is the one tag union
-      with a literal, because a translator emitting a boolean wants the value
-      rather than the two tags Roc represents it with
-      (`src/check/code_reifier.zig:5783`).
-- [x] String interpolation, and any string of more than one segment. The
-      checker leaves the segments flat, text and value alternating, and every
-      one is a `Str`, so the literal describes as the concatenation it is: one
-      `Builtin.Str.concat` per join, under the name a written `a.concat(b)`
-      takes. A segment the author left empty joins nothing and is dropped, so
-      `"${v}"` describes as `v` (`src/check/code_reifier.zig:6313`).
-- [x] A literal of a type of your own, through `from_numeral` or `from_quote`.
-      The conversion the checker wrote is named, and the number or the text
-      the author wrote stands as its one argument, because the `Num.Numeral`
-      it declares is an opaque a translator has no reason to model
-      (`src/check/code_reifier.zig:6400`). A numeral names no width, so it
-      takes the widest form `Lit` holds, `I128` or `F64`
-      (`src/check/code_reifier.zig:6573`): a fractional one rounds to `F64`
-      where the author's `from_numeral` would have seen exact digits.
-- [ ] A literal of a type of your own through `from_interpolation`. "a custom
-      string interpolation". The conversion runs in two stages (design.md,
-      "An interpolated string literal converts in two stages"):
-      `from_interpolation` reads the segments while the compiler runs and
-      hands back an assembler, and the value is that assembler applied to the
-      interpolated values. The assembler is a function value the compiler
-      computes, and the `Ir` is first order, so no node can apply it.
-- [x] A literal of a type of your own in a `match` pattern.
-      `Code.Pattern.PatGuard(Pattern, Ir, Meta)`: the pattern binds the matched
-      value and the condition beside it is that type's equality against its
-      conversion of the literal, which is the form the checker already wrote
-      it in (`src/check/code_reifier.zig:6064`).
-- [x] An embedded file. One imported as `List(U8)` describes as
-      `Code.Lit.Bytes(List(U8))`, a single literal holding the blob rather than
-      one `Int` node per byte, because a file is as large as it is
-      (`src/check/code_reifier.zig:1515`). One imported as `Str` describes as a
-      `Str` literal, through the same arm any text literal takes.
-
-## 2 Names a body may read
-
-- [x] A parameter of the reified lambda. `Ir.Param(Str, Meta)`.
-- [x] A binding the body introduced. `Ir.Let(Str, Ir, Ir, Meta)` and
-      `Ir.Local(Str, Meta)`.
-- [x] An argument the template call fixed, read as the literal it was called
-      with rather than as a name (`Binding.Kind.constant`).
-- [x] A top-level value of this module or of one it imports, written as a
-      literal or as a record, tuple, list, tag or nominal built from literals,
-      folded into the description as the value it holds
-      (`src/check/code_reifier.zig:2194`).
-- [x] A top-level value that has to be computed, `limit = 7.0 * 2.0` or
-      `limit = xs.len()`, of this module or of one in its package. It is not
-      evaluated first: its definition names only things the compiler fixes,
-      so the walk builds that definition where the name stands, by the same
-      path that folds a literal (`src/check/code_reifier.zig:2194`).
-      `x > limit` describes as `x > 7.0 * 2.0`, and a constant the definition
-      reads folds in turn, so `List.len([1, 2, 3])` stands where `limit` did.
-      The order of compile-time evaluation does not change, and two sites
-      that read different constants describe differently. Two cases stay
-      refused. A computed value of another package is a body of that package,
-      which the walk does not read (N8h): "a computed constant of another
-      package". A top-level value that computes a function names no
-      definition, so a call on it has no row to name: "a top-level constant
-      that computes a function" (`src/check/code_reifier.zig:4010`).
-- [x] A value the block around a lambda written at a `Code` position binds,
-      read by that lambda. The statement that bound it is replayed at the head
-      of the lambda's body, so it describes as a `Let` and a read of it as a
-      `Local` (`src/check/code_reifier.zig:7189`), and a statement the lambda
-      does not read stays out. A function the block binds is lifted into a row
-      that takes what it captured first. A `Let` is the one reading that holds
-      everywhere: the site's `f` leaves no room for an added parameter, and
-      folding the value needs a constant the compiler evaluated, which a block
-      is only inside a top-level constant. A translator that wants the value
-      computed once hoists the `Let`.
-- [ ] A name the compiler does not fix: a function parameter, a branch or loop
-      binder, or a `var`, whether the lambda reads it or a replayed statement
-      does. Refused as a capture, naming it
-      (`src/check/code_reifier.zig:4242`).
-
-## 3 Operators
-
-- [x] `+`, `-`, `*`, `/`, `//`, `%`. `Ir.Binop` named `plus`, `minus`, `times`,
-      `div_by`, `div_trunc_by`, `rem_by`.
-- [x] `==`. `Binop` named `is_eq`.
-- [x] `!=`. `Ir.Unary("not", ...)` over that `Binop`, whether the type derives
-      its `is_eq` or writes it. Which of the two the author wrote rides on the
-      dispatch plan (`src/check/code_reifier.zig:1549`).
-- [x] `<`, `<=`, `>`, `>=`. `Binop` named `is_lt`, `is_lte`, `is_gt`, `is_gte`.
-- [x] Prefix `-`. `Ir.Unary("neg", ...)`.
-- [x] `and` and `or`, as the `If` the compiler turns each into: `a and b` is
-      `If(a, b, Lit(Bool(False)))`. Both short-circuit, and an `If` is what
-      short-circuiting is.
-- [x] `x |> f(y)`, which is a plain call and describes as one.
-- [x] Prefix `!`. `Ir.Unary("not", ...)`. `!x` arrives as a plain call to
-      `Bool.not`, which the walk folds rather than follows
-      (`src/check/code_reifier.zig:2964`), so `!b`, `Bool.not(b)` and `b.not()`
-      all describe as the one node.
-- [x] `a..<b` and `a..=b`, as `Ir.Range(Ir, Ir, [Exclusive, Inclusive], Meta)`.
-      A range reaches the walk as the call the checker resolved it to,
-      `Num.U16.range_exclusive_to`, so the fold is on the method name
-      (`src/check/code_reifier.zig:3661`), the way `Bool.not` is.
-- [x] `x ?? default`. It desugars to a `match` whose `Ok` branch binds a name
-      the compiler made up, and the walk gives that binder one of its own
-      (`src/check/code_reifier.zig:6904`).
-- [x] `x?` and `x ? Tag`. The same desugaring, with the `Err` branch
-      returning early, so it describes through the same rewrite an early
-      `return` does: the `match` goes outside the binding, the `Ok` branch
-      holds it, and the `Err` branch is the value the function hands back
-      (`src/check/code_reifier.zig:4873`). One written inside an expression
-      lifts the `match` out past that expression, which leaves no transfer in
-      it at all (`src/check/code_reifier.zig:5212`).
-
-## 4 Calls
-
-- [x] Static dispatch, `x.f(y)`, reified as `Ir.Call(Str, List(Ir), Meta)` named
-      by its fully qualified callee, such as `Num.F32.sin`. The translator decides
-      what the call means in its target.
-- [x] An operator method, carried as `Binop` or `Unary` instead of `Call`.
-- [x] A plain call to a named function of the module being described, `f(x)`,
-      as the same `Ir.Call(Str, List(Ir), Meta)` a static dispatch produces
-      (`src/check/code_reifier.zig:2406`). The callee is named and the walk
-      stops there, so the structure the author wrote survives into the target.
-      A callee the walk cannot describe refuses the whole site, because a
-      translator would otherwise meet a `Call` with no row. The report points
-      at the call in the caller, not at the construct inside the callee that
-      stopped the walk; a frame per hop would fix that.
-      The name is module-qualified, `Shader.step`, because one table holds the
-      definitions of every module a description reaches. Naming the callee
-      rather than writing its body into the description is also what lets a
-      recursive function describe at all.
-- [x] The callee's own description, beside the root in `Code.definitions`, so
-      a translator resolves each `Call` against a table the compiler wrote
-      rather than one the user assembled by hand
-      (`src/check/code_reifier.zig:3569`). A method call writes a row too: the
-      instantiation edge names the target, whether the plan carries it or the
-      caller's evidence does (`src/check/code_reifier.zig:3732`). A method
-      whose body the walk cannot describe keeps its bare name instead, the way
-      a builtin does, so a target primitive with a Roc body that stands in for
-      it on the CPU is named rather than refused
-      (`src/check/code_reifier.zig:3698`). A definition is described once
-      however many calls reach it, and its row comes before its caller's, so a
-      target that declares before it calls emits the table in order. The
-      described function is a row of its own table only when it calls itself,
-      which is the one description whose `Call` names it. A `Call` carries no
-      tag saying what kind of callee it names: a name has a row in the table
-      or it does not, and a tag beside that would make "resolved, with no
-      row" representable.
-- [x] A call to a function in another module, `Helper.f(x)`, described from
-      that module's published view and named by it
-      (`src/check/code_reifier.zig:2946`). The binding the checker resolved
-      names the artifact rather than the import it came through, so the table
-      also reaches a module the described one never imports: a callee's own
-      callee, two modules away. A cached build still rebuilds the description
-      when that module changes: an artifact key hashes its imports' keys, and
-      the call graph is a subgraph of the import graph, because a call resolves
-      only where the checker resolved a reference.
-- [x] A call to a function the compiler provides. The builtin is named by its
-      export name and no row is written for it, because its body is the
-      compiler's and a translator resolves the name against what its own
-      target provides (`src/check/code_reifier.zig:2900`). A method call on
-      the same builtin reads that same name
-      (`src/check/code_reifier.zig:3882`), so `Str.concat(a, b)` and
-      `a.concat(b)` are one `Call` under one name. A builtin the `Ir` does
-      carry a node for is folded into that node instead: `Bool.not` is
-      `Unary("not", ...)` however it is spelled.
-- [x] A call to a generic function. The callee's body reads differently at each
-      instantiation, so the walk describes one row per instantiation: the
-      template's own function type read against the type of this exact use
-      gives what each quantified variable was fixed to
-      (`src/check/code_reifier.zig:3080`), and the row is keyed by a digest of
-      those types. `id` called at `F32` and at `U64` is two rows, `Test.id` and
-      `Test.id#1`: the walk counts rows per name and every row after the first
-      takes its count as a serial (`src/check/code_reifier.zig:2754`). A
-      variable the call does not fix is refused as "a call to a generic
-      function this call does not fix", except a row variable, which a call
-      may leave unbound because no description names a row
-      (`src/check/code_reifier.zig:3171`).
-- [x] A call to a function written inside another function, lifted into a row
-      of its own (`src/check/code_reifier.zig:2856`). The binding leaves no
-      `Let` behind, because the `Ir` is first order. What the lambda captured
-      arrives as a leading parameter and every call site passes it first
-      (`src/check/code_reifier.zig:1195`); captures are lexical, so every call
-      sits in the scope that holds them. Two functions can each write one
-      called `step`, and the second of them takes the serial. A local the
-      checker generalized describes at the type each call fixes, a row per
-      type (`src/check/code_reifier.zig:2881`).
-- [x] A type-qualified call, `Type.f(x)`, which resolves to the same dispatch
-      plan a value dispatch leaves behind, so the two describe through one arm
-      (`src/check/code_reifier.zig:1442`). The name is the plan's dispatcher
-      read under the active substitution, so `Shape.f(x)` inside a
-      `where`-constrained body is named by the type the call fixed `Shape` to.
-- [x] Calling a parameter or a binding that holds a function. The `Ir` has no
-      node for applying an expression, so the walk resolves the function at the
-      site that fixes it, the way a call fixes a generic callee's type
-      variables. A function argument binds the callee's parameter to the
-      definition it names, and the row is keyed by that as well as by the types
-      (`src/check/code_reifier.zig:2527`): `apply_to(double, x)` and
-      `apply_to(triple, x)` are two rows. A definition that hands back a
-      function and the use that runs it are one flattened row and one `Call`
-      (`src/check/code_reifier.zig:2354`), which is how a hand-written
-      `encoder_for` is run. A name bound to a function and then read rather
-      than run is still refused as "a reference to a function value".
-      Only a plain call specializes: a lambda handed to a dispatch stays a
-      `Lambda` node in the call's arguments, which is what a derived `map` and
-      a builtin `map` both want.
-- [x] A call through an exact alias, `same_thing = add_one`. The checker
-      records the lookup an alias forwards to (`forwarded_lookup`,
-      `src/check/checked_artifact.zig:17173`), and the walk follows it to the
-      procedure it names (`src/check/code_reifier.zig:4066`, `:4110`), so the
-      call is a `Call` of that procedure's row and the alias and the name
-      share one row. An alias another module exports is followed the same way
-      through its export row (`src/check/code_reifier.zig:4086`). An alias of
-      a computed function, `f = make(2)`, has no forwarded lookup and stays
-      refused as "a top-level constant that computes a function". Pinned by
-      `eval_staging_tests.zig` ("staging - a call through an alias ...") and
-      `code_reifier_test.zig:531`.
-- [x] A function chosen by an `if`, or read out of a record literal, and then
-      called: `(if c double else triple)(x)`. The callee names no definition,
-      so the call is an `Apply` of the value (`src/check/code_reifier.zig:393`,
-      N8i), and simplifying turns each `Apply` whose function is a known
-      closure into a `Call` of its row. Checked with a probe of each form.
-- [ ] A function taken from a list and then called, `Ok(g) => g(x)` in a
-      `match` on `[double].first()`. "a call to a function value that no
-      simplification resolves" (`src/reify/driver.zig:116`): simplifying does
-      not read a closure back out of a list, so the `Apply` stays.
-
-## 5 Control flow
-
-- [x] `if`, `else if` and `else`, at any depth. `Ir.If(Ir, Ir, Ir, Meta)`.
-- [x] `match`, as `Ir.Match(Ir, List(Branch), Meta)` with its branches in the
-      order they were written, each carrying its patterns, its `if` guard and
-      its value (`src/check/code_reifier.zig:5801`).
-- [x] A branch written `A | B =>`, as a branch with a pattern per alternative.
-- [x] A branch guard, as `Branch.guard`.
-- [x] `for` and `while`, each as the fold it is: `Ir.For` and `Ir.While` carry
-      the state the loop takes from one turn to the next, which is whatever
-      `var`s the body assigns (`src/check/code_reifier.zig:4606`). `carried`
-      names one entry per such `var`, so a turn writes what the author wrote.
-      A loop that assigns none carries none, and matters for what leaves it.
-- [x] `while Bool.True { .. }`, which reaches the walk as a form of its own
-      and carries what a `while` carries, so the three share one call
-      (`src/check/code_reifier.zig:4289`).
-- [x] `break`, and a `return` that crosses a loop, as `Ir.Break(Ir, Meta)` and
-      `Ir.Return(Ir, Meta)` (`src/check/code_reifier.zig:4330`). These are the
-      two whose continuation is the turns of the loop that have not run, which
-      no branch says. Each carries what the author wrote, so a target with its
-      own `break` emits one and a target that folds lowers them itself. A
-      `[Continue, Break]` step result would instead pick the fold lowering for
-      every target, and a `return` in a loop would put the statements after it
-      under a `Match` an imperative target has to read as "already returned".
-- [x] `return` as an early exit, rewritten into the shape the body already
-      has: a branch that returns hands its value back, and a branch that does
-      not runs the statements written after it
-      (`src/check/code_reifier.zig:4873`). That rewrite is what lets a target
-      with no loops at all, SQL or a query plan, take `return` and `x?` while
-      never meeting a control-flow node.
-- [x] A `return` written inside an expression, `Ok(t? * 2.0)`, by lifting the
-      branching construct out past the expression that holds it
-      (`src/check/code_reifier.zig:5212`). What is left has no transfer in it,
-      so the walk does this once rather than every translator doing it.
-- [x] `crash`, as `Ir.Crash(Ir, Meta)` (`src/check/code_reifier.zig:1536`). The
-      message is an `Ir` rather than a `Str`, so an interpolated one arrives as
-      the concatenation the checker made of it. A `crash` followed by more
-      statements is a discarded statement and stays refused; one written as a
-      branch value or as the last thing in a block is an expression and
-      describes.
-- [x] `expect` inside a body. It asserts and hands back nothing, so the
-      description passes over it the way it passes over a type annotation
-      (`src/check/code_reifier.zig:4269`). A translator emits a target, and an
-      assertion written for Roc's own test run has no place in one.
-
-## 6 Bindings and blocks
-
-- [x] A block body with `let` bindings and a final expression, reified as
-      nested `Let` nodes rather than inlined, so a binding written once stays
-      written once. Losing it is a defect in the output, not only in the
-      ergonomics: the same shader built by evaluation carries four texture
-      fetches where the source writes one
-      (`examples/reifying/shaders-without-reifying/main.roc:18`).
-- [x] A binding whose value is any describable expression.
-- [x] A destructuring binding, `{ a, b } = r`, expanded into the reads it
-      stands for: one `Let` per name, reading a `Field` or an `Index`
-      (`src/check/code_reifier.zig:5592`). A translator that has records and
-      locals emits this without also having pattern matching. A pattern that
-      names a variant is a test as well as a binding, so that one stays the
-      one-branch `match` it is.
-- [x] A parameter written as a pattern, `|(a, _), b|` or `|{ a, b }|`, as a
-      parameter under a name of its own whose reads wrap the body, the same
-      reads a destructuring binding takes (`src/check/code_reifier.zig:7054`).
-      `_` binds nothing and reads nothing. A lambda passed to a definition is
-      lifted into a row named after the first name its patterns bind, and
-      `Module.lambda` when they bind none.
-- [x] A `var`, and any reassignment to one, as versions rather than as
-      mutation: `$x`, then `$x#1`, then `$x#2`
-      (`src/check/code_reifier.zig:5356`). A `var` written in one branch and
-      read after it is joined by hoisting the branch into the binding, and
-      several `var`s travel through one join as a tuple.
-- [x] A type annotation or a type declaration inside a body, which names a type
-      for the checker and leaves no value behind, so the description passes
-      over it (`src/check/code_reifier.zig:4259`).
-- [ ] An `import` inside a body. The parser refuses one ("import must be top
-      level") before the walk could meet it, so no body holds one to describe.
-- [x] A statement whose value is discarded, as a binding nothing reads
-      (`src/check/code_reifier.zig:4363`), which keeps both its order and
-      whatever it diverges on. Two shapes of one are something else first,
-      because both hand back what the statements after them need: a branch
-      that transfers, and a branch that assigns a `var`.
-- [x] A function bound inside a block, lifted into a row of its own rather
-      than left as a `Let` holding a function
-      (`src/check/code_reifier.zig:5284`). Naming one where a `Code` is
-      expected describes by section 11.
-
-## 7 Aggregates
-
-- [x] Record literal with at least one field.
-      `Ir.MakeRecord(List({ name : Str, value : Ir }), Meta)`.
-- [x] Field access, at any depth. `Ir.Field(Ir, Str, Meta)`.
-- [x] A record field with a default (`port : U16 ?? 8080`), read as an ordinary
-      field.
-- [x] Tuple literal. `Ir.MakeTuple(List(Ir), Meta)`.
-- [x] A value used at a wider tag union than its own. There is no node for
-      it. The checker writes a `row_coerce` (design.md, "Row Coercion
-      Primitive") at each use of a top-level value, and around a call to a
-      function whose body closed the union its annotation left open. The
-      description identifies a tag by its name, so the value does not change
-      when it moves to a wider union: a value of a narrower union conforms to
-      a wider slot, with no node between. A tag switch has one arm per member
-      of its scrutinee's own union. A call takes the type its site reads it
-      at, and inlining builds the helper's ends at that type, so a helper
-      gives the same description as the code written inline. A translator that
-      matches tags by name needs nothing more. A translator that numbers tags
-      per union, such as a C or GLSL struct, converts where the type of a
-      child is narrower than the type of its slot
-      (`src/build/roc/Builtin.roc:23930-23936`). See
-      `roc-reify-tag-names.md`.
-- [x] Tuple access, `t.0`. `Ir.Index(Ir, U64, Meta)`.
-- [x] List literal with at least one item. `Ir.MakeList(List(Ir), Meta)`.
-- [x] Indexing a list. `List.get` returns `Try(a, [OutOfBounds]*)`, and the
-      checker closes that error union at the call, which the description
-      follows (`src/check/code_reifier.zig:6571`).
-- [x] An empty aggregate, `[]` or `{}`. `Ir.MakeList` and `Ir.MakeRecord` with
-      nothing in them.
-- [x] A nullary tag as the value a reified function hands back. Both this and
-      the empty aggregate once panicked in LIR lowering, because a layout
-      shared between two equal named types stopped at the name.
-      `seedSharedLayouts` and `shareLayoutsAcrossEquivalence` now carry the
-      shared layout to every type inside it
-      (`src/postcheck/solved_lir_lower.zig:11156`, `:11238`), pinned by
-      `src/eval/test/eval_staging_tests.zig:1777` and `:1783`.
-- [x] Record update, `{ ..r, b: 1 }`, expanded into the `MakeRecord` it stands
-      for: the fields the update wrote, and every other field of the type read
-      out of the subject (`src/check/code_reifier.zig:6247`). The subject is
-      bound first unless it already reads a name, because each field reads it
-      again. One over a record with an optional field is refused: the result
-      carries whatever the subject had there, and a `Field` read of a field
-      that may be absent is not that.
-- [x] An unset record field (`b: _`), left out of the entries. `MakeRecord`
-      lists what the literal sets and the type beside it says the field may be
-      absent, so `{ a: v, b: _ }` and `{ a: v }` describe alike because they
-      build the same value.
-- [x] An optional record field (`timeout ?: U64`), as the `presence` a
-      `Ty.Record` entry carries (`src/check/code_reifier.zig:6844`) and
-      `Ir.OptField(Ir, Str, Meta)` for the `.?timeout` that reads it
-      (`src/check/code_reifier.zig:6253`). The read hands back the
-      `Try(a, [MissingField])` the value sits in rather than the value, which
-      is why it is a node of its own. A field read through a `.?` segment is
-      refused: the checker gives such a path one flat `Try` however many
-      optional segments it holds, and nested nodes cannot say that.
-
-## 7b Patterns a `match` branch may test with
-
-- [x] `x`, as `Pattern.Bind(Str, Meta)`, which is also what a branch value
-      reads as a `Local`.
-- [x] `_`, as `Pattern.Anything(Meta)`.
-- [x] `Tag(p, q)` and a bare tag, as `Pattern.Variant(Str, List(Pattern), Meta)`
-      (`src/check/code_reifier.zig:6031`).
-- [x] `Bool.True` and `Bool.False`, as `Pattern.PatLit(Lit.Bool(..), Meta)`, the
-      same split a Bool expression takes.
-- [x] An integer, fractional, `Dec` or string literal, as `Pattern.PatLit`.
-- [x] `(p, q)`, as `Pattern.PatTuple(List(Pattern), Meta)`.
-- [x] `{ a, b: p }`, as `Pattern.PatRecord(List({ name, pattern }), Meta)`
-      (`src/check/code_reifier.zig:5976`).
-- [x] Reaching a tag union through a nominal, so `Ok(v)` on a `Try` is a
-      `Variant` under the nominal's own `Ty`.
-- [x] `p as name`. `Pattern.PatAs(Pattern, Str, Meta)`, so the name stays
-      beside the pattern it renames rather than moving into the branch value.
-- [x] A literal of a type of your own, as
-      `Pattern.PatGuard(Pattern, Ir, Meta)`: the value bound, and that type's
-      equality against its conversion of the literal. The condition sits on
-      the alternative that owns it, which a branch's own guard cannot do
-      (`src/check/code_reifier.zig:6064`).
-- [x] `[p, q]` as `Pattern.PatList(List(Pattern), Meta)`, and `[p, .., q]` as
-      `Pattern.PatListRest(List(Pattern), [Ignored, Named(Str)], List(Pattern), Meta)`
-      (`src/check/code_reifier.zig:6019`). Two nodes rather than one carrying
-      an optional rest, because a translator answers an exact length with a
-      test and a rest with a slice.
-- [x] `{ a, .. }`, as the entries beside the rest. A rest that binds nothing
-      stands for the fields the pattern did not name, and naming none of them
-      is what those entries already say. A rest that binds a name,
-      `{ a, ..others }`, is refused: it binds a record the pattern builds out
-      of what is left rather than one it takes apart, and `Pattern` names
-      values a match takes apart.
-- [x] A string interpolation pattern, as
-      `Pattern.PatStr(Str, List({ capture : [Ignored, Named(Str)], delimiter : Str }), [Exact, Tail], Meta)`
-      (`src/check/code_reifier.zig:6059`): the text the string starts with,
-      one step per interpolation, and whether the last delimiter ends the
-      string. A target that cannot split a string rejects the node by name.
-
-## 8 Nominal and opaque types
-
-- [x] A transparent nominal as a parameter or a result. `Ty.Named(Str, Ty)`,
-      keeping the name over its backing shape.
-- [x] Constructing one, `Vec2.({ x: x, y: 0.0 })`, which describes as the
-      backing it wraps under the nominal's own name.
-- [x] Reading a field through one.
-- [x] An opaque nominal, and a builtin with no shape in the `Ir` (`Dict`, `Set`,
-      `Box`, `Iter`, `Try`, the SIMD vectors), carried by name as
-      `Ty.Opaque(Str, List(Ty))` so a translator that owns the type recognises it and
-      every other translator refuses it by name.
-- [x] A nominal whose backing is a tag union, as `Ty.Named` over
-      `Ty.TagUnion`, including one whose union reaches the nominal again.
-- [x] A recursive nominal, as `Ty.Named` whose backing carries `Ty.Recursive`
-      naming it at each point it reaches back
-      (`src/check/code_reifier.zig:6795`). Mutual recursion describes the same
-      way, each nominal named by the `Named` that encloses it.
-- [x] A recursive nominal with a type parameter, such as a tree or a linked
-      list. A declaration's backing is one template every use shares, so what
-      is open is the nominal at the arguments this use fixed rather than the
-      checked id the use carries.
-- [ ] Reading inside an opaque nominal, which Roc itself forbids from outside
-      the defining module.
-- [x] A transparent nominal with a type parameter, read at the type arguments
-      the use fixed (`src/check/code_reifier.zig:6711`). The backing arrives as
-      the template it was declared with, so the walk binds the nominal's
-      declared variables to `args` for the span of that backing, the way a call
-      binds a callee's quantified variables for the span of its body. `Box(F32)`
-      and `Box(Str)` are two `Ty` values over one template. `Named(Str, Ty)`
-      keeps the backing read at those arguments and drops the arguments
-      themselves, where `Opaque` keeps the arguments and has no backing.
-
-## 9 Types a reified signature may name
-
-- [x] `I8` through `I128`, `U8` through `U128`, `F32`, `F64`, `Dec`, `Bool`,
-      `Str` (`src/check/code_reifier.zig:7433`).
-- [x] `List(a)`, as `Ty.ListOf(Ty)`.
-- [x] A record type, as
-      `Ty.Record(List({ name : Str, ty : Ty, presence : [Required, Optional] }))`.
-      A field with a default is `Required`, because the default fills it in
-      and every value of the type carries it. So is one whose presence the
-      checker never pinned, which is what the checker itself commits such a
-      field to. Entries arrive in the order the extension chain holds them,
-      neither source nor alphabetical (`src/check/code_reifier.zig:6976`), so a
-      translator that needs a fixed order sorts them.
-- [x] A tuple type, as `Ty.Tuple(List(Ty))`.
-- [x] A pure function type, as `Ty.Fn(List(Ty), Ty)`.
-- [x] A type alias, resolved to the type it names.
-- [x] A tag union, empty or otherwise, as
-      `Ty.TagUnion(List({ name : Str, payloads : List(Ty) }))`
-      (`src/check/code_reifier.zig:6571`). A union a nominal declares keeps its
-      written order; one the solver built arrives in name order.
-- [x] A tag union whose row the checker closed. Closing a row leaves the
-      variable it solved in place, marked with the default it closed to, so
-      the walk reads the mark rather than the extension's kind
-      (`src/check/code_reifier.zig:6624`).
-- [x] A reference back to an enclosing nominal, as `Ty.Recursive(Str)`. A
-      translator resolves the name against the `Ty.Named` nodes it is inside,
-      innermost first, which is the only reading: Roc refuses a recursive type
-      alias, so every recursion is a nominal, and a nominal that reaches itself
-      at other type arguments gets a `Named` of its own at those arguments, so
-      one nominal never has two live instantiations nested inside each other.
-- [x] A type variable the site fixes. The root is described at the types the
-      site's `Code(f)` gives it, the way a callee is described at the types its
-      call gives it: `rootSiteNode` matches the root's scheme against that `f`
-      and hands `describeDefinition` the substitution
-      (`src/check/code_reifier.zig:696`), so `twin : a -> (a, a)` named at
-      `Code(Str -> (Str, Str))` describes with `a` at `Str`. A variable `f`
-      does not reach is still refused (`src/check/code_reifier.zig:6640`), and
-      so is a literal whose type only the method it feeds fixes: unannotated,
-      `double = |x| x * 2` at a `U16` site leaves the literal open, because
-      matching fixes the signature's variables and not the one `times` would.
-      An annotation fixes both. The description takes the type the site holds
-      when this module finishes checking, so narrowing that arrives from a
-      later module does not reach it.
-      Where a site widens a row the description carries the definition's own
-      row, which is the row the function returns; `f`'s extra variants are what
-      the consumer accepts.
-- [x] A `where` constrained type variable. A constraint is no shape of its own:
-      the site fixes the variable the way it fixes any other, and the
-      description names what it was fixed to, in a parameter and in a result
-      alike. `doubled : a -> U16 where [a.size : a -> U16]` at
-      `Code(Meters -> U16)` describes `Meters -> U16`, and the method the body
-      dispatches is named `Meters.size`. The reifier holds no refusal of its
-      own for a constraint: a constrained variable no site fixes is refused as
-      a type variable, above.
-- [x] A row a sibling argument or a later clause fixes. A site's rows close
-      when the binding holding it generalizes (`src/check/Check.zig:43017`),
-      not when the site finishes, so `join(orders, |c, o| ..)` takes its row
-      from `orders`, and a second clause reading the same parameter record
-      adds the fields it reads. A row nothing else fixes closes on exactly
-      the fields the lambda reads.
-- [x] An open record, or a record extended by a variable. A row is a quantified
-      variable, so a site fixes it the way it fixes any other. `matchRecord`
-      binds the row to the record the site named
-      (`src/check/code_reifier.zig:3297`) and the walk reads that binding where
-      an extension chain ends in a variable
-      (`src/check/code_reifier.zig:6974`), so
-      `take_n : { n : U16, ..rest } -> U16` at `Code({ n : U16, m : U16 } -> U16)`
-      describes its parameter as `{ n : U16, m : U16 }`, and the same
-      definition at `Code({ n : U16 } -> U16)` describes it as `{ n : U16 }`,
-      in a row of its own. A site's own `f` closes its rows before the walk
-      reads them (`src/check/Check.zig:43044`), so the "open record" refusal
-      below is a guard that no `Code` position reaches. What the row binds to
-      is the site's whole record
-      rather than the fields the definition did not name, because the residual
-      is no type the artifact holds; the two sets are the same once a field a
-      nearer link already collected is dropped
-      (`src/check/code_reifier.zig:6998`). A row nothing fixes is still refused
-      as "an open record": `Ty.Record` is a closed list of fields, so a record
-      with no fixed set of them has no shape to write.
-- [ ] A tag union whose row is still open, so its extension is a variable the
-      checker did not close. "an open tag union": the union stands for many,
-      and a description is monomorphic.
-
-      What closed the open record above does not close this one, and the
-      position is the difference. A record's row reaches the walk through a
-      parameter, where the site's type is the precise one: the value handed to
-      the described function has every field the site named, so binding the
-      site's row describes what the body receives. A union's row reaches it
-      through a result, where the definition's variants are the precise ones
-      and the site's are wider, so binding there would write a description
-      claiming a body hands back variants it cannot build. What this box wants
-      is the other move: drop the open tail and describe the variants the
-      definition has, which is already the reading where a site widens a row
-      the checker closed.
-
-## 10 Derived methods
-
-The six derivable methods are `is_eq`, `to_hash`, `parser_for`, `encoder_for`,
-`map` and `map!`. `map!` is effectful, so it is out of scope.
-
-What decides the treatment is who the result has to agree with. A method whose
-result must agree with Roc's own, `is_eq` and `to_hash`, is expanded, because
-that knowledge is the compiler's. A method that answers to a format the
-translator owns, a codec or `to_inspect`, stays a `Derived` node.
-
-- [x] Derived `is_eq`, expanded structurally into the comparisons it performs,
-      over records, tuples and transparent nominals.
-- [x] Derived `is_eq` over a tag union, expanded into the `match` that
-      comparison is: the two operands paired, a branch per variant, and a `_`
-      for every pair that disagrees on the variant
-      (`src/check/code_reifier.zig:1711`). A payload is bound, because no `Ir`
-      node reaches inside a variant, and the compiler names those binders
-      `eq_lhs_N` and `eq_rhs_N`: it wrote the match, so no source holds a name
-      for them.
-- [x] Derived `to_hash`, expanded the same way when the description reaches far
-      enough, and emitted as `Derived` when it does not.
-- [x] `parser_for` and `encoder_for`, as one `Derived(method, subject, args,
-      meta)` per codec. A constrained body names its own evidence param rather
-      than a target, so the body alone reads the same whether the compiler
-      derived the codec or the author wrote it. The call that fixed the type
-      says which, and the walk already enters the body once per instantiation,
-      so the evidence rides in beside the substitution
-      (`src/check/code_reifier.zig:3484`, `src/check/code_reifier.zig:3738`).
-      A codec is also curried: `encoder_for` hands back an encoder the body
-      then runs, and applying a function value has no node. The two halves fold
-      into one (`src/check/code_reifier.zig:2023`), constructor arguments
-      first, so the binding that held the encoder leaves nothing behind
-      (`src/check/code_reifier.zig:5284`). Both spellings fold:
-      `enc = Shape.encoder_for(f)` then `enc(v, s)`, and
-      `Shape.encoder_for(f)(v, s)` written straight through.
-      Staying unexpanded is the design, because the wire format is the
-      translator's to decide, not Roc's.
-      A hand-written `encoder_for` returns a real closure, and a body that runs
-      one describes as the `Call` a translator resolves against a row
-      (`src/check/code_reifier.zig:2354`): both origins carry the same
-      arguments in the same order, which is what lets one translator read
-      either. Written the ergonomic way, `Json.to_str(value)` is still refused
-      as "a call to a function the compiler provides".
-- [ ] Derived `is_eq` over an empty tag union. "derived equality on an empty
-      tag union": nothing inhabits it, so there is no pair of values to
-      compare.
-- [x] Derived `is_eq` or `to_hash` through a nominal component. The compiler
-      dispatches to a component's own method before it looks at the component's
-      representation, and a derivation carries no dispatch plan, so the walk
-      resolves the method itself against the checked method registries
-      (`src/check/code_reifier.zig:1615`). The registry says which of the two a
-      declaration is: a procedure target is a written method, which describes
-      as the `Call` it is with its body in the table, and a structural target
-      is the compiler's recipe, which is the signal to expand the backing. A
-      written method the walk cannot reach keeps the bare name, the way a
-      dispatch to one does. A generic nominal's is described at the
-      instantiation its receiver fixes: the method's first parameter is the
-      value the derivation is walking, and pairing the two binds what the
-      scheme quantifies by shape (`src/check/code_reifier.zig:3965`), so
-      `Deep(U16)` and `Deep(Str)` take a row each.
-- [x] Derived `is_eq` through a `List`, `Dict`, `Set` or `Try` component, as
-      the `Call` the builtin's own method is. A scalar builtin folds into the
-      `Binop` a translator wants, `Str` among them, and every other builtin
-      goes to the registry like any nominal
-      (`src/check/code_reifier.zig:1682`). The registry keys a compiler builtin
-      under its own owner rather than under a declaration, so `ForeignNominal`
-      carries that key (`src/check/code_reifier.zig:7755`); it is a plain enum,
-      and so already means the same thing in either store. The walk stops at a
-      builtin's body by rule, so the description is the export name and nothing
-      more, which a translator resolves against its own target or rejects by
-      name. `Box` never arrives, because the checker refuses `==` on one, and a
-      derived `to_hash` over a container stays the symbolic `Derived` node the
-      stage expands.
-- [ ] Derived `is_eq` or `to_hash` through an opaque nominal that derives it.
-      An opaque type's `Ty` names it without its backing
-      (`src/check/code_reifier.zig:6671`), and the derivation is that backing's
-      comparison, so expanding here would describe a representation the
-      description hides everywhere else. One that writes its own method
-      describes as the call, which hides it.
-- [x] Derived `map`, as a `Derived(method, subject, args, meta)` carrying the
-      value and the mapping function in that order. The mapping function is a
-      `Lambda` like any other, and the subject is the parametric nominal read
-      at the type arguments the use fixed
-      (`src/check/code_reifier.zig:3982`), which is what says where the
-      payload being mapped sits. Both halves were needed: the nominal alone
-      refused as "a type variable" whether the mapping function was a lambda
-      or a name.
-- [x] `to_inspect`, reached through `Str.inspect`. The call is recognised by
-      the intrinsic the checker recorded on the use
-      (`src/check/code_reifier.zig:2544`). A subject whose `to_inspect` is the
-      inspect override describes as that call, and every other subject as
-      `Derived("to_inspect", subject, [value], meta)`, including a container
-      inside a record (`src/check/code_reifier.zig:1726`). Only the plain-call
-      path checks the intrinsic, so the method call `s.inspect()` still
-      describes as `Call("Builtin.Str.inspect", [s])`. Making the two one node
-      needs one more `ForeignLookup` question: the intrinsic an exported
-      template wraps.
-
-## 11 Where a reified definition may live
-
-- [x] A top-level definition of the module that reifies it.
-- [x] A top-level definition of a module it imports, read through that module's
-      published view and its export table.
-- [x] A definition reached through a type module (`Maker := {}.{ ... }`).
-- [x] An exact alias named where a `Code` is expected, `count_rows(same_thing)`
-      with `same_thing = add_one`, of this module or of one it imports. A
-      named site holds no lookup in its checked body, so the walk goes from
-      the name's pattern to its procedure binding through the top-level value
-      table, and from an alias binding to the lookup it forwards to
-      (`src/check/code_reifier.zig:6946`). The site describes the procedure
-      that lookup names, byte for byte the description of naming it directly.
-- [x] A function bound inside a block, named where a `Code` is expected. The
-      checker records a name a block binds to a lambda
-      (`src/check/Check.zig:24051`), and the walk follows the binder's defining
-      statement to that lambda (`src/check/code_reifier.zig:8236`). The lambda
-      reads the block around it by section 2, and one the block generalized
-      describes at the type each site fixes. A name bound to anything else,
-      `f = if c a else b`, has no body behind it and is refused.
-- [ ] A function reached through a value, such as an item of a list of
-      functions.
-- [x] A lambda written where the `Code` is expected, `describe(|s| ...)`. The
-      walk reads the lambda where it stands and the description takes its place,
-      so nothing has to name it. What it reads from the block around it
-      describes by section 2, and it may stand inside a function body as well
-      as a top-level constant.
-
-## 12 Templates: arguments fixed while the compiler runs
-
-A function that returns a `Code` is a template. The compiler calls it, writes
-the call's arguments into the lambda it returns, and the call site takes the
-description, so one template describes as many bodies as it is called with.
-
-- [x] A template defined in this module, recognised by its callee before either
-      body is checked.
-- [x] A template defined in a module this one imports. Its arguments are
-      described here and its body there, two walks into one const store.
-- [x] An integer, fractional, `Dec` or string literal as an argument.
-- [x] A list, tuple or record argument, and a nominal wrapping one, so long as
-      every part of it is itself constant.
-- [x] A field read of a record argument, which describes as a `Field` over the
-      `MakeRecord` the call fixed.
-- [x] Several calls of one template, each producing its own description.
-- [ ] An interpolated string as an argument, `labelled("a${"b"}c")`. The
-      checker binds every interpolated value to a name, so it is refused as
-      "template needs a constant" however constant its pieces are
-      (`src/check/code_reifier.zig:961`).
-- [ ] An argument computed while the program runs. Refused at the argument
-      (`src/check/code_reifier.zig:1043`), with a report that points there rather
-      than at the template.
-- [x] A template whose argument is a function. The parameter binds to the
-      definition the argument names (`src/check/code_reifier.zig:798`), so a
-      call on it names that row, and a lambda argument lifts into a row that
-      reads the block around it. The argument is a function rather than a
-      `Code`: `Code(f)` is opaque and not callable, so a template calling a
-      `Code` parameter does not check, and making it callable is a change to
-      the typing rules. A function argument that names no definition, a
-      record field or an `if`, stays refused.
-- [x] A name as an argument, bound to a literal at the top level or in an
-      imported module. The walk follows the name to the value it holds and
-      folds that value in (`src/check/code_reifier.zig:1023`), so `limit = 7`
-      passed to a template describes as the `7`.
-
-## 13 What every node carries
-
-`Code` is opaque, so only the compiler builds one. The node unions are
-transparent, because a translator `match`es them from outside `Builtin`, and
-opacity blocks matching as firmly as construction. Only `Code` is
-auto-imported, so a user module may still be named `Pattern` or `Branch`.
-
-- [x] `Meta { ty : Ty, region : Region }` on every `Ir` node, so a translator can
-      name a type and point at source. `Meta` and `Region` are aliases rather
-      than nominals, because restoring a compile-time constant refuses a
-      nominal record (`src/postcheck/boxy/lower.zig:37440`).
-- [x] A region counted in the file its author wrote, resolved to 1-based lines
-      and columns, with the module name beside them. One `Str` node per
-      distinct string, so a description holds one node naming its module and
-      not one per node (`src/check/code_reifier.zig:7316`). A description
-      another module's walk writes carries that module's regions, so a refusal
-      names the file the author must open.
-- [x] `Node.children` (the normal form of `Ir.children`) and `Ty.children`,
-      so a pass with nothing to say about any one kind walks a description
-      without an arm per kind (`src/build/roc/Builtin.roc:24004`, `:23703`).
-- [x] `Ty.numeric`, the question an operation site asks about a number, and
-      `Ty.name`, the answer a refusal names a type with
-      (`src/build/roc/Builtin.roc:23727`, `:23752`).
-- [x] Comparing two `Ty` values. `Code.Ty` declares `is_eq : _` and
-      `to_hash : _` (`src/build/roc/Builtin.roc:23689`), so `a == b` and
-      `a != b` are the derived structural comparison. Checked with a probe
-      that compares the parameter types of a `I64, I64, F32 -> I64` row.
-
----
-
-## What the remaining unticked boxes cost
-
-| Gap | What it costs |
+| | |
 | --- | --- |
-| No function taken from a list | `[double].first()` and then a call: simplifying does not read a closure back out of a list, so the call stays an `Apply` and the site is refused; a function chosen by an `if` or read from a record literal does describe |
-| No name whose value exists only at run time | a lambda cannot read a parameter, binder or `var` of the function it is written in; the value becomes a parameter of the lambda, or a template fixes it |
-| No computed function at top level | `doubler = make(2.0)` names no definition, so a call on it is refused; the author writes it as a lambda, `doubler = \|x\| x * 2.0`, or as a template; an exact alias, `same = add_one`, does describe |
-| No computed value of another package | `limit = xs.len()` in a package the app depends on is refused, because its body is that package's; a value written as data still folds |
-| No open tag union | a result whose row nothing closed has no one set of variants to describe |
+| `Code(f)` | a description of a pure Roc function of type `f`, as data |
+| The rule | a function that stands where the type says `Code(f)` is described, not compiled |
 
-A shader or a codec is written as one function calling others, over as many
-modules as its author split it into, and that describes whole: the compiler
-walks the callees and ships their descriptions in the table, and every builtin
-either folds into a node or arrives under the name the compiler knows it by. A
-higher-order call describes too, because the walk resolves a function at the
-site that fixes it rather than handing a translator a value it has nowhere to
-put.
+```roc
+area : F64, F64 -> F64
+area = |w, h| w * h + 1.0
 
-## How each box was checked
+# Calc.to_expr : Code(f) -> Try(Str, [Unsupported(Str)])
+expr = Calc.to_expr(area)   # area is described, not called
+```
 
-A ticked box is proven by one of three things: a case in
-`src/eval/test/eval_staging_tests.zig`, a fixture under `test/cli/`, or a probe
-compiled with `roc <file>` where a translator prints `ok` for a `Lambda` root.
-An unticked box quotes the reason line the compiler printed for the same probe.
-The walk's trees are also pinned by `src/compile/test/code_reifier_test.zig`,
-and the position rule's reports by snapshots such as
-`test/snapshots/staged_code_outside_staged_position.md`. The reifier is checked
-against Roc's semantics too: `Interp.eval` runs a description, and
-`examples/reifying/glsl/main.roc:113` compares its answer with what Roc
-computes for the same function.
+There is no new syntax. The parameter type is the whole interface, in the
+same way that a numeric literal takes its type from the place it stands.
 
-Working on the reifier:
+A translator is the function that reads a `Code`. It is ordinary pure Roc. It
+runs while the compiler runs, usually during the evaluation of a top-level
+constant, and it returns data: GLSL text, a SQL script, a Rust program. The
+compiler knows the word reification. It never knows the words shader, query or
+Z-set. Each target is a library.
 
-| Task | What to know |
+The described function stays an ordinary Roc function. The program can still
+call it, test it with `expect` and step through it. The GLSL example runs its
+shader on the CPU in a test and compares the result with an interpreter of the
+description (`examples/reifying/glsl/`).
+
+### 1.1 Names
+
+The early discussions called the feature staging, and the value a typed
+quotation. Both names were dropped. "Staging" already means several other
+things in the compiler and in CI, and "quotation" collides with `from_quote`.
+The words now are:
+
+| Concept | Name |
 | --- | --- |
-| run the GLSL example | `roc test --no-cache examples/reifying/glsl/main.roc`; the CLI suite runs the same command (`src/cli/test/parallel_cli_runner.zig:1875`) |
-| a call into another module or a builtin | `code_reifier_test.zig` builds its walk with `ForeignLookup.none` (line 112), so those paths refuse there and are pinned only in `eval_staging_tests.zig` |
-| a `Code` union gains a variant | the staging cases still pass with it unlisted; the GLSL example and `test/cli/StagedMatch.roc`, which match every variant, are what fail |
-| a field added to `NodeStore` or `CommonEnv` | it moves the sizes pinned in `test/serialization_size_check.zig:41-42` and needs a `CACHE_VERSION` bump (`src/compile/cache_config.zig:237`) |
-| lines added to `Check.zig` and the other files `run-check-type-checker-patterns` scans | its excluded ranges are line numbers (`build.zig:770`), so `minici` can fail at code the change never touched |
-Line numbers were last checked against the `staging` branch over `main` at
-`90d6e058ec`. The sections C24 and C25 rewrote carry current ones; the rest
-have drifted.
+| The value | `Code(f)` |
+| The act of making it | reification, or describing |
+| The consumer | a translator |
+| The data a translator reads | the description: a `Code.Graph` in the normal form |
+
+A translator has no special module kind. It is an ordinary package. Many
+identifiers in the compiler still say `staged` (`stagedCode`,
+`StagedCode`, `test/cli/Staged*.roc`); they mean the same thing.
+
+## 2. The model
+
+### 2.1 What a `Code` is
+
+Every `Code` value has these properties:
+
+| Property | Meaning |
+| --- | --- |
+| Typed | `Code(Person -> Bool)` holds only a function of that type. A type error in the function is an ordinary type error. |
+| Pure | `Code(a => b)` is a type error. An effect has no place to happen while the compiler runs. |
+| Closed | The description has no free names. Everything the function reads from outside is in the description. |
+| Monomorphic | Every type in the description is concrete. A generic function is described at the types its use fixes. |
+| Inert | No operation calls a `Code`. It is data. |
+| Compile-time only | Only the compiler makes one. A value cannot be annotated with `Code`. |
+| Comparable | Two `Code` values are equal when their normal forms and versions are equal, wherever each came from. |
+
+`Code` is an opaque type, so user code cannot build one. A hand-built
+description therefore cannot pose as one the compiler wrote. The data types
+inside it (`Graph`, `Row`, `Node`, `Op`, `Ty` and the rest) are transparent,
+so a translator can `match` on them. All of them are in the `Code` module of
+`src/build/roc/Builtin.roc`.
+
+### 2.2 Code places
+
+A `Code` can stand in two places of an annotation: as a parameter of the
+outermost function, and as what that function returns. Every other place is
+the error `code is not allowed here`: a callback parameter, a record field, a
+tuple item, a value annotation.
+
+```roc
+is_adult : Code({ age : U8 } -> Bool)   # ERROR! A Code is not allowed here
+is_adult = |p| p.age >= 18
+```
+
+The fix is to write `is_adult` as an ordinary function and pass it where a
+`Code` is expected. A package that wants to ship reusable reified functions
+ships ordinary functions.
+
+The checker reads code places from the annotation the user wrote, not from
+the solved type. A transparent alias of a `Code`, such as
+`MyCode : Code(I32 -> I32)`, is a code place too, and follows the same rule.
+`Code.Binds(code, fmt)` (section 6) is an alias that is also a code place.
+
+These forms can stand at a code place:
+
+| Form | Example |
+| --- | --- |
+| A top-level function of this module or an imported module | `Calc.to_expr(area)` |
+| A method declared on a type | `Calc.to_expr(Meters.twice)` |
+| A function bound in a block around the call | `double = \|x\| x * 2`, then `Calc.to_expr(double)` |
+| A lambda written at the place | `Sql.select_where(events, [], \|e\| e.at < cutoff)` |
+| An exact alias of a function | `same = add_one`, then `Calc.to_expr(same)` |
+
+A lambda at a code place takes its parameter types from the call before its
+body is checked, the same as a lambda argument of an ordinary function. So a
+field read and a method call on a parameter both resolve.
+
+The view is chosen by the parameter type. `Code(f)` gives the `graph` view,
+and `Code.Inlined(f)`, `Code.Outlined(f)` and `Code.Lawful(f)` give the
+others (section 3.2).
+
+### 2.3 Templates
+
+A function that returns a `Code` is a template. The compiler calls it while
+it runs, and does not compile it. It writes each argument of the call into
+the lambda the template returns, so one template gives one description per
+call.
+
+```roc
+add_k : I64 -> Code(I64 -> I64)
+add_k = |k| |x| x + k
+
+Calc.to_expr(add_k(5))   # Ok("(p0 + 5)")
+Calc.to_expr(add_k(7))   # Ok("(p0 + 7)")
+```
+
+Each argument must be fixed at build time: a literal, a name bound to one, an
+aggregate of those, or a function. An argument that the program computes when
+it runs is the error `template needs a constant`, reported at the argument.
+
+A call is a template call only when the callee's own return type is a `Code`.
+A generic function that receives a `Code` and returns it, such as
+`pick : Bool, a, a -> a`, is an ordinary call.
+
+### 2.4 Query fragments and instance descriptions
+
+A query fragment is a generic function that holds a code place whose type
+names the function's own type variables:
+
+```roc
+named_only : Db.Q({ name : Str, ..r }) -> Db.Q({ name : Str, ..r })
+named_only = |q| q.filter(|x| x.name != "")
+```
+
+The lambda has no single type, so it has no single description. A
+description is monomorphic, and an open row has no shape to write. The
+design calls such a code place an instance site. It has no description of its
+own. Each closing use of the fragment describes the lambda at the types that
+use fixes, in the module of the use. `named_only(pets)` describes it at `Pet`,
+and `named_only(owners)` describes it again at `Owner`. A use is a call, a
+method call, a lookup of the fragment as a value at a fixed type, a constant
+that holds the fragment, a fragment that calls a fragment, and a `for` loop
+over a type whose `iter` is a fragment.
+
+The checked module builder records these descriptions in an instance table
+(`CodeInstanceTable`), keyed by template and instantiation, so equal
+instances share one table. Monotype and Boxy read the table in force where
+the program runs the fragment. Boxy plans one worker per table, not a hidden
+argument. `Code.ty_of` and `Code.type_id` calls (section 5) whose proxy type
+names a type variable of the function around them are entries of the same
+table.
+
+A refusal inside a fragment can only be found at a use, because that is the
+first place a description exists. The report points at the source inside the
+fragment and names the use that reached it.
+
+Three forms are refused by name:
+
+| Form | Report | Why |
+| --- | --- | --- |
+| A fragment whose translator binds captured values | `cannot bind inputs in a generic function` | input slots have one order per call, and a fragment would need a new order at each use |
+| A fragment that a `where` requirement selects | `cannot reify through a where requirement` | the requirement picks its method only when the program is built for one type, after descriptions exist |
+| A fragment at the type variables of `to_inspect`, `is_eq`, `to_hash`, `encoder_for` or `parser_for` | `cannot reify in a method the compiler calls` | the compiler calls these itself, so no use in the program fixes their types |
+
+A use inside a function that a block made generic is also refused
+(`cannot reify in a local generic function`).
+
+The design of instance descriptions is D1 of
+`roc-reify-structural-proposal.md`.
+
+## 3. The description
+
+### 3.1 Graphs, rows and nodes
+
+A description is a graph of functions. Each function is a row.
+
+| Type | What it holds |
+| --- | --- |
+| `Graph` | `{ root, rows, slots }`. The root row is the function that was passed. `slots` are the types of the input slots (section 6). |
+| `Row` | One function: `id`, `params` and `result` (as `Ty`), `nodes`, `body`, `recursive`. |
+| `Node` | One operation: `op`, its arguments `args`, its type `ty`, and `speculatable`. |
+| `Val` | What a node reads: `Param(k)`, `Node(i)`, `Out({ node, k })`, `Arg({ owner, k })` or `Input(k)`. |
+| `Region`, `End` | A body and how it ends: `Value`, `Jump`, `Return`, `Continue`, `Break`, `Branch`. |
+| `Tree` | One row as nested expressions, from `Graph.to_tree`. |
+
+There are 24 ops. They group as constants (`Lit`), builtin and primitive calls
+(`Prim`), calls of rows (`Call`, `Closure`, `Lambda`), construction (`Record`,
+`Tuple`, `List`, `Tag`, `Wrap`), reads (`Field`, `Index`, `Payload`, `Item`,
+`OptField`, `Unwrap`), choice (`Switch`, `And`, `Or`), loops (`ForRange`,
+`ForList`, `Loop`) and the rest (`Crash`, `Derived`).
+
+For `area = |w, h| w * h + 1.0` the graph has one row with three nodes:
+
+| Index | `op` | `args` | `ty` |
+| --- | --- | --- | --- |
+| 0 | `Prim` `Num.F64.times` | `Param(0)`, `Param(1)` | `F64` |
+| 1 | `Lit(Frac(1, F64))` | none | `F64` |
+| 2 | `Prim` `Num.F64.plus` | `Node(0)`, `Node(1)` | `F64` |
+
+The body ends in `Value([Node(2)])`. The names `w` and `h` are gone, and no
+source region is in the description.
+
+The description is first order. There is no node that applies an arbitrary
+function value. A function passed as a value is a `Closure` of a row, and the
+walk resolves every call to a known row or primitive. A call it cannot
+resolve refuses the site.
+
+A binding has no node of its own. The node that computes the value is the
+binding. A value read more than once stays one node, so shared work stays
+shared, and `to_tree` keeps such a node as a `Def`.
+
+`speculatable` says whether a translator may evaluate the node where the
+source would not, for example in a target with no short-circuit evaluation.
+It is exact: only builtins on the normal form's list are speculatable, and a
+package primitive never is.
+
+### 3.2 Views
+
+Different targets want different amounts of structure. A view decides which
+functions stay rows.
+
+| View | Parameter type | What stays a row |
+| --- | --- | --- |
+| `graph` | `Code(f)` | a recursive row, a row called from two or more places, a row a `Closure` names, a row with a `Return` in a loop or a switch arm |
+| `inline` | `Code.Inlined(f)` | a recursive row, a row with a `Return` in a loop or a switch arm. Every other call is inlined. |
+| `outline` | `Code.Outlined(f)` | the rows of `inline`, and one row for each computation of at least four nodes that occurs at two or more places |
+| `lawful` | `Code.Lawful(f)` | the rows of `graph`, after the laws of the builtins (layer L) |
+
+A single-expression target such as a fragment shader reads `inline`. SQL with
+common table expressions reads `graph` and keeps each `Call`. A target whose
+functions must not change when the author moves code into or out of helpers
+reads `outline`: its rows are chosen by the compiler with anti-unification, so
+`step(input.a)` and `step(input.b)` call one row. Only `lawful` applies the
+laws: a loop that appends to an empty list is `List.map`, a `map` of a `map`
+is one `map`, and `len() > 0` is `!is_empty()`.
+
+A row with a `Return` inside a loop or a switch arm is never inlined, because
+inlining it would make the caller return the callee's value.
+
+The view rules are in `src/reify/views.zig`, and the laws in
+`src/reify/laws.zig`.
+
+### 3.3 The normal form
+
+The description is a normal form. Two ways to write one computation give one
+graph. A translator therefore sees fewer forms than the source has, and some
+of them are not the forms the author wrote:
+
+| Written | Described as |
+| --- | --- |
+| `"Hello, ${name}!"` | one n-ary `Prim` `Str.concat` with three arguments |
+| `x >= 10`, `x > 10` | `is_lte` and `is_lt` with the operands swapped; there is no `is_gt` or `is_gte` |
+| `a != b` | `Bool.not` of `is_eq` |
+| `1 + x` | `plus(x, 1)`: a literal comes last in an integer `plus`, `times` or `is_eq` |
+| `a and b`, `a or b` | an `And` or `Or` node; each operand after the first is a region, so it short-circuits |
+| `t?`, `t ?? 0`, `match t { Ok(v) => .. }` | `Unwrap` of the `Try`, then a `Switch` on `Err` and `Ok` |
+| `for`, `while`, tail recursion | `ForRange`, `ForList` or `Loop`, with the carried `var`s as numbered slots |
+| `return`, `x?` inside a body | an exiting `Switch` whose arms end in `Return` or a `Jump` to the join |
+| derived `==` on a record | `And` of the field comparisons, in field-name order |
+
+A rule of the normal form holds for every `Code` of one `Code.version`. A new
+version can add, change or remove a rule. So a translator matches the forms
+it knows and refuses the rest by name.
+
+The rules are numbered (`N1` and onward) in `roc-reify-normal-form.md`, and
+the plan that produced them is `roc-reify-normalization-plan.md`. The rules
+are a rule table plus rebuild passes in `src/reify/` (`rules/table.zig`,
+`loops.zig`, `scalar.zig`, `lists.zig`, `ranges.zig`). An offline tool,
+`zig build reify-rules` (`src/reify/derive/`), searches for missing rules by
+critical pairs and enumeration (`roc-reify-rule-derivation.md`).
+
+The semantics the normal form keeps is called C2: the result equals Roc's
+result wherever Roc does not crash or diverge, and a description never
+evaluates what Roc would not. Only speculatable nodes move. A `crash` the
+author wrote stays. A crash the compiler wrote, such as a literal rejected by
+its own conversion, is a `Crash` of kind `rejected_literal`, and rule N13w
+drops the tests that only lead to it.
+
+The normal form is checked in several ways: a verifier of each graph
+(`src/reify/verify.zig`), a reference evaluator that compares a description
+with Roc (`src/reify/eval.zig`), and fuzzers that generate small typed terms,
+apply random refactors and assert equal normal forms (`src/reify/fuzz_gen.zig`,
+`src/compile/reify_fuzz.zig`).
+
+### 3.4 Types
+
+Every node carries its `Code.Ty`. A `Ty` is one of the scalar types, `Bool`,
+`Str`, `ListOf`, `Record`, `Tuple`, `Fn`, `TagUnion`, `Named`, `Recursive` and
+`Opaque`.
+
+- A type alias is resolved. It never appears in a `Ty`.
+- A transparent nominal is `Named(name, args, backing)`. `args` are the type
+  arguments of the use, in the order the declaration lists its variables, and
+  `backing` is read at those arguments. An argument that the backing does not
+  hold is kept: with `Id(row) := { table : Str, key : Str }`, an
+  `Id(Customer)` carries `Customer` in `args`, so a translator knows which
+  table it points to.
+- An opaque nominal, and a builtin with no shape (`Dict`, `Set`, `Box`,
+  `Iter`, the SIMD vectors), is `Opaque(name, id, args)`. It has no backing.
+  The `id` is its `Code.TypeId` (section 5).
+- A recursive type is a `Named` whose backing holds `Recursive(name)` where it
+  reaches back. A translator resolves the name against the innermost enclosing
+  `Named`. Roc refuses recursive aliases, so every recursion goes through a
+  nominal.
+- A tag union lists its variants in name order, each with its payload types.
+- A record lists its fields in name order. A record extended by a
+  record-backed `:=` nominal (`Labeled(r) := { label : Str, ..r }`) arrives
+  with every field, the nominal's fields included.
+
+Types are read by Monotype's rules, so the walk commits nothing to the solved
+types. A numeral with no other type defaults to `Dec`, as in compiled code. An
+open record or tag row seals to the row default that checking recorded, as
+Monotype seals it, so `|r| r.id > 0` describes `r` as `{ id : Dec }`. A
+function whose types nothing fixes, such as `|x| x`, is refused as
+polymorphic. A default that does not fit its use, as in `|x| x * 2.U8`, is
+refused rather than described at a type the program never has.
+
+`Code.ty_of(proxy)` gives the `Ty` of a type without a lambda, for a
+translator that only needs a schema.
+
+### 3.5 Tag names and union width
+
+A tag is identified by its name, not by its index in a union. So a value does
+not change when it moves to a wider union, and the description has no node
+for widening. A value of a narrower union conforms to a wider slot. A tag
+`Switch` has one arm per variant of its scrutinee's own union, in name order.
+
+A translator that matches tags by name needs nothing more. A translator that
+numbers tags per union, such as a C or GLSL struct, converts where the type
+of a child is narrower than the type of its slot. Inside the walk, tag names
+are interned ids. Hashes were rejected because a collision would select the
+wrong arm without an error. An earlier `Op.Widen` node was removed, because it
+carried no meaning for a translator and broke refactor safety. The decision
+is `roc-reify-tag-names.md`.
+
+### 3.6 Records, optional fields and defaults
+
+Each field of a `Ty.Record` has a `presence`:
+
+| `presence` | Field | Means |
+| --- | --- | --- |
+| `Required` | `id : Str` | every value has it |
+| `Optional` | `note ?: Str` | a value may not have it |
+| `Default(value)` | `stock : I32 ?? 0` | every value has it; `value` is the default as a `Code.Value` |
+| `DefaultComputed` | `label : Str ?? made({})` | every value has it, but the type does not carry the default |
+
+A default is `Default(value)` when it is a literal, or a list, record, tuple,
+tag or nominal of literals, or the name of a constant that holds one.
+Anything else is `DefaultComputed`. The default is part of the type, so two
+nominals that differ only in a default are two different `Ty` values. A
+schema translator writes `Default(value)` as a column default and refuses
+`DefaultComputed` with advice.
+
+A record literal that leaves out a field with `Default(value)` is described
+with the default filled in, as the program fills it when it runs. One that
+leaves out a `DefaultComputed` field is refused.
+
+An optional field is read with `OptField`, which gives the `Try` the value
+sits in. A `Record` node lists the members it sets when its type has an
+optional member, so a literal that leaves one out has one form. A record
+update and a record pattern rest over an optional field are a `Switch` on its
+`OptField`, so the description decides what Roc decides at run time. Derived
+equality over an optional field compares the two `Try` values: two records
+that both lack the field are equal there.
+
+## 4. Calls, primitives and the cut
+
+### 4.1 What is walked and what is a `Prim`
+
+A description is closed, so the walk follows every call into its callee and
+describes the callee as a row. It does this across modules and across
+packages. A call in another module is read from that module's published
+view, so the graph also reaches a module the described one never imports.
+A row has no name. The graph holds every module it reaches under one
+numbering.
+
+Some callees are not walked. They are a `Prim`, named and identified, with no
+body. One step classifies every definition the walk reaches, the same on the
+direct-call, method-call and constant paths (`primitiveOf` in
+`src/check/code_reifier.zig`):
+
+| Definition | Described as |
+| --- | --- |
+| An intrinsic (section 8) | a `Prim`, always |
+| A function of the builtin module | a `Prim` under its export name, such as `Str.concat` |
+| A constant of the builtin module | its value, folded |
+| A function or constant whose type names an opaque (`::`) type of its own module | a `Prim`, such as `Time.is_before` or `Time.epoch` |
+| A function in the translator's cut | a `Prim` named by its nominal and item |
+| Anything else | walked by its body |
+
+The rule for opaque types follows from opacity. The body of `Time.is_before`
+reads the representation that `Time` hides, so a description that walked it
+would expose what Roc itself hides from the caller. The test reads only
+explicit data: the module's role, the nominal's opaque flag, its declaring
+module and the definition's checked type. A function of that module whose
+type does not name the type, such as `Time.days_in_week : U8`, is walked like
+any other. A walked body that builds a value of an opaque type from its
+fields is refused.
+
+A primitive function is a `Prim` over its arguments, and a primitive constant
+is a `Prim` with no arguments. One definition has one name and one id
+whichever path reaches it, so `Time.is_before(t, c)`, `t.is_before(c)` and
+`t < c` give the same node. A package primitive gets no law, no fold and no
+speculation. Only builtins have laws, because only they have a reference
+evaluator that checks the law.
+
+A builtin that the normal form has a node for is folded into that node:
+`Bool.not` is one `Prim` however it is spelled, and `and` and `or` are `And`
+and `Or`.
+
+### 4.2 The cut and `code_primitives`
+
+A translator sometimes wants a function by name, even though its body is
+readable. A GLSL translator keeps a math library's `lerp` as GLSL's `mix`. A
+SQL translator reads the same body. So the cut belongs to the translator, not
+to the library. The translator declares it with an item named
+`code_primitives` on its type:
+
+```roc
+Glsl :: {}.{
+    code_primitives = [Code.prim(Vec3.scale), Code.prim(Vec3.plus), Code.prim(Sampler.texture)]
+
+    fragment_330 : Code.Inlined(f) -> Try(Fragment, Error)
+}
+```
+
+The item has the type `List(Code.PrimId)`. Each entry is `Code.prim` of one
+top-level function or constant. The item may also be the name of a constant
+of the same module that holds such a list, so several translator types can
+share one cut. A constant of another module is not read this way. The older
+tuple form is a type error whose hint says to wrap each entry in `Code.prim`.
+
+The cut is explicit data. The checker records which call a code place is an
+argument of (`CodeReificationSite.translator`). For a method call it reads
+the method from the dispatch plan, never from the method's name. The walk then
+reads the cut of the nominal that owns that translator. Two sites with
+different cuts share no normal form they do not both build.
+
+The reports for a bad cut are `not a primitive`, `cannot read this cut`,
+`primitive listed twice` and `already a primitive`. The last one is for a
+builtin, an intrinsic, or a function of an opaque type, which is a `Prim`
+already.
+
+The tradeoff of the cut is reach. A dependency's body is part of what a
+translator reads. If an upgrade changes the operations of a function that a
+described function calls, the translation can change, or the build can stop
+at the call with a report that names it. Upgrades are explicit, because
+packages are pinned by URL and content hash.
+
+### 4.3 Calls the walk resolves
+
+The walk resolves each call at the place that fixes it:
+
+- A generic callee is described once per instantiation. `id` called at `F32`
+  and at `U64` is two rows. The row key is a digest of the types the call
+  fixed.
+- A function parameter that a call fixes binds to the definition it names.
+  `apply_to(double, x)` and `apply_to(triple, x)` are two rows.
+- A function chosen by an `if` between known functions becomes a `Switch`
+  over the calls.
+- A top-level value that computes a function, `doubler = make(2.0)`, is read
+  by its definition where the name stands, so `doubler(x)` is a call of the
+  lambda inside `make` over the capture `2.0`.
+- A top-level constant is folded into the description, as a literal or as the
+  computation its definition writes. `x > limit` with `limit = 7.0 * 2.0`
+  describes as `x > 7.0 * 2.0`.
+- A value that the block around a lambda binds is replayed at the head of the
+  lambda's body.
+- A literal of the author's own type is the call of its conversion
+  (`from_numeral`, `from_quote`, `from_interpolation`), over the digits or the
+  text the author wrote.
+
+### 4.4 Evidence
+
+A builtin such as `List.sort` or `Dict.get` has a `where` clause. A
+translator must know which method answers each requirement at this call. A
+`Prim` therefore carries `evidence`: one `Code.Evidence` per requirement, in
+the order of the clause, each with the `method`, the type `ty` it is called
+on, and a `target`:
+
+| `target` | Means |
+| --- | --- |
+| `Prim(..)` | a primitive, with its own `evidence` |
+| `Row(id)` | a method with a body; row `id` is that body |
+| `Derived(method)` | a method the compiler derives for the type |
+| `Unreachable` | no value of `ty` can reach the call |
+
+`xs.sort()` over `List(I64)` has the target `Prim(Num.I64.order_relative_to)`.
+Over a type that writes its own order, the target is a `Row`. A translator
+checks that the order is one its target has before it emits its target's sort.
+
+The walk reads the evidence that the checker recorded. It plans no dispatch.
+A call whose evidence the compiler leaves to a later stage is refused. Without
+evidence, a translator would have to assume the natural order, which is a
+wrong translation with no error.
+
+### 4.5 Derived methods
+
+The six derivable methods are `is_eq`, `to_hash`, `parser_for`,
+`encoder_for`, `map` and `map!`. The rule is: who must the result agree with?
+
+- `is_eq` and `to_hash` must agree with Roc. That knowledge is the compiler's,
+  so a derived `is_eq` is expanded into the comparisons it performs. A
+  derived `to_hash` is expanded where the description reaches far enough, and
+  is `Derived` otherwise.
+- A codec answers to a format that the translator owns. `parser_for`,
+  `encoder_for`, `map` and `to_inspect` stay a `Derived(method, type)` node.
+  A translator that owns the format expands it, and every other translator
+  refuses it by name.
+
+Through an opaque nominal, a derived `is_eq` stays `Derived`, because
+expanding it would describe the hidden representation.
+
+## 5. Identity
+
+### 5.1 Ids, not names
+
+A name is for messages. Two packages can each have a `Time.is_before`, and a
+module can declare its own `Bool` with its own `not`. So each `Prim` carries a
+`Code.PrimId`, and each `Opaque` type carries a `Code.TypeId`. Both are 128-bit
+hashes of the identity the compiler already keys the definition by. They are
+made only in `src/reify/identity.zig`:
+
+| Identity | Hashed |
+| --- | --- |
+| builtin primitive | owner and method (`Str`, `concat`) |
+| package primitive | the checked module digest of its module, and the definition |
+| builtin nominal | the name its `Ty` spells (`Dict`) |
+| declared nominal | the content identity of its module, and the declaration |
+
+A translator gets the same ids from source with three intrinsics of the
+`Code` module:
+
+| Call | Gives |
+| --- | --- |
+| `Code.prim(Time.is_before)` | the `PrimId` of each `Prim` that calls `Time.is_before` |
+| `Code.type_id(proxy)` | the `TypeId` of the opaque type of the proxy |
+| `Code.ty_of(proxy)` | the `Ty` of the proxy's type |
+
+```roc
+time_proxy : Code.Proxy(Time)
+time_proxy = Code.proxy()
+
+is_time : Code.Ty -> Bool
+is_time = |ty| match ty {
+    Opaque(_, id, _) => id == Code.type_id(time_proxy)
+    _ => Bool.False
+}
+```
+
+Roc has no type arguments, so a `Code.Proxy(t)` with an annotation stands for
+the type. `Code.prim` does not call or instantiate its argument, so a generic
+function with a `where` clause can be named. The compiler computes each id at
+publication and stores it as a constant. The three are only ever called;
+passing one as a value is `call this function`. `Code.prim` of a local, a
+parameter or a computed function is `not a definition`, and `Code.type_id` of
+a proxy whose type is not nominal is `not a nominal type`.
+
+An id comes from the module that declares the definition, contents included.
+An edit to that module gives new ids. Ids are not meant to be stored across
+builds. The glue package and the app are compiled in one build, so
+`Code.prim` and the `Prim` nodes always agree.
+
+A `Named` type carries no `TypeId` yet. That is open.
+
+### 5.2 Extending a translator
+
+A translator knows the builtins. It cannot know every package. A glue package
+tells a translator what the functions and types of another package mean in
+its target. It exists apart from both, because a package cannot add methods to
+another package's type, and it cannot change the translator's source.
+
+The translator takes the extensions as ordinary values, keyed by id:
+
+```roc
+extension = Sql.extension({
+    prims: [
+        { prim: Code.prim(Time.is_lt), render: TimeSql.binary("<") },
+        { prim: Code.prim(Time.is_eq), render: TimeSql.binary("=") },
+    ],
+    types: [{ type: Code.type_id(TimeSql.time_proxy), column: "BLOB" }],
+})
+```
+
+The extension type belongs to the translator. The language gives only the
+ids. The translator cannot check what a glue package claims: the SQL above is
+correct only because the translator writes a `Time` as bytes that sort as its
+nanoseconds do. The design is D6 of `roc-reify-opaque-proposal.md`.
+
+### 5.3 Rows, nodes and equal descriptions
+
+Rows have no names. A row is keyed by its content digest, and recursive
+groups are hashed as a unit. Rows that are equal merge. The order of
+`row.nodes` comes from the graph alone, so a rename or a reordered binding
+keeps every node index. `Code.Inlined.inline_digest` gives each node of the
+`inline` view a content digest that also survives helper extraction, for a
+translator that needs stable operator ids.
+
+`Code.is_eq` and `Code.to_hash` read the normal form and the version, never
+the site. So two places with equal descriptions give equal `Code` values, and
+a translator can key a cache with `Code.to_hash` and `Code.version`.
+
+## 6. Captured values
+
+A lambda may read a value that exists only when the program runs:
+
+```roc
+before = |cutoff| Sql.select_where(events, [TimeSql.extension], |e| e.at < cutoff)
+```
+
+The description is built before `cutoff` exists. A translator that returns a
+`Code.Bound(result)` accepts such a lambda. It still runs once, while the
+compiler runs, and writes a placeholder for each value it cannot know, such as
+a `?` in SQL. In the description, each such value is an input slot,
+`Input(k)`. Each call of `before` then gives the program a `Code.Bound` whose
+`inputs` holds one `Code.Value` per slot. The translator writes
+`Code.bound(code, result)`, and the program adds the inputs.
+
+The rules:
+
+- A slot is a value the description reads whole. A lambda that reads only
+  fields of a captured record gets one slot per field path. One that also
+  reads the record whole gets one slot for it, and reads its fields as
+  `Field` of that slot's `Input` (rule N18e).
+- A `Code.Value` follows the slot's type. An optional field the record does
+  not hold is `Absent`.
+- Where the translator does not return a `Code.Bound`, the read is refused as
+  `reified function captures a value`.
+- A `var` is never a slot, because its value at the call is not always the
+  value the description reads.
+- The lowering of the call reads only the slots the walk recorded
+  (`CheckedCodeBinding`). It plans nothing.
+
+A value of an opaque type cannot be a structural `Code.Value`, because its
+fields belong to its package. A translator that wants such values names a
+format with `Code.Binds`:
+
+```roc
+select_where : Table(row), List(Extension), Code.Binds(Code(row -> Bool), Param) -> Code.Bound(Try(Str, Error))
+```
+
+`Code.Binds(code, fmt)` is a transparent alias of `code` with a phantom
+`fmt`, so no existing signature changes. At such a place, the checker adds
+the requirement `t.encoder_for : fmt -> (t, List(U8) -> Try(List(U8), []))`
+for each captured value read as a name or a field path, and `fmt.default`
+once for the site. These are ordinary `where` requirements, generated as
+constraints, not a rewrite of solved types. A slot whose type holds an opaque
+type arrives as `Encoded(bytes)`, in the translator's own format. A captured
+function needs no encoder, because it is described as code. A type the format
+cannot encode is the error `cannot bind captured value`, at the read.
+
+The design is section 10.1 of `roc-reify-proposal.md` and D5 of
+`roc-reify-opaque-proposal.md`.
+
+## 7. Translators: reading and refusing
+
+### 7.1 What a translator does
+
+A translator is a function from a `Code` to data. It walks `row.nodes` and
+`Val`, or a `Tree` from `to_tree`, and emits its target. It matches the ops
+and types it knows. For everything else it refuses, by name.
+
+The compiler reifies and the translator validates. The compiler never asks
+whether a target can run `Str.split_on`. A construct a target cannot run is
+still described, because a named node costs one translator a refusal, while
+a compiler refusal would cost every author the construct.
+
+### 7.2 Two ways to refuse
+
+| | Return an `Err` | `Code.refuse_at` |
+| --- | --- | --- |
+| Written as | `Err(Unsupported(reason))` | `code.refuse_at({ row: row.id, node: index }, reason)` |
+| The user sees | what the caller does with the `Err` | a `translation refused` report at every source place of the node |
+| Testable with `expect` | yes | no, the compile stops |
+| At program run time | the same | a crash with the message |
+
+The description holds no source regions, so a translator cannot branch on
+them. The compiler keeps a provenance table from each node to its source
+places (`src/reify/provenance.zig`, `CodeProvenanceTable`). `refuse_at` is the
+only reader. It names a row and a node index, and the compiler reports the
+message at every source place the node came from, with the calls that reached
+it. Each view has its own `refuse_at`, because node indexes differ between
+views.
+
+```
+── ✗ translation refused ────────────────────────────────────── refused.roc:6:12
+
+A translator refused code that this expression built.
+
+root = |x| x.sqrt() + 1.0
+           ^^^^^^^^
+
+The translator gave this reason:
+
+    `sqrt` has no operator here
+```
+
+When the refused node is a `Prim` that names an intrinsic, directly or
+through its evidence, the report adds one line per intrinsic: it has no Roc
+body, and a translator binds it by id, as it binds a builtin. The translator
+writes nothing for this line. The bit comes from the compiler's own record of
+the primitive (`ir.NamedPrim.intrinsic`) through the provenance table. No
+rule, digest, numbering or view reads it, and the `Prim` has no field for it.
+
+### 7.3 Reports of the walk
+
+A function the walk cannot describe gives one report, and its site becomes a
+`runtime_error` in the checked body. So no later stage meets a site with no
+description, and no later stage reports it again. The program still runs, and
+crashes only if it reaches that site, like any other Roc compile error.
+
+Each report names its construct. A refusal inside another module's source is
+shown in that module's file, followed by the place in the reporting module
+that reached it. Every frame prints as `path:line:col`. The report for a type
+variable left open names the variable as the annotation wrote it, the place it
+stands in, and a fix that follows the cause. The full list of reports is in
+`docs/langref/reifying.md`, "Every Report".
+
+## 8. Where reification runs
+
+### 8.1 The stages
+
+Reification is not a stage of its own. It runs inside the publication of the
+checked module, after solving and before every post-check stage.
+
+| Stage | What it does with a description |
+| --- | --- |
+| Checking | types a function at a code place as usual, records a `CodeReificationSite`, and enforces the position rule (`src/check/Check.zig`) |
+| Description | walks each site's checked bodies, solved types and dispatch plans, builds the normal form with `src/reify/`, and writes the `Code` into the module's `ConstStore` (`reifyStagedCode`, `src/check/code_reifier.zig`) |
+| Lowering | restores the stored node as a constant, or the node the instance table names. It walks no function. |
+| Evaluation | runs the translator as any other Roc, usually while it evaluates a top-level constant. `Code.refuse_at` lowers to a crash statement that carries a `Refusal`. |
+
+A translator's result that a top-level value holds is stored in the binary as
+a constant. A translator also runs during `roc check`.
+
+### 8.2 Invariants
+
+- The walk is the only stage that reads a function body for a `Code`. It
+  consumes solved types and dispatch plans and never infers a missing one. A
+  construct with no normal form stops the walk with a named reason. No
+  partial description exists.
+- A description is a specialization read without lowering. The walk reads
+  types by Monotype's rules, and checking commits nothing for it.
+- Later stages treat a description as a constant. They never read its rows
+  and never rewrite it.
+- Backends know nothing of reification.
+
+### 8.3 Caching and `normal_form_version`
+
+A description is part of the checked artifact, so the module cache stores it
+and a cache hit replays it. An artifact key hashes the keys of its imports,
+and every call the walk follows resolves through an import, so a change to a
+callee's module rebuilds the description.
+
+`normal_form_version` in `src/reify/mod.zig` names the rules. It changes
+exactly when the rules, the builtin table or the speculatable lists change. A
+fingerprint test pins each version, and a recorded entry is never edited, so a
+rule change without a version bump fails the test. Every `Code` carries the
+version, and `Code.version` returns it, so a translator can key its own cache
+with `Code.to_hash` and `Code.version`. A change to the stored layout also
+moves the compiler's `CACHE_VERSION` (`src/compile/cache_config.zig`).
+
+The translator's result is not cached between runs of `roc check`. A slow
+translator makes both `roc check` and `roc build` slower.
+
+## 9. Intrinsics and reify-only definitions
+
+### 9.1 Intrinsics
+
+Some operations of a target have no meaning in Roc: a search score, a session
+value, a database's clock, a GPU texture fetch. Others have a meaning that
+nobody has written in Roc yet. Before intrinsics, such a function needed a
+Roc body, so its author wrote `crash "runs in the database only"`, and misuse
+failed only when the program ran.
+
+An intrinsic is a declaration with a type and no body, outside the builtin
+module and outside a platform:
+
+```roc
+Text :: {}.{
+    is_email : Str -> Bool
+}
+```
+
+It checks, infers and dispatches like any function. It can be a method and
+can have a `where` clause. Nothing says what it computes. Only a translator
+gives it a meaning. A bodyless declaration in a platform module stays hosted,
+and one in an app or a package is an intrinsic
+(`AnnotationOnlyKind.intrinsic`).
+
+At every code place an intrinsic is a `Prim`, whatever the translator's cut
+says. A translator binds it by id, the same as a builtin:
+
+```roc
+{ prim: Code.prim(Text.is_email), render: TextSql.call("is_email") },
+```
+
+A translator sees no difference between the `Prim` of an intrinsic and any
+other `Prim`. It has the same fields, and the normal form is the same. An
+earlier plan gave `Prim` a field `body : [Roc, Intrinsic]`. It was dropped by
+decision: a target binds a primitive by id in either case, and the one place
+where the difference helps a user, a refusal, gets it from the compiler
+(section 7.2).
+
+An intrinsic must be called in a description. Used as a value
+(`xs.map(Text.is_email)`) or named as the function to describe, it is refused,
+as a function in the cut is. Listing one in `code_primitives` is
+`already a primitive`.
+
+### 9.2 Description-only bodies and the runs bit
+
+An intrinsic is legal in code that is described and never run. The checker
+must know which code that is. A body is description-only when it is:
+
+- the body of a lambda written at a code place;
+- a function name written as a `Code` argument, or as the callee of a template
+  call;
+- the whole body of a template, which the reifier walks as code to describe
+  at each call.
+
+The checker counts the description-only bodies around the expression it
+checks, and records the root of each such subtree.
+
+Generic code needs more. In `inner = |x| x.now()` the method `now` is chosen
+only where a use fixes the type of `x`. So each static-dispatch constraint has
+a `runs` bit: it is set when some code that runs uses the relation.
+Compile-time evaluation counts as running. A constraint created outside every
+description-only body runs. An instantiation ANDs each copied constraint's bit
+with the bit of the use. Two merged relations OR their bits. The bit is
+metadata: unification, type keys and constraint equality do not read it, so it
+never changes typing. The over-approximations are declared in design.md, and
+each can only set a bit that could be clear, so a reader can only reject more
+code, never accept code it must reject.
+
+### 9.3 Reify-only definitions
+
+A top-level definition is reify-only when code of it that runs references an
+intrinsic or another reify-only definition. The rule is inferred, never
+annotated.
+
+The pass `src/check/reify_only.zig` finds these definitions once, after the
+module is checked. It reads only data that checking produced: the checked
+bodies minus the description-only subtrees, the lookups, and the dispatch
+edges, each with the final `runs` bit of the relation it resolves. The
+fixpoint is breadth-first and least. Each marked definition records a
+witness, its first reference to an intrinsic or to a definition marked in an
+earlier round. So the chain of witnesses ends at an intrinsic and has no
+cycle, and a mutually recursive group that reaches no intrinsic stays
+unmarked.
+
+A reify-only definition is fine as long as only described code uses it. It is
+walked by its body like any helper, and nothing lowers it.
+
+```roc
+valid = |s| Text.is_email(s)
+
+described = Calc.count(|s| valid(s))   # fine: the translator reads valid
+```
+
+A generic function is reify-only only at a use that fixes its type to one
+whose method is an intrinsic. A call of `outer` at a type whose `now` has a
+body is fine.
+
+### 9.4 The roots rule
+
+A root is a definition whose code runs whatever references it:
+
+- a platform requirement the app supplies, an entry of the module's provides
+  list, and a zero-argument definition the caller records as an evaluated
+  root. The checker reads these from the module header, the platform and the
+  caller. It never finds a root by its name, such as `main!`;
+- a top-level constant, which compile-time evaluation runs;
+- a top-level `expect`.
+
+A root is never reify-only. A reference in a root that runs and reaches an
+intrinsic or a reify-only definition is the error
+`exists only in reified code`, at that reference. The reference is poisoned, so
+it lowers to a crash and nothing behind it is lowered. The report prints the
+chain from the reference to the intrinsic, one line per witness:
+
+```
+── ✗ exists only in reified code ────────────────────────────── main.roc:15:20
+
+This call runs when the program runs, but it reaches an intrinsic, which has no
+Roc body.
+
+echo!(Str.inspect(valid("a@b.c")))
+                  ^^^^^^^^^^^^^^
+
+valid calls Text.is_email at main.roc:10:13
+Text.is_email is an intrinsic at main.roc:7:2
+
+An intrinsic exists only inside a function that a translator describes. Pass
+the function where a Code is expected, or give Text.is_email a Roc body.
+```
+
+A use as a value has the first line "is used here as a value, but it reaches
+an intrinsic". The error behaves as every checking error does: `roc check`
+exits 1, a dev run crashes only if it reaches the reference, `roc build`
+writes the binary and exits 1, and `roc test` counts an `expect` with the
+error under compiler errors.
+
+Two invariants follow, each a debug assertion and `unreachable` in release
+builds: Monotype lowering never reaches an intrinsic, and the reifier never
+asks for an intrinsic's body.
+
+One case needed a rule in Boxy. Boxy fills a dictionary slot for each
+relation of a callee's scheme. A fragment `|q| Db.Q.filter(q, |x| x.t.now())`
+has `now` in its scheme, but only the described lambda uses it. At `Clock`,
+whose `now` is an intrinsic, the evidence is marked
+`description_only_intrinsic`, and Boxy gives the slot a crashing value in
+place of a worker. No run-time code reads it.
+
+### 9.5 Across modules
+
+`ModuleEnv.reify_only_defs` exports each reify-only definition with its
+witness and its full chain of frames. An importer appends the exported chain
+at an imported reify-only definition. So an app that imports `Lib` and not
+`Text` still names `Text.is_email` and its place. The module cache keeps these
+tables, and the checking interface hashes them, so an importer is checked
+again when a frame it reports changes.
+
+### 9.6 Tools
+
+The declaration is the marker, so every listing is exact. All tools read one
+predicate, `ModuleEnv.isIntrinsicDef`.
+
+| Tool | Gives |
+| --- | --- |
+| `roc check --intrinsics` | after the check, one line per intrinsic of the checked modules, imported packages included: `pa/Text.roc:3:2 Text.is_email : Str -> Bool`, sorted by file and line. The exit code is the one of `roc check`. |
+| `roc docs` | the badge `intrinsic: no Roc body` next to the signature |
+| The language server | the same badge on hover over an intrinsic or a use of one |
+| `ROC_REIFY_ONLY` | in Debug and `-Ddev-diagnostics` compilers only: each definition's requirements with their `runs` bits, and each reify-only definition with its witness |
+
+### 9.7 Giving an intrinsic a body later
+
+Adding a body is a local change. The declaration gains a body and nothing
+else changes. Its id stays, because the id is keyed by the declaration, so a
+translator's table still finds it. Callers outside code places start to work,
+and the reports about it go away.
+
+### 9.8 A known over-approximation
+
+The rule is per definition, not per value. In `doubler = make(2.0)` with
+`make = |k| |x| Text.is_close(x, k)`, evaluating the constant only builds a
+closure. It never calls the intrinsic. It is still an error, because `make` is
+reify-only. Making it exact would need reify-only-ness on function types, as
+effects are on `=>`. The fix for the author is to call `make` at the code
+place: `Calc.count(|x| make(2.0)(x))`.
+
+The design is `roc-reify-translator-only-proposal.md`. Its plan for a
+`Prim.body` field was not adopted (section 9.1).
+
+## 10. Refactor safety
+
+A translator reads the program. So a refactor that keeps the meaning could
+still change what a translator emits, and a translator could branch on a name
+or a binding order. This is the strongest objection to the design
+(`roc-reify-refactor-safety.md`).
+
+The answer is that a translator observes a quotient, not the syntax. Roc
+declares a set of meaning-preserving refactors, and the normal form is the same
+under each one:
+
+| Refactor | Why the normal form does not change |
+| --- | --- |
+| rename a local or a parameter | binders are positional |
+| reorder independent bindings | node order comes from the graph |
+| bind a value once or write it twice | the graph is hash-consed |
+| drop a binding nothing reads | dead nodes are removed |
+| extract or inline a helper | non-recursive callees are inlined in `inline`; `outline` chooses its own rows |
+| `and`, `or` and the `if` they mean | one form |
+| `?`, `??`, `return` and the `match` they mean | one form |
+| move code, reformat, comment | no regions in the value |
+| add or remove an annotation | the solved types are the same |
+| method, pipe and operator spellings | one `Prim` |
+
+The full set, with the tiers of guarantee, is section 7 of
+`roc-reify-normal-form.md`. Each example ships a `refactored.roc` that must
+print the same output.
+
+Some refactors stay outside the set, and they should: `x * 2` to `x + x`,
+reassociating a float sum, `len() > 0` to `!is_empty()` outside the `lawful`
+view, or a recursion rewritten as a fold. Each changes the operations that run.
+Each either changes the output or stops the build at the site, never silently.
+
+Two more facts keep translators honest. A translator cannot read names or
+regions, because the description has neither. And the reach across packages is
+bounded by explicit choices: the cut, and pinned package versions. The
+refactor-safety document proposed a marker for packages that expose their
+bodies. The design reads every body outside the cut instead.
+
+## 11. What is refused, and known limits
+
+A function describes when everything it names is fixed by the time checking
+ends. Three kinds of thing are never fixed, and they are the only exclusions:
+
+| Excluded | Why |
+| --- | --- |
+| a function value nothing fixes: a parameter named at the code place, an item of a list | no body stands behind it |
+| a type nothing settles: a type variable with no default | the body reads differently at each type |
+| a template argument the program computes when it runs | the description is built before the program runs |
+
+Effects are out of scope by design. Captured run-time values are refused
+unless the translator binds them. Everything else in pure Roc describes:
+recursion, generic functions at the types the program settles, `where`
+functions, loops, `?`, early `return`, `var` and `crash`. When Roc gains a
+construct, the construct describes if it names fixed things.
+
+Limits that are not part of the rule:
+
+- A lambda parameter has no annotation syntax, so a lambda whose types neither
+  the site nor the numeric default fixes needs a named, annotated function.
+- A top-level value that computes a function cannot be named as the function
+  to describe, because the root needs a lambda whose parameters it can list.
+  `|x| doubler(x)` works.
+- A custom `from_interpolation` that can leave early with `?`, or that is
+  generic in its assembler's item type, is refused.
+- The converted value of a literal of the author's own type is not shown. A
+  translator sees the conversion call, because the reifier runs before that
+  value is computed.
+- A primitive used as a value is refused.
+- `Named` types carry no `TypeId`.
+- A `where` method's argument is not a code place, so an unannotated fragment
+  in method form cannot be described.
+- A refusal inside a callee is reported at the call in the caller, not at the
+  construct inside the callee that stopped the walk.
+
+The checklist lists each unticked box with its reason line.
+
+## 12. Rejected alternatives
+
+Each alternative is in a longer document. In short:
+
+| Alternative | Why not |
+| --- | --- |
+| Explicit construction, `Code.(f)` | `Code` is opaque so that only the compiler builds one, and the signature already says it (`roc-reify-proposal.md` section 3) |
+| Annotating a definition, `is_adult : Code(..)` | a `Code` exists only while the compiler runs; a package ships an ordinary function instead |
+| Monads or a free monad | they structure composition, not representation; the builder still holds a function pointer, and Roc has no higher-kinded types |
+| Effect rows such as `a -[GPU]-> b` | a row says where a function runs, and a translator needs what it says, as data |
+| Tracing, as in JAX | needs a value that is symbolic at run time while it passes for the real type; Roc is static and monomorphic |
+| A compiler that knows each domain | not general, and every diagnostic would be in the compiler instead of in the library |
+| Reifying effectful functions | the normal form would gain ordering semantics, and the platform boundary would move (`roc-reify-proposal.md` 7.8) |
+| A fold, where the translator owns the description | information flows only upward, whole-body analysis needs data again, and the vocabulary is large (`roc-reify-fold-alternative.md`) |
+| A second backend, a primitive-cut dataflow graph, code as run-time data, translatability in the type, a variable-free description | each picks one pipeline point for every target; the trade-offs are in `roc-reify-whole-design-alternatives.md` |
+| Describing once with an open row in `Ty` | derived `==`, record update and scalarization have no meaning over an unknown row (`roc-reify-structural-proposal.md`) |
+| Describing in Monotype per specialization | lowering walks no function, and the checked bodies are not kept there |
+| Primitives listed explicitly in the opaque type's module | a package that lists nothing would have no primitives, so every use would be refused (`roc-reify-opaque-proposal.md`) |
+| Package-declared laws | a wrong law gives a wrong description with no error, and no reference evaluator checks it |
+| Evidence as extra `Prim` arguments | changes the arity of every constrained builtin, and a target would be a primitive used as a value |
+| No evidence | a translator would assume the natural order and translate wrongly without an error |
+| A run-time handle to a captured opaque value, or `Wrap` of its backing | the first needs an existential type; the second breaks the package's abstraction |
+| A builtin encoding format for captures | the translator would decode a format it does not own |
+| An `Op.Widen` node, or tag ids by hash | `Widen` means nothing to a translator; a hash collision selects the wrong arm (`roc-reify-tag-names.md`) |
+| A `Prim.body : [Roc, Intrinsic]` field | a target binds by id in both cases; the refusal report gets the fact from the compiler |
+| A marker for packages that expose their bodies | replaced by the translator's cut and pinned versions |
+
+## 13. Prior art
+
+The closest systems, briefly:
+
+- C# expression trees chose the same trigger in 2007: a lambda at a parameter
+  of type `Expression<T>` becomes a tree.
+- F# reflected definitions reify whole named functions.
+- Julia's GPUCompiler hands a library a typed, monomorphic IR.
+- Swift's `#Predicate` macro serves the same database use case by syntax.
+- Scala 3, MetaOCaml and Template Haskell offer full multi-stage programming
+  with splices, which this design does not have.
+- Dhall and Unison normalize and hash code, but not for translation.
+
+What appears to be new is the combination: ordinary, inferred, pure functions,
+monomorphized by rule, given to a library as a canonical graph that is
+guaranteed identical across a published set of refactors. Roc can offer it
+because it has complete type inference, purity in its types, and strict
+semantics whose one observable order can be stated as a rule. The comparison is `roc-reify-prior-art-comparison.md`, and a survey
+of ideas from less common languages is `roc-reify-prior-art-survey.md`.
+
+## 14. Examples and tests
+
+| Example | What it shows |
+| --- | --- |
+| `examples/reifying/hello/` | a translator of about 60 lines; both ways to refuse |
+| `examples/reifying/glsl/` | a GLSL 330 fragment shader; the `inline` view, `to_tree`, the cut, and a CPU interpreter of the description |
+| `examples/reifying/sql/` | SQL for a schema, migrations and queries; the `graph` view, captured values bound with `Code.Binds`, and the glue package `time_sql` |
+| `examples/reifying/dbsp/` | incremental views as Roc closures, and a Rust circuit out |
+| `examples/reifying/shaders-without-reifying/` | the control experiment: the same shader written as a library DSL |
+| `examples/reifying/surreal/` | a pointer to the SurrealDB ORM, which moved to its own repository, `roc-reify-surrealdb`; it uses fragments, intrinsics and `Code.ty_of` |
+
+The tests come in layers: unit tests of the normal form in `src/reify/`, walk
+tests in `src/compile/test/code_reifier_test.zig`, staging cases from checker
+to translator in `src/eval/test/eval_staging_tests.zig`, CLI fixtures
+`test/cli/Staged*.roc` and `test/cli/Intrinsic*.roc`, the fuzzers, and the
+examples.
+
+The developer diagnostics `ROC_REIFY_INSTANCES` (each closing use and its
+instance table), `ROC_REIFY_ONLY` (runs bits and witnesses) and
+`ROC_REIFY_OUTLINE_STATS` are read only by Debug and `-Ddev-diagnostics`
+compilers.
+
+## 15. Document map
+
+| Document | Role |
+| --- | --- |
+| `docs/reifying-overview.md` | a short overview for the community |
+| `docs/langref/reifying.md` | the user guide, with every report |
+| `roc-reify-design-checklist.md` | the checklist of constructs and features, with the reason line of each refusal |
+| `design.md` "Code Reification", "The Runs Bit", "Reify-Only Definitions" | the compiler's rules and invariants |
+| `roc-reify-proposal.md` | the original proposal: motivation, syntax options, criticisms, use cases |
+| `roc-reify-normal-form.md`, `roc-reify-normalization-plan.md`, `roc-reify-rule-derivation.md` | the normal form, its plan, and the rule tool |
+| `roc-reify-opaque-proposal.md` | primitives of opaque types, ids, evidence, captured opaque values |
+| `roc-reify-structural-proposal.md` | instance descriptions, record presence and defaults, `Named` arguments, `Code.ty_of` |
+| `roc-reify-translator-only-proposal.md` | intrinsics and reify-only definitions |
+| `roc-reify-tag-names.md`, `roc-reify-refactor-safety.md` | tags by name, and the refactor objection |
+| `roc-reify-fold-alternative.md`, `roc-reify-whole-design-alternatives.md`, `roc-reify-prior-art-*.md` | alternatives and prior art |
+
+The proposals record plans. Several details changed in the implementation,
+and this article follows the implementation.

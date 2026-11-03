@@ -76,12 +76,12 @@ NO CHANGE
 			(args
 				(p-assign (ident "value"))
 				(p-assign (ident "fmt")))
-			(e-dispatch-call (method "encode") (constraint-fn-var 401)
+			(e-dispatch-call (method "encode") (constraint-fn-var 482)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "value"))))
 				(args
-					(e-dispatch-call (method "encode") (constraint-fn-var 398)
+					(e-dispatch-call (method "encode") (constraint-fn-var 479)
 						(receiver
 							(e-lookup-local
 								(p-assign (ident "value"))))

@@ -253,7 +253,6 @@ MOD NOT FOUND - fuzz_crash_027.md:6:1:8:4
 MOD NOT FOUND - fuzz_crash_027.md:12:1:12:19
 MOD NOT FOUND - fuzz_crash_027.md:13:1:14:4
 TOO FEW ARGS - fuzz_crash_027.md:21:3:22:4
-DECLARATION HAS NO VALUE - fuzz_crash_027.md:28:1:31:2
 TYPE MISMATCH - fuzz_crash_027.md:50:5:50:8
 NAME NOT BOUND IN EVERY ALTERNATIVE - fuzz_crash_027.md:64:17:64:20
 TYPE MISMATCH - fuzz_crash_027.md:68:3:68:8
@@ -2030,17 +2029,6 @@ TOO FEW ARGS - fuzz_crash_027.md:111:2:113:3
 			(reflow "instead."))
 		(document
 			(source-region (file "fuzz_crash_027.md") (start 21 3) (end 22 4) (annotation error) (line-text "\t\tList( #rg\n\t\t),"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 28 1) (end 31 2))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_027.md") (start 28 1) (end 31 2) (annotation error) (line-text "line : ( # Cpen\n\tBar, #\n\tBaz, #m\n) # Co"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
 	(report
 		(severity runtime_error)
 		(title "Type Mismatch")

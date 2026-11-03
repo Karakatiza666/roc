@@ -8207,7 +8207,7 @@ test "check type - mutually recursive functions - constraint propagation" {
     try checkTypesModuleDefs(
         source,
         &.{
-            .{ .def = "test", .expected = "(c -> { a: c, b: c }, d -> d)" },
+            .{ .def = "test", .expected = "((c -> { a: c, b: c }), (d -> d))" },
         },
     );
 }

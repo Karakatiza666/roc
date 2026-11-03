@@ -2,7 +2,8 @@
 //!
 //! Merkle style: a node's digest comes from its op, payload, types,
 //! immediates, its arguments' digests and its regions' digests; a region's
-//! from its kind, parameter types and its end. A region parameter is named by
+//! from its kind, parameter types, its end and its loops that can end the
+//! row in `Return` (`live.exits`), read or not. A region parameter is named by
 //! its position and by the region that binds it: the owner's op, payload,
 //! types, immediates and arguments, and the region's place among the owner's
 //! regions. So two loops over one start computing one thing have equal body
@@ -13,6 +14,7 @@
 const std = @import("std");
 const collections = @import("collections");
 const ir = @import("ir.zig");
+const live = @import("live.zig");
 const types_mod = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -52,6 +54,11 @@ const Hasher = struct {
     fn text(self: *Hasher, bytes: []const u8) void {
         self.word(@intCast(bytes.len));
         self.h.update(bytes);
+    }
+
+    fn definition(self: *Hasher, d: ir.Definition) void {
+        self.h.update(&d.module);
+        self.word(d.def);
     }
 
     // A type, by its id, or by its content where `ctx` reads content.
@@ -126,6 +133,131 @@ pub fn ofRowContent(gpa: Allocator, store: *const ir.Store, row: ir.RowId, names
     return rowDigest(store, &memo, row);
 }
 
+/// The digest of every node of the rows a site reaches (V5a), for the
+/// `inline` view: `rows` in the order the emitter numbers them, and for
+/// each, its nodes in numbering order (`orders`). The result holds one
+/// slice per row, with one digest per node.
+///
+/// A node's digest is its content digest: its op, immediates and types
+/// hashed by content, so two sites with one normal form give each node one
+/// digest, whatever their type ids and row ids were. A `Call` or `Closure`
+/// that `inline` leaves names its row by the row's place in `rows` and the
+/// content of the row's own body, so a change inside a recursive helper
+/// changes its callers' digests.
+pub fn ofSite(
+    gpa: Allocator,
+    store: *const ir.Store,
+    types: *const types_mod.Types,
+    rows: []const ir.RowId,
+    orders: []const []const NodeId,
+) Allocator.Error![]const []const Digest {
+    std.debug.assert(rows.len == orders.len);
+    var content: Content = .{ .gpa = gpa, .types = types };
+    defer content.deinit();
+    const names = try siteRowNames(gpa, store, rows, &content);
+    defer gpa.free(names);
+    const names_slice: []Digest = names;
+    const named: RowNamer = .{ .ctx = @ptrCast(&names_slice), .name = ByPlace.name };
+    var memo: Memo = .{ .gpa = gpa, .store = store, .names = named, .content = &content };
+    defer memo.deinit();
+    const out = try gpa.alloc([]const Digest, rows.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |each| gpa.free(each);
+        gpa.free(out);
+    }
+    for (orders, out) |order, *slot| {
+        const row_digests = try gpa.alloc(Digest, order.len);
+        errdefer gpa.free(row_digests);
+        for (order, row_digests) |n, *d| d.* = try memo.nodeD(n);
+        slot.* = row_digests;
+        made += 1;
+    }
+    return out;
+}
+
+/// Per row of the store, by index: the name a `Call` or `Closure` of it
+/// has in the digests of a site whose rows are `rows`, in the order the
+/// emitter numbers them (V5a). A row is named by its place in `rows` and the
+/// content of its own body, in which every row it reaches is named by its
+/// place alone, so a row that calls itself has a name. A row outside `rows`
+/// is named 0. The caller frees the result.
+pub fn siteRowNames(gpa: Allocator, store: *const ir.Store, rows: []const ir.RowId, content: *Content) Allocator.Error![]Digest {
+    const place = try gpa.alloc(Digest, store.rows.items.len);
+    defer gpa.free(place);
+    @memset(place, 0);
+    for (rows, 0..) |r, i| place[r.index()] = @as(Digest, i) | (@as(Digest, 1) << 64);
+    const place_slice: []Digest = place;
+    const shallow: RowNamer = .{ .ctx = @ptrCast(&place_slice), .name = ByPlace.name };
+    const names = try gpa.alloc(Digest, store.rows.items.len);
+    errdefer gpa.free(names);
+    @memset(names, 0);
+    for (rows) |r| {
+        var h: Hasher = .{};
+        h.digest(place[r.index()]);
+        h.digest(try ofRowContent(gpa, store, r, shallow, content));
+        names[r.index()] = h.final();
+    }
+    return names;
+}
+
+const ByPlace = struct {
+    fn name(ctx: *const anyopaque, row: ir.RowId) Digest {
+        const table: *const []Digest = @ptrCast(@alignCast(ctx));
+        return table.*[row.index()];
+    }
+};
+
+/// The digest of node `nd`'s own content, by what its ids name
+/// (`ofRowContent`): its op, payload, types and immediates, and not its
+/// arguments or regions. A `Call` or `Closure` names its row by `row_name`,
+/// and the evidence of a `Prim` names each row by `row_names`.
+pub fn localContent(store: *const ir.Store, content: *Content, nd: ir.Node, row_name: ?Digest, row_names: ?[]const Digest) Allocator.Error!Digest {
+    var h: Hasher = .{};
+    const ctx: ContentOnly = .{ .content = content, .row_names = row_names };
+    if (row_name) |d| {
+        h.words(&.{ @backingInt(nd.op), std.math.maxInt(u32) });
+        h.digest(d);
+        h.word(nd.tys.len);
+        for (store.tySlice(nd.tys)) |t| h.digest(try content.ty(t));
+        h.word(nd.aux.len);
+        h.words(store.wordSlice(nd.aux));
+    } else try immediates(store, ctx, &h, nd);
+    h.word(nd.args.len);
+    h.word(nd.regions.len);
+    return h.final();
+}
+
+/// The digest of literal `l`'s type and value.
+pub fn litContent(store: *const ir.Store, content: *Content, l: ir.LitId) Allocator.Error!Digest {
+    var h: Hasher = .{};
+    try content.lit(&h, store, l);
+    return h.final();
+}
+
+// Content read for `localContent`, which reads no child.
+const ContentOnly = struct {
+    content: *Content,
+    /// Per row of the store, by index: its name, where the caller names
+    /// the rows a `Prim`'s evidence reads (D7).
+    row_names: ?[]const Digest = null,
+
+    fn contentOf(self: ContentOnly) ?*Content {
+        return self.content;
+    }
+
+    fn rowName(self: ContentOnly, row: ir.RowId) ?Digest {
+        const names = self.row_names orelse return null;
+        return names[row.index()];
+    }
+};
+
+/// Free what `ofSite` returned.
+pub fn freeSite(gpa: Allocator, digests: []const []const Digest) void {
+    for (digests) |each| gpa.free(each);
+    gpa.free(digests);
+}
+
 fn rowDigest(store: *const ir.Store, memo: *Memo, row: ir.RowId) Allocator.Error!Digest {
     const info = store.row(row);
     var h: Hasher = .{};
@@ -147,7 +279,8 @@ pub const Content = struct {
         self.tys.deinit(self.gpa);
     }
 
-    fn ty(self: *Content, t: TyId) Allocator.Error!Digest {
+    /// The digest of type `t`'s structure, with names by their text.
+    pub fn ty(self: *Content, t: TyId) Allocator.Error!Digest {
         if (self.tys.get(t)) |d| return d;
         const types = self.types;
         const shape = types.get(t);
@@ -163,6 +296,7 @@ pub const Content = struct {
                 for (members) |m| {
                     self.name(&h, m.name);
                     h.word(@intFromBool(m.optional));
+                    self.default(&h, m.default);
                     const tys = types.tySlice(m.tys);
                     h.word(@intCast(tys.len));
                     for (tys) |mt| h.digest(try self.ty(mt));
@@ -172,6 +306,8 @@ pub const Content = struct {
             .list => |elem| h.digest(try self.ty(elem)),
             .nominal => |n| {
                 self.name(&h, n.name);
+                self.origin(&h, n.origin);
+                try self.list(&h, types.tySlice(n.args));
                 h.digest(try self.ty(n.backing));
             },
             .func => |f| {
@@ -180,6 +316,7 @@ pub const Content = struct {
             },
             .opaque_ => |o| {
                 self.name(&h, o.name);
+                self.origin(&h, o.origin);
                 try self.list(&h, types.tySlice(o.args));
             },
             .recursive => |n| self.name(&h, n),
@@ -187,6 +324,51 @@ pub const Content = struct {
         const d = h.final();
         try self.tys.put(self.gpa, t, d);
         return d;
+    }
+
+    // A record field's default (D5): none, computed, or its value by
+    // content, since each table numbers its values in its own order.
+    fn default(self: *Content, h: *Hasher, d: types_mod.Default) void {
+        switch (d) {
+            .none => h.word(0),
+            .computed => h.word(1),
+            _ => {
+                h.word(2);
+                self.value(h, d.value().?);
+            },
+        }
+    }
+
+    fn value(self: *Content, h: *Hasher, v: types_mod.ValueId) void {
+        const types = self.types;
+        const shape = types.value(v);
+        h.word(@backingInt(std.meta.activeTag(shape)));
+        switch (shape) {
+            .int, .dec => |bits| self.wide(h, @bitCast(bits)),
+            .u128 => |bits| self.wide(h, bits),
+            .frac => |bits| self.wide(h, bits),
+            .bool_ => |b| h.word(@intFromBool(b)),
+            .str => |n| self.name(h, n),
+            .record, .tuple, .list => |span| {
+                const items = types.valueSlice(span);
+                h.word(@intCast(items.len));
+                for (items) |item| self.value(h, item);
+            },
+            .tag => |t| {
+                self.name(h, t.name);
+                const items = types.valueSlice(t.payloads);
+                h.word(@intCast(items.len));
+                for (items) |item| self.value(h, item);
+            },
+            .wrap => |backing| self.value(h, backing),
+        }
+    }
+
+    fn wide(_: *Content, h: *Hasher, bits: u128) void {
+        h.word(@truncate(bits));
+        h.word(@truncate(bits >> 32));
+        h.word(@truncate(bits >> 64));
+        h.word(@truncate(bits >> 96));
     }
 
     fn list(self: *Content, h: *Hasher, tys: []const TyId) Allocator.Error!void {
@@ -198,6 +380,15 @@ pub const Content = struct {
         h.text(self.types.nameText(n));
     }
 
+    // A nominal's origin, by its declaration: one table numbers origins in
+    // its own order, and two packages' nominals of one name differ (F2).
+    fn origin(self: *Content, h: *Hasher, o: types_mod.Origin) void {
+        const declaration = self.types.declarationOf(o) orelse return h.word(0);
+        h.word(1);
+        h.h.update(&declaration.module);
+        h.word(declaration.decl);
+    }
+
     fn lit(self: *Content, h: *Hasher, store: *const ir.Store, l: ir.LitId) Allocator.Error!void {
         const entry = store.lit(l);
         h.digest(try self.ty(entry.ty));
@@ -207,6 +398,12 @@ pub const Content = struct {
             .float => |v| h.h.update(std.mem.asBytes(&v)),
             .bool_ => |v| h.word(@intFromBool(v)),
             .str, .bytes => |span| h.text(store.byteSlice(span)),
+            .numeral => |n| {
+                h.word(@intFromBool(n.negative));
+                h.text(n.before(store));
+                h.text(n.after(store));
+                h.h.update(std.mem.asBytes(&n.after_count));
+            },
         }
     }
 };
@@ -283,6 +480,7 @@ fn refDigest(store: *const ir.Store, ctx: anytype, ref: ir.Ref) Allocator.Error!
             h.word(ref.output);
         },
         .row_param => h.words(&.{ 1, ref.output }),
+        .input => h.words(&.{ 3, ref.target }),
         .region_param => {
             h.words(&.{ 2, ref.output });
             h.digest(try binderDigest(store, ctx, ref.regionId()));
@@ -334,6 +532,7 @@ fn immediates(store: *const ir.Store, ctx: anytype, h: *Hasher, nd: ir.Node) All
         h.words(&.{ @backingInt(nd.op), nd.payload, nd.tys.len });
         for (store.tySlice(nd.tys)) |t| h.word(t.index());
         h.word(nd.aux.len);
+        if (nd.op == .prim) return evidenceImmediates(store, ctx, h, store.wordSlice(nd.aux), null);
         h.words(store.wordSlice(nd.aux));
         return;
     };
@@ -341,11 +540,7 @@ fn immediates(store: *const ir.Store, ctx: anytype, h: *Hasher, nd: ir.Node) All
     const aux = store.wordSlice(nd.aux);
     switch (nd.op) {
         .lit => try content.lit(h, store, ir.LitId.of(nd.payload)),
-        .prim => {
-            const name = store.primName(ir.PrimId.of(nd.payload));
-            h.text(name.owner);
-            h.text(name.method);
-        },
+        .prim => primContent(store, h, ir.PrimId.of(nd.payload)),
         // A tag is its name, and one store interns names in its own order.
         .derived, .tag, .payload => content.name(h, types_mod.NameId.of(nd.payload)),
         .call, .closure, .crash, .record, .tuple, .list, .wrap, .field, .index, .elem, .opt_field, .unwrap, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => h.word(nd.payload),
@@ -356,7 +551,42 @@ fn immediates(store: *const ir.Store, ctx: anytype, h: *Hasher, nd: ir.Node) All
     switch (nd.op) {
         .derived => h.digest(try content.ty(TyId.of(aux[0]))),
         .switch_ => for (aux) |l| try content.lit(h, store, ir.LitId.of(l)),
-        .lit, .prim, .call, .closure, .crash, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => h.words(aux),
+        .prim => try evidenceImmediates(store, ctx, h, aux, content),
+        .lit, .call, .closure, .crash, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => h.words(aux),
+    }
+}
+
+// A primitive by what it is: its names and role, and a function of a
+// package by its definition too, as the builder keys it, so two packages'
+// functions of one name differ (F2).
+fn primContent(store: *const ir.Store, h: *Hasher, id: ir.PrimId) void {
+    const name = store.primName(id);
+    h.text(name.owner);
+    h.text(name.method);
+    if (name.role != .none) h.word(@backingInt(name.role));
+    switch (name.origin) {
+        .builtin => {},
+        .declared => |definition| h.definition(definition),
+    }
+}
+
+// The evidence of a `Prim` (D7), entry by entry: a row it names by the
+// row's name where `ctx` names rows, as a `Call` names its row, and every
+// method, type and primitive by its content where `content` is set.
+fn evidenceImmediates(store: *const ir.Store, ctx: anytype, h: *Hasher, aux: []const u32, content: ?*Content) Allocator.Error!void {
+    var it = ir.EvidenceWords.of(aux);
+    while (it.next()) |e| {
+        h.words(&.{ @backingInt(e.kind), e.nested });
+        if (content) |c| {
+            c.name(h, types_mod.NameId.of(e.method));
+            h.digest(try c.ty(e.ty));
+        } else h.words(&.{ e.method, e.ty.index() });
+        switch (e.kind) {
+            .prim => if (content != null) primContent(store, h, ir.PrimId.of(e.target)) else h.word(e.target),
+            .row => if (ctx.rowName(ir.RowId.of(e.target))) |d| h.digest(d) else h.word(e.target),
+            .derived => if (content) |c| c.name(h, types_mod.NameId.of(e.target)) else h.word(e.target),
+            .unreachable_ => {},
+        }
     }
 }
 
@@ -378,10 +608,17 @@ fn regionDigest(store: *const ir.Store, ctx: anytype, r: RegionId) Allocator.Err
         .open, .value, .return_, .continue_, .break_ => {},
     }
     for (store.refSlice(reg.end.refs)) |ref| h.digest(try refDigest(store, ctx, ref));
+    // Its loops that can return, read or not, in the order they run, as the
+    // structural comparison reads them (`equal.zig`).
+    var loops = live.ExitLoops.of(store, r);
+    while (loops.next()) |m| h.digest(try ctx.nodeD(m));
     return h.final();
 }
 
 const testing = std.testing;
+
+// The errors of the test helpers: allocation, and a failed check.
+const TestError = std.mem.Allocator.Error || error{ TestUnexpectedResult, TestExpectedEqual };
 const builder_mod = @import("builder.zig");
 
 test "two arms that compute one value have one digest, wherever the node sits" {
@@ -440,4 +677,38 @@ test "two loops that compute the same thing in two arms have one body digest" {
     try testing.expect(loops[0] != loops[1]);
     try testing.expectEqual(d.regions[bodies[0].index()], d.regions[bodies[1].index()]);
     try testing.expectEqual(d.nodes[loops[0].target], d.nodes[loops[1].target]);
+}
+
+// The content digest of `|x, y| Time.later(x, y)` in a store of its own,
+// where `Time` is the opaque type of `declaration` and `later` the function
+// at `definition`.
+fn timeLaterDigest(declaration: types_mod.Declaration, definition: ir.Definition) TestError!Digest {
+    var store = ir.Store.init(testing.allocator);
+    defer store.deinit();
+    var types = types_mod.Types.init(testing.allocator);
+    defer types.deinit();
+    var b = builder_mod.Builder.init(testing.allocator, &store, &types);
+    defer b.deinit();
+    const time = try types.opaqueTy("Time", try types.declared(declaration), &.{});
+    const row = try b.beginRow(&.{ time, time }, time);
+    const lt = try b.primOf(try b.declaredPrim(definition, "Time", "later", false), &.{ ir.Ref.rowParam(0), ir.Ref.rowParam(1) }, time);
+    try b.endRow(.{ .value = &.{lt} });
+    const order = [_]NodeId{lt.nodeId()};
+    const orders = [_][]const NodeId{&order};
+    const digests = try ofSite(testing.allocator, &store, &types, &.{row}, &orders);
+    defer freeSite(testing.allocator, digests);
+    return digests[0][0];
+}
+
+test "F2: two packages' types and functions of one name have two digests, and one of each has one" {
+    const time_a: types_mod.Declaration = .{ .module = @splat(1), .decl = 3 };
+    const time_b: types_mod.Declaration = .{ .module = @splat(2), .decl = 3 };
+    const lt_a: ir.Definition = .{ .module = @splat(1), .def = 9 };
+    const lt_b: ir.Definition = .{ .module = @splat(2), .def = 9 };
+    const a = try timeLaterDigest(time_a, lt_a);
+    // One type and one function, in another store: one digest.
+    try testing.expectEqual(a, try timeLaterDigest(time_a, lt_a));
+    // Another package's type, or another package's function, of one name.
+    try testing.expect(a != try timeLaterDigest(time_b, lt_a));
+    try testing.expect(a != try timeLaterDigest(time_a, lt_b));
 }

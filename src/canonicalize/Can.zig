@@ -1137,6 +1137,43 @@ fn lookupBuiltinAutoImportedType(self: *const Self, ident: Ident.Idx) ?AutoImpor
     return self.builtin_auto_imported_types.get(ident);
 }
 
+/// What the qualifier `M` names in `M.x`, `M.T`, `M.T.Tag` or a hosted entry
+/// `M.f!`.
+const ModuleQualifier = union(enum) {
+    /// A module the source imports under the name `M`.
+    imported: Scope.ModuleAliasInfo,
+    /// The builtin type named `M`, which no import of the source shadows.
+    builtin: AutoImportedType,
+};
+
+/// The one rule for a module qualifier (roc-lang/roc#12720): a module the
+/// source imports under a name wins over the builtin type of the same name.
+/// The builtin type is the qualifier only where no import binds the name.
+/// Every site that resolves a module qualifier asks here.
+fn resolveModuleQualifier(self: *Self, name: Ident.Idx) std.mem.Allocator.Error!?ModuleQualifier {
+    if (try self.scopeLookupOrPrepareModule(name)) |info| return .{ .imported = info };
+    if (self.lookupBuiltinAutoImportedType(name)) |builtin| return .{ .builtin = builtin };
+    return null;
+}
+
+/// The builtin type that a qualifier names, or null when an import binds the
+/// qualifier or no builtin type has its name. See `resolveModuleQualifier`.
+fn builtinModuleQualifier(self: *Self, name: Ident.Idx) std.mem.Allocator.Error!?AutoImportedType {
+    return switch ((try self.resolveModuleQualifier(name)) orelse return null) {
+        .imported => null,
+        .builtin => |builtin| builtin,
+    };
+}
+
+/// The builtin type that a type binding denotes. Only a binding the compiler
+/// installed for its own baked Builtin module denotes one. A binding from a
+/// source import names that import's module, also when the module has the
+/// name of a builtin type.
+fn builtinTypeOfBinding(self: *const Self, external: Scope.ExternalTypeBinding) ?AutoImportedType {
+    if (!self.externalTypeBindingIsCompilerBuiltin(external)) return null;
+    return self.lookupBuiltinAutoImportedType(external.original_ident);
+}
+
 fn autoImportedTypeUsesCompilerBuiltinImport(info: AutoImportedType) bool {
     return switch (info.import_identity) {
         .compiler_builtin => true,
@@ -6308,33 +6345,34 @@ fn resolvePlatformHosted(
             entry.target_status = .resolved;
             continue;
         };
-        const imported = self.lookupBuiltinAutoImportedType(module_alias) orelse blk: {
-            const module_info = (try self.scopeLookupOrPrepareModule(module_alias)) orelse {
-                entry.target_status = .missing_module;
-                continue;
-            };
-            if (self.lookupBuiltinAutoImportedType(module_info.module_name)) |builtin_info| break :blk builtin_info;
-
-            // Which definition an imported module exposes under this name is
-            // not a source-local question, so the entry waits for the
-            // import-resolution drain.
-            const import_idx = self.scopeLookupImportedModule(module_info.module_name) orelse {
-                entry.target_status = .missing_module;
-                continue;
-            };
-            const ref = try self.pushDeferredRef(.{
-                .import_idx = import_idx,
-                .kind = .hosted_entry,
-                .path = entry.func_ident,
-                .module_name = module_info.module_name,
-                .item_name = entry.func_ident,
-                .parent_name = module_info.module_name,
-                .qualified_name = entry.func_ident,
-                .missing_module_failure = .value_not_exposed,
-                .not_found_failure = .value_not_exposed,
-            });
-            self.setDeferredRefNode(ref, @intCast(entry_index));
+        const qualifier = (try self.resolveModuleQualifier(module_alias)) orelse {
+            entry.target_status = .missing_module;
             continue;
+        };
+        const imported = switch (qualifier) {
+            .builtin => |builtin| builtin,
+            .imported => |module_info| {
+                // Which definition an imported module exposes under this name
+                // is not a source-local question, so the entry waits for the
+                // import-resolution drain.
+                const import_idx = self.scopeLookupImportedModule(module_info.module_name) orelse {
+                    entry.target_status = .missing_module;
+                    continue;
+                };
+                const ref = try self.pushDeferredRef(.{
+                    .import_idx = import_idx,
+                    .kind = .hosted_entry,
+                    .path = entry.func_ident,
+                    .module_name = module_info.module_name,
+                    .item_name = entry.func_ident,
+                    .parent_name = module_info.module_name,
+                    .qualified_name = entry.func_ident,
+                    .missing_module_failure = .value_not_exposed,
+                    .not_found_failure = .value_not_exposed,
+                });
+                self.setDeferredRefNode(ref, @intCast(entry_index));
+                continue;
+            },
         };
 
         const func_text = self.env.getIdent(entry.func_ident);
@@ -8344,17 +8382,7 @@ fn canonicalizeQualifiedIdentExpr(
         }
     }
 
-    const module_info: ?Scope.ModuleAliasInfo = (try self.scopeLookupOrPrepareModule(module_alias)) orelse blk: {
-        if (self.hasBuiltinAutoImportedType(module_alias)) {
-            break :blk Scope.ModuleAliasInfo{
-                .module_name = module_alias,
-                .is_package_qualified = false,
-            };
-        }
-        break :blk null;
-    };
-
-    const module_name = if (module_info) |info| info.module_name else {
+    const qualifier = (try self.resolveModuleQualifier(module_alias)) orelse {
         if (qualifier_tokens.len == 1) {
             if (try self.canonicalizeTypeAssociatedLookup(module_alias, ident, region)) |expr| {
                 return .{ .expr = expr };
@@ -8383,7 +8411,7 @@ fn canonicalizeQualifiedIdentExpr(
         } }) };
     };
 
-    return try self.canonicalizeModuleQualifiedIdent(e, module_name, ident, region, qualifier_tokens);
+    return try self.canonicalizeModuleQualifiedIdent(e, module_alias, qualifier, ident, region, qualifier_tokens);
 }
 
 fn canonicalizeTypeDispatchOwner(
@@ -8459,94 +8487,75 @@ fn canonicalizeTypeAssociatedLookup(
     region: Region,
 ) std.mem.Allocator.Error!?CanonicalizedExpr {
     const module_alias = unresolved_module_alias;
-    const local_type_binding = try self.scopeLookupOrPrepareTypeBinding(module_alias);
-    const is_type_in_scope = local_type_binding != null;
-    const is_auto_imported_type = self.hasBuiltinAutoImportedType(module_alias);
-    if (!is_type_in_scope and !is_auto_imported_type) return null;
+    // The caller reaches here only where `resolveModuleQualifier` found no
+    // module and no builtin type for the name.
+    std.debug.assert(!self.hasBuiltinAutoImportedType(module_alias));
+    const binding_location = (try self.scopeLookupOrPrepareTypeBinding(module_alias)) orelse return null;
 
     const type_qualified_idx = try self.insertQualifiedIdent(self.env.getIdent(module_alias), self.env.getIdent(ident));
 
-    if (local_type_binding) |binding_location| {
-        if (self.typePathForBinding(binding_location.binding.*)) |owner_path| {
-            if (try self.lookupOrCreateAssocValuePattern(owner_path, ident, type_qualified_idx, region)) |pattern_idx| {
-                return try self.canonicalizedAssociatedLookup(owner_path, type_qualified_idx, pattern_idx, region);
-            }
-        }
-
-        const binding = binding_location.binding.*;
-        if (binding == .local_alias) {
-            return try self.canonicalizedLocalAssociatedLookup(
-                @backingInt(binding.local_alias),
-                module_alias,
-                ident,
-                region,
-            );
-        }
-
-        // A type imported via `import M exposing [T]` is an `external_nominal`
-        // binding. Its associated items live in `M` below the declaration the
-        // binding names, which the import-resolution drain settles.
-        if (binding == .external_nominal) {
-            const ext = binding.external_nominal;
-            const import_idx = ext.import_idx orelse try self.getOrCreateAutoImportIdent(ext.module_ident);
-            // A binding the compiler installed for its own baked Builtin
-            // module already carries its target declaration.
-            if (ext.target_node_idx) |type_node_idx| {
-                const type_stmt: Statement.Idx = @fromBackingInt(@intCast(type_node_idx));
-                if (self.lookupBuiltinAutoImportedType(ext.module_ident)) |builtin_type| {
-                    if (builtin_type.env.store.getStatement(type_stmt) == .s_alias_decl) {
-                        return try self.canonicalizedExternalAssociatedLookup(
-                            import_idx,
-                            type_node_idx,
-                            module_alias,
-                            ident,
-                            region,
-                        );
-                    }
-                    const original_type_text = self.env.getIdent(ext.original_ident);
-                    const qualified_type_idx = try self.insertQualifiedIdent(builtin_type.env.module_name, original_type_text);
-                    const fully_qualified_idx = try self.insertQualifiedIdent(self.env.getIdent(qualified_type_idx), self.env.getIdent(ident));
-                    const qualified_text = self.env.getIdent(fully_qualified_idx);
-                    if (builtin_type.env.common.findIdent(qualified_text)) |qname_ident| {
-                        if (builtin_type.env.getExposedValueNodeIndexById(qname_ident)) |target_node_idx| {
-                            return try self.canonicalizedExternalLookup(import_idx, target_node_idx, type_qualified_idx, region);
-                        }
-                    }
-                }
-            }
-            const path_ident = if (ext.names_import_main_type)
-                ident
-            else
-                try self.insertQualifiedIdent(self.env.getIdent(ext.original_ident), self.env.getIdent(ident));
-            return try self.deferredValueExpr(.{
-                .import_idx = import_idx,
-                .kind = .expr_value,
-                .path = path_ident,
-                .module_name = ext.module_ident,
-                .item_name = ident,
-                .parent_name = module_alias,
-                .qualified_name = type_qualified_idx,
-                .missing_module_failure = .nested_value_not_found,
-                .not_found_failure = .nested_value_not_found,
-            }, region);
+    if (self.typePathForBinding(binding_location.binding.*)) |owner_path| {
+        if (try self.lookupOrCreateAssocValuePattern(owner_path, ident, type_qualified_idx, region)) |pattern_idx| {
+            return try self.canonicalizedAssociatedLookup(owner_path, type_qualified_idx, pattern_idx, region);
         }
     }
 
-    if (is_auto_imported_type) {
-        if (self.lookupBuiltinAutoImportedType(module_alias)) |auto_imported_type_env| {
-            const module_env = auto_imported_type_env.env;
-            const qualified_type_text = self.env.getIdent(auto_imported_type_env.qualified_type_ident);
-            const fully_qualified_idx = try self.insertQualifiedIdent(qualified_type_text, self.env.getIdent(ident));
-            const qualified_text = self.env.getIdent(fully_qualified_idx);
+    const binding = binding_location.binding.*;
+    if (binding == .local_alias) {
+        return try self.canonicalizedLocalAssociatedLookup(
+            @backingInt(binding.local_alias),
+            module_alias,
+            ident,
+            region,
+        );
+    }
 
-            if (module_env.common.findIdent(qualified_text)) |qname_ident| {
-                if (module_env.getExposedValueNodeIndexById(qname_ident)) |target_node_idx| {
-                    const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type_env);
-
-                    return try self.canonicalizedExternalLookup(import_idx, target_node_idx, type_qualified_idx, region);
+    // A type imported via `import M exposing [T]` is an `external_nominal`
+    // binding. Its associated items live in `M` below the declaration the
+    // binding names, which the import-resolution drain settles.
+    if (binding == .external_nominal) {
+        const ext = binding.external_nominal;
+        const import_idx = ext.import_idx orelse try self.getOrCreateAutoImportIdent(ext.module_ident);
+        // A binding the compiler installed for its own baked Builtin
+        // module already carries its target declaration.
+        if (ext.target_node_idx) |type_node_idx| {
+            const type_stmt: Statement.Idx = @fromBackingInt(@intCast(type_node_idx));
+            if (self.builtinTypeOfBinding(ext)) |builtin_type| {
+                if (builtin_type.env.store.getStatement(type_stmt) == .s_alias_decl) {
+                    return try self.canonicalizedExternalAssociatedLookup(
+                        import_idx,
+                        type_node_idx,
+                        module_alias,
+                        ident,
+                        region,
+                    );
+                }
+                const original_type_text = self.env.getIdent(ext.original_ident);
+                const qualified_type_idx = try self.insertQualifiedIdent(builtin_type.env.module_name, original_type_text);
+                const fully_qualified_idx = try self.insertQualifiedIdent(self.env.getIdent(qualified_type_idx), self.env.getIdent(ident));
+                const qualified_text = self.env.getIdent(fully_qualified_idx);
+                if (builtin_type.env.common.findIdent(qualified_text)) |qname_ident| {
+                    if (builtin_type.env.getExposedValueNodeIndexById(qname_ident)) |target_node_idx| {
+                        return try self.canonicalizedExternalLookup(import_idx, target_node_idx, type_qualified_idx, region);
+                    }
                 }
             }
         }
+        const path_ident = if (ext.names_import_main_type)
+            ident
+        else
+            try self.insertQualifiedIdent(self.env.getIdent(ext.original_ident), self.env.getIdent(ident));
+        return try self.deferredValueExpr(.{
+            .import_idx = import_idx,
+            .kind = .expr_value,
+            .path = path_ident,
+            .module_name = ext.module_ident,
+            .item_name = ident,
+            .parent_name = module_alias,
+            .qualified_name = type_qualified_idx,
+            .missing_module_failure = .nested_value_not_found,
+            .not_found_failure = .nested_value_not_found,
+        }, region);
     }
 
     switch (self.scopeLookup(.ident, type_qualified_idx)) {
@@ -8566,12 +8575,21 @@ fn canonicalizeTypeAssociatedLookup(
 fn canonicalizeModuleQualifiedIdent(
     self: *Self,
     e: @TypeOf(@as(AST.Expr, undefined).ident),
-    module_name: Ident.Idx,
+    module_alias: Ident.Idx,
+    /// What `module_alias` names, from `resolveModuleQualifier`.
+    qualifier: ModuleQualifier,
     ident: Ident.Idx,
     region: Region,
     qualifier_tokens: []const u32,
 ) std.mem.Allocator.Error!?IdentExprResolution {
-    const auto_imported_type_info = self.lookupBuiltinAutoImportedType(module_name);
+    const auto_imported_type_info: ?AutoImportedType = switch (qualifier) {
+        .imported => null,
+        .builtin => |info| info,
+    };
+    const module_name = switch (qualifier) {
+        .imported => |info| info.module_name,
+        .builtin => module_alias,
+    };
 
     const import_idx = if (auto_imported_type_info) |info|
         try self.getOrCreateAutoImportedTypeImport(info)
@@ -15100,29 +15118,31 @@ fn resolveNominalTypePath(
     const qualifier_toks = self.parse_ir.store.tokenSlice(qualifiers);
     const first_tok_ident = self.parse_ir.tokens.resolveIdentifier(qualifier_toks[0]) orelse
         return Target{ .malformed = notCanonicalized(kind, region) };
-    const is_imported = (try self.scopeLookupOrPrepareModule(first_tok_ident)) != null;
+    const qualifier = try self.resolveModuleQualifier(first_tok_ident);
     const full_type_ident = try self.joinedQualifiedIdent(qualifier_toks, final_type_ident);
-    if (self.lookupBuiltinAutoImportedType(first_tok_ident)) |auto_imported_type| {
-        if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_tok_ident, self.env.getIdent(full_type_ident))) |target_node_idx| {
-            const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type);
+    const module_info: Scope.ModuleAliasInfo = module_blk: {
+        if (qualifier) |q| switch (q) {
+            .imported => |info| break :module_blk info,
+            .builtin => |auto_imported_type| {
+                if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_tok_ident, self.env.getIdent(full_type_ident))) |target_node_idx| {
+                    const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type);
 
-            if (importedNominalTargetProblem(auto_imported_type.env, target_node_idx, first_tok_ident, full_type_ident, type_region)) |problem| {
-                return Target{ .malformed = problem };
-            }
-            return Target{ .auto_imported = .{ .import_idx = import_idx, .target_node_idx = target_node_idx } };
-        }
-    }
+                    if (importedNominalTargetProblem(auto_imported_type.env, target_node_idx, first_tok_ident, full_type_ident, type_region)) |problem| {
+                        return Target{ .malformed = problem };
+                    }
+                    return Target{ .auto_imported = .{ .import_idx = import_idx, .target_node_idx = target_node_idx } };
+                }
+            },
+        };
 
-    if (!is_imported) {
         const nominal_type_decl_stmt_idx = (try self.scopeLookupOrPrepareTypeDecl(full_type_ident)) orelse
             return Target{ .malformed = Diagnostic{ .undeclared_type = .{
                 .name = full_type_ident,
                 .region = type_region,
             } } };
         return localNominalTypePathTarget(self.env, kind, nominal_type_decl_stmt_idx, full_type_ident, type_region);
-    }
+    };
 
-    const module_info = (try self.scopeLookupOrPrepareModule(first_tok_ident)).?;
     const module_name = module_info.module_name;
     const import_idx = self.scopeLookupImportedModule(module_name) orelse
         return Target{ .malformed = Diagnostic{ .module_not_imported = .{
@@ -15263,7 +15283,7 @@ fn finishTagExprWithArgs(
         }
 
         // Not found locally, check if this is an auto-imported type like Bool or Try
-        if (self.lookupBuiltinAutoImportedType(type_tok_ident)) |auto_imported_type| {
+        if (try self.builtinModuleQualifier(type_tok_ident)) |auto_imported_type| {
             // Check if this has a statement_idx - auto-imported types from Builtin (Bool, Try, etc.) have one
             // Regular module imports and primitive types (Str) don't have statement_idx
             if (auto_imported_type.statement_idx) |stmt_idx| {
@@ -15445,7 +15465,7 @@ fn finishTagExprWithArgs(
                 }
             }
 
-            if (self.lookupBuiltinAutoImportedType(first_tok_ident)) |auto_imported_type| {
+            if (try self.builtinModuleQualifier(first_tok_ident)) |auto_imported_type| {
                 if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_tok_ident, self.env.getIdent(full_type_ident))) |target_node_idx| {
                     const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type);
 
@@ -15964,7 +15984,7 @@ fn finishTagPattern(
 
         // Lookup the type ident in scope
         const nominal_type_decl_stmt_idx = (try self.scopeLookupOrPrepareTypeDecl(type_tok_ident)) orelse {
-            if (self.lookupBuiltinAutoImportedType(type_tok_ident)) |auto_imported_type| {
+            if (try self.builtinModuleQualifier(type_tok_ident)) |auto_imported_type| {
                 if (auto_imported_type.statement_idx) |stmt_idx| {
                     const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type);
                     const target_node_idx = auto_imported_type.env.getExposedNodeIndexByStatementIdx(stmt_idx) orelse {
@@ -16127,7 +16147,7 @@ fn finishTagPattern(
                 }
             }
 
-            if (self.lookupBuiltinAutoImportedType(first_tok_ident)) |auto_imported_type| {
+            if (try self.builtinModuleQualifier(first_tok_ident)) |auto_imported_type| {
                 if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_tok_ident, self.env.getIdent(full_type_ident))) |target_node_idx| {
                     const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type);
 
@@ -17871,19 +17891,14 @@ fn canonicalizePatternInGroup(
                     last_pattern = duplicate;
                     continue :patternkernel_loop .dispatch;
                 }
-                // The pattern reaches through the name it binds, so its region
-                // ends where that name does. Reading a binder's name off its
-                // region depends on that, the way an `assign` pattern's region
-                // being exactly its identifier does.
-                const region = base.Region{ .start = state.region.start, .end = name_region.end };
                 // Create the as pattern
-                const adopted_binder = try self.adoptForwardAsBinder(ident_idx, inner_pattern, region);
+                const adopted_binder = try self.adoptForwardAsBinder(ident_idx, inner_pattern, state.region);
                 const pattern_idx = adopted_binder orelse try self.env.addPattern(Pattern{
                     .as = .{
                         .pattern = inner_pattern,
                         .ident = ident_idx,
                     },
-                }, region);
+                }, state.region);
 
                 // Introduce the identifier into scope (an adopted binder is
                 // already there)
@@ -19194,8 +19209,7 @@ fn resolveTypePath(
                         // A binding the compiler installed for its own baked
                         // Builtin module already carries its target.
                         .external => |found| ext: {
-                            const builtin_type = self.lookupBuiltinAutoImportedType(external.module_ident) orelse
-                                self.lookupBuiltinAutoImportedType(external.original_ident);
+                            const builtin_type = self.builtinTypeOfBinding(external);
                             break :ext .{ .external = .{
                                 .import_idx = found.import_idx,
                                 .target_node_idx = found.target_node_idx,
@@ -19338,7 +19352,7 @@ fn resolveQualifiedTypeName(
     }
 
     const first_qualifier_ident = self.parse_ir.tokens.resolveIdentifier(qualifier_toks[0]) orelse unreachable; // the parser builds token spans only from identifier tokens
-    if (self.lookupBuiltinAutoImportedType(first_qualifier_ident)) |auto_imported_type| {
+    if (try self.builtinModuleQualifier(first_qualifier_ident)) |auto_imported_type| {
         if (try self.lookupNestedAutoImportedTypeNode(auto_imported_type, first_qualifier_ident, self.env.getIdent(qualified_name_ident))) |target_node_idx| {
             const import_idx = try self.getOrCreateAutoImportedTypeImport(auto_imported_type);
             return .{ .found = .{ .name = qualified_name_ident, .target = .{ .external = .{
@@ -19542,9 +19556,7 @@ fn resolveNestedExternalType(
     nested_path_ident: Ident.Idx,
 ) std.mem.Allocator.Error!?QualifiedTypeTarget {
     const import_idx = external.import_idx orelse return null;
-    if (self.lookupBuiltinAutoImportedType(external.module_ident) orelse
-        self.lookupBuiltinAutoImportedType(external.original_ident)) |imported_type|
-    {
+    if (self.builtinTypeOfBinding(external)) |imported_type| {
         if (self.isInternalAutoImportedNestedType(imported_type, external.original_ident, self.env.getIdent(type_path_ident))) return null;
         const target_node_idx = (try self.lookupImportedExposedTypeNode(imported_type.env, self.env.getIdent(type_path_ident))) orelse
             (try self.lookupImportedTypeDeclNode(imported_type.env, self.env.getIdent(type_path_ident))) orelse
@@ -20630,25 +20642,30 @@ fn scopeIntroduceModuleAliasAt(
         {
             return .bound;
         }
+        // The rule of `resolveModuleQualifier`: an import wins over the
+        // builtin type of the same name, so the builtin binding is not an
+        // earlier declaration of the name. The import's own type binding
+        // replaces it and reports the shadowed builtin type.
+        if (!typeBindingIsAutoImportedBuiltin(existing_binding)) {
+            // Get the original region from the existing binding
+            const original_region = if (existing_binding == .external_nominal)
+                existing_binding.external_nominal.origin_region
+            else
+                Region.zero();
 
-        // Get the original region from the existing binding
-        const original_region = if (existing_binding == .external_nominal)
-            existing_binding.external_nominal.origin_region
-        else
-            Region.zero();
+            if (report_diagnostics) {
+                try self.env.pushDiagnostic(Diagnostic{
+                    .shadowing_warning = .{
+                        .ident = alias_name,
+                        .region = import_region,
+                        .original_region = original_region,
+                    },
+                });
+            }
 
-        if (report_diagnostics) {
-            try self.env.pushDiagnostic(Diagnostic{
-                .shadowing_warning = .{
-                    .ident = alias_name,
-                    .region = import_region,
-                    .original_region = original_region,
-                },
-            });
+            // Don't add the duplicate binding
+            return .duplicate;
         }
-
-        // Don't add the duplicate binding
-        return .duplicate;
     }
 
     // Simplified introduction without parent lookup for now

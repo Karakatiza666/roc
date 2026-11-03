@@ -5,6 +5,7 @@
 //! | every ref points to a row parameter, a parameter of an enclosing region, or an earlier node in an enclosing region | `checkRef` |
 //! | every node's types agree with its op and its argument types; a `Lambda` owns one lambda body over its function type's parameters | `checkTypes` |
 //! | a value that flows into a slot has a type that conforms to the slot's (`Types.widens`): the member of a record, tuple or tag, a `Wrap` or `Call` or `Apply` argument, a region's end value, a jump value, a loop argument. A projection takes its type from its argument and stays exact. | `checkTypes`, `region` |
+//! | only the root reads an input slot (N18c); a projection of a slot is a node only over a slot the root reads whole, and no node reads a slot that is a projection of a whole slot (N18b, N18e) | `checkRef`, `node` |
 //! | `speculatable` agrees with the op, the builtin table, the callee row, and the owned regions | `checkSpeculatable` |
 //! | every path of a loop body ends in `Continue`, `Break`, `Return` or a `Jump`; `Continue` and `Break` appear only in loop bodies; a `Jump` names a join of the exiting switch its region belongs to, and a join jumps only to a later join | `checkEnd` |
 //!
@@ -39,7 +40,7 @@ pub const Report = struct {
         return self.messages.items.len == 0;
     }
 
-    fn add(self: *Report, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+    pub fn add(self: *Report, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
         try self.messages.append(self.gpa, try std.fmt.allocPrint(self.gpa, fmt, args));
     }
 };
@@ -79,6 +80,15 @@ const Verifier = struct {
         switch (ref.kind) {
             .row_param => if (ref.output >= self.store.row(row_id).params.len)
                 try self.report.add("{s} {d}: row parameter {d} out of range", .{ what, id, ref.output }),
+            // N18c: only the root reads a slot, and the root is the one row
+            // with fixed parameters that no call reaches.
+            .input => {
+                if (ref.target >= self.store.slots.items.len) return self.report.add("{s} {d}: input slot {d} does not exist", .{ what, id, ref.target });
+                if (!self.store.row(row_id).fixed_params) try self.report.add("{s} {d}: reads input slot {d} in a row that is not the root", .{ what, id, ref.target });
+                // N18e: a slot that is a projection of a whole slot is read
+                // as the projections from it.
+                if (self.store.wholeAncestor(ref.slotId()) != null) try self.report.add("{s} {d}: reads input slot {d}, a projection of a slot the root reads whole", .{ what, id, ref.target });
+            },
             .region_param => {
                 const p = ref.regionId();
                 if (p.index() >= self.store.regionCount()) return self.report.add("{s} {d}: region {d} does not exist", .{ what, id, p.index() });
@@ -99,6 +109,11 @@ const Verifier = struct {
     fn node(self: *Verifier, n: NodeId) Allocator.Error!void {
         const nd = self.store.node(n);
         for (self.store.refSlice(nd.args)) |a| try self.checkRef(nd.region, n, a, "node", n.index());
+        // N18b, N18e: a projection of a slot is a node only over a whole slot.
+        if (nd.op == .field or nd.op == .index or nd.op == .unwrap) {
+            const of = self.store.refSlice(nd.args)[0];
+            if (of.kind == .input and !self.store.slots.items[of.target].whole) try self.report.add("node {d}: a projection of input slot {d}, which is a slot of its own", .{ n.index(), of.target });
+        }
         for (self.store.regionSlice(nd.regions)) |r| {
             const reg = self.store.region(r);
             if (reg.owner != n) try self.report.add("node {d}: owns region {d}, whose owner is {d}", .{ n.index(), r.index(), reg.owner.index() });
@@ -117,7 +132,7 @@ const Verifier = struct {
                 break :blk if (self.types.get(a.ty).int.signed()) @as(i128, @bitCast(x)) < @as(i128, @bitCast(y)) else x < y;
             },
             .str => |x| std.mem.order(u8, self.store.byteSlice(x), self.store.byteSlice(b.value.str)) == .lt,
-            .bool_, .float, .dec, .bytes => false,
+            .bool_, .float, .dec, .bytes, .numeral => false,
         };
     }
 
@@ -148,9 +163,16 @@ const Verifier = struct {
         const bad = switch (nd.op) {
             .lit => !single or self.store.lit(ir.LitId.of(nd.payload)).ty != tys[0],
             .prim => blk: {
+                // A row the evidence names (D7) exists and is not merged away.
+                var evidence = ir.EvidenceWords.of(self.store.wordSlice(nd.aux));
+                while (evidence.next()) |e| if (e.kind == .row) {
+                    if (e.target >= self.store.rows.items.len or self.store.row(RowId.of(e.target)).merged_into != null) break :blk true;
+                };
                 // A primitive the table does not hold takes the types the checker gave it.
                 const p = prims.lookup(ir.PrimId.of(nd.payload)) orelse break :blk !single;
                 if (!single or !p.takes(args.len)) break :blk true;
+                // A checked chain is one only where N13u proved it fits.
+                if (!p.associative and args.len > p.arity and !self.provedFit(n)) break :blk true;
                 break :blk !try self.primTypesAgree(p, nd, tys[0]);
             },
             .record => blk: {
@@ -158,10 +180,29 @@ const Verifier = struct {
                 const t = self.types.get(tys[0]);
                 if (t != .record) break :blk true;
                 const members = self.types.memberSlice(t.record);
-                if (members.len != args.len) break :blk true;
-                const slots = try self.report.gpa.alloc(TyId, members.len);
+                const set = self.store.wordSlice(nd.aux);
+                // A node that sets every member lists none, and one that
+                // leaves a member unset lists the members it sets, in the
+                // type's order, with every required member among them.
+                if (args.len == members.len) {
+                    if (set.len != 0) break :blk true;
+                } else {
+                    if (set.len != args.len) break :blk true;
+                    var from: usize = 0;
+                    for (set) |k| {
+                        if (k < from or k >= members.len) break :blk true;
+                        from = k + 1;
+                    }
+                    for (members, 0..) |m, k| {
+                        if (!m.optional and std.mem.findScalar(u32, set, @intCast(k)) == null) break :blk true;
+                    }
+                }
+                const slots = try self.report.gpa.alloc(TyId, args.len);
                 defer self.report.gpa.free(slots);
-                for (members, slots) |m, *slot| slot.* = self.types.tySlice(m.tys)[0];
+                for (slots, 0..) |*slot, at| {
+                    const k = if (args.len == members.len) at else set[at];
+                    slot.* = self.types.tySlice(members[k].tys)[0];
+                }
                 break :blk !try self.argsFit(nd, 0, slots);
             },
             .tuple => blk: {
@@ -256,15 +297,24 @@ const Verifier = struct {
                     .for_range => 2,
                     .for_list => 1,
                     .loop => 0,
-                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable,
+                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // this branch is reached for loop ops only
                 };
                 const header: usize = switch (nd.op) {
                     .for_range => 1,
                     .for_list => 2,
                     .loop => 0,
-                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable,
+                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // this branch is reached for loop ops only
                 };
-                if (args.len < lead or params.len != header + (args.len - lead) or tys.len != args.len - lead) break :blk true;
+                if (args.len < lead or params.len != header + (args.len - lead)) break :blk true;
+                // A bounded loop's outputs are its slots, as they stand when
+                // the indices run out. A general loop ends only in `Break`,
+                // so its outputs are the values its `Break`s carry, and they
+                // are free of its slots (N12).
+                if (nd.op == .loop) {
+                    for (0..args.len - lead) |k| if (!try self.argFits(nd, lead + k, params[header + k])) break :blk true;
+                    break :blk false;
+                }
+                if (tys.len != args.len - lead) break :blk true;
                 for (tys, 0..) |t, k| if (t != params[header + k] or !try self.argFits(nd, lead + k, t)) break :blk true;
                 break :blk false;
             },
@@ -285,7 +335,8 @@ const Verifier = struct {
                 if (!std.mem.eql(TyId, self.store.tySlice(reg.params), self.types.tySlice(f.func.params))) break :blk true;
                 break :blk !try self.endGives(body[0], &.{f.func.ret});
             },
-            .crash, .derived, .list, .closure, .elem, .opt_field => !single,
+            .crash => !single or std.enums.fromInt(ir.CrashKind, nd.payload) == null,
+            .derived, .list, .closure, .elem, .opt_field => !single,
         };
         if (bad) try self.report.add("node {d}: types disagree with op {s}", .{ n.index(), @tagName(nd.op) });
     }
@@ -301,6 +352,18 @@ const Verifier = struct {
     }
 
     fn primTypesAgree(self: *Verifier, p: prims.Prim, nd: ir.Node, result: TyId) Allocator.Error!bool {
+        // A numeral builtin reads one `Num.Numeral`, which is opaque.
+        if (prims.isNumeralMethod(p.method)) return switch (self.types.get(self.argTy(nd, 0))) {
+            .opaque_ => switch (p.method) {
+                .is_negative => result == try self.types.boolTy(),
+                .digits_after_pt_count => result == try self.types.intTy(.u64),
+                .digits_before_pt, .digits_after_pt => result == try self.types.listTy(try self.types.intTy(.u8)),
+                // `Try(owner, [InvalidNumeral(Str)])`, a nominal.
+                .from_numeral => self.types.get(result) == .nominal,
+                .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or => unreachable, // the branch is taken only for a numeral builtin (prims.isNumeralMethod)
+            },
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .nominal, .func, .recursive => false,
+        };
         const operand: ?TyId = if (p.owner.int()) |int|
             try self.types.intTy(int)
         else if (p.owner.float()) |float|
@@ -308,8 +371,9 @@ const Verifier = struct {
         else switch (p.owner) {
             .bool_ => try self.types.boolTy(),
             .str => try self.types.strTy(),
-            .list => null,
-            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => unreachable,
+            .list, .iter, .try_ => null,
+            .numeral => unreachable, // every builtin of Num.Numeral is a numeral builtin, handled above
+            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128, .f32, .f64 => unreachable, // int and float owners are handled by the branches above
         };
         if (operand) |o| for (0..self.store.refSlice(nd.args).len) |k| if (self.argTy(nd, k) != o) return false;
         const bool_ty = try self.types.boolTy();
@@ -317,7 +381,15 @@ const Verifier = struct {
             .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not => result == bool_ty,
             .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat => result == self.argTy(nd, 0),
             .len => result == try self.types.intTy(.u64),
-            .get => true,
+            .is_empty => result == bool_ty,
+            .append, .keep_if => result == self.argTy(nd, 0),
+            .fold => result == self.argTy(nd, 1),
+            .prepend, .drop_first, .take_first => result == self.argTy(nd, 0),
+            .fold_rev, .fold_with_index => result == self.argTy(nd, 1),
+            .ok_or => result == self.argTy(nd, 1),
+            .any, .all => result == bool_ty,
+            .get, .map, .collect, .first, .last, .single, .with_capacity, .set, .repeat, .map2, .map_with_index, .sum => true,
+            .from_numeral, .is_negative, .digits_before_pt, .digits_after_pt, .digits_after_pt_count => unreachable, // a numeral builtin returned above (prims.isNumeralMethod)
         };
     }
 
@@ -325,13 +397,20 @@ const Verifier = struct {
         const want: bool = switch (nd.op) {
             .lit, .record, .tuple, .list, .tag, .wrap, .unwrap, .closure, .field, .index, .opt_field, .lambda => true,
             .payload, .elem, .crash, .derived, .loop, .apply => false,
-            .prim => if (prims.lookup(ir.PrimId.of(nd.payload))) |p| p.speculatable else false,
+            // A checked op N13u proved fits its type is speculatable, and the
+            // store records the proof (`ir.NodeRange.fits`).
+            .prim => if (prims.lookup(ir.PrimId.of(nd.payload))) |p| p.speculatable or self.provedFit(n) else false,
             .call => self.store.row(RowId.of(nd.payload)).speculatable,
             .and_, .or_, .switch_, .for_range, .for_list => for (self.store.regionSlice(nd.regions)) |r| {
                 if (!self.regionSpeculatable(r)) break false;
             } else true,
         };
         if (want != nd.flags.speculatable) try self.report.add("node {d}: speculatable is {}, the op gives {}", .{ n.index(), nd.flags.speculatable, want });
+    }
+
+    fn provedFit(self: *const Verifier, n: NodeId) bool {
+        const r = self.store.ranges.get(n) orelse return false;
+        return r.fits;
     }
 
     fn regionSpeculatable(self: *Verifier, r: RegionId) bool {
@@ -353,7 +432,7 @@ const Verifier = struct {
         for (self.store.refSlice(reg.end.refs)) |ref| try self.checkRef(r, null, ref, "region", r.index());
         const loop = self.innermostLoopBody(r);
         switch (reg.end.kind) {
-            .open => unreachable,
+            .open => unreachable, // open ends are reported just above
             .value => {
                 if (reg.kind == .loop_body) try self.report.add("region {d}: a loop body ends in Value", .{r.index()});
                 // A row body delivers the row's result.
@@ -368,9 +447,16 @@ const Verifier = struct {
             },
             .continue_, .break_ => {
                 const lb = loop orelse return self.report.add("region {d}: {s} outside a loop body", .{ r.index(), @tagName(reg.end.kind) });
-                // `Continue` carries the next slots and `Break` the loop's outputs: one per slot either way.
-                const want = self.store.node(self.store.region(lb).owner).tys.len;
-                if (reg.end.refs.len != want) try self.report.add("region {d}: {s} carries {d} values for {d} slots", .{ r.index(), @tagName(reg.end.kind), reg.end.refs.len, want });
+                // `Continue` carries the next slots and `Break` the loop's outputs.
+                const owner = self.store.node(self.store.region(lb).owner);
+                const slots = self.store.tySlice(self.store.region(lb).params).len - switch (owner.op) {
+                    .for_range => @as(usize, 1),
+                    .for_list => 2,
+                    .loop => 0,
+                    .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .lambda, .apply => unreachable, // a loop body is owned by a loop
+                };
+                const want = if (reg.end.kind == .continue_) slots else owner.tys.len;
+                if (reg.end.refs.len != want) try self.report.add("region {d}: {s} carries {d} values for {d}", .{ r.index(), @tagName(reg.end.kind), reg.end.refs.len, want });
             },
             .branch => {
                 const sw = NodeId.of(reg.end.target);
@@ -603,4 +689,58 @@ test "a call may carry a wider type than its row's result, and not a narrower on
     var report = try verifyAll(testing.allocator, &store, &types);
     defer report.deinit();
     try testing.expect(!report.ok());
+}
+
+test "F9: a row whose result is a nominal and whose value is the structural backing does not verify" {
+    // Rule L: the lift into a nominal is a `Wrap`. Without it the value does
+    // not conform to the row's result, and the verifier says so.
+    var store = ir.Store.init(testing.allocator);
+    defer store.deinit();
+    var types = types_mod.Types.init(testing.allocator);
+    defer types.deinit();
+    var b = builder_mod.Builder.init(testing.allocator, &store, &types);
+    defer b.deinit();
+    const i64_ty = try types.intTy(.i64);
+    const backing = try types.tagUnionTy(&.{ .{ .name = "Err", .payload = &.{} }, .{ .name = "Ok", .payload = &.{i64_ty} } });
+    const try_ty = try types.nominalTy("Try", .builtin, &.{}, backing);
+    {
+        _ = try b.beginRow(&.{backing}, try_ty);
+        try b.endRow(.{ .value = &.{try b.wrap(try_ty, Ref.rowParam(0))} });
+        var report = try verifyAll(testing.allocator, &store, &types);
+        defer report.deinit();
+        try testing.expect(report.ok());
+    }
+    _ = try b.beginRow(&.{backing}, try_ty);
+    try b.endRow(.{ .value = &.{Ref.rowParam(0)} });
+    var report = try verifyAll(testing.allocator, &store, &types);
+    defer report.deinit();
+    try testing.expect(!report.ok());
+    try testing.expect(std.mem.find(u8, report.messages.items[0], "does not conform to the row's result") != null);
+}
+
+test "an input slot verifies in the root and is reported in any other row" {
+    var store = ir.Store.init(testing.allocator);
+    defer store.deinit();
+    var types = types_mod.Types.init(testing.allocator);
+    defer types.deinit();
+    var b = builder_mod.Builder.init(testing.allocator, &store, &types);
+    defer b.deinit();
+    const i64_ty = try types.intTy(.i64);
+    const row = try b.beginRow(&.{i64_ty}, i64_ty);
+    const sum = try b.call(.i64, .plus_wrap, &.{ Ref.rowParam(0), try b.input(i64_ty, 0) });
+    try b.endRow(.{ .value = &.{sum} });
+
+    var not_root = try verifyAll(testing.allocator, &store, &types);
+    defer not_root.deinit();
+    try testing.expect(!not_root.ok());
+    var saw = false;
+    for (not_root.messages.items) |m| {
+        if (std.mem.find(u8, m, "in a row that is not the root") != null) saw = true;
+    }
+    try testing.expect(saw);
+
+    store.rows.items[row.index()].fixed_params = true;
+    var root = try verifyAll(testing.allocator, &store, &types);
+    defer root.deinit();
+    try testing.expect(root.ok());
 }

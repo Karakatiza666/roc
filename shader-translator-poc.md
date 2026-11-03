@@ -192,7 +192,7 @@ Each node carries its solved type, because a shader translator must distinguish
 **Reification happens after solving.** Types must be concrete; before solving
 `0.8` is an open numeric literal. The reifier runs in the checker once
 solving is done, and describes each site at the types its `Code(f)` fixes
-(`roc-reify-design.md` §9).
+(`roc-reify-design-checklist.md` §9).
 
 **A reference must be followed.** `Glsl.fragment_330(wobble)` passes a
 *name*, not a lambda literal. The reifier has to resolve the top-level

@@ -49,6 +49,9 @@ pub const Emitter = struct {
     str_cache: std.StringHashMapUnmanaged(ConstNodeId) = .empty,
     /// Per row of the site being written: its index in the graph.
     row_index: collections.DenseMapUnmanaged(RowId, u32) = .empty,
+    /// The input slots the root of the graph last written reads, in slot
+    /// order (N18d). `Input(k)` reads `slot_order[k]`.
+    slot_order: []ir.SlotId = &.{},
 
     /// An emitter over `store`, whose rows are in their normal form.
     pub fn init(gpa: Allocator, out: *ConstStore, store: *const ir.Store, types: *const types_mod.Types) Allocator.Error!Emitter {
@@ -66,6 +69,7 @@ pub const Emitter = struct {
         while (keys.next()) |k| self.gpa.free(k.*);
         self.str_cache.deinit(self.gpa);
         self.row_index.deinit(self.gpa);
+        self.gpa.free(self.slot_order);
     }
 
     fn clearRegions(self: *Emitter) void {
@@ -86,6 +90,30 @@ pub const Emitter = struct {
         return self.record(&.{ graph_node, try self.scalar(.{ .u64 = site_key }), try self.u32Node(version) });
     }
 
+    /// The `Code.Inlined` backing over a graph already written and its
+    /// digests (`digests`): `{ digests, graph, site, version }`, in label
+    /// order.
+    pub fn inlinedOf(self: *Emitter, graph_node: ConstNodeId, digests_node: ConstNodeId, site_key: u64) Allocator.Error!ConstNodeId {
+        return self.record(&.{ digests_node, graph_node, try self.scalar(.{ .u64 = site_key }), try self.u32Node(version) });
+    }
+
+    /// The content digest of every node of the rows the site of `root`
+    /// reaches (V5a): a list per row, root first, with one `U128` per node,
+    /// in the numbering of `graph`.
+    pub fn digests(self: *Emitter, root: RowId) Allocator.Error!ConstNodeId {
+        const all = try reify.rows.siteDigests(self.gpa, self.store, self.types, root);
+        defer reify.digest.freeSite(self.gpa, all);
+        const per_row = try self.gpa.alloc(ConstNodeId, all.len);
+        defer self.gpa.free(per_row);
+        for (all, per_row) |row_digests, *out| {
+            const items = try self.gpa.alloc(ConstNodeId, row_digests.len);
+            defer self.gpa.free(items);
+            for (row_digests, items) |d, *o| o.* = try self.scalar(.{ .u128 = d });
+            out.* = try self.listOf(items);
+        }
+        return self.listOf(per_row);
+    }
+
     /// The `Graph` of the site whose root is `root`: the rows it reaches.
     pub fn graph(self: *Emitter, root: RowId) Allocator.Error!ConstNodeId {
         self.row_index.clearRetainingCapacity();
@@ -98,10 +126,17 @@ pub const Emitter = struct {
         }
         try reify.number.siteRows(self.gpa, self.store, &returns, root, &rows);
         for (rows.keys(), 0..) |r, i| try self.row_index.put(self.gpa, r, @intCast(i));
+        self.gpa.free(self.slot_order);
+        self.slot_order = &.{};
+        self.slot_order = try reify.number.slotOrder(self.gpa, self.store, root, &rows.values()[0]);
         const row_nodes = try self.gpa.alloc(ConstNodeId, rows.count());
         defer self.gpa.free(row_nodes);
         for (rows.keys(), rows.values(), row_nodes) |r, *numbering, *node| node.* = try self.rowValue(r, numbering);
-        return self.record(&.{ try self.u32Node(0), try self.listOf(row_nodes) });
+        const slot_tys = try self.gpa.alloc(TyId, self.slot_order.len);
+        defer self.gpa.free(slot_tys);
+        for (self.slot_order, slot_tys) |slot, *t| t.* = self.store.slots.items[slot.index()].ty;
+        // `Graph := { root, rows, slots }`, in label order.
+        return self.record(&.{ try self.u32Node(0), try self.listOf(row_nodes), try self.tyList(slot_tys) });
     }
 
     // `Row := { id, params, result, nodes, body, recursive }`.
@@ -168,6 +203,13 @@ pub const Emitter = struct {
     fn val(self: *Emitter, ref: Ref) Allocator.Error!ConstNodeId {
         return switch (ref.kind) {
             .row_param => self.tag("Param", &.{try self.u32Node(ref.output)}),
+            .input => blk: {
+                const slot = ref.slotId();
+                const k = for (self.slot_order, 0..) |held, at| {
+                    if (held == slot) break at;
+                } else invariant("a live value reads an input slot the root's slot order does not hold");
+                break :blk self.tag("Input", &.{try self.u32Node(@intCast(k))});
+            },
             .region_param => blk: {
                 const owner = self.store.region(ref.regionId()).owner;
                 break :blk self.tag("Arg", &.{try self.record(&.{ try self.u32Node(ref.output), try self.u32Node(self.index[owner.index()]) })});
@@ -205,16 +247,23 @@ pub const Emitter = struct {
         return switch (nd.op) {
             .lit => self.tag("Lit", &.{try self.lit(ir.LitId.of(nd.payload))}),
             .prim => blk: {
-                const name = self.store.primName(ir.PrimId.of(nd.payload));
-                break :blk self.tag("Prim", &.{try self.record(&.{ try self.str(name.method), try self.str(name.owner) })});
+                var it = ir.EvidenceWords.of(self.store.wordSlice(nd.aux));
+                break :blk self.tag("Prim", &.{try self.primRecord(ir.PrimId.of(nd.payload), &it, it.left)});
             },
             .call => self.tag("Call", &.{try self.u32Node(self.row_index.get(RowId.of(nd.payload)).?)}),
             .closure => self.tag("Closure", &.{try self.u32Node(self.row_index.get(RowId.of(nd.payload)).?)}),
             .record => blk: {
+                // The names of the fields the node sets: every field of the
+                // type, or the ones it lists where it leaves a field unset
+                // (`ir.RecordForm`).
                 const fields = self.types.memberSlice(self.types.get(tys[0]).record);
-                const names = try self.gpa.alloc(ConstNodeId, fields.len);
+                const set = self.store.wordSlice(nd.aux);
+                const names = try self.gpa.alloc(ConstNodeId, args.len);
                 defer self.gpa.free(names);
-                for (fields, names) |f, *o| o.* = try self.str(self.types.nameText(f.name));
+                for (names, 0..) |*o, at| {
+                    const field = if (args.len == fields.len) fields[at] else fields[set[at]];
+                    o.* = try self.str(self.types.nameText(field.name));
+                }
                 break :blk self.tag("Record", &.{try self.listOf(names)});
             },
             .tuple => self.tag("Tuple", &.{}),
@@ -239,12 +288,40 @@ pub const Emitter = struct {
             .or_ => self.tag("Or", &.{try self.regionList(regions)}),
             .for_range => self.tag("ForRange", &.{try self.record(&.{ try self.regionValue(regions[0]), try self.boolNode(nd.payload == 1) })}),
             .for_list => self.tag("ForList", &.{try self.regionValue(regions[0])}),
-            .loop => self.tag("Loop", &.{try self.regionValue(regions[0])}),
+            .loop => self.tag("Loop", &.{try self.record(&.{
+                try self.regionValue(regions[0]),
+                try self.tyList(self.store.tySlice(nd.tys)),
+            })}),
             .lambda => self.tag("Lambda", &.{try self.regionValue(regions[0])}),
             .switch_ => self.switchOp(r, nd, args[0], regions),
             // An `Apply` a site reaches refuses the site before it is emitted (N8j).
             .apply => invariant("an Apply reached the emitter"),
         };
+    }
+
+    // `{ evidence, id, method, owner }`, in label order: a `Prim` op, or a
+    // `Prim` target of evidence, whose own `count` entries `it` reads next.
+    fn primRecord(self: *Emitter, id: ir.PrimId, it: *ir.EvidenceWords, count: u32) Allocator.Error!ConstNodeId {
+        const name = self.store.primName(id);
+        return self.record(&.{ try self.evidenceList(it, count), try self.identityOf(reify.identity.prim(name)), try self.str(name.method), try self.str(name.owner) });
+    }
+
+    // `List(Evidence)`, `Evidence := { method, target, ty }` in label order,
+    // with `Target := [Prim(..), Row(U32), Derived(Str), Unreachable]` (D7).
+    fn evidenceList(self: *Emitter, it: *ir.EvidenceWords, count: u32) Allocator.Error!ConstNodeId {
+        const out = try self.gpa.alloc(ConstNodeId, count);
+        defer self.gpa.free(out);
+        for (out) |*o| {
+            const e = it.next() orelse invariant("a Prim's evidence ends before its count");
+            const target = switch (e.kind) {
+                .prim => try self.tag("Prim", &.{try self.primRecord(ir.PrimId.of(e.target), it, e.nested)}),
+                .row => try self.tag("Row", &.{try self.u32Node(self.row_index.get(RowId.of(e.target)) orelse invariant("a Prim's evidence names a row the site does not reach"))}),
+                .derived => try self.tag("Derived", &.{try self.str(self.types.nameText(types_mod.NameId.of(e.target)))}),
+                .unreachable_ => try self.tag("Unreachable", &.{}),
+            };
+            o.* = try self.record(&.{ try self.str(self.types.nameText(types_mod.NameId.of(e.method))), target, try self.ty(e.ty) });
+        }
+        return self.listOf(out);
     }
 
     // `Switch({ arms : List({ key, region }), joins, outputs })`.
@@ -289,7 +366,7 @@ pub const Emitter = struct {
         return self.types.nameText(fields[k].name);
     }
 
-    // `Lit := [Int(I128, Ty), Frac(F64, Ty), Fixed(Dec), Bool(Bool), Str(Str), Bytes(List(U8))]`.
+    // `Lit := [Int(I128, Ty), Frac(F64, Ty), Fixed(Dec), Bool(Bool), Str(Str), Bytes(List(U8)), Numeral(Num.Numeral)]`.
     fn lit(self: *Emitter, id: ir.LitId) Allocator.Error!ConstNodeId {
         const l = self.store.lit(id);
         return switch (l.value) {
@@ -304,17 +381,33 @@ pub const Emitter = struct {
             .dec => |bits| self.tag("Fixed", &.{try self.scalar(.{ .dec_bits = @bitCast(bits) })}),
             .bool_ => |b| self.tag("Bool", &.{try self.boolNode(b)}),
             .str => |span| self.tag("Str", &.{try self.str(self.store.byteSlice(span))}),
-            .bytes => |span| blk: {
-                const bytes = self.store.byteSlice(span);
-                const data = try self.out.addBlobData(bytes);
-                const packed_node = try self.out.append(.{ .list = .{ .packed_bytes = .{
-                    .bytes = .{ .data = data, .offset = 0, .len = @intCast(bytes.len) },
-                    .len = @intCast(bytes.len),
-                    .element = .u8,
-                } } });
-                break :blk self.tag("Bytes", &.{packed_node});
-            },
+            .bytes => |span| self.tag("Bytes", &.{try self.u8List(self.store.byteSlice(span))}),
+            // `Num.Numeral :: [Literal({ is_negative, digits_before_pt,
+            // digits_after_pt, digits_after_pt_count })]`, built as Monotype's
+            // `lowerNumeralValue` builds it: the one `Literal` tag of the
+            // record, whose fields are in label order.
+            .numeral => |n| self.tag("Numeral", &.{try self.tag("Literal", &.{try self.record(&.{
+                try self.u8List(n.after(self.store)),
+                try self.scalar(.{ .u64 = n.after_count }),
+                try self.u8List(n.before(self.store)),
+                try self.boolNode(n.negative),
+            })})}),
         };
+    }
+
+    /// A `List(U8)` of `bytes`, packed.
+    fn u8List(self: *Emitter, bytes: []const u8) Allocator.Error!ConstNodeId {
+        const data = try self.out.addBlobData(bytes);
+        return self.out.append(.{ .list = .{ .packed_bytes = .{
+            .bytes = .{ .data = data, .offset = 0, .len = @intCast(bytes.len) },
+            .len = @intCast(bytes.len),
+            .element = .u8,
+        } } });
+    }
+
+    /// The `Code.Ty` value of `id`, alone: what `Code.ty_of` computes (D6).
+    pub fn tyValue(self: *Emitter, id: TyId) Allocator.Error!ConstNodeId {
+        return self.ty(id);
     }
 
     // `Ty`, as `Builtin.roc` declares it.
@@ -348,7 +441,7 @@ pub const Emitter = struct {
                 defer self.gpa.free(entries);
                 for (fields, entries) |f, *o| o.* = try self.record(&.{
                     try self.str(self.types.nameText(f.name)),
-                    try self.tag(if (f.optional) "Optional" else "Required", &.{}),
+                    try self.presence(f),
                     try self.ty(self.types.tySlice(f.tys)[0]),
                 });
                 break :blk try self.tag("Record", &.{try self.listOf(entries)});
@@ -363,13 +456,62 @@ pub const Emitter = struct {
                 });
                 break :blk try self.tag("TagUnion", &.{try self.listOf(entries)});
             },
-            .nominal => |n| try self.tag("Named", &.{ try self.str(self.types.nameText(n.name)), try self.ty(n.backing) }),
+            .nominal => |n| try self.tag("Named", &.{ try self.str(self.types.nameText(n.name)), try self.tyList(self.types.tySlice(n.args)), try self.ty(n.backing) }),
             .func => |f| try self.tag("Fn", &.{ try self.tyList(self.types.tySlice(f.params)), try self.ty(f.ret) }),
-            .opaque_ => |o| try self.tag("Opaque", &.{ try self.str(self.types.nameText(o.name)), try self.tyList(self.types.tySlice(o.args)) }),
+            .opaque_ => |o| try self.tag("Opaque", &.{ try self.str(self.types.nameText(o.name)), try self.identityOf(self.typeIdentity(o.name, o.origin)), try self.tyList(self.types.tySlice(o.args)) }),
             .recursive => |name| try self.tag("Recursive", &.{try self.str(self.types.nameText(name))}),
         };
         try self.ty_cache.put(self.gpa, id, node);
         return node;
+    }
+
+    // A record field's `presence : [Required, Optional, Default(Value), DefaultComputed]` (D5).
+    fn presence(self: *Emitter, field: types_mod.Member) Allocator.Error!ConstNodeId {
+        if (field.optional) return self.tag("Optional", &.{});
+        return switch (field.default) {
+            .none => self.tag("Required", &.{}),
+            .computed => self.tag("DefaultComputed", &.{}),
+            _ => self.tag("Default", &.{try self.valueNode(field.default.value().?)}),
+        };
+    }
+
+    // `Code.Value`, as `Builtin.roc` declares it, for a field default (D5).
+    fn valueNode(self: *Emitter, id: types_mod.ValueId) Allocator.Error!ConstNodeId {
+        return switch (self.types.value(id)) {
+            .int => |v| self.tag("Int", &.{try self.scalar(.{ .i128 = v })}),
+            .u128 => |v| self.tag("U128", &.{try self.scalar(.{ .u128 = v })}),
+            .frac => |bits| self.tag("Frac", &.{try self.scalar(.{ .f64_bits = bits })}),
+            .dec => |v| self.tag("Dec", &.{try self.scalar(.{ .dec_bits = v })}),
+            .bool_ => |b| self.tag("Bool", &.{try self.boolNode(b)}),
+            .str => |n| self.tag("Str", &.{try self.str(self.types.nameText(n))}),
+            .record => |span| self.tag("Record", &.{try self.valueList(span)}),
+            .tuple => |span| self.tag("Tuple", &.{try self.valueList(span)}),
+            .list => |span| self.tag("List", &.{try self.valueList(span)}),
+            .tag => |t| self.tag("Tag", &.{ try self.str(self.types.nameText(t.name)), try self.valueList(t.payloads) }),
+            .wrap => |backing| self.tag("Wrap", &.{try self.valueNode(backing)}),
+        };
+    }
+
+    fn valueList(self: *Emitter, span: ir.Span) Allocator.Error!ConstNodeId {
+        const ids = self.types.valueSlice(span);
+        const out = try self.gpa.alloc(ConstNodeId, ids.len);
+        defer self.gpa.free(out);
+        for (ids, out) |id, *o| o.* = try self.valueNode(id);
+        return self.listOf(out);
+    }
+
+    /// The bits of the `Code.TypeId` of the nominal named `name` of origin
+    /// `origin`.
+    fn typeIdentity(self: *Emitter, name: types_mod.NameId, origin: types_mod.Origin) u128 {
+        return if (self.types.declarationOf(origin)) |declaration|
+            reify.identity.declaredType(declaration)
+        else
+            reify.identity.builtinType(self.types.nameText(name));
+    }
+
+    /// A `Code.PrimId` or a `Code.TypeId`, whose backing is `{ bits : U128 }`.
+    fn identityOf(self: *Emitter, bits: u128) Allocator.Error!ConstNodeId {
+        return self.record(&.{try self.scalar(.{ .u128 = bits })});
     }
 
     fn tyList(self: *Emitter, ids: []const TyId) Allocator.Error!ConstNodeId {
@@ -468,9 +610,70 @@ test "a site's value holds its reached rows root first, with the nodes it reache
     const callee_nodes = out.get(out.get(rows[1]).record[2]).list.nodes;
     const prim = out.get(out.get(callee_nodes[0]).record[1]).tag;
     try testing.expectEqualStrings("Prim", prim.tag_name);
+    // `{ evidence, id, method, owner }`: `times` has no `where`, so no evidence.
     const names = out.get(prim.payloads[0]).record;
-    try testing.expectEqualStrings("times", out.strBytes(out.get(names[0]).str));
-    try testing.expectEqualStrings("Num.I64", out.strBytes(out.get(names[1]).str));
+    try testing.expectEqual(@as(usize, 0), out.get(names[0]).list.nodes.len);
+    try testing.expectEqual(reify.identity.builtinPrim("Num.I64", "times"), out.get(out.get(names[1]).record[0]).scalar.u128);
+    try testing.expectEqualStrings("times", out.strBytes(out.get(names[2]).str));
+    try testing.expectEqualStrings("Num.I64", out.strBytes(out.get(names[3]).str));
+}
+
+test "D7: a Prim's evidence is a list of { method, target, ty }, and a row it names is a row of the graph" {
+    var store = ir.Store.init(testing.allocator);
+    defer store.deinit();
+    var types = types_mod.Types.init(testing.allocator);
+    defer types.deinit();
+    var b = reify.builder.Builder.init(testing.allocator, &store, &types);
+    defer b.deinit();
+    const i64_ty = try types.intTy(.i64);
+    const list_ty = try types.listTy(i64_ty);
+    // order(a, b) = a - b, a stand-in for a written `order_relative_to`.
+    const order = try b.beginRow(&.{ i64_ty, i64_ty }, i64_ty);
+    try b.endRow(.{ .value = &.{try b.call(.i64, .minus, &.{ Ref.rowParam(0), Ref.rowParam(1) })} });
+    const method = (try types.name("order_relative_to")).index();
+    const sort = try b.namedPrim("List", "sort");
+    // root(xs) = List.sort(xs) where [order_relative_to @ I64 -> r1, order_relative_to @ I64 -> Num.I64.order_relative_to]
+    const builtin_order = try b.namedPrim("Num.I64", "order_relative_to");
+    const evidence = [_]u32{
+        2,
+        method,
+        i64_ty.index(),
+        @backingInt(ir.EvidenceKind.row),
+        order.index(),
+        method,
+        i64_ty.index(),
+        @backingInt(ir.EvidenceKind.prim),
+        builtin_order.index(),
+        0,
+    };
+    const root = try b.beginRow(&.{list_ty}, list_ty);
+    try b.endRow(.{ .value = &.{try b.primWith(sort, &.{Ref.rowParam(0)}, list_ty, &evidence)} });
+
+    var out = ConstStore.init(testing.allocator);
+    defer out.deinit();
+    var emitter = try Emitter.init(testing.allocator, &out, &store, &types);
+    defer emitter.deinit();
+    const code = try emitter.site(root, 7);
+    const rows = out.get(out.get(out.get(code).record[0]).record[1]).list.nodes;
+    // The root, then the row the evidence names, which nothing calls.
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    const root_nodes = out.get(out.get(rows[0]).record[2]).list.nodes;
+    const prim = out.get(out.get(root_nodes[0]).record[1]).tag;
+    try testing.expectEqualStrings("Prim", prim.tag_name);
+    const entries = out.get(out.get(prim.payloads[0]).record[0]).list.nodes;
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    const first = out.get(entries[0]).record;
+    try testing.expectEqualStrings("order_relative_to", out.strBytes(out.get(first[0]).str));
+    const row_target = out.get(first[1]).tag;
+    try testing.expectEqualStrings("Row", row_target.tag_name);
+    try testing.expectEqual(@as(u32, 1), out.get(row_target.payloads[0]).scalar.u32);
+    try testing.expectEqualStrings("I64", out.get(first[2]).tag.tag_name);
+    const prim_target = out.get(out.get(entries[1]).record[1]).tag;
+    try testing.expectEqualStrings("Prim", prim_target.tag_name);
+    const nested = out.get(prim_target.payloads[0]).record;
+    try testing.expectEqual(@as(usize, 0), out.get(nested[0]).list.nodes.len);
+    try testing.expectEqualStrings("order_relative_to", out.strBytes(out.get(nested[2]).str));
+    try testing.expectEqualStrings("Num.I64", out.strBytes(out.get(nested[3]).str));
 }
 
 /// Where `join` first sits in `joins`.

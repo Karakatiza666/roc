@@ -363,6 +363,7 @@ pub fn canonicalizeAndTypeCheckModule(
         .is_entry_module = true,
     });
     try czer.canonicalizeFile();
+    can.HostedCompiler.markIntrinsicsByModuleHeader(env);
     switch (validation_mode) {
         .none => {},
         .checking => try czer.validateForChecking(),

@@ -16616,6 +16616,9 @@ fn handleProcessFileError(err: ProcessFileError, stderr: anytype, path: []const 
 /// Result from checking a file using BuildEnv
 const CheckResult = struct {
     reports: []DrainedReport,
+    /// The intrinsics of the checked modules, sorted by path and then line.
+    /// Filled only for `roc check --intrinsics`.
+    intrinsics: []IntrinsicLine = &.{},
     timing: CheckTimingInfo = if (builtin.target.cpu.arch == .wasm32) .{} else .{
         .tokenize_parse_ns = 0,
         .canonicalize_ns = 0,
@@ -16647,8 +16650,101 @@ const CheckResult = struct {
             report.deinit(gpa);
         }
         gpa.free(self.reports);
+        for (self.intrinsics) |*line| line.deinit(gpa);
+        gpa.free(self.intrinsics);
     }
 };
+
+/// One line of `roc check --intrinsics`.
+const IntrinsicLine = struct {
+    path: []const u8,
+    line: u32,
+    /// The whole line: `<path>:<line>:<col> <Module>.<name> : <type>`.
+    text: []const u8,
+
+    fn deinit(self: *IntrinsicLine, gpa: Allocator) void {
+        gpa.free(self.path);
+        gpa.free(self.text);
+    }
+
+    fn lessThan(_: void, a: IntrinsicLine, b: IntrinsicLine) bool {
+        const order = std.mem.order(u8, a.path, b.path);
+        if (order != .eq) return order == .lt;
+        return a.line < b.line;
+    }
+};
+
+/// The intrinsics of every module `build_env` checked, sorted by path and
+/// then line. A declaration is an intrinsic when canonicalization marked it
+/// (`ModuleEnv.isIntrinsicDef`). The path is the spelling that reports use.
+fn collectIntrinsics(ctx: *CliCtx, build_env: *BuildEnv) Allocator.Error![]IntrinsicLine {
+    const gpa = ctx.gpa;
+    var lines: std.ArrayList(IntrinsicLine) = .empty;
+    errdefer {
+        for (lines.items) |*line| line.deinit(gpa);
+        lines.deinit(gpa);
+    }
+    // A build that stopped before any module was discovered checked nothing.
+    if (build_env.coordinator == null) return lines.toOwnedSlice(gpa);
+    const modules = try build_env.getCompiledModules(gpa);
+    defer gpa.free(modules);
+    for (modules) |module| {
+        const env = module.semantic.env;
+        for (env.store.sliceDefs(env.all_defs)) |def_idx| {
+            const def = env.store.getDef(def_idx);
+            if (!env.isIntrinsicDef(def)) continue;
+            const annotation_idx = def.annotation orelse
+                base.invariant("an intrinsic is a bodyless annotated declaration", .{});
+            const annotation = env.store.getAnnotation(annotation_idx);
+            const info = env.calcRegionInfo(env.store.getPatternRegion(def.pattern));
+            // The type as written: from the start of the type to the end of
+            // the annotation, which includes a `where` clause.
+            const start = env.store.getTypeAnnoRegion(annotation.anno).start.offset;
+            const end = env.store.getAnnotationRegion(annotation_idx).end.offset;
+            const written = env.getSourceAll()[start..end];
+            const path = try gpa.dupe(u8, try ctx.displayPath(env.diagnosticSourceName()));
+            errdefer gpa.free(path);
+            var text: std.Io.Writer.Allocating = .init(gpa);
+            errdefer text.deinit();
+            // An allocating writer fails only when allocation fails.
+            const ident = intrinsicIdent(env, def);
+            const qualified = ident.len > env.module_name.len and
+                std.mem.startsWith(u8, ident, env.module_name) and
+                ident[env.module_name.len] == '.';
+            text.writer.print("{s}:{d}:{d} {s}{s}{s} :", .{
+                path,
+                info.start_line_idx + 1,
+                info.start_col_idx + 1,
+                if (qualified) "" else env.module_name,
+                if (qualified) "" else ".",
+                ident,
+            }) catch return error.OutOfMemory;
+            // A type that spans lines is written on one line.
+            var words = std.mem.tokenizeAny(u8, written, " \t\r\n");
+            while (words.next()) |word| text.writer.print(" {s}", .{word}) catch return error.OutOfMemory;
+            try lines.append(gpa, .{
+                .path = path,
+                .line = info.start_line_idx + 1,
+                .text = try text.toOwnedSlice(),
+            });
+        }
+    }
+    std.mem.sort(IntrinsicLine, lines.items, {}, IntrinsicLine.lessThan);
+    return lines.toOwnedSlice(gpa);
+}
+
+/// The name an intrinsic binds. A type module binds `Type.name`, which
+/// already names its module.
+fn intrinsicIdent(env: *const ModuleEnv, def: can.CIR.Def) []const u8 {
+    const pattern = env.store.getPattern(def.pattern);
+    if (pattern != .assign) base.invariant("an intrinsic binds one name", .{});
+    return env.getIdentText(pattern.assign.ident);
+}
+
+/// Prints the `--intrinsics` listing, one line each.
+fn printIntrinsics(stdout: *std.Io.Writer, lines: []const IntrinsicLine) void {
+    for (lines) |line| stdout.print("{s}\n", .{line.text}) catch {};
+}
 
 /// Drained report with module info and file path
 const DrainedReport = struct {
@@ -16878,6 +16974,7 @@ fn checkFileWithBuildEnv(
     resolution_config: compile.package_resolution.Config,
     source_dir_override: ?[]const u8,
     synthetic_default_app: ?SyntheticDefaultAppMapping,
+    list_intrinsics: bool,
     reporter: ?*progress.Reporter,
     specialization_strategy: base.SpecializationStrategy,
 ) CheckFileWithBuildEnvPreservedError!CheckResult {
@@ -16906,10 +17003,16 @@ fn checkFileWithBuildEnv(
 
     buildForCheckWithOptionalMain(&build_env, filepath, main_filepath, reporter) catch |err| {
         const drained = try drainReportedCheckFailure(&build_env, err);
-        return collectCheckResult(ctx, &build_env, drained, false);
+        var failed_result = try collectCheckResult(ctx, &build_env, drained, false);
+        errdefer failed_result.deinit(ctx.gpa);
+        if (list_intrinsics) failed_result.intrinsics = try collectIntrinsics(ctx, &build_env);
+        return failed_result;
     };
 
-    return collectCheckResult(ctx, &build_env, try build_env.drainReports(), true);
+    var result = try collectCheckResult(ctx, &build_env, try build_env.drainReports(), true);
+    errdefer result.deinit(ctx.gpa);
+    if (list_intrinsics) result.intrinsics = try collectIntrinsics(ctx, &build_env);
+    return result;
 }
 
 /// Collects a check's drained reports (taking ownership of the reports and
@@ -16987,6 +17090,9 @@ fn finishRocCheck(
 
         ctx.io.flush();
 
+        printIntrinsics(stdout, check_result.intrinsics);
+        ctx.io.flush();
+
         if (check_result.error_count > 0) {
             return error.CheckFailed;
         } else {
@@ -17003,6 +17109,7 @@ fn finishRocCheck(
             printVerboseStats(stdout, check_result);
         }
 
+        printIntrinsics(stdout, check_result.intrinsics);
         ctx.io.flush();
     }
 
@@ -17061,6 +17168,7 @@ fn rocCheckDefaultApp(
         resolutionConfigFromLimits(args.resolve_limits),
         original_source_dir,
         SyntheticDefaultAppMapping.fromStaged(args.path, staged),
+        args.intrinsics,
         reporter,
         currentRuntimeSpecializationStrategy(args.specialization_strategy),
     );
@@ -17185,6 +17293,7 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
             };
             defer default_result.deinit(ctx.gpa);
             const check_result = &default_result.result_with_env.check_result;
+            if (args.intrinsics) check_result.intrinsics = try collectIntrinsics(ctx, &default_result.result_with_env.build_env);
 
             if (builtin.target.cpu.arch == .wasm32) {
                 reporter.end();
@@ -17219,6 +17328,7 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
         };
         defer result_with_env.deinit(ctx.gpa);
         const check_result = &result_with_env.check_result;
+        if (args.intrinsics) check_result.intrinsics = try collectIntrinsics(ctx, &result_with_env.build_env);
 
         if (builtin.target.cpu.arch == .wasm32) {
             reporter.end();
@@ -17250,6 +17360,7 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
             resolutionConfigFromLimits(args.resolve_limits),
             null,
             null,
+            args.intrinsics,
             &reporter,
             currentRuntimeSpecializationStrategy(args.specialization_strategy),
         ) catch |err| {

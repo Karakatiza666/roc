@@ -13,7 +13,8 @@
 //! | a parameter, a binding, a `var` version | a reference to a row parameter or a node (N2 to N4) |
 //! | an operator, a method or builtin call | `Prim`, named by owner and method (N1a) |
 //! | a call of a definition | `Call` of the definition's row, walked once per key (N8a) |
-//! | a function of another package | `Prim` by its qualified name; its body is not walked (N8h) |
+//! | a function in the site's cut (`code_primitives`) | `Prim` by its qualified name; its body is not walked (N8h) |
+//! | a function outside the cut, in any package | its body, walked as one of the site's own (N8l) |
 //! | a lambda used as a value | `Closure` of its row, with its captures (N8b) |
 //! | `if`, `match` | switches, first match wins; a construct that can exit is an exiting switch whose continuation is one join (N1c, N11f) |
 //! | `for`, `while` | `ForRange`, `ForList` or `Loop`, with each carried `var` a slot (N11) |
@@ -62,9 +63,16 @@ const NameId = reify.types.NameId;
 pub const Rejection = struct {
     kind: Kind,
     region: base.Region,
+    /// The module whose source holds `region`: the body the walk was reading
+    /// (`Walk.body`), which is another module's where the walk entered a
+    /// callee or a constant of that module.
+    module: Module,
     /// Names the offending construct, binding or type. Borrowed from a name
     /// store or a static string; valid as long as the artifact is.
     detail: []const u8,
+    /// For `unresolved_type` met at a type variable: which variable, and
+    /// where it stands. Null for every other refusal.
+    open: ?OpenVariable = null,
 
     pub const Kind = enum {
         /// An expression form the normal form has no node for (`detail` names the form).
@@ -86,6 +94,82 @@ pub const Rejection = struct {
         /// (`detail` names the bound), so the site is refused rather than
         /// normalized without end.
         bound_exceeded,
+        /// A value the lambda reads at run time that its translator's
+        /// `Code.Bound` cannot receive as an input slot (`detail` says why).
+        input_not_bound,
+        /// A site whose translator binds its inputs (`Code.Bound`), inside a
+        /// generic function whose types it mentions (D1, Q4).
+        bound_instance,
+        /// A use whose `where` evidence names a method that holds an
+        /// instance site, which the evidence carries no table for (D1, Q14).
+        instance_through_evidence,
+        /// A use of a template that holds an instance site, at the types of
+        /// a lambda a block generalized (D1, Q5).
+        instance_in_local_generic,
+        /// A site, or a use of a template that holds one, at the type
+        /// variables of a method the compiler calls with no written use:
+        /// `to_inspect`, `is_eq`, `to_hash`, `encoder_for` or `parser_for`
+        /// (D1, Q17). `detail` names the method.
+        implicit_method_instance,
+        /// A `Code` value, or a value computed from one, inside the walked
+        /// body: a lambda at a `Code` position, or a `Code.type_id` or
+        /// `Code.prim` call. A description has no form for a description
+        /// (D7). `detail` names the top-level constant the walk was folding,
+        /// or is empty.
+        code_value,
+        /// A `Code.type_id` call in a generic function, at a use that fixes
+        /// its proxy to a type that is no nominal (Q8).
+        type_id_not_nominal,
+        /// A `Code.ty_of` call whose proxy type holds a type variable that
+        /// the call, or the use that reached it, leaves open (D6).
+        ty_of_not_closed,
+        /// A root whose checked body holds a checking error. The checker
+        /// has reported that error, so publication refuses the site or the
+        /// use with no report of its own.
+        checking_error,
+    };
+
+    /// A module a refusal is placed in: its identity, and its env, which
+    /// holds the source the region indexes.
+    pub const Module = struct {
+        artifact: checked.CheckedModuleArtifactKey,
+        env: *const ModuleEnv,
+    };
+};
+
+/// A type variable a refusal names, and where it stands.
+pub const OpenVariable = struct {
+    /// The name the annotation wrote for the variable, or null for one the
+    /// checker introduced without a name.
+    name: ?[]const u8,
+    place: Place,
+    cause: Cause,
+
+    pub const Place = union(enum) {
+        /// A parameter of the function, by its name, or by its position
+        /// (from 1) for a pattern that binds no single name.
+        parameter: union(enum) { name: []const u8, position: u32 },
+        /// What the function returns.
+        result,
+        /// An expression inside the body.
+        expression,
+        /// The type a call or a `Code` position gives the function, which
+        /// leaves one of its quantified variables unbound.
+        use: enum { call, site },
+    };
+
+    pub const Cause = enum {
+        /// An annotation wrote the variable, and the call or the `Code`
+        /// position that uses the function does not fix it.
+        use_leaves_open,
+        /// An annotation wrote the variable, and nothing that uses the
+        /// function fixes it.
+        annotation_leaves_open,
+        /// Checking inferred the variable, and nothing fixes it.
+        inferred,
+        /// Checking inferred the variable, and the call or the `Code`
+        /// position that uses the function does not fix it.
+        inferred_use_leaves_open,
     };
 };
 
@@ -168,6 +252,21 @@ pub const DefinitionKey = struct {
     /// parameters. One lambda can be described each way: at a `Code` position
     /// or as a template's argument, and as a call.
     replayed: bool = false,
+    /// The type this row delivers where it is not the one its lambda's own
+    /// type gives: the nominal a lambda is read at, where the checker took
+    /// the lambda's record or tag union for it.
+    result: ?TyId = null,
+    /// The function type a call reads a generic definition at, where the
+    /// checker recorded one for the call: the callable its instantiation edge
+    /// related the target to (`EvidenceTargetInstantiation`), or the type a
+    /// direct use instantiated the procedure's scheme at. The row's body is
+    /// walked with its own function type read as this one (`instanceFrame`),
+    /// so its parameters and result are this type's. Monotype specializes the
+    /// target at the same callable, so a parameter the call fixed to a
+    /// nominal, where the scheme has the record or tag union the checker took
+    /// for it, is that nominal. Null for a use that records none, which reads
+    /// its own type.
+    signature: ?TyId = null,
     /// Which definitions this row's function parameters were fixed to,
     /// digested from the rows they name. Zero for a definition that takes no
     /// function parameter, so one body describes once.
@@ -204,8 +303,13 @@ pub const Reifier = struct {
     procedure_bindings: *const checked.TopLevelProcedureBindingTable,
     procedure_templates: *const checked.CheckedProcedureTemplateTable,
     callable_eval_templates: checked.CallableEvalTemplateTableView,
+    entry_wrappers: *const checked.EntryWrapperTable,
     const_templates: *const checked.ConstTemplateTable,
     const_bodies: *const checked.CheckedConstBodyTable,
+    top_level_values: *const checked.TopLevelValueTable,
+    code_cuts: *const checked.CodeCutTable,
+    /// The module's inventories and closing uses (D1).
+    code_instances: *const checked.CodeInstanceTable,
     env: *const ModuleEnv,
     ranges: RangeNames,
     bool_tags: BoolTags,
@@ -220,40 +324,36 @@ pub const Reifier = struct {
     /// at every site, because each site has a type table of its own.
     ty_cache: collections.DenseMapUnmanaged(CheckedTypeId, TyId) = .empty,
     /// The types `tyOf` is part way through building. Roc reaches recursion
-    /// only through a nominal, and `nominal_in_progress` closes that, so a type
-    /// that reaches itself any other way has no description and is refused
-    /// rather than recursed into forever.
+    /// only through a nominal, and `nominalTy` closes that, so a type that
+    /// reaches itself any other way has no description and is refused rather
+    /// than recursed into forever.
     ///
-    /// Keyed by the enclosing instantiation as well as the id, because a
-    /// declaration's backing is one template every use shares: `Chain(F32)`
-    /// and the `Chain(U16)` written inside it walk the same backing id under
-    /// different bindings, and the second is not the first reaching itself.
+    /// Keyed by how many nominals the walk is inside as well as the id,
+    /// because a declaration's backing is one template every expansion
+    /// shares: `Chain(F32)` and the `Chain(U16)` written inside it walk the
+    /// same backing id under different bindings, and the second is not the
+    /// first reaching itself.
     type_in_progress: std.AutoHashMapUnmanaged(TypeFrame, void) = .empty,
-    /// Nominals that a `recursive` type built so far still refers to. A
-    /// nominal closes its own, and a type left holding one names a nominal it
-    /// does not contain, so what it means depends on where it sits rather than
-    /// on its checked id alone.
-    open_recursions: collections.DenseMapUnmanaged(CheckedTypeId, void) = .empty,
-    /// The nominals `tyOf` is part way through building, each keyed by the
-    /// declaration and what this use fixed its variables to, and each valued
-    /// by the checked id the nominal being built carries.
-    nominal_in_progress: std.AutoHashMapUnmanaged([32]u8, CheckedTypeId) = .empty,
-    /// The innermost nominal instantiation `tyOf` is walking inside, zero
-    /// where the walk is inside none.
-    nominal_instance: [32]u8 = @splat(0),
     /// The constants the walk is part way through folding. A definition that
     /// reads itself is refused on the repeat rather than followed forever.
     folding: collections.DenseMapUnmanaged(CheckedExprId, void) = .empty,
+    /// The iterator plan of each `for` loop by the loop's body, which keys
+    /// the loop's `iter` call as a use (D1). Built on first ask.
+    iter_loops: ?collections.DenseMapUnmanaged(CheckedExprId, static_dispatch.IteratorForPlanId) = null,
     /// The loop whose body the walk is building, or null outside one. A
     /// `break` reads it for the slots it ends the loop with.
     loop: ?Loop = null,
-    /// What the quantified variables of the definition being walked stand for.
-    /// Empty while the walk is inside one that has none, which is every
-    /// definition a monomorphic program writes.
+    /// The frame holding what the quantified variables of the definition
+    /// being walked stand for. `empty_frame` while the walk is inside one that
+    /// has none, which is every definition a monomorphic program writes.
     ///
-    /// Borrowed from the call that fixed them, and restored on the way out, so
+    /// Set when the walk enters an instance, and restored on the way out, so
     /// one reader walks the same body once per instantiation.
-    substitution: Substitution = .empty,
+    frame: FrameId = empty_frame,
+    /// The key of the instantiation `substitution` holds, zero where it is
+    /// empty. A lambda written in the row extends it, so each instantiation
+    /// of the definition keys its lambdas' rows apart.
+    instance_key: [32]u8 = @splat(0),
     /// How often `substitution` has answered, so a type can tell whether it
     /// means anything beyond its own checked id.
     substitution_uses: u32 = 0,
@@ -271,6 +371,17 @@ pub const Reifier = struct {
     /// What each parametric nominal in the type being walked fixed its
     /// declared variables to, innermost last.
     nominal_args: Substitution = .empty,
+    /// What relating each dispatch target publication selected to the
+    /// callable it was selected for fixes this module's variables to (see
+    /// `relateSelectedTargets`). A variable it answers for is no quantified
+    /// variable of any definition, so the answer holds in every row.
+    related: Substitution = .empty,
+    /// Whether `related` has been computed.
+    related_ready: bool = false,
+    /// The dispatchers whose selected target does not fit the callable it
+    /// was selected for: `x` in `|x| x * 2.U8`, whose default `Dec` has no
+    /// `times` that takes a `U8`. Such a variable has no type to seal to.
+    unfit: RowVars = .empty,
     /// What this reader shares with every other module's reader: the site's
     /// rows, who calls whom, and the first refusal.
     walk: *Walk,
@@ -279,23 +390,37 @@ pub const Reifier = struct {
     ///
     /// A type id is that module's, so a variable a call fixes carries the
     /// reader that can read what it was fixed to.
-    const TypeRef = struct {
+    const FramedType = struct {
         reader: *Reifier,
         id: CheckedTypeId,
+        /// The frame whose bindings the variables of `id` are read in: the
+        /// instance of the definition that named the type. A binding is read
+        /// where it was made, not in the frame of the definition that reads
+        /// it later (Y2, D2).
+        frame: FrameId,
     };
 
-    /// What each quantified variable of one definition stands for.
-    const Substitution = collections.DenseMapUnmanaged(CheckedTypeId, TypeRef);
+    /// An index into the walk's frames (`Walk.frames`). Each frame is the
+    /// substitution of one instance a site's walk entered.
+    pub const FrameId = u32;
 
-    /// One field of a record type, beside the reader its ids are canonical in.
+    /// The frame of a definition with no quantified variables.
+    const empty_frame: FrameId = 0;
+
+    /// What each quantified variable of one definition stands for.
+    const Substitution = collections.DenseMapUnmanaged(CheckedTypeId, FramedType);
+
+    /// One field of a record type, beside the reader its ids are canonical in
+    /// and the frame its variables are read in.
     const FieldRef = struct {
         reader: *Reifier,
+        frame: FrameId,
         field: checked.CheckedRecordField,
     };
 
-    /// One type id, under the nominal instantiation the walk reached it in.
+    /// One type id, at the count of nominals the walk reached it inside.
     const TypeFrame = struct {
-        instance: [32]u8,
+        depth: usize,
         id: CheckedTypeId,
     };
 
@@ -314,26 +439,43 @@ pub const Reifier = struct {
     const Unfixed = struct {
         missing: []const u8,
         partial: []const u8,
+        use: @FieldType(OpenVariable.Place, "use"),
 
         const call = Unfixed{
             .missing = "the type this call gives its callee",
             .partial = "a type variable this call does not fix",
+            .use = .call,
         };
         const site = Unfixed{
             .missing = "the type of this Code position",
             .partial = "a type variable at this Code position",
+            .use = .site,
         };
     };
 
     /// What one call supplied for its callee's `where` obligations, in
     /// canonical evidence-param order.
     ///
-    /// `reader` is the module the call was written in: an evidence node id
-    /// indexes that module's plan table, and the types recorded beside it are
-    /// named in that module's store.
+    /// `reader` is the module the call was written in, or null where no call
+    /// supplied any. An entry may have been recorded in another module: one
+    /// the call forwarded from its own definition's evidence is the entry the
+    /// call that instantiated that definition supplied (see `supply`).
     const SuppliedEvidence = struct {
         reader: ?*Reifier = null,
-        entries: []const static_dispatch.CheckedEvidence = &.{},
+        entries: []const SuppliedEntry = &.{},
+    };
+
+    /// How one obligation was discharged, beside what reads it.
+    ///
+    /// `reader` is the module that recorded the evidence: an evidence node id
+    /// indexes that module's plan table, and the types recorded beside it are
+    /// named in that module's store. `scope` is the evidence the walk held
+    /// where it was recorded, which the nested evidence of a target it names
+    /// forwards into.
+    const SuppliedEntry = struct {
+        reader: *Reifier,
+        evidence: static_dispatch.CheckedEvidence,
+        scope: SuppliedEvidence,
     };
 
     /// The definition a call's callee names: which one, and the reader of the
@@ -358,6 +500,10 @@ pub const Reifier = struct {
         /// The function type a row that replays the block around it describes
         /// at. Null for every other row, which reads its own node's type.
         at: ?CheckedTypeId = null,
+        /// The callable the checker recorded for this call of a generic
+        /// definition, read where the call was written. The row the call
+        /// reaches is read at it (`DefinitionKey.signature`).
+        signature: ?FramedType = null,
     };
 
     /// A template argument fixed to a value: the expression the call wrote,
@@ -377,24 +523,39 @@ pub const Reifier = struct {
     /// One function parameter of a callee, fixed to the definition the call
     /// passed for it.
     const BoundCallee = struct {
-        /// Which parameter this fixed, in the callee's own order.
-        param: u32,
+        param: Slot,
         target: CalleeTarget,
+
+        /// What the definition fixes: a parameter, in the callee's own order,
+        /// or a name a lifted lambda captured from a row where a call had
+        /// fixed it. The lambda then names the definition, as the row did,
+        /// and takes nothing for the name.
+        const Slot = union(enum) {
+            position: u32,
+            capture: CheckedPatternId,
+        };
     };
 
     /// What a call's callee is: a definition the walk builds a row for, a
-    /// builtin, or a function of another package, which is a named
+    /// builtin, or a function in the site's cut, which is a named
     /// primitive (N8h).
     const Callee = union(enum) {
         definition: CalleeTarget,
         /// A builtin, by its export name.
-        provided: []const u8,
+        provided: Provided,
         foreign: ForeignName,
         /// A function value the walk does not know, such as a parameter or
         /// one an `if` chooses: the call is an `Apply` (N8i), which
         /// simplifying resolves or the site is refused (N8j).
         value,
     };
+
+    /// Why a callee is resolved. A description names a primitive or a
+    /// function in the site's cut rather than walking it. An instance table
+    /// (D1) is the table of the template the program runs, so a primitive
+    /// with an inventory (an operation of a `::` type) is the definition
+    /// there too.
+    const CalleeUse = enum { described, instance_table };
 
     const Binding = struct {
         binder: PatternBinderId,
@@ -475,11 +636,24 @@ pub const Reifier = struct {
         /// holds. An exact alias of a function, `same = add_one`, is one of
         /// these, and its template names the lookup the alias forwards to.
         callable_eval_templates: checked.CallableEvalTemplateTableView,
+        /// The entry wrapper of each compile-time root. A top-level method
+        /// alias owns the scope of its binding's wrapper, whose template
+        /// holds the quantified variables an edge through the alias fixes.
+        entry_wrappers: *const checked.EntryWrapperTable,
         /// Where a name bound to a compile-time value leads. A constant the
         /// compiler fixed is folded into the description where the name
         /// stands, so the walk needs the template that holds its body.
         const_templates: *const checked.ConstTemplateTable,
         const_bodies: *const checked.CheckedConstBodyTable,
+        /// The definition each top-level value's pattern binds, which names a
+        /// constant the walk reaches by its template (D1).
+        top_level_values: *const checked.TopLevelValueTable,
+        /// The translators' cuts the module declares (I14).
+        code_cuts: *const checked.CodeCutTable,
+        /// The module's inventories and closing uses (D1). Publication of
+        /// the module being read fills its inventories before its closing
+        /// uses are walked.
+        code_instances: *const checked.CodeInstanceTable = &no_code_instances,
     };
 
     pub fn init(
@@ -499,8 +673,12 @@ pub const Reifier = struct {
             .procedure_bindings = sources.procedure_bindings,
             .procedure_templates = sources.procedure_templates,
             .callable_eval_templates = sources.callable_eval_templates,
+            .entry_wrappers = sources.entry_wrappers,
             .const_templates = sources.const_templates,
             .const_bodies = sources.const_bodies,
+            .top_level_values = sources.top_level_values,
+            .code_cuts = sources.code_cuts,
+            .code_instances = sources.code_instances,
             .env = env,
             .ranges = RangeNames.resolve(sources.names),
             .bool_tags = BoolTags.resolve(sources.names),
@@ -520,8 +698,12 @@ pub const Reifier = struct {
             .procedure_bindings = &artifact.top_level_procedure_bindings,
             .procedure_templates = &artifact.checked_procedure_templates,
             .callable_eval_templates = artifact.callable_eval_templates.view(),
+            .entry_wrappers = &artifact.entry_wrappers,
             .const_templates = &artifact.const_templates,
             .const_bodies = &artifact.checked_const_bodies,
+            .top_level_values = &artifact.top_level_values,
+            .code_cuts = &artifact.code_cuts,
+            .code_instances = &artifact.code_instances,
         };
     }
 
@@ -529,10 +711,159 @@ pub const Reifier = struct {
         self.scope.deinit(self.gpa);
         self.ty_cache.deinit(self.gpa);
         self.type_in_progress.deinit(self.gpa);
-        self.open_recursions.deinit(self.gpa);
-        self.nominal_in_progress.deinit(self.gpa);
         self.nominal_args.deinit(self.gpa);
+        self.related.deinit(self.gpa);
+        self.unfit.deinit(self.gpa);
         self.folding.deinit(self.gpa);
+        if (self.iter_loops) |*loops| loops.deinit(self.gpa);
+    }
+
+    /// The iterator plan of the `for` loop whose body is `body`, or null.
+    fn iterLoopOf(self: *Reifier, body: CheckedExprId) Allocator.Error!?static_dispatch.IteratorForPlanId {
+        if (self.iter_loops == null) {
+            var loops: collections.DenseMapUnmanaged(CheckedExprId, static_dispatch.IteratorForPlanId) = .empty;
+            errdefer loops.deinit(self.gpa);
+            for (0..self.bodies.exprCount()) |raw| {
+                switch (self.bodies.expr(@fromBackingInt(@intCast(raw))).data) {
+                    .for_ => |loop| if (loop.plan) |plan| try loops.put(self.gpa, loop.body, plan),
+                    .pending,
+                    .numeral,
+                    .str_from_quote,
+                    .code_from_lambda,
+                    .str_segment,
+                    .str,
+                    .bytes_literal,
+                    .lookup_local,
+                    .lookup_external,
+                    .lookup_required,
+                    .list,
+                    .empty_list,
+                    .tuple,
+                    .match_,
+                    .if_,
+                    .call,
+                    .record,
+                    .empty_record,
+                    .block,
+                    .tag,
+                    .nominal,
+                    .zero_argument_tag,
+                    .closure,
+                    .lambda,
+                    .binop,
+                    .unary_minus,
+                    .unary_not,
+                    .field_access,
+                    .dispatch_call,
+                    .interpolation,
+                    .structural_eq,
+                    .structural_hash,
+                    .method_eq,
+                    .type_dispatch_call,
+                    .tuple_access,
+                    .runtime_error,
+                    .crash,
+                    .dbg,
+                    .expect_err,
+                    .expect,
+                    .ellipsis,
+                    .anno_only,
+                    .break_,
+                    .return_,
+                    .row_coerce,
+                    .hosted_lambda,
+                    .run_low_level,
+                    => {},
+                }
+            }
+            for (0..self.bodies.statementCount()) |raw| {
+                switch (self.bodies.statement(@fromBackingInt(@intCast(raw))).data) {
+                    .for_ => |loop| if (loop.plan) |plan| try loops.put(self.gpa, loop.body, plan),
+                    .pending,
+                    .decl,
+                    .promoted_proc,
+                    .var_,
+                    .var_uninitialized,
+                    .reassign,
+                    .crash,
+                    .dbg,
+                    .expr,
+                    .expect,
+                    .while_,
+                    .infinite_loop,
+                    .breakable_loop,
+                    .break_,
+                    .return_,
+                    .import_,
+                    .alias_decl,
+                    .where_alias_decl,
+                    .nominal_decl,
+                    .type_anno,
+                    .type_var_alias,
+                    .runtime_error,
+                    => {},
+                }
+            }
+            self.iter_loops = loops;
+        }
+        return self.iter_loops.?.get(body);
+    }
+
+    /// The static dispatch a use makes, where it is one: a `dispatch_call`,
+    /// or the `iter` call of a `for` loop, keyed by the loop's body (D1).
+    fn dispatchOfUse(self: *Reifier, use: CheckedExprId) Allocator.Error!?DispatchSpec {
+        switch (self.bodies.expr(use).data) {
+            .dispatch_call, .method_eq, .type_dispatch_call => |plan_id| return DispatchSpec.ofPlan(self.plans.plans[@backingInt(plan_id orelse return null)]),
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_local,
+            .lookup_external,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => {},
+        }
+        const loop = (try self.iterLoopOf(use)) orelse return null;
+        const iter = self.plans.iterator_for_plans[@backingInt(loop)].iter;
+        return .{ .method = iter.method, .dispatcher_ty = iter.dispatcher_ty, .resolution = iter.resolution };
     }
 
     /// The builder of the site being walked.
@@ -559,6 +890,11 @@ pub const Reifier = struct {
     /// written in, and the `f` of the surrounding `Code(f)`.
     pub fn reifyLambda(self: *Reifier, root: CheckedExprId, site: Site) Allocator.Error!Outcome {
         try self.walk.startSite();
+        // The site's region is in the module that holds the site, until the
+        // walk enters the root's body.
+        self.walk.body = site.caller;
+        try site.caller.relateSelectedTargets();
+        try self.relateSelectedTargets();
         return self.outcomeOf(self.rootSite(root, site), site.region);
     }
 
@@ -580,7 +916,25 @@ pub const Reifier = struct {
         /// takes it as its own function type too, which a lambda written at
         /// the site needs because its node holds the `Code`.
         fixed: ?CheckedTypeId,
+        /// The expression the site is written at, which the checker keyed
+        /// what the use copied the root's quantified variables to by. Null
+        /// for a lambda written at the site.
+        use: ?CheckedExprId = null,
         region: base.Region,
+        /// For an instance site (D1): the instance of the template that
+        /// holds the site, which a closing use fixed. A lambda written at
+        /// the site reads its `f` in that frame and with that evidence. Null
+        /// for every other site.
+        enclosing: ?Enclosing = null,
+    };
+
+    /// The instance of the template that holds an instance site (D1): the
+    /// frame that holds what the closing use fixed its variables to, the
+    /// instance's key, and the evidence the use supplied.
+    pub const Enclosing = struct {
+        frame: FrameId,
+        key: [32]u8,
+        evidence: SuppliedEvidence,
     };
 
     /// A quantified function type: the variables a use fixes, and the type
@@ -606,13 +960,23 @@ pub const Reifier = struct {
     }
 
     fn rootSite(self: *Reifier, root: CheckedExprId, site: Site) Error!RowId {
+        // Publication marks each expression that holds a checking error. A
+        // root so marked has its report from the checker already.
+        if (self.bodies.exprContainsDiagnosticError(root)) return self.rejectError(.checking_error, site.region, "");
         // The root is a use of its own definition, so the site fixes its
         // quantified variables the way a call fixes a callee's. The walk of
         // the root's body borrows the substitution and finishes here.
         var instance = if (site.scheme) |scheme|
-            try self.instantiationOf(scheme, site.caller, site.fixed, site.region, .site)
-        else
-            null;
+            try self.instantiationOf(scheme, site.caller, site.fixed, site.use, site.region, .site)
+        else if (site.enclosing) |enclosing| enclosed: {
+            // A lambda written at an instance site is part of the template
+            // that holds it, so it is read in that template's instance.
+            if (enclosing.frame == empty_frame) break :enclosed null;
+            break :enclosed Instantiation{
+                .substitution = try self.walk.frameSubstitution(enclosing.frame).clone(self.gpa),
+                .key = enclosing.key,
+            };
+        } else null;
         defer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
         const key = DefinitionKey{
             .artifact = self.artifact.bytes,
@@ -621,7 +985,17 @@ pub const Reifier = struct {
             .replayed = site.in_block,
         };
         const at = if (site.in_block) site.fixed else null;
-        return self.describeDefinition(key, instance, .{}, &.{}, at);
+        // The site's lookup of the root is a use of its definition, and the
+        // checker recorded on it how the use discharged the root's `where`
+        // obligations, as on a call's callee. The root reads them from here,
+        // as a callee reads its call's (D3).
+        const supplied: SuppliedEvidence = if (site.use) |use|
+            if (site.caller.plans.siteEvidence(use)) |entries| try site.caller.supply(entries, site.caller.evidence) else .{}
+        else if (site.enclosing) |enclosing|
+            enclosing.evidence
+        else
+            .{};
+        return self.describeDefinition(key, instance, supplied, &.{}, at, null);
     }
 
     /// The site's `Code` value, or the reason the walk stopped.
@@ -648,6 +1022,9 @@ pub const Reifier = struct {
         hasher.update(&self.artifact.bytes);
         hasher.update(std.mem.asBytes(&region.start.offset));
         hasher.update(std.mem.asBytes(&region.end.offset));
+        // Each instance of an instance site is a description of its own
+        // (D1), so its key tells it apart from the site's other instances.
+        if (self.walk.instance) |instance| hasher.update(&instance);
         return hasher.final();
     }
 
@@ -662,6 +1039,8 @@ pub const Reifier = struct {
         out: *std.ArrayList(TemplateArg),
         gpa: Allocator,
     ) Allocator.Error!?Rejection {
+        // The arguments are written at the call, in this module.
+        self.walk.body = self;
         out.clearRetainingCapacity();
         for (args) |arg_id| {
             const value = self.templateArg(arg_id) catch |err| switch (err) {
@@ -719,7 +1098,7 @@ pub const Reifier = struct {
                     return self.rejectError(.unresolved_reference, region, "this argument");
                 if (self.blockLambdaOf(binder)) |lambda| {
                     const binding = Binding{ .binder = binder, .kind = .{ .function = lambda } };
-                    var lifted = (try self.liftedTarget(binding, arg.ty, region)).definition;
+                    var lifted = (try self.liftedTarget(binding, arg.ty, arg_id, region)).definition;
                     lifted.key.replayed = true;
                     lifted.captures = &.{};
                     lifted.at = arg.ty;
@@ -793,24 +1172,72 @@ pub const Reifier = struct {
     pub fn reifyTemplateCall(
         self: *Reifier,
         template: CheckedExprId,
+        fixing: TemplateFixing,
         values: []const TemplateArg,
         region: base.Region,
     ) Allocator.Error!Outcome {
         try self.walk.startSite();
-        return self.outcomeOf(self.templateSite(template, values, region), region);
+        // `region` is the call's, in the module whose arguments the walk read
+        // last (`reifyConstants`).
+        std.debug.assert(self.walk.body != null);
+        try fixing.caller.relateSelectedTargets();
+        try self.relateSelectedTargets();
+        return self.outcomeOf(self.templateSite(template, fixing, values, region), region);
     }
+
+    /// What a template call fixes the template's quantified variables to:
+    /// the template's scheme, and the type the call gives the name it calls,
+    /// read in the module of the call (Q15 of
+    /// roc-reify-structural-proposal.md).
+    pub const TemplateFixing = struct {
+        scheme: Scheme,
+        /// The reader of the module the call is written in.
+        caller: *Reifier,
+        /// The template's function type at the call. Null where checking
+        /// left the callee without a type.
+        fixed: ?CheckedTypeId,
+        /// The callee's lookup, which the checker keyed what the call copied
+        /// the template's variables to by.
+        use: ?CheckedExprId,
+    };
 
     /// A template call's root row. The lambda a template returns is not a
     /// definition of any module, so nothing names it and no call reaches it.
+    ///
+    /// The call is a use of the template, so it fixes the template's
+    /// quantified variables the way a call fixes a callee's, and the body is
+    /// read in a frame that holds them.
     fn templateSite(
         self: *Reifier,
         template: CheckedExprId,
+        fixing: TemplateFixing,
         values: []const TemplateArg,
         region: base.Region,
     ) Error!RowId {
         const lambda = try self.lambdaData(template);
         if (lambda.args.len != values.len) {
             return self.rejectError(.unsupported_expression, region, "a template called with the wrong number of arguments");
+        }
+
+        var instance = try self.instantiationOf(fixing.scheme, fixing.caller, fixing.fixed, fixing.use, region, .call);
+        defer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
+        const supplied: SuppliedEvidence = if (fixing.use) |use|
+            if (fixing.caller.plans.siteEvidence(use)) |entries| try fixing.caller.supply(entries, fixing.caller.evidence) else .{}
+        else
+            .{};
+        const outer_frame = self.frame;
+        const outer_instance_key = self.instance_key;
+        const outer_uses = self.substitution_uses;
+        const outer_evidence = self.evidence;
+        self.frame = if (instance) |fixed| try self.walk.pushFrame(fixed.substitution) else empty_frame;
+        self.instance_key = if (instance) |fixed| fixed.key else @splat(0);
+        self.substitution_uses = 0;
+        self.evidence = supplied;
+        defer {
+            self.frame = outer_frame;
+            self.instance_key = outer_instance_key;
+            self.substitution_uses = outer_uses;
+            self.evidence = outer_evidence;
         }
 
         const scope_base = self.scope.items.len;
@@ -825,7 +1252,7 @@ pub const Reifier = struct {
                 .value => |constant| try self.bindName(pattern_id, .{ .constant = constant }, region),
                 .callee => |target| {
                     try self.bindName(pattern_id, .{ .callee = @intCast(bound.items.len) }, region);
-                    try bound.append(self.gpa, .{ .param = @intCast(index), .target = target });
+                    try bound.append(self.gpa, .{ .param = .{ .position = @intCast(index) }, .target = target });
                 },
             }
         }
@@ -838,6 +1265,8 @@ pub const Reifier = struct {
             self.bound = outer_bound;
             self.bound_lambda = outer_bound_lambda;
         }
+        const outer_body = self.enter();
+        defer self.leave(outer_body);
         return self.lambdaRow(lambda.body, .in_scope, null, null);
     }
 
@@ -972,9 +1401,40 @@ pub const Reifier = struct {
     /// call fixed it at all.
     fn boundCallee(self: *Reifier, index: usize) ?u32 {
         for (self.bound, 0..) |entry, slot| {
-            if (entry.param == index) return @intCast(slot);
+            switch (entry.param) {
+                .position => |position| if (position == index) return @intCast(slot),
+                .capture => {},
+            }
         }
         return null;
+    }
+
+    /// The bound callee a capture of the lambda being described names, as an
+    /// index into the walk's bound callees.
+    fn boundCapture(self: *Reifier, lambda: CheckedExprId, pattern: CheckedPatternId) ?u32 {
+        if (self.bound_lambda != lambda) return null;
+        return capturedCallee(self.bound, pattern);
+    }
+
+    /// The entry of `bound` that fixes a captured name, as an index into it.
+    fn capturedCallee(bound: []const BoundCallee, pattern: CheckedPatternId) ?u32 {
+        for (bound, 0..) |entry, slot| {
+            switch (entry.param) {
+                .capture => |captured| if (captured == pattern) return @intCast(slot),
+                .position => {},
+            }
+        }
+        return null;
+    }
+
+    /// The bound callee a name in scope stands for, when a call fixed it.
+    fn calleeInScope(self: *Reifier, pattern: CheckedPatternId) ?u32 {
+        const binder = self.bodies.patternBinderForCheckedPattern(pattern) orelse return null;
+        const binding = self.lookupBinding(binder) orelse return null;
+        return switch (binding.kind) {
+            .callee => |index| index,
+            .value, .constant, .function => null,
+        };
     }
 
     /// The function type of a lambda.
@@ -1012,25 +1472,34 @@ pub const Reifier = struct {
         /// holds the `Code` rather than the function. Null for a definition,
         /// whose node holds its own type.
         at: ?CheckedTypeId,
+        /// The callable the call recorded (`CalleeTarget.signature`).
+        signature: ?FramedType,
     ) Error!RowId {
         std.debug.assert(std.meta.eql(key.artifact, self.artifact.bytes));
+        try self.relateSelectedTargets();
         try self.walk.definitions.put(self.gpa, key, .{});
+        // The signature and the body are this module's source.
+        const outer_body = self.enter();
+        defer self.leave(outer_body);
 
-        const outer_substitution = self.substitution;
+        const outer_frame = self.frame;
+        const outer_instance_key = self.instance_key;
         const outer_uses = self.substitution_uses;
         const outer_evidence = self.evidence;
         const outer_bound = self.bound;
         const outer_bound_lambda = self.bound_lambda;
         const outer_replay = self.replay;
         const replay: Replay = .{ .region = self.bodies.expr(key.body).source_region };
-        self.substitution = if (instance) |fixed| fixed.substitution else .empty;
+        self.frame = try self.instanceFrame(instance, signature, key.body, key.curried);
+        self.instance_key = key.instantiation;
         self.substitution_uses = 0;
         self.evidence = supplied;
         self.bound = bound;
         self.bound_lambda = key.body;
         self.replay = if (at != null) &replay else null;
         defer {
-            self.substitution = outer_substitution;
+            self.frame = outer_frame;
+            self.instance_key = outer_instance_key;
             self.substitution_uses = outer_uses;
             self.evidence = outer_evidence;
             self.bound = outer_bound;
@@ -1081,17 +1550,18 @@ pub const Reifier = struct {
 
         const fn_ty_id = at orelse self.stagedFunctionTypeId(expr);
         const staged_fn = self.functionOf(fn_ty_id) orelse
-            return self.rejectError(.unsupported_type, region, "a reified value that is not a function");
+            return self.rejectCodeValue(region);
         // A stage runs this description during `roc build`, where an effect has
         // nowhere to happen. `tyOf` refuses an effectful function everywhere
         // else; the staged lambda's own type is the one that never reaches it.
-        if (staged_fn.kind == .effectful) return self.rejectError(.effect, region, "an effectful function");
+        if (staged_fn.kind == .effectful) return self.rejectError(.effect, region, "this function's own type is effectful (`=>`)");
         if (staged_fn.args.len != lambda.args.len) return self.rejectError(.unsupported_expression, region, "lambda");
 
         var params = std.ArrayList(TyId).empty;
         defer params.deinit(self.gpa);
         switch (captures) {
             .parameter => for (captured) |capture| {
+                if (self.boundCapture(expr_id, capture.pattern) != null) continue;
                 const pattern = self.bodies.pattern(capture.pattern);
                 try params.append(self.gpa, try self.tyOf(pattern.ty, pattern.source_region));
             },
@@ -1102,6 +1572,9 @@ pub const Reifier = struct {
             .in_scope => for (captured) |capture| {
                 if (self.capturedInScope(capture.pattern)) continue;
                 if (self.replayStatement(capture.pattern) != null) continue;
+                // A translator that returns a `Code.Bound` receives what the
+                // body reads of it as an input slot (`inputSlot`).
+                if (self.walk.inputs != null) continue;
                 return self.rejectError(.capture, region, self.capturedName(capture.pattern));
             },
         }
@@ -1110,11 +1583,15 @@ pub const Reifier = struct {
             // the row: a call on it names that definition, and the call site
             // passes nothing for it.
             if (self.bound_lambda == expr_id and self.boundCallee(index) != null) continue;
-            try params.append(self.gpa, try self.tyOf(param_ty, region));
+            const place: TypePlace = .{ .parameter = .{ .reader = self, .pattern = lambda.args[index], .position = @intCast(index) } };
+            try params.append(self.gpa, try self.placedTy(param_ty, region, place));
         }
-        const result = try self.tyOf(staged_fn.ret, region);
+        const own_result = try self.placedTy(staged_fn.ret, region, .result);
+        const demanded = if (key) |k| k.result else null;
+        const result = demanded orelse own_result;
         const lambdas = [_]CheckedExprId{expr_id};
         return self.buildRow(params.items, result, key, .{
+            .demanded = demanded != null,
             .captures = if (captures == .parameter) captured else &.{},
             .lambdas = &lambdas,
             .body = lambda.body,
@@ -1137,14 +1614,17 @@ pub const Reifier = struct {
         for (lambdas) |lambda_id| {
             const lambda = try self.lambdaData(lambda_id);
             const fn_ty = self.functionOf(self.stagedFunctionTypeId(self.bodies.expr(lambda_id))) orelse
-                return self.rejectError(.unsupported_type, region, "a reified value that is not a function");
-            if (fn_ty.kind == .effectful) return self.rejectError(.effect, region, "an effectful function");
+                return self.rejectCodeValue(region);
+            if (fn_ty.kind == .effectful) return self.rejectError(.effect, region, "this function's own type is effectful (`=>`)");
             if (fn_ty.args.len != lambda.args.len) return self.rejectError(.unsupported_expression, region, "lambda");
-            for (fn_ty.args) |arg| try params.append(self.gpa, try self.tyOf(arg, region));
+            for (fn_ty.args, 0..) |arg, index| {
+                const place: TypePlace = .{ .parameter = .{ .reader = self, .pattern = lambda.args[index], .position = @intCast(params.items.len) } };
+                try params.append(self.gpa, try self.placedTy(arg, region, place));
+            }
             ret = fn_ty.ret;
         }
         const inner = try self.lambdaData(outer.body);
-        return self.buildRow(params.items, try self.tyOf(ret, region), key, .{
+        return self.buildRow(params.items, try self.placedTy(ret, region, .result), key, .{
             .captures = self.capturesOf(expr_id),
             .lambdas = &lambdas,
             .body = inner.body,
@@ -1156,6 +1636,9 @@ pub const Reifier = struct {
     /// whose parameters follow, outermost first, the body, and the checked
     /// result of the function type the row is built at.
     const RowParts = struct {
+        /// Whether the row delivers a type other than the lambda's own
+        /// (`DefinitionKey.result`).
+        demanded: bool = false,
         captures: []const checked.CheckedCapture,
         lambdas: []const CheckedExprId,
         body: CheckedExprId,
@@ -1175,6 +1658,10 @@ pub const Reifier = struct {
 
         const scope_base = self.scope.items.len;
         defer self.scope.shrinkRetainingCapacity(scope_base);
+        // A row is no part of the first stage that reached it.
+        const outer_stage = self.walk.stage_one;
+        self.walk.stage_one = 0;
+        defer self.walk.stage_one = outer_stage;
         // A lambda written inside a loop is a function of its own, so a
         // `break` in it has no loop to leave.
         const outer_loop = self.loop;
@@ -1183,7 +1670,12 @@ pub const Reifier = struct {
 
         var next: u30 = 0;
         for (parts.captures) |capture| {
-            try self.bindName(capture.pattern, .{ .value = Ref.rowParam(next) }, self.bodies.pattern(capture.pattern).source_region);
+            const region = self.bodies.pattern(capture.pattern).source_region;
+            if (self.boundCapture(parts.lambdas[0], capture.pattern)) |slot| {
+                try self.bindName(capture.pattern, .{ .callee = slot }, region);
+                continue;
+            }
+            try self.bindName(capture.pattern, .{ .value = Ref.rowParam(next) }, region);
             next += 1;
         }
         for (parts.lambdas) |lambda_id| {
@@ -1216,7 +1708,7 @@ pub const Reifier = struct {
     /// has a checked type of its own, narrower than the function's result,
     /// and delivers at the result (design.md "Try Return-Row Composition").
     fn bodyValue(self: *Reifier, parts: RowParts, result: TyId) Error!Ref {
-        if (parts.ret == self.bodies.expr(parts.body).ty) return self.exprRef(parts.body);
+        if (!parts.demanded and parts.ret == self.bodies.expr(parts.body).ty) return self.exprRef(parts.body);
         return self.exprAt(parts.body, result);
     }
 
@@ -1230,37 +1722,456 @@ pub const Reifier = struct {
         var target = callee;
         defer if (target.instantiation) |*instance| instance.substitution.deinit(self.gpa);
         defer self.releaseBound(target.bound);
+        // The signature is read in the site's own types, where the row is.
+        if (target.signature) |callable| {
+            target.key.signature = try callable.reader.tyOfIn(callable.frame, callable.id, target.reader.bodies.expr(target.key.body).source_region);
+        }
         if (self.walk.definitions.get(target.key)) |existing| {
             const row = existing.row orelse invariant("a call reached a definition before its row began");
             if (existing.open) self.walk.markRecursive(row);
             return row;
         }
-        return target.reader.describeDefinition(target.key, target.instantiation, target.evidence, target.bound, target.at);
+        return target.reader.describeDefinition(target.key, target.instantiation, target.evidence, target.bound, target.at, target.signature);
     }
 
     /// A lambda written where a value stands: a closure of its row, over what
     /// it captured (N8b).
-    fn closureExpr(self: *Reifier, expr_id: CheckedExprId) Error!Ref {
+    ///
+    /// `at` is the function type the lambda is read at. The checker takes a
+    /// record or a tag union for the nominal that declares it, so a lambda
+    /// that builds one and is read at a function of the nominal delivers the
+    /// nominal: its row is built at it.
+    fn closureAt(self: *Reifier, expr_id: CheckedExprId, at: ?TyId) Error!Ref {
         const expr = self.bodies.expr(expr_id);
         const fn_ty = try self.tyOf(self.stagedFunctionTypeId(expr), expr.source_region);
-        return self.closureOf(.{
-            .key = .{ .artifact = self.artifact.bytes, .body = expr_id },
+        var target = try self.enclosedLambda(expr_id, null, self.capturesOf(expr_id));
+        target.key.result = self.readAsNominal(fn_ty, at);
+        const closure_ty = if (target.key.result != null) at.? else fn_ty;
+        if (self.walk.stage_one == 0) return self.closureOf(target, closure_ty);
+        // A lambda a first stage writes may be applied before the stage ends,
+        // where the walk stands, so its target is kept beside its row.
+        const kept = try self.boundTarget(target);
+        errdefer Walk.freeTarget(self.gpa, kept);
+        const closure = try self.closureOf(target, closure_ty);
+        const known = self.bld().knownClosure(closure) orelse invariant("a lambda's closure is a Closure node");
+        const previous = self.walk.closure_targets.get(known.row);
+        try self.walk.closure_targets.put(self.gpa, known.row, kept);
+        if (previous) |old| Walk.freeTarget(self.gpa, old);
+        return closure;
+    }
+
+    /// The target of a lambda written in the row being walked.
+    ///
+    /// The lambda is part of the definition that row describes, so it
+    /// describes under the instantiation the row does: what the call fixed
+    /// the definition's quantified variables to, and how it discharged its
+    /// `where` obligations. `local` is what a lookup fixed the variables of a
+    /// lambda its block generalized to, and it extends the row's own. Such a
+    /// lambda has a dispatch scope of its own, so the row's evidence is not
+    /// its evidence. Takes `local`.
+    fn enclosedLambda(
+        self: *Reifier,
+        expr_id: CheckedExprId,
+        local: ?Instantiation,
+        captures: []const checked.CheckedCapture,
+    ) Error!CalleeTarget {
+        const evidence: SuppliedEvidence = if (local == null) self.evidence else .{};
+        var instance = local;
+        errdefer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
+
+        // A name a call fixed to a definition is that definition here too,
+        // so the lambda's row names it rather than taking a function value.
+        var bound = std.ArrayList(BoundCallee).empty;
+        errdefer {
+            self.releaseBound(bound.items);
+            bound.deinit(self.gpa);
+        }
+        for (captures) |capture| {
+            const index = self.calleeInScope(capture.pattern) orelse continue;
+            try bound.append(self.gpa, .{ .param = .{ .capture = capture.pattern }, .target = try self.boundTarget(self.bound[index].target) });
+        }
+        if (self.walk.frameSubstitution(self.frame).count() != 0) {
+            var merged = try self.walk.frameSubstitution(self.frame).clone(self.gpa);
+            errdefer merged.deinit(self.gpa);
+            var hasher = std.crypto.hash.Blake3.init(.{});
+            hasher.update(&self.instance_key);
+            if (instance) |*fixed| {
+                var entries = fixed.substitution.iterator();
+                while (entries.next()) |entry| try merged.put(self.gpa, entry.key_ptr.*, entry.value_ptr.*);
+                hasher.update(&fixed.key);
+                fixed.substitution.deinit(self.gpa);
+            }
+            var key: [32]u8 = undefined;
+            hasher.final(&key);
+            instance = .{ .substitution = merged, .key = key };
+        }
+        const callees = if (bound.items.len == 0) @as([32]u8, @splat(0)) else boundCalleesKey(bound.items);
+        return .{
+            .key = .{
+                .artifact = self.artifact.bytes,
+                .body = expr_id,
+                .instantiation = if (instance) |fixed| fixed.key else @as([32]u8, @splat(0)),
+                .callees = callees,
+            },
             .reader = self,
-            .captures = self.capturesOf(expr_id),
-        }, fn_ty);
+            .instantiation = instance,
+            .evidence = evidence,
+            .captures = captures,
+            .bound = try bound.toOwnedSlice(self.gpa),
+        };
     }
 
     /// A closure of a callee's row. What the callee captured is read here,
     /// where the lambda was written, before the row is built.
     fn closureOf(self: *Reifier, target: CalleeTarget, fn_ty: TyId) Error!Ref {
-        const values = try self.gpa.alloc(Ref, target.captures.len);
-        defer self.gpa.free(values);
-        for (target.captures, values) |capture, *value| {
+        var values = std.ArrayList(Ref).empty;
+        defer values.deinit(self.gpa);
+        for (target.captures) |capture| {
+            if (capturedCallee(target.bound, capture.pattern) != null) continue;
             const pattern = self.bodies.pattern(capture.pattern);
-            value.* = try self.lookupRef(capture.pattern, null, pattern.ty, null, pattern.source_region);
+            try values.append(self.gpa, try self.lookupRef(capture.pattern, null, pattern.ty, null, null, pattern.source_region));
         }
         const row = try self.calledRow(target);
-        return self.bld().closure(row, values, fn_ty);
+        return self.bld().closure(row, values.items, fn_ty);
+    }
+
+    /// The frame a definition's body is walked in: what the call fixed its
+    /// quantified variables to, and, where the call recorded the callable it
+    /// reads the definition at (`CalleeTarget.signature`), each parameter and
+    /// result of the definition's own function type read as that callable's.
+    ///
+    /// This is the relation Monotype makes between a target's function type
+    /// and the callable it is specialized at (`relateFunctionRequestInterface`).
+    /// The checker took a record or a tag union for a parameter the call fixed
+    /// to a nominal, and the definition's own type keeps the record, so the
+    /// callable is what says the nominal. Every node of the body whose type is
+    /// that parameter's then reads the nominal: a call that passes it on reads
+    /// its callee at the nominal too. A variable the call fixed keeps what the
+    /// call fixed it to. `curried` relates the inner lambda of a curried
+    /// definition to the function the callable returns.
+    fn instanceFrame(self: *Reifier, instance: ?Instantiation, signature: ?FramedType, body: CheckedExprId, curried: bool) Error!FrameId {
+        const callable = signature orelse return if (instance) |fixed| self.walk.pushFrame(fixed.substitution) else empty_frame;
+        var related: Substitution = if (instance) |fixed| try fixed.substitution.clone(self.gpa) else .empty;
+        defer related.deinit(self.gpa);
+        var lambda_id = body;
+        var at = callable;
+        var remaining: usize = if (curried) 2 else 1;
+        while (true) {
+            const own = self.functionOf(self.stagedFunctionTypeId(self.bodies.expr(lambda_id))) orelse
+                invariant("a definition a call reads at its callable is a lambda of a function type");
+            const called = at.reader.functionOf(at.id) orelse invariant("a call's recorded callable is a function");
+            if (own.args.len != called.args.len) invariant("a call's callable takes the parameters its callee's lambda does");
+            for (own.args, called.args) |arg, called_arg| try self.relateType(&related, arg, at.reader.resolvedTypeIn(at.frame, called_arg));
+            const result = at.reader.resolvedTypeIn(at.frame, called.ret);
+            try self.relateType(&related, own.ret, result);
+            remaining -= 1;
+            if (remaining == 0) break;
+            lambda_id = (try self.lambdaData(lambda_id)).body;
+            at = result;
+        }
+        return self.walk.pushFrame(related);
+    }
+
+    /// Read one type of a definition's own function type as the callable's
+    /// type at that position, and every type inside it as the callable's type
+    /// at the same position inside, as Monotype's graph unification relates
+    /// the nodes below the two roots it joins (`unifyRoots`). A type the
+    /// relation already reads, a variable the call fixed among them, keeps
+    /// what it reads, which also ends the walk of a recursive type.
+    ///
+    /// The definition's side is a type of this store, and the callable's side
+    /// is a type of the store and frame the call recorded it in. Positions
+    /// pair as unification pairs them: a function's parameters and result, a
+    /// tuple's elements, a record's fields by name, a tag union's variants by
+    /// name and their payloads, and a nominal's arguments where both sides
+    /// are that nominal. A record or a tag union of the definition's side that
+    /// the callable's side holds a nominal for is the lift the checker made
+    /// (unify.zig `unifyRecordWithNominal`), and pairs with the nominal's
+    /// backing at the callable's arguments, as Monotype's
+    /// `unifyThroughBacking` does. A row variable is not paired: the record or
+    /// tag union that stands on it is, as a whole.
+    fn relateType(self: *Reifier, related: *Substitution, own: CheckedTypeId, called: FramedType) Error!void {
+        const entry = try related.getOrPut(self.gpa, own);
+        if (entry.found_existing) return;
+        entry.value_ptr.* = called;
+        try self.relateInside(related, own, called);
+    }
+
+    /// The pairing of `relateType` below one pair of positions.
+    fn relateInside(self: *Reifier, related: *Substitution, own: CheckedTypeId, raw_called: FramedType) Error!void {
+        const called = settledType(raw_called);
+        const called_payload = called.reader.types.payload(called.id);
+        // A position the callable leaves open fixes nothing inside.
+        switch (called_payload) {
+            .flex, .rigid, .pending, .err => return,
+            .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => {},
+            .alias => unreachable, // settledType reads through every alias
+        }
+        switch (self.types.payload(own)) {
+            .alias => |alias| try self.relateType(related, alias.backing, called),
+            .flex, .rigid, .pending, .err, .empty_record, .empty_tag_union => {},
+            .function => |own_fn| {
+                const called_fn = switch (called_payload) {
+                    .function => |function| function,
+                    .record, .tuple, .nominal, .empty_record, .tag_union, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a function type of a definition relates to a function of its callable"),
+                };
+                if (own_fn.args.len != called_fn.args.len) invariant("a function type of a definition takes the parameters the callable's does");
+                for (own_fn.args, called_fn.args) |arg, called_arg| try self.relateType(related, arg, called.reader.resolvedTypeIn(called.frame, called_arg));
+                try self.relateType(related, own_fn.ret, called.reader.resolvedTypeIn(called.frame, called_fn.ret));
+            },
+            .tuple => |own_elements| {
+                const called_elements = switch (called_payload) {
+                    .tuple => |elements| elements,
+                    .record, .function, .nominal, .empty_record, .tag_union, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a tuple of a definition relates to a tuple of its callable"),
+                };
+                if (own_elements.len != called_elements.len) invariant("a tuple of a definition has the elements the callable's does");
+                for (own_elements, called_elements) |element, called_element| try self.relateType(related, element, called.reader.resolvedTypeIn(called.frame, called_element));
+            },
+            .nominal => |own_nominal| {
+                const called_nominal = switch (called_payload) {
+                    .nominal => |nominal| nominal,
+                    .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a nominal of a definition relates to that nominal of its callable"),
+                };
+                if (!self.sameTypeName(own_nominal.name, called.reader, called_nominal.name) or own_nominal.args.len != called_nominal.args.len) {
+                    invariant("a nominal of a definition relates to that nominal of its callable");
+                }
+                for (own_nominal.args, called_nominal.args) |arg, called_arg| try self.relateType(related, arg, called.reader.resolvedTypeIn(called.frame, called_arg));
+            },
+            .record => |own_record| switch (called_payload) {
+                .record => |called_record| {
+                    var own_fields = std.ArrayList(checked.CheckedRecordField).empty;
+                    defer own_fields.deinit(self.gpa);
+                    try self.recordFields(&own_fields, own_record.fields, own_record.ext);
+                    var called_fields = std.ArrayList(checked.CheckedRecordField).empty;
+                    defer called_fields.deinit(self.gpa);
+                    try called.reader.recordFields(&called_fields, called_record.fields, called_record.ext);
+                    for (own_fields.items) |field| {
+                        // A field the definition's kind lets a record omit
+                        // (`?` or a default) pairs with nothing where the
+                        // callable's record omits it.
+                        const match = for (called_fields.items) |called_field| {
+                            if (self.sameFieldLabel(field.name, called.reader, called_field.name)) break called_field;
+                        } else switch (field.kind.tag) {
+                            .required => invariant("a required field of a definition's record is a field of its callable's"),
+                            .optional, .defaulted, .undetermined, .err => continue,
+                        };
+                        try self.relateType(related, field.ty, called.reader.resolvedTypeIn(called.frame, match.ty));
+                    }
+                },
+                .nominal => |called_nominal| try self.relateInside(related, own, try called.reader.nominalBacking(called, called_nominal)),
+                .tuple, .function, .empty_record, .tag_union, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a record of a definition relates to a record of its callable, or to a nominal it lifted into"),
+            },
+            .tag_union => |own_union| switch (called_payload) {
+                .tag_union => |called_union| {
+                    var own_tags = std.ArrayList(checked.CheckedTag).empty;
+                    defer own_tags.deinit(self.gpa);
+                    try self.unionTags(&own_tags, own_union.tags, own_union.ext);
+                    var called_tags = std.ArrayList(checked.CheckedTag).empty;
+                    defer called_tags.deinit(self.gpa);
+                    try called.reader.unionTags(&called_tags, called_union.tags, called_union.ext);
+                    for (own_tags.items) |variant| {
+                        const match = for (called_tags.items) |called_variant| {
+                            if (self.sameTagLabel(variant.name, called.reader, called_variant.name)) break called_variant;
+                        } else invariant("a variant of a definition's tag union is a variant of its callable's");
+                        const payloads = variant.argsSlice(self.types);
+                        const called_payloads = match.argsSlice(called.reader.types);
+                        if (payloads.len != called_payloads.len) invariant("a variant of a definition carries the payloads its callable's does");
+                        for (payloads, called_payloads) |payload, called_arg| try self.relateType(related, payload, called.reader.resolvedTypeIn(called.frame, called_arg));
+                    }
+                },
+                .nominal => |called_nominal| try self.relateInside(related, own, try called.reader.nominalBacking(called, called_nominal)),
+                .record, .tuple, .function, .empty_record, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a tag union of a definition relates to a tag union of its callable, or to a nominal it lifted into"),
+            },
+        }
+    }
+
+    /// `type`, read through what its frame fixes it to and through every
+    /// alias, to the structure or variable it stands for.
+    fn settledType(framed: FramedType) FramedType {
+        var current = framed;
+        while (true) {
+            if (current.reader.fixedTypeIn(current.frame, current.id)) |fixed| {
+                current = fixed;
+                continue;
+            }
+            switch (current.reader.types.payload(current.id)) {
+                .alias => |alias| current.id = alias.backing,
+                .flex, .rigid, .pending, .err, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => return current,
+            }
+        }
+    }
+
+    /// The backing of a nominal of this store, read in a frame that fixes the
+    /// declaration's variables to the arguments `framed` gives them.
+    fn nominalBacking(self: *Reifier, framed: FramedType, nominal: checked.CheckedNominalType) Error!FramedType {
+        const backing = self.types.nominalBackingTemplateForPayload(nominal) orelse
+            invariant("a nominal a definition's structure lifted into has a backing");
+        if (nominal.args.len == 0) return .{ .reader = self, .id = backing, .frame = empty_frame };
+        const declaration = self.types.nominalDeclarationForPayload(nominal) orelse
+            invariant("a nominal a definition's structure lifted into has a declaration");
+        const formals = declaration.formalArgs(self.types);
+        if (formals.len != nominal.args.len) invariant("a nominal's arguments are its declaration's variables");
+        var fixed: Substitution = .empty;
+        defer fixed.deinit(self.gpa);
+        for (formals, nominal.args) |formal, arg| try fixed.put(self.gpa, formal, self.resolvedTypeIn(framed.frame, arg));
+        return .{ .reader = self, .id = backing, .frame = try self.walk.pushFrame(fixed) };
+    }
+
+    /// The result type `at` gives a function of type `own`, where `at` reads
+    /// the nominal over the type `own` delivers, and null for any other `at`.
+    fn readAsNominal(self: *Reifier, own: TyId, at: ?TyId) ?TyId {
+        const types = self.rt();
+        const wanted = at orelse return null;
+        const own_ret = switch (types.get(own)) {
+            .func => |function| function.ret,
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .nominal, .opaque_, .recursive => return null,
+        };
+        const wanted_ret = switch (types.get(wanted)) {
+            .func => |function| function.ret,
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .nominal, .opaque_, .recursive => return null,
+        };
+        if (wanted_ret == own_ret) return null;
+        return switch (types.get(wanted_ret)) {
+            .nominal => |nominal| if (nominal.backing == own_ret) wanted_ret else null,
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .func, .opaque_, .recursive => null,
+        };
+    }
+
+    // First stage //
+
+    /// Whether this reader's walk is inside the first stage of an
+    /// interpolated literal, at a call whose result holds a function. Such a
+    /// call is walked where it stands, because a node named for it would give
+    /// back a function that nothing can apply.
+    fn walksInline(self: *Reifier, result_ty: CheckedTypeId, region: base.Region) Error!bool {
+        if (self.walk.stage_one == 0) return false;
+        return self.holdsFunction(try self.tyOf(result_ty, region));
+    }
+
+    /// Whether a value of `ty` holds a function.
+    fn holdsFunction(self: *Reifier, ty: TyId) bool {
+        const types = self.rt();
+        return switch (types.get(ty)) {
+            .func => true,
+            .bool_, .str, .int, .float, .dec, .opaque_, .recursive => false,
+            .list => |elem| self.holdsFunction(elem),
+            .nominal => |nominal| self.holdsFunction(nominal.backing),
+            .record, .tuple, .tag_union => |span| {
+                for (types.memberSlice(span)) |member| {
+                    for (types.tySlice(member.tys)) |item| if (self.holdsFunction(item)) return true;
+                }
+                return false;
+            },
+        };
+    }
+
+    /// A definition's body, walked where the call stands with its parameters
+    /// bound to `args`, as a lifted lambda's body is with its captures first.
+    /// Takes the callee's instantiation and bound callees.
+    fn inlineCall(self: *Reifier, callee: CalleeTarget, args: []const Ref, at: ?TyId, region: base.Region) Error!Ref {
+        var target = callee;
+        defer if (target.instantiation) |*instance| instance.substitution.deinit(self.gpa);
+        defer self.releaseBound(target.bound);
+        return target.reader.inlineBody(target, args, at, region);
+    }
+
+    /// `at` is the type the site reads the value at, where it is not the
+    /// definition's own.
+    fn inlineBody(self: *Reifier, target: CalleeTarget, args: []const Ref, at: ?TyId, region: base.Region) Error!Ref {
+        std.debug.assert(std.meta.eql(target.key.artifact, self.artifact.bytes));
+        const lambda_id = target.key.body;
+        const lambda = try self.lambdaData(lambda_id);
+        // A body that reads itself, or that can leave the row it is walked in,
+        // has no value to walk to.
+        if (self.folding.contains(lambda_id)) return self.rejectError(.unsupported_expression, region, "a conversion that calls itself");
+        if (self.transfers(lambda.body)) return self.rejectError(.unsupported_expression, region, "a conversion that leaves its body early");
+        const fn_ty = self.functionOf(self.stagedFunctionTypeId(self.bodies.expr(lambda_id))) orelse
+            return self.rejectCodeValue(region);
+        try self.relateSelectedTargets();
+        try self.folding.put(self.gpa, lambda_id, {});
+        defer _ = self.folding.remove(lambda_id);
+
+        const outer_frame = self.frame;
+        const outer_instance_key = self.instance_key;
+        const outer_uses = self.substitution_uses;
+        const outer_evidence = self.evidence;
+        const outer_bound = self.bound;
+        const outer_bound_lambda = self.bound_lambda;
+        const outer_replay = self.replay;
+        self.frame = try self.instanceFrame(target.instantiation, target.signature, lambda_id, false);
+        self.instance_key = target.key.instantiation;
+        self.substitution_uses = 0;
+        self.evidence = target.evidence;
+        self.bound = target.bound;
+        self.bound_lambda = lambda_id;
+        self.replay = null;
+        defer {
+            self.frame = outer_frame;
+            self.instance_key = outer_instance_key;
+            self.substitution_uses = outer_uses;
+            self.evidence = outer_evidence;
+            self.bound = outer_bound;
+            self.bound_lambda = outer_bound_lambda;
+            self.replay = outer_replay;
+        }
+        // The body sees none of the names around the call.
+        const outer_scope = self.scope;
+        const outer_loop = self.loop;
+        self.scope = .empty;
+        self.loop = null;
+        defer {
+            self.scope.deinit(self.gpa);
+            self.scope = outer_scope;
+            self.loop = outer_loop;
+        }
+
+        // The call's region is the caller's, so the result type is read
+        // before the walk enters this module's source.
+        const result = at orelse target.key.result orelse try self.tyOf(fn_ty.ret, region);
+        const outer_body = self.enter();
+        defer self.leave(outer_body);
+
+        var next: usize = 0;
+        for (target.captures) |capture| {
+            const capture_region = self.bodies.pattern(capture.pattern).source_region;
+            if (self.boundCapture(lambda_id, capture.pattern)) |slot| {
+                try self.bindName(capture.pattern, .{ .callee = slot }, capture_region);
+                continue;
+            }
+            try self.bindName(capture.pattern, .{ .value = args[next] }, capture_region);
+            next += 1;
+        }
+        for (lambda.args, 0..) |pattern_id, index| {
+            if (self.boundCallee(index)) |slot| {
+                try self.bindName(pattern_id, .{ .callee = slot }, self.bodies.pattern(pattern_id).source_region);
+                continue;
+            }
+            try self.bindPattern(pattern_id, args[next]);
+            next += 1;
+        }
+        std.debug.assert(next == args.len);
+
+        const walked = if (at == null and target.key.result == null and fn_ty.ret == self.bodies.expr(lambda.body).ty)
+            self.exprRef(lambda.body)
+        else
+            self.exprAt(lambda.body, result);
+        return walked catch |err| switch (err) {
+            error.Diverged => invariant("a body the scan found no exit in diverged"),
+            error.Rejected, error.OutOfMemory => |e| return e,
+        };
+    }
+
+    /// The call of a function value that a first stage wrote as a lambda,
+    /// walked where it stands, or null for any other function value.
+    fn appliedInline(self: *Reifier, f: Ref, args: []const Ref, at: TyId, region: base.Region) Error!?Ref {
+        if (self.walk.stage_one == 0) return null;
+        const known = self.bld().knownClosure(f) orelse return null;
+        const registered = self.walk.closure_targets.get(known.row) orelse return null;
+        const all = try self.gpa.alloc(Ref, known.captures.len + args.len);
+        defer self.gpa.free(all);
+        @memcpy(all[0..known.captures.len], known.captures);
+        @memcpy(all[known.captures.len..], args);
+        return try self.inlineCall(try self.boundTarget(registered), all, at, region);
     }
 
     // Scope //
@@ -1401,33 +2312,14 @@ pub const Reifier = struct {
         return self.lookupBinding(binder);
     }
 
-    /// An `assign` pattern's region is exactly its identifier, and an `as`
-    /// pattern's region ends at the identifier it binds, so both name a binder
-    /// through the source. Regions survive serialization where the source-node
-    /// map does not, which is why the name comes from here.
-    ///
-    /// One `assign` reads wider than its identifier: a string pattern's
-    /// capture carries the interpolation that wrote it, braces and all.
+    /// The name the canonicalizer recorded on the pattern that binds `binder`,
+    /// read from the ident store of the module that owns it.
     fn binderName(self: *Reifier, binder: PatternBinderId) []const u8 {
-        const record = self.bodies.patternBinder(binder);
-        const pattern = self.bodies.pattern(record.pattern);
-        const text = self.env.getSource(pattern.source_region);
-        return switch (pattern.data) {
-            .as => trailingIdentifier(text),
-            .assign => interpolatedIdentifier(text),
-            .pending,
-            .applied_tag,
-            .nominal,
-            .record_destructure,
-            .list,
-            .tuple,
-            .numeral_literal,
-            .str_literal,
-            .str_interpolation,
-            .underscore,
-            .runtime_error,
-            => text,
-        };
+        // A source binding pattern always records its identifier; only a
+        // literal pattern's matched-value binder has none, and no capture,
+        // parameter or exported function names one.
+        const name = self.bodies.patternBinder(binder).name orelse unreachable; // a source binding pattern always records its identifier (see above)
+        return self.env.getIdentText(name);
     }
 
     // Values //
@@ -1564,14 +2456,16 @@ pub const Reifier = struct {
     /// own: a lambda body composes a `?` result, whose error row holds every
     /// tag of the body's own (design.md "Try Return-Row Composition"), or the
     /// checker stamped a `row_coerce` (design.md "Row Coercion Primitive").
-    /// A constructor and a call build at `at` directly, and a branching
-    /// construct or block builds each of its values there. Any other value
-    /// whose own type is not `at` is returned as it is: a tag has the same
-    /// name at every union, so the value conforms to `at` (the verifier
-    /// checks it).
+    /// A constructor builds at `at` directly, and a branching construct or
+    /// block builds each of its values there. Any other value is built at
+    /// its own type and lifted to `at` (`liftTo`): conformance where the
+    /// step widens a union, `Wrap` where it lifts a union into a nominal. A
+    /// call is built at the union `liftReach` gives, and lifted from there.
     fn exprAt(self: *Reifier, expr_id: CheckedExprId, at: TyId) Error!Ref {
         const expr_data = self.bodies.expr(expr_id);
         const region = expr_data.source_region;
+        const outer_body = self.enter();
+        defer self.leave(outer_body);
         var here = [1]reify.provenance.OriginId{try self.walk.originAt(self.artifact, region)};
         const outer = self.bld().origins;
         self.bld().origins = &here;
@@ -1580,12 +2474,15 @@ pub const Reifier = struct {
             .tag, .zero_argument_tag, .nominal => self.exprAs(expr_id, at),
             .row_coerce => |coerce| self.exprAt(coerce.value, at),
             // A call whose result is read at a wider union has that union as its type.
-            .call => |call| self.callExpr(call.func, call.args, expr_data.ty, at, region),
+            .call => |call| blk: {
+                const reached = try self.liftReach(try self.tyOf(expr_data.ty, region), at);
+                break :blk self.liftTo(try self.callExpr(call.func, call.args, expr_data.ty, reached, region), at, region);
+            },
             // A constant a name folds to is built at `at`.
-            .lookup_local => |lookup| self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, at, region),
+            .lookup_local => |lookup| self.liftTo(try self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, expr_id, at, region), at, region),
             .lookup_external, .lookup_required => |reference| blk: {
-                if (try self.foldedConstant(reference, at, region)) |folded| break :blk folded;
-                break :blk self.exprRef(expr_id);
+                if (try self.foldedConstant(reference, expr_data.ty, at, region)) |folded| break :blk self.liftTo(folded, at, region);
+                break :blk self.liftTo(try self.exprRef(expr_id), at, region);
             },
             .match_ => |match_expr| (try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .{ .at = at }, region)).?,
             .block => |block| (try self.blockExpr(block.statements, block.final_expr, .{ .at = at })).?,
@@ -1594,10 +2491,11 @@ pub const Reifier = struct {
             .return_, .break_ => self.exprRef(expr_id),
             .crash => |literal| self.bld().crash(at, try self.bld().litStr(self.bodies.stringLiteral(literal))),
             .run_low_level => |run| blk: {
-                if (run.op != .crash or run.args.len != 1) break :blk self.exprRef(expr_id);
+                if (run.op != .crash or run.args.len != 1) break :blk self.liftTo(try self.exprRef(expr_id), at, region);
                 break :blk try self.bld().crash(at, try self.exprRef(run.args[0]));
             },
-            .numeral, .str_segment, .str, .binop, .unary_minus, .unary_not, .tuple, .list, .empty_list, .record, .empty_record, .tuple_access, .field_access, .dispatch_call, .type_dispatch_call, .method_eq, .structural_eq, .structural_hash, .dbg, .hosted_lambda, .lambda, .closure, .str_from_quote, .interpolation, .bytes_literal, .expect, .for_, .pending, .code_from_lambda, .runtime_error, .expect_err, .ellipsis, .anno_only => self.exprRef(expr_id),
+            .lambda, .closure => self.closureAt(expr_id, at),
+            .numeral, .str_segment, .str, .binop, .unary_minus, .unary_not, .tuple, .list, .empty_list, .record, .empty_record, .tuple_access, .field_access, .dispatch_call, .type_dispatch_call, .method_eq, .structural_eq, .structural_hash, .dbg, .hosted_lambda, .str_from_quote, .interpolation, .bytes_literal, .expect, .for_, .pending, .code_from_lambda, .runtime_error, .expect_err, .ellipsis, .anno_only => self.liftTo(try self.exprRef(expr_id), at, region),
         };
     }
 
@@ -1616,6 +2514,8 @@ pub const Reifier = struct {
     fn exprAs(self: *Reifier, expr_id: CheckedExprId, as: ?TyId) Error!Ref {
         const expr_data = self.bodies.expr(expr_id);
         const region = expr_data.source_region;
+        const outer_body = self.enter();
+        defer self.leave(outer_body);
         const b = self.bld();
         // What this expression builds comes from it (N10); what its parts
         // build comes from them.
@@ -1627,7 +2527,7 @@ pub const Reifier = struct {
             .numeral => |data| try self.numeralExpr(data, expr_data.ty, region),
             .str_segment => |literal| try b.litStr(self.bodies.stringLiteral(literal)),
             .str => |segments| try self.interpolatedExpr(segments),
-            .lookup_local => |lookup| try self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, null, region),
+            .lookup_local => |lookup| try self.lookupRef(lookup.pattern, lookup.resolved, expr_data.ty, expr_id, null, region),
             .match_ => |match_expr| (try self.matchExpr(match_expr.cond, match_expr.branches, expr_data.ty, .value, region)).?,
             .block => |block| (try self.blockExpr(block.statements, block.final_expr, .value)).?,
             .if_ => |if_expr| (try self.ifExpr(if_expr.branches, if_expr.final_else, expr_data.ty, .value, region)).?,
@@ -1676,11 +2576,11 @@ pub const Reifier = struct {
             .tag => |tag_expr| try self.tagExpr(tag_expr.name, tag_expr.args, expr_data.ty, as, region),
             .zero_argument_tag => |tag_expr| try self.tagExpr(tag_expr.name, &.{}, expr_data.ty, as, region),
             .call => |call| try self.callExpr(call.func, call.args, expr_data.ty, null, region),
-            .lambda, .closure => try self.closureExpr(expr_id),
+            .lambda, .closure => try self.closureAt(expr_id, null),
             // A name of another module holds no binding in the scope, so it is
             // the value it was fixed to, or the definition it names.
             .lookup_external, .lookup_required => |reference| blk: {
-                if (try self.foldedConstant(reference, null, region)) |folded| break :blk folded;
+                if (try self.foldedConstant(reference, expr_data.ty, null, region)) |folded| break :blk folded;
                 if (reference) |resolved| {
                     if (self.functionOf(expr_data.ty) != null) break :blk try self.functionValue(resolved, null, expr_data.ty, region);
                 }
@@ -1692,12 +2592,13 @@ pub const Reifier = struct {
             .str_from_quote => |quote| blk: {
                 const ty = try self.tyOf(expr_data.ty, region);
                 if (self.rt().get(ty) == .str) break :blk try b.litStr(self.bodies.stringLiteral(quote.literal));
+                if (quote.conversion_root) |root| try self.walk.noteRead(self.artifact, root);
                 break :blk try self.dispatchExpr(quote.plan, expr_data.ty, region);
             },
             // An interpolated literal of the author's own type is the
             // `from_interpolation` call the checker wrote: the method decides
             // what the pieces become.
-            .interpolation => |interpolation| try self.dispatchExpr(interpolation.plan, expr_data.ty, region),
+            .interpolation => |interpolation| try self.interpolationExpr(interpolation, expr_data.ty, region),
             // An embedded file, which is the one expression a `List(U8)`
             // literal is written as.
             .bytes_literal => |literal| try b.litBytes(try self.tyOf(expr_data.ty, region), self.bodies.stringLiteral(literal)),
@@ -1710,8 +2611,8 @@ pub const Reifier = struct {
                 try self.forLoop(loop.pattern, loop.expr, loop.body, loop.plan, loop.mutations, region);
                 break :blk try b.record(try self.tyOf(expr_data.ty, region), &.{});
             },
+            .code_from_lambda => self.rejectCodeValue(region),
             .pending,
-            .code_from_lambda,
             .runtime_error,
             .expect_err,
             .ellipsis,
@@ -1787,11 +2688,59 @@ pub const Reifier = struct {
         }
     }
 
+    /// An interpolated literal of the author's own type, which the language
+    /// converts in two stages (langref "Static dispatch"). The first stage is
+    /// `from_interpolation` over the literal's segments, which are literals,
+    /// so the walk runs it by its definition where the literal stands: a
+    /// builtin it wraps, such as `Str.from_interpolation`, is walked too, and
+    /// so is every lambda it applies, until the lambda it hands back in its
+    /// `Ok` is a closure of a row. The second stage is that closure applied
+    /// to the list of the interpolated values, a `Call` of the row over its
+    /// captures and the list. The `Err` of the first stage is the crash of a
+    /// rejected literal, as the `Err` of a `from_numeral` is
+    /// (`convertedWith`), and the rule N13w drops the branches that reach it.
+    /// A conversion in the site's cut is one `Prim` over the segments and
+    /// the values.
+    fn interpolationExpr(self: *Reifier, interpolation: checked.CheckedInterpolation, checked_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        const id = interpolation.plan orelse return self.rejectError(.unresolved_reference, region, "this literal");
+        const plan = self.plans.plans[@backingInt(id)];
+        const b = self.bld();
+        const types = self.rt();
+        const out_ty = try self.tyOf(checked_ty, region);
+        const item_ty = switch (types.get(try self.tyOf(interpolation.assembler_ty, region))) {
+            .func => |assembler| switch (types.get(types.tySlice(assembler.params)[0])) {
+                .list => |item| item,
+                .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .nominal, .func, .opaque_, .recursive => invariant("an assembler takes a list"),
+            },
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .nominal, .opaque_, .recursive => invariant("an interpolation's assembler is a function"),
+        };
+        // Every segment is kept, the empty ones too: the assembler reads them by position.
+        const segments = try self.exprRefs(interpolation.segments);
+        defer self.gpa.free(segments);
+        const values = try self.exprRefs(interpolation.values);
+        defer self.gpa.free(values);
+        const segment_list = try b.listOf(try types.listTy(try types.strTy()), segments);
+        const value_list = try b.listOf(try types.listTy(item_ty), values);
+        switch (try self.dispatchTarget(DispatchSpec.ofPlan(plan), region, .described)) {
+            .definition => |target| {
+                if (interpolation.conversion_root) |root| try self.walk.noteRead(self.artifact, root);
+                self.walk.stage_one += 1;
+                defer self.walk.stage_one -= 1;
+                const converted = try self.inlineCall(target, &.{segment_list}, null, region);
+                return self.convertedWith(converted, value_list, checked_ty, region);
+            },
+            .foreign => |name| return self.foreignPrim(name, &.{ segment_list, value_list }, out_ty, region),
+            .provided, .none => return self.rejectError(.unresolved_reference, region, "a method this literal names no target for"),
+        }
+    }
+
     /// A numeric literal: one `Lit` of its type (N1i), or, for a literal of
     /// the author's own type, the `from_numeral` call the checker wrote.
     fn numeralExpr(self: *Reifier, data: checked.CheckedNumeralData, checked_ty: CheckedTypeId, region: base.Region) Error!Ref {
-        const primitive = self.primitiveOf(checked_ty) orelse
+        const primitive = self.builtinNominalOf(checked_ty) orelse {
+            if (data.conversion_root) |root| try self.walk.noteRead(self.artifact, root);
             return self.dispatchExpr(data.plan, checked_ty, region);
+        };
         return self.numeralLit(data.literal, primitive, try self.tyOf(checked_ty, region), region);
     }
 
@@ -1944,6 +2893,13 @@ pub const Reifier = struct {
 
     /// A record literal, in the type's field order, and a record update as
     /// the full record it builds (N1g).
+    ///
+    /// A field the literal unsets (`b: _`), or leaves out where the type marks
+    /// it optional, is a member the `Record` node does not set
+    /// (`ir.RecordForm`). An update carries a field it did not write from its
+    /// subject, and a subject's optional field may be absent, so the update
+    /// is a switch on whether the subject holds it: the arm where it does
+    /// sets it, and the arm where it does not leaves it unset.
     fn recordExpr(
         self: *Reifier,
         fields: []const checked.CheckedRecordExprField,
@@ -1958,10 +2914,9 @@ pub const Reifier = struct {
         const shape = switch (types.get(target)) {
             .nominal => try types.unfold(target),
             .record => target,
-            .bool_, .str, .int, .float, .dec, .tuple, .tag_union, .list, .func, .opaque_, .recursive => return self.rejectError(.unsupported_type, region, "a record of this type"),
+            .opaque_ => return self.rejectError(.unsupported_type, region, opaque_built),
+            .bool_, .str, .int, .float, .dec, .tuple, .tag_union, .list, .func, .recursive => return self.rejectError(.unsupported_type, region, "a record of this type"),
         };
-        if (unsets.len != 0) return self.rejectError(.unsupported_expression, region, "a record literal that unsets an optional field");
-        const b = self.bld();
         // The subject of an update is written first, then the fields, and
         // they are built in that order.
         const subject = if (ext) |subject_id| try self.readable(try self.exprRef(subject_id)) else null;
@@ -1969,36 +2924,258 @@ pub const Reifier = struct {
         const values = try self.gpa.alloc(?Ref, members_len);
         defer self.gpa.free(values);
         @memset(values, null);
+        const unset = try self.gpa.alloc(bool, members_len);
+        defer self.gpa.free(unset);
+        @memset(unset, false);
         for (fields) |field| {
             const value = try self.exprRef(field.value);
             const index = self.memberIndex(shape, self.names.recordFieldLabelText(field.label)) orelse
                 return self.rejectError(.unsupported_type, region, "a field the record's type does not have");
             values[index] = value;
         }
-        const refs = try self.gpa.alloc(Ref, members_len);
-        defer self.gpa.free(refs);
-        for (values, refs, 0..) |value, *ref, index| {
-            if (value) |v| {
-                ref.* = v;
-                continue;
-            }
-            const member = types.memberSlice(types.get(shape).record)[index];
-            const from = subject orelse
-                return self.rejectError(.unsupported_expression, region, "a record literal that leaves out a field");
-            // A field the update did not write carries whatever the subject
-            // had, and a `Field` read of one that may be absent is not that.
-            if (member.optional) return self.rejectError(.unsupported_expression, region, "a record update over a record with an optional field");
-            ref.* = try b.field(from, try self.fieldIndex(from, types.nameText(member.name), region));
+        for (unsets) |label| {
+            const index = self.memberIndex(shape, self.names.recordFieldLabelText(label)) orelse
+                return self.rejectError(.unsupported_type, region, "a field the record's type does not have");
+            std.debug.assert(types.memberSlice(types.get(shape).record)[index].optional);
+            unset[index] = true;
         }
-        const record = try b.record(shape, refs);
-        return if (shape == target) record else b.wrap(target, record);
+        var carried = std.ArrayList(Carry).empty;
+        defer carried.deinit(self.gpa);
+        if (subject) |from| {
+            try self.carryMembers(from, shape, values, unset, &carried, region);
+        } else for (values, unset, 0..) |*value, is_unset, index| {
+            if (value.* != null or is_unset) continue;
+            // No subject: the checker accepts a literal that leaves out an
+            // optional field, which is then unset, and one that leaves out
+            // a field with a default, which the default fills (Q18).
+            const member = self.rt().memberSlice(self.rt().get(shape).record)[index];
+            if (member.optional) continue;
+            switch (member.default) {
+                .none => return self.rejectError(.unsupported_expression, region, "a record literal that leaves out a field"),
+                .computed => return self.rejectError(.unsupported_expression, region, "a record literal that leaves out a field whose default is computed. The type does not carry the value of a computed default, so a description cannot fill the field: write the field in the literal"),
+                _ => {
+                    const field_ty = self.rt().tySlice(member.tys)[0];
+                    value.* = try self.valueRef(member.default.value().?, field_ty);
+                },
+            }
+        }
+        return self.recordSetting(target, shape, values, carried.items, subject, region);
     }
+
+    /// The literal a field default's value is at the field's type `ty`
+    /// (Q18): the nodes the walk builds for the default's literal. The value
+    /// was read off the same type, so its shape is the type's.
+    fn valueRef(self: *Reifier, value: reify.types.ValueId, ty: TyId) Error!Ref {
+        const b = self.bld();
+        const types = self.rt();
+        const shape = types.get(ty);
+        switch (types.value(value)) {
+            .int => |v| return b.litInt(ty, v),
+            .u128 => |v| return b.litInt(ty, @bitCast(v)),
+            .frac => |bits| return switch (shape) {
+                .float => |float| switch (float) {
+                    .f64 => b.litFloatBits(ty, bits),
+                    .f32 => b.litFloatBits(ty, @as(u32, @bitCast(@as(f32, @floatCast(@as(f64, @bitCast(bits))))))),
+                },
+                .bool_,
+                .str,
+                .int,
+                .dec,
+                .record,
+                .tuple,
+                .tag_union,
+                .list,
+                .nominal,
+                .func,
+                .opaque_,
+                .recursive,
+                => invariant("a float default is at a float type"),
+            },
+            .dec => |v| return b.litDec(v),
+            .bool_ => |v| return b.litBool(v),
+            .str => |n| return b.litStr(types.nameText(n)),
+            .wrap => |backing| {
+                if (shape != .nominal) invariant("a nominal default is at a nominal type");
+                const inner = try self.valueRef(backing, try self.rt().unfold(ty));
+                return self.bld().wrap(ty, inner);
+            },
+            .list, .tuple, .record => |span| {
+                const items = try self.gpa.dupe(reify.types.ValueId, types.valueSlice(span));
+                defer self.gpa.free(items);
+                const refs = try self.gpa.alloc(Ref, items.len);
+                defer self.gpa.free(refs);
+                for (items, refs, 0..) |item, *ref, k| {
+                    // Read the type again each time: a part's walk interns types.
+                    const t = self.rt();
+                    const part_ty = switch (t.get(ty)) {
+                        .list => |elem| elem,
+                        .tuple => |parts| t.tySlice(parts)[k],
+                        .record => |members| t.tySlice(t.memberSlice(members)[k].tys)[0],
+                        .bool_,
+                        .str,
+                        .int,
+                        .float,
+                        .dec,
+                        .tag_union,
+                        .nominal,
+                        .func,
+                        .opaque_,
+                        .recursive,
+                        => invariant("an aggregate default is at an aggregate type"),
+                    };
+                    ref.* = try self.valueRef(item, part_ty);
+                }
+                return switch (types.value(value)) {
+                    .list => self.bld().listOf(ty, refs),
+                    .tuple => self.bld().tuple(ty, refs),
+                    .int,
+                    .u128,
+                    .frac,
+                    .dec,
+                    .bool_,
+                    .str,
+                    .record,
+                    .tag,
+                    .wrap,
+                    => self.bld().record(ty, refs),
+                };
+            },
+            .tag => |t| {
+                if (shape != .tag_union) invariant("a tag default is at a tag union type");
+                const items = try self.gpa.dupe(reify.types.ValueId, types.valueSlice(t.payloads));
+                defer self.gpa.free(items);
+                const refs = try self.gpa.alloc(Ref, items.len);
+                defer self.gpa.free(refs);
+                const index = types.memberIndex(ty, t.name) orelse invariant("a tag default names a tag of its union");
+                for (items, refs, 0..) |item, *ref, k| {
+                    const u = self.rt();
+                    ref.* = try self.valueRef(item, u.tySlice(u.memberSlice(u.get(ty).tag_union)[index].tys)[k]);
+                }
+                return self.bld().tag(ty, t.name, refs);
+            },
+        }
+    }
+
+    /// Take each member of `shape` that `values` leaves null, and `unset` does
+    /// not unset, from the record `from`. A field `from` always holds is a
+    /// read. An optional one is a read where `from` holds it and is left
+    /// unset where it does not, which only `from`'s value says, so it goes
+    /// into `carried`.
+    fn carryMembers(
+        self: *Reifier,
+        from: Ref,
+        shape: TyId,
+        values: []?Ref,
+        unset: []const bool,
+        carried: *std.ArrayList(Carry),
+        region: base.Region,
+    ) Error!void {
+        const b = self.bld();
+        const types = self.rt();
+        for (values, unset, 0..) |*value, is_unset, index| {
+            if (value.* != null or is_unset) continue;
+            const member = types.memberSlice(types.get(shape).record)[index];
+            const at = try self.fieldIndex(from, types.nameText(member.name), region);
+            const held = types.memberSlice(types.get(self.irs().refTy(b.row, from)).record)[at];
+            if (member.optional and held.optional) {
+                try carried.append(self.gpa, .{ .member = @intCast(index), .at = at });
+            } else value.* = try b.field(from, at);
+        }
+    }
+
+    /// A member an update takes from its subject if the subject holds it.
+    const Carry = struct {
+        /// The member's position in the record type.
+        member: u32,
+        /// Its position in the subject's record type.
+        at: u32,
+    };
+
+    /// The record `shape` setting the members `values` holds, in `target`,
+    /// and, for each member of `carried`, the member too in the arm where
+    /// the subject holds it. The members `values` leaves null and `carried`
+    /// does not name are unset.
+    fn recordSetting(
+        self: *Reifier,
+        target: TyId,
+        shape: TyId,
+        values: []const ?Ref,
+        carried: []const Carry,
+        subject: ?Ref,
+        region: base.Region,
+    ) Error!Ref {
+        const b = self.bld();
+        const types = self.rt();
+        if (carried.len == 0) {
+            const set = try self.gpa.alloc(u32, values.len);
+            defer self.gpa.free(set);
+            const refs = try self.gpa.alloc(Ref, values.len);
+            defer self.gpa.free(refs);
+            var count: usize = 0;
+            for (values, 0..) |value, index| {
+                const v = value orelse continue;
+                set[count] = @intCast(index);
+                refs[count] = v;
+                count += 1;
+            }
+            const record = try b.recordSetting(shape, set[0..count], refs[0..count]);
+            return if (shape == target) record else b.wrap(target, record);
+        }
+        const from = subject.?;
+        const first = carried[0];
+        const ok_ty = types.tySlice(types.memberSlice(types.get(self.irs().refTy(b.row, from)).record)[first.at].tys)[0];
+        const found = try self.readable(try b.optField(from, first.at, try self.missingFieldTry(ok_ty)));
+        const union_ty = self.irs().refTy(b.row, found);
+        const ok = try types.name("Ok");
+        const names = try self.memberNames(union_ty, region);
+        defer self.gpa.free(names);
+        const arms = try self.gpa.alloc(RegionId, names.len);
+        defer self.gpa.free(arms);
+        const own = try self.gpa.dupe(?Ref, values);
+        defer self.gpa.free(own);
+        for (arms, names) |*arm, name| {
+            arm.* = try b.openTagArm(found, name);
+            own[first.member] = if (name == ok) try b.payload(found, ok, 0) else null;
+            const built = try self.recordSetting(target, shape, own, carried[1..], subject, region);
+            try b.close(.{ .value = &.{built} });
+        }
+        return b.switchOn(found, arms, &.{}, &.{target}, &.{});
+    }
+
+    /// `Try(ok, [MissingField])`, the type the checker gives a `.?` read
+    /// (`mkTryContent` over `makeFieldMissingTag`, `src/check/Check.zig`).
+    fn missingFieldTry(self: *Reifier, ok_ty: TyId) Error!TyId {
+        return self.tryOver(ok_ty, "MissingField");
+    }
+
+    /// `Try(ok, [err])`, for the one payload-free tag `err`.
+    fn tryOver(self: *Reifier, ok_ty: TyId, err: []const u8) Error!TyId {
+        const types = self.rt();
+        const err_ty = try types.tagUnionTy(&.{.{ .name = err, .payload = &.{} }});
+        const backing = try types.tagUnionTy(&.{
+            .{ .name = "Err", .payload = &.{err_ty} },
+            .{ .name = "Ok", .payload = &.{ok_ty} },
+        });
+        // `ok` can hold this very `Try` in a cycle, so the type is spelled
+        // canonically as a whole (roc-reify-normal-form.md 2.1).
+        return types.canonical(try types.nominalTy(try_type_name, .builtin, &.{ ok_ty, err_ty }, backing));
+    }
+
+    /// The name the type table gives the builtin `Try`: the registry entry
+    /// the canonicalizer interns the builtin's qualified name from, so it is
+    /// the text `typeNameText` answers for the checker's own `Try`
+    /// (`src/canonicalize/CIR.zig` (`builtin_type_specs`)). The `.?` assert
+    /// in `optionalPath` holds the two together: the type built here must be
+    /// the type the checker gave the path.
+    const try_type_name = CIR.builtinTypeSpec("try_type").qualified_name;
 
     /// A field access path, one read per segment. A segment written `.?`
     /// reads a field the type marks optional and hands back the
-    /// `Try(a, [MissingField])` the value sits in; the checker gives the whole
-    /// path one flat `Try`, which nested reads cannot say, so an optional
-    /// segment is built only where it is the path's last.
+    /// `Try(a, [MissingField])` the value sits in. The checker gives the
+    /// whole path one flat `Try` of the last field's type, and the first
+    /// optional segment found missing is the `Err` of all of it, so an
+    /// optional segment before the last is a switch on its own `Try`: the
+    /// `Err` arm is the path's `Err`, and the `Ok` arm reads the rest.
     fn fieldAccessExpr(
         self: *Reifier,
         receiver_id: CheckedExprId,
@@ -2007,20 +3184,70 @@ pub const Reifier = struct {
         region: base.Region,
     ) Error!Ref {
         const b = self.bld();
-        var value = try self.exprRef(receiver_id);
+        const receiver = try self.exprRef(receiver_id);
+        const optional = for (segments) |segment| {
+            if (segment.mode == .optional) break true;
+        } else false;
+        if (!optional) {
+            var value = receiver;
+            for (segments) |segment| {
+                const record = try self.readable(value);
+                value = try b.field(record, try self.fieldIndex(record, self.names.recordFieldLabelText(segment.field_name), segment.source_region));
+            }
+            return value;
+        }
+        return self.optionalPath(receiver, segments, try self.tyOf(path_ty, region), region);
+    }
+
+    /// The rest of a path that holds an optional segment, read from `value`,
+    /// as the `Try` of type `path`.
+    fn optionalPath(self: *Reifier, value: Ref, segments: []const checked.CheckedFieldAccessSegment, path: TyId, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const types = self.rt();
+        var current = value;
         for (segments, 1..) |segment, walked| {
-            const record = try self.readable(value);
+            const record = try self.readable(current);
             const index = try self.fieldIndex(record, self.names.recordFieldLabelText(segment.field_name), segment.source_region);
-            if (segment.mode == .optional) {
-                if (walked != segments.len) {
-                    return self.rejectError(.unsupported_expression, region, "a field read through an optional field");
-                }
-                value = try b.optField(record, index, try self.tyOf(path_ty, region));
+            if (segment.mode == .required) {
+                current = try b.field(record, index);
                 continue;
             }
-            value = try b.field(record, index);
+            const field_ty = types.tySlice(types.memberSlice(types.get(self.irs().refTy(b.row, record)).record)[index].tys)[0];
+            const found = try b.optField(record, index, try self.missingFieldTry(field_ty));
+            if (walked == segments.len) {
+                // The last segment's `Try` is the path's own.
+                std.debug.assert(self.irs().refTy(b.row, found) == path);
+                return found;
+            }
+            const union_value = try self.readable(found);
+            const ok = try types.name("Ok");
+            const names = try self.memberNames(self.irs().refTy(b.row, union_value), region);
+            defer self.gpa.free(names);
+            const arms = try self.gpa.alloc(RegionId, names.len);
+            defer self.gpa.free(arms);
+            for (arms, names) |*arm, name| {
+                arm.* = try b.openTagArm(union_value, name);
+                const delivered = if (name == ok)
+                    try self.optionalPath(try b.payload(union_value, ok, 0), segments[walked..], path, region)
+                else
+                    try self.pathTry(path, "Err", null, region);
+                try b.close(.{ .value = &.{delivered} });
+            }
+            return b.switchOn(union_value, arms, &.{}, &.{path}, &.{});
         }
-        return value;
+        return self.pathTry(path, "Ok", current, region);
+    }
+
+    /// The path's `Try` holding the `Ok` value, or the `Err(MissingField)`.
+    fn pathTry(self: *Reifier, path: TyId, tag_text: []const u8, ok_value: ?Ref, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const types = self.rt();
+        const unfolded = try types.unfold(path);
+        const name = try self.tagName(unfolded, tag_text, region);
+        if (ok_value) |value| return b.wrap(path, try b.tag(unfolded, name, &.{value}));
+        const missing_ty = types.tySlice(types.memberSlice(types.get(unfolded).tag_union)[types.memberIndex(unfolded, name).?].tys)[0];
+        const missing = try b.tag(missing_ty, try self.tagName(missing_ty, "MissingField", region), &.{});
+        return b.wrap(path, try b.tag(unfolded, name, &.{missing}));
     }
 
     /// A nominal's value: its backing, built at the unfolded backing type,
@@ -2032,9 +3259,14 @@ pub const Reifier = struct {
             .nominal => self.bld().wrap(target, try self.exprAs(backing_id, try self.rt().unfold(target))),
             .bool_ => self.exprAs(backing_id, target),
             .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .func, .recursive => self.exprAs(backing_id, target),
-            .opaque_ => self.rejectError(.unsupported_type, region, "a value of an opaque type"),
+            .opaque_ => self.rejectError(.unsupported_type, region, opaque_built),
         };
     }
+
+    /// The refusal of a value of an opaque type built from its fields in a
+    /// body the walk reads (1.7). The type hides its fields, and each of its
+    /// functions is a primitive (D1), so the fix is to call one.
+    const opaque_built = "a value of an opaque type, built from its fields. The type hides its fields from a description: build the value by calling one of the type's functions, which a description names as a primitive";
 
     /// A tag: a `Bool` literal, or a variant of a tag union, wrapped in the
     /// nominal its type is where it is one.
@@ -2076,6 +3308,120 @@ pub const Reifier = struct {
         return self.bld().tag(union_ty, tag_name, payloads);
     }
 
+    /// `value`, built at its own type, read at `at`, the type a `row_coerce`
+    /// gives it (rule L, `roc-reify-tag-names.md` 2.4). A widening is
+    /// conformance and adds no node. A lift into a nominal is a `Wrap`. A
+    /// lift below a tag payload or a nominal's backing is the `match` that
+    /// does it: a `Switch` whose arms construct each tag at the destination.
+    /// The steps read only the two types; a pair that is neither a widening
+    /// nor a lift is outside the reach of design.md "Row Coercion Primitive".
+    fn liftTo(self: *Reifier, value: Ref, at: TyId, region: base.Region) Error!Ref {
+        const types = self.rt();
+        const own = self.irs().refTy(self.bld().row, value);
+        if (try types.widens(own, at)) return value;
+        if (types.get(own) == .recursive or types.get(at) == .recursive)
+            return self.rejectError(.unsupported_type, region, "a recursive tag union lifted into a nominal");
+        switch (types.get(at)) {
+            .nominal => |target| {
+                const backing = try types.unfold(at);
+                switch (types.get(own)) {
+                    .nominal => |source| {
+                        if (source.name != target.name or source.origin != target.origin) invariant("a row_coerce reads a nominal at another nominal");
+                        return self.liftArms(try self.bld().unwrap(value), backing, at, region);
+                    },
+                    .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .func, .opaque_, .recursive => {},
+                }
+                if (try types.widens(own, backing)) return self.bld().wrap(at, value);
+                if (types.get(own) != .tag_union or types.get(backing) != .tag_union)
+                    invariant("a row_coerce lifts a value into a nominal whose backing it does not reach");
+                return self.liftArms(value, backing, at, region);
+            },
+            .bool_ => {
+                if (types.get(own) != .tag_union) invariant("a row_coerce reads a value at Bool that is no tag union");
+                return self.liftBool(value, region);
+            },
+            .tag_union => {
+                if (types.get(own) != .tag_union) invariant("a row_coerce reads a value at a tag union that is no tag union");
+                return self.liftArms(value, at, null, region);
+            },
+            .str, .int, .float, .dec, .record, .tuple, .list, .func, .opaque_, .recursive => invariant("a row_coerce reads a value at a type it neither widens nor lifts to"),
+        }
+    }
+
+    /// The `match` that lifts the tag union `scrutinee` to the union `union_ty`:
+    /// one arm per tag of the scrutinee, each the tag at `union_ty` over its
+    /// payloads lifted to the payload types there, in a `Wrap` of `wrap` where
+    /// the destination is that nominal.
+    fn liftArms(self: *Reifier, scrutinee: Ref, union_ty: TyId, wrap: ?TyId, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const names = try self.memberNames(self.irs().refTy(b.row, scrutinee), region);
+        defer self.gpa.free(names);
+        const arms = try self.gpa.alloc(RegionId, names.len);
+        defer self.gpa.free(arms);
+        for (arms, names) |*arm, name| {
+            arm.* = try b.openTagArm(scrutinee, name);
+            const types = self.rt();
+            const own_ty = self.irs().refTy(b.row, scrutinee);
+            const own_count = types.memberSlice(types.get(own_ty).tag_union)[types.memberIndex(own_ty, name).?].tys.len;
+            const index = types.memberIndex(union_ty, name) orelse invariant("a row_coerce lifts a tag the destination union does not have");
+            const target_tys = try self.gpa.dupe(TyId, types.tySlice(types.memberSlice(types.get(union_ty).tag_union)[index].tys));
+            defer self.gpa.free(target_tys);
+            if (target_tys.len != own_count) invariant("a row_coerce lifts a tag to one with another payload count");
+            const payloads = try self.gpa.alloc(Ref, target_tys.len);
+            defer self.gpa.free(payloads);
+            for (payloads, target_tys, 0..) |*payload, target_ty, k| {
+                payload.* = try self.liftTo(try b.payload(scrutinee, name, @intCast(k)), target_ty, region);
+            }
+            const rebuilt = try b.tag(union_ty, name, payloads);
+            try b.close(.{ .value = &.{if (wrap) |nominal| try b.wrap(nominal, rebuilt) else rebuilt} });
+        }
+        return b.switchOn(scrutinee, arms, &.{}, &.{wrap orelse union_ty}, &.{});
+    }
+
+    /// The `match` that lifts the tag union `[False, True]`, or a narrower
+    /// one, into `Bool`: each arm the literal its tag spells.
+    fn liftBool(self: *Reifier, scrutinee: Ref, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const names = try self.memberNames(self.irs().refTy(b.row, scrutinee), region);
+        defer self.gpa.free(names);
+        const arms = try self.gpa.alloc(RegionId, names.len);
+        defer self.gpa.free(arms);
+        const true_name = self.rt().findName("True");
+        const false_name = self.rt().findName("False");
+        for (arms, names) |*arm, name| {
+            arm.* = try b.openTagArm(scrutinee, name);
+            const flag = if (name == true_name)
+                true
+            else if (name == false_name)
+                false
+            else
+                invariant("a row_coerce lifts a tag other than False and True into Bool");
+            try b.close(.{ .value = &.{try b.litBool(flag)} });
+        }
+        return b.switchOn(scrutinee, arms, &.{}, &.{try self.rt().boolTy()}, &.{});
+    }
+
+    /// The type a `Call` whose own result is `own` is built at, where its
+    /// value is read at `at`: `at` where the result widens to it, the
+    /// backing where the result widens to the backing of the nominal `at`
+    /// (`liftTo` then wraps it), and else the result itself (`liftTo` then
+    /// rebuilds it). A `Call` is never built at a nominal its row's result
+    /// only lifts into.
+    fn liftReach(self: *Reifier, own: TyId, at: TyId) Error!TyId {
+        const types = self.rt();
+        if (try types.widens(own, at)) return at;
+        switch (types.get(at)) {
+            .nominal => switch (types.get(own)) {
+                .nominal => return own,
+                .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .func, .opaque_, .recursive => {
+                    const backing = try types.unfold(at);
+                    return if (try types.widens(own, backing)) backing else own;
+                },
+            },
+            .bool_, .str, .int, .float, .dec, .record, .tuple, .tag_union, .list, .func, .opaque_, .recursive => return own,
+        }
+    }
+
     /// The value a name stands for: its binding in scope, the statement
     /// that binds it replayed, or the constant or top-level function it
     /// resolves to.
@@ -2088,6 +3434,7 @@ pub const Reifier = struct {
         pattern_id: CheckedPatternId,
         resolved: ?checked.ResolvedValueRefId,
         use_ty: CheckedTypeId,
+        use_expr: ?CheckedExprId,
         at: ?TyId,
         region: base.Region,
     ) Error!Ref {
@@ -2095,7 +3442,7 @@ pub const Reifier = struct {
             return self.rejectError(.unresolved_reference, region, "this reference");
         const binding = self.lookupBinding(binder) orelse try self.replayBinding(binder) orelse
             return self.unboundRef(binder, resolved, use_ty, at, region);
-        return self.bindingValue(binding, use_ty, region);
+        return self.bindingValue(binding, use_ty, use_expr, region);
     }
 
     /// A reference no scope binds: a constant, or a top-level function used
@@ -2108,14 +3455,38 @@ pub const Reifier = struct {
         at: ?TyId,
         region: base.Region,
     ) Error!Ref {
-        if (try self.foldedConstant(resolved, at, region)) |folded| return folded;
+        if (try self.foldedConstant(resolved, use_ty, at, region)) |folded| return folded;
         if (resolved) |id| {
             if (self.functionOf(use_ty) != null) return self.functionValue(id, binder, use_ty, region);
+        }
+        if (self.walk.inputs) |*inputs| {
+            if (inputs.reader == self) return self.inputSlot(inputs, binder, region);
         }
         return self.rejectError(.capture, region, self.binderName(binder));
     }
 
-    fn bindingValue(self: *Reifier, binding: Binding, use_ty: CheckedTypeId, region: base.Region) Error!Ref {
+    /// The input slot of a run-time name the walk cannot replay (N18a), at a
+    /// site whose translator returns a `Code.Bound`
+    /// (`roc-reify-proposal.md` section 10.1). The program supplies the
+    /// value at the call, so the name has to be the value the description
+    /// reads there: a `var` can be written again before the call, and a row
+    /// other than the root has no call of its own to supply it at.
+    fn inputSlot(self: *Reifier, inputs: *Walk.Inputs, binder: PatternBinderId, region: base.Region) Error!Ref {
+        const record = self.bodies.patternBinder(binder);
+        if (record.reassignable) return self.rejectError(.input_not_bound, region, "a `var`, whose value at the call is not always the value the description reads");
+        if (self.walk.rows.items.len != 1) return self.rejectError(.input_not_bound, region, "a value that a function inside the description reads from around the lambda");
+        const pattern = self.bodies.pattern(record.pattern);
+        const ty = try self.tyOf(pattern.ty, pattern.source_region);
+        const leaf: u32 = for (inputs.leaves.items, 0..) |known, i| {
+            if (known == binder) break @intCast(i);
+        } else blk: {
+            try inputs.leaves.append(self.gpa, binder);
+            break :blk @intCast(inputs.leaves.items.len - 1);
+        };
+        return self.bld().input(ty, leaf);
+    }
+
+    fn bindingValue(self: *Reifier, binding: Binding, use_ty: CheckedTypeId, use_expr: ?CheckedExprId, region: base.Region) Error!Ref {
         return switch (binding.kind) {
             .value => |value| value,
             // The value the template call fixed, walked where it is read.
@@ -2124,7 +3495,7 @@ pub const Reifier = struct {
                 // A lambda the block bound is a closure of its row. A function
                 // a call handed back is that call, built where it is read.
                 if (self.lambdaOf(value_id) == null) break :blk try self.exprRef(value_id);
-                const target = (try self.liftedTarget(binding, use_ty, region)).definition;
+                const target = (try self.liftedTarget(binding, use_ty, use_expr, region)).definition;
                 break :blk try self.closureOf(target, try self.tyOf(use_ty, region));
             },
             .callee => |index| try self.closureOf(try self.boundTarget(self.bound[index].target), try self.tyOf(use_ty, region)),
@@ -2140,9 +3511,19 @@ pub const Reifier = struct {
         use_ty: CheckedTypeId,
         region: base.Region,
     ) Error!Ref {
-        return switch (try self.resolvedTarget(resolved, written_binder, region)) {
+        // A top-level value that computes a function is the definition it was
+        // written as, built where the name stands, as a constant is.
+        if (try self.computedFunction(resolved, region)) |computed| {
+            return try computed.written.reader.foldedBody(computed.written.body, null) orelse
+                self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function and reads itself");
+        }
+        return switch (try self.resolvedTarget(resolved, written_binder, region, .described)) {
             .definition => |target| self.closureOf(target, try self.tyOf(use_ty, region)),
-            .provided, .foreign => self.rejectError(.unsupported_expression, region, "a function of the compiler or of another package used as a value"),
+            .foreign => |name| if (name.intrinsic)
+                self.rejectError(.unsupported_expression, region, "an intrinsic, a function with no Roc body, used as a value")
+            else
+                self.rejectError(.unsupported_expression, region, "a builtin or a function in the translator's cut used as a value"),
+            .provided => self.rejectError(.unsupported_expression, region, "a builtin or a function in the translator's cut used as a value"),
             .value => self.rejectError(.unsupported_expression, region, "a function value that names no definition"),
         };
     }
@@ -2156,6 +3537,10 @@ pub const Reifier = struct {
     const ConstantDefinition = struct {
         reader: *Reifier,
         body: CheckedExprId,
+        /// The top-level definition that binds the constant, and its checked
+        /// type in `reader`'s store. Null for a constant the compiler hoisted
+        /// out of an expression, which no definition names.
+        named: ?struct { def: CIR.Def.Idx, ty: CheckedTypeId },
     };
 
     fn constantDefinition(
@@ -2183,10 +3568,23 @@ pub const Reifier = struct {
         };
         if (std.meta.eql(const_ref.artifact.bytes, self.artifact.bytes)) {
             const body = constantBody(self.const_templates, self.const_bodies, const_ref) orelse return null;
-            return .{ .reader = self, .body = body };
+            return .{ .reader = self, .body = body, .named = self.constantNamed(const_ref) };
         }
         const away = self.walk.foreign.findConstant(const_ref) orelse return null;
-        return .{ .reader = try self.walk.reader(away.module), .body = away.body };
+        const reader = try self.walk.reader(away.module);
+        return .{ .reader = reader, .body = away.body, .named = reader.constantNamed(const_ref) };
+    }
+
+    /// The definition of this reader's module that binds the constant
+    /// `const_ref` names, and its checked type, or null for a hoisted one.
+    fn constantNamed(self: *Reifier, const_ref: checked.ConstRef) @FieldType(ConstantDefinition, "named") {
+        const pattern = switch (self.const_templates.get(const_ref).owner) {
+            .top_level_binding => |binding| binding.pattern,
+            .hoisted_expr => return null,
+        };
+        const entry = self.top_level_values.lookupByPattern(pattern) orelse
+            invariant("a top-level constant's pattern is a top-level value");
+        return .{ .def = entry.def, .ty = self.bodies.pattern(pattern).ty };
     }
 
     /// The value a name holds, built where the name stands.
@@ -2199,25 +3597,112 @@ pub const Reifier = struct {
     /// no value the compiler evaluates after the description is built.
     /// Where the use reads a wider tag union than the value's own (`at`),
     /// the body is built at it, as it would be if written at the use.
+    ///
+    /// A constant that is a primitive (D1), or that the site's cut lists, is
+    /// no fold: it is a `Prim` with no arguments, at the type `use_ty` the
+    /// name has, and the caller lifts it to `at` as any `Prim` result.
     fn foldedConstant(
         self: *Reifier,
         resolved: ?checked.ResolvedValueRefId,
+        use_ty: CheckedTypeId,
         at: ?TyId,
         region: base.Region,
     ) Error!?Ref {
+        // An intrinsic constant has no body: it is a `Prim` with no arguments.
+        if (resolved) |id| if (try self.intrinsicConstantOf(id)) |intrinsic| {
+            const b = self.bld();
+            const name = intrinsic.name;
+            return try b.primOf(try b.declaredPrim(name.definition, name.owner, name.method, name.intrinsic), &.{}, try self.tyOf(use_ty, region));
+        };
         const definition = try self.constantDefinition(resolved) orelse return null;
-        const reader = definition.reader;
-        // A constant that reads itself is refused on the repeat.
-        if (reader.folding.contains(definition.body)) return null;
-        // A computation of another package is a body of that package, which
-        // the walk does not read, as it does not read that package's
-        // functions (N8h).
-        if (!samePackage(self.env, reader.env) and !try self.nameHoldsConstant(resolved)) {
-            return self.rejectError(.unsupported_expression, region, "a computed constant of another package");
+        if (definition.named) |named| {
+            const reader = definition.reader;
+            const name: ?ForeignName = if (try reader.primitiveOf(named.def, named.ty)) |primitive| switch (primitive) {
+                .operation => |operation| operation,
+                // A builtin constant is no primitive: it folds.
+                .builtin => invariant("a constant of the builtin module is no primitive"),
+            } else self.inCut(reader, definition.body);
+            if (name) |prim| {
+                const b = self.bld();
+                return try b.primOf(try b.declaredPrim(prim.definition, prim.owner, prim.method, prim.intrinsic), &.{}, try self.tyOf(use_ty, region));
+            }
         }
-        try reader.folding.put(reader.gpa, definition.body, {});
-        defer _ = reader.folding.remove(definition.body);
-        return if (at) |ty| try reader.exprAt(definition.body, ty) else try reader.exprRef(definition.body);
+        // A computed constant folds to its computation in any package, as a
+        // function outside the cut is walked in any package (N8l). A refusal
+        // of a `Code` value inside it names the outermost constant (D7).
+        const outer_constant = self.walk.constant;
+        if (outer_constant == null) {
+            if (definition.named) |named| self.walk.constant = definition.reader.constantName(named.def);
+        }
+        defer self.walk.constant = outer_constant;
+        return definition.reader.foldedBody(definition.body, at);
+    }
+
+    /// The definition `body` of `reader`'s module, built where a name stands.
+    /// Null for a definition that reads itself, which is refused on the repeat
+    /// rather than followed forever.
+    fn foldedBody(reader: *Reifier, body: CheckedExprId, at: ?TyId) Error!?Ref {
+        if (reader.folding.contains(body)) return null;
+        try reader.folding.put(reader.gpa, body, {});
+        defer _ = reader.folding.remove(body);
+        return if (at) |ty| try reader.exprAt(body, ty) else try reader.exprRef(body);
+    }
+
+    /// A top-level value that computes a function, `doubler = make(2.0)`.
+    ///
+    /// The compiler evaluates such a value after the description is built, so
+    /// the closure it holds is not known to the walk. What the walk knows is
+    /// the definition, and it reads that where the name stands, the way it
+    /// reads a computed constant. The definition names the lambda's row and
+    /// every capture, so no value the compiler evaluates is needed.
+    const ComputedFunction = union(enum) {
+        /// The definition, and the reader of the module that wrote it, in
+        /// any package (N8l).
+        written: struct { reader: *Reifier, body: CheckedExprId },
+    };
+
+    /// Where a name that is a top-level value computing a function leads, or
+    /// null for any other name, an exact alias of a function included: its
+    /// lookup names the procedure it forwards to.
+    fn computedFunction(self: *Reifier, resolved: checked.ResolvedValueRefId, region: base.Region) Error!?ComputedFunction {
+        const use = switch (self.value_refs.callableTarget(resolved).ref) {
+            .top_level_proc, .imported_proc, .promoted_top_level_proc => |use| use,
+            .local_proc,
+            .local_param,
+            .local_value,
+            .local_mutable_version,
+            .pattern_binder,
+            .selected_hoisted_const,
+            .top_level_const,
+            .imported_const,
+            .hosted_proc,
+            .platform_required_declaration,
+            .platform_required_checked_error,
+            .platform_required_const,
+            .platform_required_proc,
+            => return null,
+        };
+        switch (use.binding) {
+            .top_level => |top_level| {
+                if (!std.meta.eql(top_level.artifact.bytes, self.artifact.bytes)) return null;
+                const template_id = switch (self.procedure_bindings.get(top_level.binding).body) {
+                    .callable_eval_template => |id| id,
+                    .direct_template, .checked_error => return null,
+                };
+                const template = self.callable_eval_templates.templates[@backingInt(template_id)];
+                if (template.forwarded_lookup != null) return null;
+                return .{ .written = .{ .reader = self, .body = template.body } };
+            },
+            .imported => |imported| {
+                const away = self.walk.foreign.findExportedComputed(imported.artifact, imported.def) orelse return null;
+                const reader = try self.walk.reader(away.module);
+                if (reader.env.module_role == .builtin) {
+                    return self.rejectError(.unsupported_expression, region, "a call to a function the compiler provides");
+                }
+                return .{ .written = .{ .reader = reader, .body = away.body } };
+            },
+            .hosted, .platform_required => return null,
+        }
     }
 
     // Control //
@@ -2827,6 +4312,7 @@ pub const Reifier = struct {
         queue: []const Test,
         value: CheckedExprId,
         list: ListReads,
+        str: StrReads,
     };
 
     /// A `Bool` switch on `flag`: the arm where it is `holds` goes on to
@@ -2856,6 +4342,7 @@ pub const Reifier = struct {
             .queue => |queue| self.testQueue(br, subject, at, queue, top, region),
             .value => |value| self.armBody(br, value, top),
             .list => |reads| self.listReads(br, subject, at, reads, top),
+            .str => |reads| self.strReads(br, subject, at, reads, top),
         };
     }
 
@@ -2908,7 +4395,12 @@ pub const Reifier = struct {
                         .required, .sub_pattern => |inner| inner,
                         .rest => |inner| {
                             if (self.bodies.pattern(inner).data == .underscore) continue;
-                            return self.rejectError(.unsupported_expression, pattern.source_region, "a record pattern whose `..` binds a name");
+                            // The name binds a record of the fields the pattern
+                            // does not name, which is the record those reads
+                            // build.
+                            const rest_ty = try self.tyOf(self.bodies.pattern(inner).ty, pattern.source_region);
+                            try parts.append(self.gpa, .{ .pattern = inner, .value = try self.restRecord(record, rest_ty, pattern.source_region) });
+                            continue;
                         },
                     };
                     const index = try self.fieldIndex(record, self.names.recordFieldLabelText(destruct.label), pattern.source_region);
@@ -2930,8 +4422,29 @@ pub const Reifier = struct {
                 return self.boolTest(br, subject, at, eq, true, .{ .queue = queue[1..] }, top, region);
             },
             .list => |list| return self.listTest(br, subject, at, queue, list.patterns, list.rest, top, region),
-            .str_interpolation, .pending, .runtime_error => return self.rejectError(.unsupported_expression, pattern.source_region, patternFormName(pattern.data)),
+            .str_interpolation => |str| return self.strTest(br, subject, at, queue, str.prefix, str.steps, str.end, top, region),
+            .pending, .runtime_error => return self.rejectError(.unsupported_expression, pattern.source_region, patternFormName(pattern.data)),
         }
+    }
+
+    /// The record of type `rest_ty` that `..rest` binds: each of its fields
+    /// read from `record`.
+    fn restRecord(self: *Reifier, record: Ref, rest_ty: TyId, region: base.Region) Error!Ref {
+        const types = self.rt();
+        const members_len = switch (types.get(rest_ty)) {
+            .record => |span| span.len,
+            .bool_, .str, .int, .float, .dec, .tuple, .tag_union, .list, .nominal, .func, .opaque_, .recursive => return self.rejectError(.unsupported_type, region, "a record pattern rest of this type"),
+        };
+        const values = try self.gpa.alloc(?Ref, members_len);
+        defer self.gpa.free(values);
+        @memset(values, null);
+        const unset = try self.gpa.alloc(bool, members_len);
+        defer self.gpa.free(unset);
+        @memset(unset, false);
+        var carried = std.ArrayList(Carry).empty;
+        defer carried.deinit(self.gpa);
+        try self.carryMembers(record, rest_ty, values, unset, &carried, region);
+        return self.recordSetting(rest_ty, rest_ty, values, carried.items, record, region);
     }
 
     /// A literal pattern of the author's own type: the checker wrote the
@@ -3140,6 +4653,120 @@ pub const Reifier = struct {
         return self.testQueue(br, subject, at, tail, top, reads.region);
     }
 
+    /// A string interpolation pattern, as the decisions and reads Roc makes
+    /// for it (`LIR.strMatchStep`): the text starts with the prefix; each
+    /// step but a final tail capture splits the text left at the first place
+    /// its delimiter appears, capturing what comes before it; an exact end
+    /// leaves no text. A test that fails goes on to the next alternative.
+    fn strTest(
+        self: *Reifier,
+        br: *Branching,
+        subject: Ref,
+        at: MatchAt,
+        queue: []const Test,
+        prefix_id: checked.CheckedStringLiteralId,
+        steps: []const checked.CheckedStrPatternStep,
+        end: checked.CheckedStrPatternEnd,
+        top: bool,
+        region: base.Region,
+    ) Error!?Ref {
+        const b = self.bld();
+        const text = try self.readable(queue[0].value);
+        const prefix = self.bodies.stringLiteral(prefix_id);
+        var captures = std.ArrayList(Test).empty;
+        defer captures.deinit(self.gpa);
+        const reads: StrReads = .{ .text = text, .prefix = prefix, .steps = steps, .end = end, .queue = queue, .captures = &captures, .region = region };
+        if (prefix.len == 0) return self.strReads(br, subject, at, reads, top);
+        const starts = try b.primOf(try b.namedPrim("Str", "starts_with"), &.{ text, try b.litStr(prefix) }, try self.rt().boolTy());
+        return self.boolTest(br, subject, at, starts, true, .{ .str = reads }, top, region);
+    }
+
+    /// What a string pattern reads once its prefix matched.
+    const StrReads = struct {
+        text: Ref,
+        prefix: []const u8,
+        steps: []const checked.CheckedStrPatternStep,
+        end: checked.CheckedStrPatternEnd,
+        /// The queue whose first test is this string pattern.
+        queue: []const Test,
+        /// The captures read so far, as the tests of their patterns.
+        captures: *std.ArrayList(Test),
+        region: base.Region,
+    };
+
+    /// Drop the prefix, and go on to the steps.
+    fn strReads(self: *Reifier, br: *Branching, subject: Ref, at: MatchAt, reads: StrReads, top: bool) Error!?Ref {
+        const b = self.bld();
+        const str_ty = try self.rt().strTy();
+        const rest = if (reads.prefix.len == 0)
+            reads.text
+        else
+            try b.primOf(try b.namedPrim("Str", "drop_prefix"), &.{ reads.text, try b.litStr(reads.prefix) }, str_ty);
+        return self.strSteps(br, subject, at, reads, rest, reads.steps, top);
+    }
+
+    /// The steps of a string pattern from the text `rest` that is left.
+    fn strSteps(self: *Reifier, br: *Branching, subject: Ref, at: MatchAt, reads: StrReads, rest: Ref, steps: []const checked.CheckedStrPatternStep, top: bool) Error!?Ref {
+        const b = self.bld();
+        const region = reads.region;
+        const captured = reads.captures.items.len;
+        defer reads.captures.shrinkRetainingCapacity(captured);
+        const step = steps[0];
+        const last = steps.len == 1;
+        if (last and reads.end == .tail) {
+            if (step.capture) |capture| try reads.captures.append(self.gpa, .{ .pattern = capture, .value = rest });
+            return self.strDone(br, subject, at, reads, top);
+        }
+        const str_ty = try self.rt().strTy();
+        const pair_ty = try self.rt().recordTy(&.{ .{ .name = "after", .ty = str_ty }, .{ .name = "before", .ty = str_ty } });
+        const split_ty = try self.tryOver(pair_ty, "NotFound");
+        const split = try b.primOf(try b.namedPrim("Str", "split_first"), &.{ rest, try b.litStr(self.bodies.stringLiteral(step.delimiter)) }, split_ty);
+        const found = try self.readable(split);
+        const ok = try self.rt().name("Ok");
+        const names = try self.memberNames(self.irs().refTy(b.row, found), region);
+        defer self.gpa.free(names);
+        const arms = try self.gpa.alloc(RegionId, names.len);
+        defer self.gpa.free(arms);
+        const scope_base = self.scope.items.len;
+        for (arms, names) |*arm, name| {
+            arm.* = try br.openTagArm(found, name);
+            if (name == ok) {
+                const pair = try self.readable(try b.payload(found, ok, 0));
+                if (step.capture) |capture| {
+                    const before = try b.field(pair, try self.fieldIndex(pair, "before", region));
+                    try reads.captures.append(self.gpa, .{ .pattern = capture, .value = before });
+                }
+                const after = try b.field(pair, try self.fieldIndex(pair, "after", region));
+                if (last) {
+                    // An exact end leaves no text after the last delimiter.
+                    const empty = try b.primOf(try b.namedPrim("Str", "is_empty"), &.{after}, try self.rt().boolTy());
+                    try closedArm(self.strEnd(br, subject, at, reads, empty, false));
+                } else try closedArm(self.strSteps(br, subject, at, reads, after, steps[1..], false));
+                reads.captures.shrinkRetainingCapacity(captured);
+            } else try closedArm(self.failed(br, subject, at, false, region));
+            self.scope.shrinkRetainingCapacity(scope_base);
+        }
+        if (top) return br.finish(found, arms, &.{});
+        try br.inner(found, arms, &.{});
+        return null;
+    }
+
+    /// The pattern ended where `empty` says no text is left: the tests of
+    /// the captures and then of the queue run where it holds.
+    fn strEnd(self: *Reifier, br: *Branching, subject: Ref, at: MatchAt, reads: StrReads, empty: Ref, top: bool) Error!?Ref {
+        const tail = try self.expanded(reads.queue, reads.captures.items);
+        defer self.gpa.free(tail);
+        return self.boolTest(br, subject, at, empty, true, .{ .queue = tail }, top, reads.region);
+    }
+
+    /// The pattern matched whatever text is left: the tests of the captures
+    /// and then of the queue.
+    fn strDone(self: *Reifier, br: *Branching, subject: Ref, at: MatchAt, reads: StrReads, top: bool) Error!?Ref {
+        const tail = try self.expanded(reads.queue, reads.captures.items);
+        defer self.gpa.free(tail);
+        return self.testQueue(br, subject, at, tail, top, reads.region);
+    }
+
     // Blocks //
 
     /// A block: its statements in order, then its final expression. Each
@@ -3272,7 +4899,7 @@ pub const Reifier = struct {
             return self.countedLoop(.{ .range = .{ .inclusive = range.inclusive, .start = start, .end = end } }, pattern_id, body_id, &carried, region);
         }
         const iterable_ty = self.bodies.expr(iterable_id).ty;
-        if (self.primitiveOf(iterable_ty) == .list) {
+        if (self.builtinNominalOf(iterable_ty) == .list) {
             const list = try self.exprRef(iterable_id);
             return self.countedLoop(.{ .list = list }, pattern_id, body_id, &carried, region);
         }
@@ -3293,7 +4920,7 @@ pub const Reifier = struct {
         const plan_id = data.dispatch_call orelse return null;
         const plan = self.plans.plans[@backingInt(plan_id)];
         const inclusive = self.ranges.inclusiveOf(plan.method) orelse return null;
-        const primitive = self.primitiveOf(plan.dispatcher_ty) orelse return null;
+        const primitive = self.builtinNominalOf(plan.dispatcher_ty) orelse return null;
         if (intTarget(primitive) == null) return null;
         const operands = plan.argsSlice(self.plans);
         if (operands.len != 2) return null;
@@ -3345,6 +4972,10 @@ pub const Reifier = struct {
         try params.appendSlice(self.gpa, slot_tys);
 
         const body = try b.openRegion(.loop_body, params.items);
+        switch (counted) {
+            .range => |range| try b.noteRangeLoop(body, range.start, range.end, range.inclusive),
+            .list => |list| try b.noteListLoop(body, list),
+        }
         try self.loopBody(.{ .body = body, .slot_base = slot_base, .iterator = false, .carried = carried.binders.items }, carried, body_id, switch (counted) {
             .range => .{ .item = .{ .pattern = pattern_id, .value = Ref.regionParam(body, 0) } },
             .list => .{ .item = .{ .pattern = pattern_id, .value = Ref.regionParam(body, 1) } },
@@ -3496,7 +5127,7 @@ pub const Reifier = struct {
                 const slots = try self.slotValues(loop, rest, region);
                 defer self.gpa.free(slots);
                 try b.close(.{ .continue_ = slots });
-            } else unreachable;
+            } else unreachable; // a step union has exactly the done, one and skip variants (checked above)
             self.scope.shrinkRetainingCapacity(scope_base);
         }
         const sw = try b.exitingSwitch(step, &arms, &.{}, &.{});
@@ -3567,13 +5198,598 @@ pub const Reifier = struct {
 
     // Calls //
 
-    /// A function of another package, named by owner and method (N8h). For a
-    /// method the owner is its type's name; for a plain function, its
-    /// module's.
-    const ForeignName = struct { owner: []const u8, method: []const u8 };
+    /// A function in the site's cut, or a method of an opaque nominal, named
+    /// by owner and method (N8h). The owner of a function in the cut is the
+    /// nominal it is an associated item of, or its module where it is none.
+    /// `definition` is what identifies it: two packages can give two
+    /// functions one name (F2).
+    pub const ForeignName = struct {
+        owner: []const u8,
+        method: []const u8,
+        definition: reify.ir.Definition,
+        /// Its `where` requirements and what the call recorded for them (D7).
+        evidence: PrimEvidence = .{},
+        /// Whether it is an intrinsic, which has no body. Only a refusal
+        /// reads it: the `Prim` of an intrinsic is the `Prim` of any other
+        /// function.
+        intrinsic: bool = false,
+    };
+
+    /// The `where` requirements of a primitive a call names, and what the
+    /// call recorded for them (D7). `scheme` holds the evidence params of
+    /// the primitive's template, in its scheme's requirement order with a
+    /// constraint alias expanded, and `names` the reader of the module whose
+    /// names they are in. `recorded` is null where the call recorded nothing.
+    /// `receiver` is set where the compiler's own derivation reached the
+    /// primitive, which records nothing by construction: the receiver's type
+    /// fixes each requirement's dispatcher (`receiverEvidence`).
+    const PrimEvidence = struct {
+        names: ?*Reifier = null,
+        template: ?checked.CheckedProcedureTemplate = null,
+        scheme: []const static_dispatch.EvidenceParamRecord = &.{},
+        recorded: ?Recorded = null,
+        receiver: ?FramedType = null,
+
+        /// The requirements of the template `template` of `reader`'s module.
+        fn of(reader: *Reifier, template: checked.CheckedProcedureTemplate) PrimEvidence {
+            return .{ .names = reader, .template = template, .scheme = reader.procedure_templates.evidenceParams(&template) };
+        }
+    };
+
+    /// What a call recorded for its callee's `where` requirements: the
+    /// entries, in the callee scheme's requirement order, the reader of the
+    /// module that recorded them, and the evidence the walk held there,
+    /// which an entry that forwards reads (`supply`).
+    const Recorded = struct {
+        reader: *Reifier,
+        entries: []const static_dispatch.CheckedEvidence,
+        scope: SuppliedEvidence,
+    };
+
+    /// What identifies a function in a site's cut: the module that defines it
+    /// and its checked body, which is what every path to a callee resolves it
+    /// to (`resolvedTarget`, `methodTargetCallee`), and what a row is keyed by.
+    pub const CutKey = struct { artifact: [32]u8, body: CheckedExprId };
+
+    /// A function or a constant a `code_primitives` item, or a translator
+    /// call, names: the reader of the module that defines it, its body, its
+    /// definition, and its checked type in that reader's store.
+    const CutMember = struct { reader: *Reifier, body: CheckedExprId, def: CIR.Def.Idx, ty: CheckedTypeId };
+
+    /// The function a resolved reference names, where it names one defined
+    /// as a lambda, following every exact alias (`same = add_one`), or null
+    /// for any other reference: a local, a constant, a value that computes a
+    /// function, a function the host or the platform provides.
+    fn cutMember(self: *Reifier, resolved: checked.ResolvedValueRefId) Allocator.Error!?CutMember {
+        const use = switch (self.value_refs.callableTarget(resolved).ref) {
+            .top_level_proc, .imported_proc => |use| use,
+            .promoted_top_level_proc,
+            .local_proc,
+            .local_param,
+            .local_value,
+            .local_mutable_version,
+            .pattern_binder,
+            .selected_hoisted_const,
+            .top_level_const,
+            .imported_const,
+            .hosted_proc,
+            .platform_required_declaration,
+            .platform_required_checked_error,
+            .platform_required_const,
+            .platform_required_proc,
+            => return null,
+        };
+        switch (use.binding) {
+            .top_level => |top_level| {
+                std.debug.assert(std.meta.eql(top_level.artifact.bytes, self.artifact.bytes));
+                switch (self.procedure_bindings.get(top_level.binding).body) {
+                    .direct_template => |direct| {
+                        const template_ref = switch (direct.template) {
+                            .checked => |template| template,
+                            .lifted, .synthetic => return null,
+                        };
+                        const template = self.procedure_templates.templates.items[@backingInt(template_ref.template)];
+                        const body_id = switch (template.body) {
+                            .checked_body => |body| body,
+                            .intrinsic_wrapper, .entry_wrapper => return null,
+                            // The walk never asks for an intrinsic's body.
+                            .unimplemented => {
+                                std.debug.assert(!self.templateIsIntrinsic(template));
+                                return null;
+                            },
+                        };
+                        const def = self.names.procBase(template.proc_base).source_def_idx orelse return null;
+                        return .{ .reader = self, .body = self.bodies.body(body_id).root_expr, .def = @fromBackingInt(def), .ty = template.checked_fn_root };
+                    },
+                    .callable_eval_template => |id| {
+                        const lookup = self.callable_eval_templates.templates[@backingInt(id)].forwarded_lookup orelse return null;
+                        const forwarded = self.value_refs.lookupIdByCheckedExpr(lookup) orelse
+                            invariant("an alias forwards to a lookup with no resolved reference");
+                        return self.cutMember(forwarded);
+                    },
+                    .checked_error => return null,
+                }
+            },
+            .imported => |imported| {
+                if (self.walk.foreign.findExported(imported.artifact, imported.def)) |definition| {
+                    const reader = try self.walk.reader(definition.module);
+                    return .{ .reader = reader, .body = definition.body, .def = imported.def, .ty = definition.template.checked_fn_root };
+                }
+                const alias = self.walk.foreign.findExportedAlias(imported.artifact, imported.def) orelse return null;
+                const reader = try self.walk.reader(alias.module);
+                const forwarded = reader.value_refs.lookupIdByCheckedExpr(alias.lookup) orelse
+                    invariant("an alias forwards to a lookup with no resolved reference");
+                return reader.cutMember(forwarded);
+            },
+            .hosted, .platform_required => return null,
+        }
+    }
+
+    /// What a `code_primitives` entry names: a function, as `cutMember`
+    /// resolves it, or a top-level constant, or null for anything else.
+    fn listedMember(self: *Reifier, resolved: checked.ResolvedValueRefId) Allocator.Error!?CutMember {
+        if (try self.cutMember(resolved)) |function| return function;
+        const constant = try self.constantDefinition(resolved) orelse return null;
+        const named = constant.named orelse return null;
+        return .{ .reader = constant.reader, .body = constant.body, .def = named.def, .ty = named.ty };
+    }
+
+    /// The function a translator call names: the reader of the module that
+    /// defines it, and its definition.
+    const Translator = struct { reader: *Reifier, def: CIR.Def.Idx };
+
+    /// The function a translator call names, as a member of a cut is named:
+    /// the callee of a direct call, through its resolved reference, or the
+    /// method a method call dispatches to, through its dispatch plan. Null
+    /// where the call names no function defined as a lambda or intrinsic.
+    fn translatorFunction(self: *Reifier, call: CheckedExprId) Allocator.Error!?Translator {
+        switch (self.bodies.expr(call).data) {
+            .call => |direct| {
+                const resolved = self.lookupResolved(direct.func) orelse return null;
+                if (try self.listedIntrinsic(resolved)) |intrinsic| return .{ .reader = intrinsic.reader, .def = intrinsic.def };
+                const member = try self.cutMember(resolved) orelse return null;
+                return .{ .reader = member.reader, .def = member.def };
+            },
+            .dispatch_call => |plan_id| {
+                // A dispatch checking rejected has no plan, and the build
+                // already stops at its error.
+                const id = plan_id orelse return null;
+                const node_id = switch (self.plans.plans[@backingInt(id)].resolution) {
+                    .direct_closed, .direct_parametric => |direct| direct.evidence,
+                    .direct_pending => |node_id| node_id,
+                    .checked_error, .@"unreachable" => return null,
+                    // The checker plans a method call's arguments against the
+                    // method's parameters only once its receiver's type is
+                    // known, so a site's translator is dispatched directly.
+                    .evidence_dependent, .structural => invariant("a translator's method call dispatches to a target its receiver's type names"),
+                };
+                return self.methodTranslator(self.plans.evidenceNode(node_id).target);
+            },
+            // A call checking rejected, which the build stops at.
+            .runtime_error => return null,
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_local,
+            .lookup_external,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => invariant("a translator call is a direct call or a method call"),
+        }
+    }
+
+    /// The function one method target names, as a translator is named, or
+    /// null for a method that is no function of a module the walk reads: a
+    /// builtin, whose type declares no cut, a local function, a derived one.
+    fn methodTranslator(self: *Reifier, target: static_dispatch.MethodTarget) Allocator.Error!?Translator {
+        const procedure = switch (target.kind) {
+            .procedure => |procedure| procedure,
+            .local_proc, .structural => return null,
+        };
+        if (try self.intrinsicOfTemplate(procedure.template.artifact, target.def_idx)) |intrinsic| return .{ .reader = intrinsic.reader, .def = intrinsic.def };
+        const found = self.methodDefinition(procedure.template, target.def_idx) orelse return null;
+        return switch (found) {
+            .here => .{ .reader = self, .def = target.def_idx },
+            .away => |definition| .{ .reader = try self.walk.reader(definition.module), .def = target.def_idx },
+            .here_builtin, .provided => null,
+        };
+    }
+
+    /// The resolved reference a checked lookup holds, or null for an
+    /// expression that is no lookup.
+    fn lookupResolved(self: *Reifier, expr_id: CheckedExprId) ?checked.ResolvedValueRefId {
+        return switch (self.bodies.expr(expr_id).data) {
+            .lookup_local => |lookup| lookup.resolved,
+            .lookup_external => |resolved| resolved,
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => null,
+        };
+    }
+
+    /// The nominal this module declares that has `def` as an associated
+    /// item, and the item's name, or null for a definition that is none.
+    fn ownerOf(self: *Reifier, def: CIR.Def.Idx) ?struct { decl: CIR.Statement.Idx, method: base.Ident.Idx } {
+        for (self.env.method_defs.entries.items) |entry| {
+            if (entry.value.def_idx != def) continue;
+            if (self.env.store.getStatement(entry.key.owner) != .s_nominal_decl) continue;
+            return .{ .decl = entry.key.owner, .method = entry.key.methodIdent() };
+        }
+        return null;
+    }
+
+    /// The qualified name of the definition `def` of this module (N8h): the
+    /// nominal it is an associated item of and the item, `Glsl.Vec3` and
+    /// `scale`, or the module and the definition where it is no item.
+    /// The name a top-level constant binds, or null for a definition whose
+    /// pattern binds no single name.
+    fn constantName(self: *Reifier, def: CIR.Def.Idx) ?[]const u8 {
+        return switch (self.env.store.getPattern(self.env.store.getDef(def).pattern)) {
+            .assign => |assign| self.env.getIdentText(assign.ident),
+            .var_assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .deferred_import_ref,
+            .record_destructure,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .num_from_numeral_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => null,
+        };
+    }
+
+    fn qualifiedName(self: *Reifier, def: CIR.Def.Idx) ForeignName {
+        const definition: reify.ir.Definition = .{ .module = self.artifact.bytes, .def = @backingInt(def) };
+        if (self.ownerOf(def)) |owned| {
+            const header = self.env.store.getStatement(owned.decl).s_nominal_decl.header;
+            return .{
+                .owner = self.env.getIdentText(self.env.store.getTypeHeader(header).name),
+                .method = self.env.getIdentText(owned.method),
+                .definition = definition,
+            };
+        }
+        const ident = switch (self.env.store.getPattern(self.env.store.getDef(def).pattern)) {
+            .assign => |assign| assign.ident,
+            .var_assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .deferred_import_ref,
+            .record_destructure,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .num_from_numeral_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => invariant("a function defined as a lambda binds one name"),
+        };
+        return .{ .owner = self.env.module_name, .method = self.env.getIdentText(ident), .definition = definition };
+    }
+
+    /// What a definition is to every description, whichever path reaches it
+    /// (D1, `roc-reify-opaque-proposal.md` 3.1). `self` is the reader of the
+    /// module that defines it, and `ty` its checked type in that reader's
+    /// store.
+    const Primitive = union(enum) {
+        /// A function of the builtin module, named by its export name, which
+        /// the path that reached it reads from the procedure's template.
+        builtin,
+        /// An operation of an opaque type, named by its qualified name.
+        operation: ForeignName,
+    };
+
+    /// An intrinsic a description names (`AnnotationOnlyKind.intrinsic`): an
+    /// annotated declaration with no body outside the builtin and platform
+    /// modules. It is a `Prim` at every site, whatever the site's cut says,
+    /// and the walk never asks for its body. `reader` is the reader of the
+    /// module that declares it, `name` its qualified name, marked as an
+    /// intrinsic, and `template` its procedure template, whose `where`
+    /// requirements its `Prim` carries, or null for a constant.
+    const Intrinsic = struct {
+        reader: *Reifier,
+        def: CIR.Def.Idx,
+        name: ForeignName,
+        template: ?checked.CheckedProcedureTemplate,
+
+        /// Its `where` requirements, which the call answers (D7).
+        fn requirements(self: Intrinsic) PrimEvidence {
+            return if (self.template) |template| PrimEvidence.of(self.reader, template) else .{};
+        }
+    };
+
+    /// Whether `env` declares `def` as an intrinsic.
+    fn defIsIntrinsic(env: *const ModuleEnv, def: CIR.Def.Idx) bool {
+        const expr = env.store.getExpr(env.store.getDef(def).expr);
+        if (expr != .e_anno_only) return false;
+        return expr.e_anno_only.kind == .intrinsic;
+    }
+
+    /// Whether this reader's procedure template `template` is an intrinsic's.
+    fn templateIsIntrinsic(self: *Reifier, template: checked.CheckedProcedureTemplate) bool {
+        const def = self.names.procBase(template.proc_base).source_def_idx orelse return false;
+        return defIsIntrinsic(self.env, @fromBackingInt(def));
+    }
+
+    /// The intrinsic `def` of this reader's module, or null where `def` is no
+    /// intrinsic.
+    fn intrinsicAt(self: *Reifier, def: CIR.Def.Idx) ?Intrinsic {
+        if (!defIsIntrinsic(self.env, def)) return null;
+        var name = self.qualifiedName(def);
+        name.intrinsic = true;
+        const template: ?checked.CheckedProcedureTemplate = if (self.procedure_templates.lookupByDef(def)) |ref|
+            self.procedure_templates.get(ref.template)
+        else
+            null;
+        // An annotation with no body publishes no checked body.
+        if (template) |found| std.debug.assert(found.body == .unimplemented);
+        return .{ .reader = self, .def = def, .name = name, .template = template };
+    }
+
+    /// The intrinsic `def` of the module whose artifact is `artifact`, or null
+    /// where `def` is no intrinsic or the walk cannot read that module.
+    fn intrinsicOfTemplate(self: *Reifier, artifact: canonical.ArtifactRef, def: CIR.Def.Idx) Allocator.Error!?Intrinsic {
+        if (std.meta.eql(artifact.bytes, self.artifact.bytes)) return self.intrinsicAt(def);
+        const module = self.walk.foreign.findModule(&artifact.bytes) orelse return null;
+        if (!defIsIntrinsic(module.env, def)) return null;
+        return (try self.walk.reader(module)).intrinsicAt(def);
+    }
+
+    /// The intrinsic a procedure binding names, or null for a binding of any
+    /// other procedure.
+    fn intrinsicCallee(self: *Reifier, binding: checked.ProcedureBindingRef) Allocator.Error!?Intrinsic {
+        switch (binding) {
+            .top_level => |top_level| {
+                if (!std.meta.eql(top_level.artifact.bytes, self.artifact.bytes)) return null;
+                const template_ref = switch (self.procedure_bindings.get(top_level.binding).body) {
+                    .direct_template => |direct| switch (direct.template) {
+                        .checked => |template| template,
+                        .lifted, .synthetic => return null,
+                    },
+                    .callable_eval_template, .checked_error => return null,
+                };
+                const template = self.procedure_templates.templates.items[@backingInt(template_ref.template)];
+                if (template.body != .unimplemented) return null;
+                const def = self.names.procBase(template.proc_base).source_def_idx orelse return null;
+                return self.intrinsicAt(@fromBackingInt(def));
+            },
+            .imported => |imported| return self.intrinsicOfTemplate(imported.artifact, imported.def),
+            .hosted, .platform_required => return null,
+        }
+    }
+
+    /// The intrinsic constant `const_ref` names, or null for any other
+    /// constant.
+    fn intrinsicConstant(self: *Reifier, const_ref: checked.ConstRef) Allocator.Error!?Intrinsic {
+        const reader = if (std.meta.eql(const_ref.artifact.bytes, self.artifact.bytes)) self else blk: {
+            const module = self.walk.foreign.findModule(&const_ref.artifact.bytes) orelse return null;
+            break :blk try self.walk.reader(module);
+        };
+        if (reader.const_templates.get(const_ref).state != .unimplemented) return null;
+        const named = reader.constantNamed(const_ref) orelse return null;
+        return reader.intrinsicAt(named.def);
+    }
+
+    /// The intrinsic constant a resolved reference names, or null for a
+    /// reference to anything else.
+    fn intrinsicConstantOf(self: *Reifier, resolved: checked.ResolvedValueRefId) Allocator.Error!?Intrinsic {
+        return switch (self.value_refs.callableTarget(resolved).ref) {
+            .top_level_const, .imported_const => |use| self.intrinsicConstant(use.const_ref),
+            .top_level_proc,
+            .imported_proc,
+            .promoted_top_level_proc,
+            .selected_hoisted_const,
+            .local_proc,
+            .local_param,
+            .local_value,
+            .local_mutable_version,
+            .pattern_binder,
+            .hosted_proc,
+            .platform_required_declaration,
+            .platform_required_checked_error,
+            .platform_required_const,
+            .platform_required_proc,
+            => null,
+        };
+    }
+
+    /// The intrinsic a resolved reference names, a function or a constant,
+    /// or null for a reference to anything else.
+    fn listedIntrinsic(self: *Reifier, resolved: checked.ResolvedValueRefId) Allocator.Error!?Intrinsic {
+        return switch (self.value_refs.callableTarget(resolved).ref) {
+            .top_level_proc, .imported_proc, .promoted_top_level_proc => |use| self.intrinsicCallee(use.binding),
+            .top_level_const, .imported_const => |use| self.intrinsicConstant(use.const_ref),
+            .selected_hoisted_const,
+            .local_proc,
+            .local_param,
+            .local_value,
+            .local_mutable_version,
+            .pattern_binder,
+            .hosted_proc,
+            .platform_required_declaration,
+            .platform_required_checked_error,
+            .platform_required_const,
+            .platform_required_proc,
+            => null,
+        };
+    }
+
+    /// The builtin module declares its primitives by being the builtin
+    /// module: each of its functions is one, and a constant folds. A module
+    /// that declares a nominal with `::` declares its primitives by the rule
+    /// of D1: each function or constant it defines whose checked type
+    /// mentions such a nominal at any depth. Every other definition is none,
+    /// and the walk reads its body. The rule reads only the declaration's
+    /// opaque flag, the nominal's builtin origin, the module that declares
+    /// it and the definition's checked type.
+    ///
+    /// An intrinsic is classified first: it has no body, so it is a primitive
+    /// whatever its type mentions, named by its qualified name. Its `Prim` is
+    /// the `Prim` of any other function.
+    fn primitiveOf(self: *Reifier, def: CIR.Def.Idx, ty: CheckedTypeId) Allocator.Error!?Primitive {
+        if (self.intrinsicAt(def)) |intrinsic| return .{ .operation = intrinsic.name };
+        if (self.env.module_role == .builtin) return if (self.functionOf(ty) != null) .builtin else null;
+        const here_hash = self.env.contentIdentityHash() orelse
+            invariant("a module the walk reads has its content identity");
+        // A nominal names the module that declares it by an identity of this
+        // module's name store. When the store has no identity for this
+        // module, no nominal of the checked types is declared by it.
+        const here = self.names.lookupModuleIdentity(here_hash) orelse return null;
+        var seen: collections.DenseMapUnmanaged(CheckedTypeId, void) = .empty;
+        defer seen.deinit(self.gpa);
+        if (!try self.mentionsOpaqueOf(&seen, here, ty)) return null;
+        return .{ .operation = self.qualifiedName(def) };
+    }
+
+    /// Whether `id` mentions, at any depth, a nominal declared with `::` by
+    /// the module whose module identity is `module`: through a function's
+    /// parameters and result, a record's fields, a tag's payloads, a
+    /// nominal's arguments and a `where` requirement's method type. A
+    /// nominal's backing is not descended, as the walk does not descend it.
+    fn mentionsOpaqueOf(self: *Reifier, seen: *collections.DenseMapUnmanaged(CheckedTypeId, void), module: canonical.ModuleIdentityId, id: CheckedTypeId) Allocator.Error!bool {
+        if ((try seen.getOrPut(self.gpa, id)).found_existing) return false;
+        switch (self.types.payload(id)) {
+            .alias => |alias| return self.mentionsOpaqueOf(seen, module, alias.backing),
+            .function => |fn_ty| {
+                for (fn_ty.args) |arg| if (try self.mentionsOpaqueOf(seen, module, arg)) return true;
+                return self.mentionsOpaqueOf(seen, module, fn_ty.ret);
+            },
+            .nominal => |nominal| {
+                if (nominal.is_opaque and nominal.builtin == null and
+                    nominal.origin_module == module) return true;
+                for (nominal.args) |arg| if (try self.mentionsOpaqueOf(seen, module, arg)) return true;
+                return false;
+            },
+            .tuple => |parts| {
+                for (parts) |part| if (try self.mentionsOpaqueOf(seen, module, part)) return true;
+                return false;
+            },
+            .record => |record| {
+                for (record.fields) |field| if (try self.mentionsOpaqueOf(seen, module, field.ty)) return true;
+                return self.mentionsOpaqueOf(seen, module, record.ext);
+            },
+            .tag_union => |union_ty| {
+                for (union_ty.tags) |variant| {
+                    for (variant.argsSlice(self.types)) |arg| if (try self.mentionsOpaqueOf(seen, module, arg)) return true;
+                }
+                return self.mentionsOpaqueOf(seen, module, union_ty.ext);
+            },
+            .flex, .rigid => |variable| {
+                for (variable.constraints) |constraint| if (try self.mentionsOpaqueOf(seen, module, constraint.fn_ty)) return true;
+                return false;
+            },
+            .empty_record, .empty_tag_union, .pending, .err => return false,
+        }
+    }
+
+    /// The function in the site's cut that a callee resolved to `reader` and
+    /// `body` is, named, or null where the callee is no such function.
+    fn inCut(self: *Reifier, reader: *Reifier, body: CheckedExprId) ?ForeignName {
+        return self.walk.cut.get(.{ .artifact = reader.artifact.bytes, .body = body });
+    }
 
     /// A plain call, `f(x)`: `Call` of the callee's row, a `Prim` for a
-    /// builtin or a function of another package, or the derived codec or
+    /// builtin or a function in the site's cut, or the derived codec or
     /// curried definition the call runs, folded into one node.
     fn callExpr(
         self: *Reifier,
@@ -3594,23 +5810,36 @@ pub const Reifier = struct {
         // or the checker's own for the call.
         const at = demanded orelse try self.tyOf(result_ty, region);
         if (try self.curriedCall(func, operands, at, region)) |flattened| return flattened;
-        var callee = try self.calleeTarget(func, region);
+        const inline_call = try self.walksInline(result_ty, region);
+        self.walk.open_builtins = inline_call;
+        var callee = self.calleeTarget(func, region) catch |err| {
+            self.walk.open_builtins = false;
+            return err;
+        };
+        self.walk.open_builtins = false;
         switch (callee) {
-            .provided => |export_name| {
+            // A primitive's `where` evidence is the call's own: the callee
+            // reference is the instantiation edge the checker keyed it by
+            // (D7).
+            .provided => |found| {
+                var provided = found;
+                provided.evidence.recorded = self.callRecorded(func);
                 const args = try self.exprRefs(operands);
                 defer self.gpa.free(args);
-                return self.providedPrim(export_name, args, result_ty, region);
+                return self.providedPrim(provided, args, result_ty, region);
             },
-            .foreign => |name| {
+            .foreign => |found| {
+                var name = found;
+                name.evidence.recorded = self.callRecorded(func);
                 const args = try self.exprRefs(operands);
                 defer self.gpa.free(args);
-                const b = self.bld();
-                return b.primOf(try b.namedPrim(name.owner, name.method), args, try self.tyOf(result_ty, region));
+                return self.foreignPrim(name, args, try self.tyOf(result_ty, region), region);
             },
             .value => {
                 const f = try self.exprRef(func);
                 const args = try self.exprRefs(operands);
                 defer self.gpa.free(args);
+                if (try self.appliedInline(f, args, at, region)) |applied| return applied;
                 return self.bld().apply(f, args, try self.tyOf(result_ty, region));
             },
             .definition => {},
@@ -3619,7 +5848,12 @@ pub const Reifier = struct {
         // evidence by, so the answer to every `where` obligation of the callee
         // is in hand here and nowhere inside the body.
         if (self.plans.siteEvidence(func)) |supplied| {
-            callee.definition.evidence = .{ .reader = self, .entries = supplied };
+            callee.definition.evidence = try self.supply(supplied, self.evidence);
+        }
+        if (inline_call) {
+            const args = try self.exprRefs(operands);
+            defer self.gpa.free(args);
+            return self.inlineCall(callee.definition, args, at, region);
         }
         // A function argument the call fixes to a definition is no argument
         // of the row: the parameter binds to the definition, and the row is
@@ -3627,7 +5861,7 @@ pub const Reifier = struct {
         try self.bindCallees(&callee.definition, operands, region);
         const kept = try self.keptOperands(operands, callee.definition.bound);
         defer self.gpa.free(kept);
-        return self.callOf(callee.definition, &.{kept}, at);
+        return self.callOf(callee.definition, &.{.{ .reader = self, .exprs = kept }}, at);
     }
 
     /// `Call` of a definition's row over what it captured, read here, then
@@ -3635,47 +5869,381 @@ pub const Reifier = struct {
     /// and bound callees. The call has the type `at` the site reads its result
     /// at, which is wider than the row's result where the site reads a
     /// narrower union at a wider one (design.md "Row Coercion Primitive").
-    fn callOf(self: *Reifier, target: CalleeTarget, groups: []const []const CheckedExprId, at: TyId) Error!Ref {
-        var total = target.captures.len;
-        for (groups) |group| total += group.len;
-        const args = try self.gpa.alloc(Ref, total);
-        defer self.gpa.free(args);
-        for (target.captures, 0..) |capture, index| {
-            const pattern = self.bodies.pattern(capture.pattern);
-            args[index] = try self.lookupRef(capture.pattern, null, pattern.ty, null, pattern.source_region);
+    fn callOf(self: *Reifier, target: CalleeTarget, groups: []const ArgumentGroup, at: TyId) Error!Ref {
+        var args = std.ArrayList(Ref).empty;
+        defer args.deinit(self.gpa);
+        // The callee was resolved where the first group is written, so that
+        // is where what it captured is read.
+        const owner = groups[0].reader;
+        for (target.captures) |capture| {
+            if (capturedCallee(target.bound, capture.pattern) != null) continue;
+            const pattern = owner.bodies.pattern(capture.pattern);
+            const outer_body = owner.enter();
+            defer owner.leave(outer_body);
+            try args.append(self.gpa, try owner.lookupRef(capture.pattern, null, pattern.ty, null, null, pattern.source_region));
         }
-        var next = target.captures.len;
-        for (groups) |group| for (group) |child| {
-            args[next] = try self.exprRef(child);
-            next += 1;
+        for (groups) |group| for (group.exprs) |child| {
+            try args.append(self.gpa, try group.reader.exprRef(child));
         };
         const row = try self.calledRow(target);
-        return self.bld().callRowAt(row, args, at);
+        return self.bld().callRowAt(row, args.items, at);
     }
+
+    /// The arguments of one group of a call, with the reader of the module
+    /// that wrote them. A curried call's two groups can be written in two
+    /// modules: a top-level value that computes a function is written in the
+    /// module that defines it, and the call that runs it in the module that
+    /// uses it.
+    const ArgumentGroup = struct {
+        reader: *Reifier,
+        exprs: []const CheckedExprId,
+    };
 
     /// A builtin by its export name, `Builtin.Num.I64.plus`: the `Prim` of
     /// its owner and method (N1a).
-    fn providedPrim(self: *Reifier, export_name: []const u8, args: []const Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
-        const name = prims.namedOfExport(export_name) orelse
-            return self.rejectError(.unresolved_reference, region, "a builtin with no owner in its name");
-        const b = self.bld();
-        return b.primOf(try b.namedPrim(name.owner, name.method), args, try self.tyOf(result_ty, region));
+    fn providedPrim(self: *Reifier, provided: Provided, args: []const Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        return self.providedPrimAt(provided, args, try self.tyOf(result_ty, region), region);
     }
 
-    /// The call one expression constructed a function with: the call itself,
-    /// or the one a held binding remembers.
-    fn constructorCall(self: *Reifier, func: CheckedExprId) ?CheckedExprId {
-        const callee = self.bodies.expr(func);
-        if (callee.data != .lookup_local) {
-            return if (self.constructsFunction(func)) func else null;
-        }
-        const binder = self.bodies.patternBinderForCheckedPattern(callee.data.lookup_local.pattern) orelse
-            return null;
-        const binding = self.lookupBinding(binder) orelse return null;
-        return switch (binding.kind) {
-            .function => |bound| if (self.lambdaOf(bound) == null) bound else null,
-            .value, .constant, .callee => null,
+    /// `providedPrim`, of the type `ty`.
+    fn providedPrimAt(self: *Reifier, provided: Provided, args: []const Ref, ty: TyId, region: base.Region) Error!Ref {
+        const id = try self.providedId(provided, region);
+        const evidence = try self.primEvidence(provided.evidence, region);
+        defer self.gpa.free(evidence);
+        return self.bld().primWith(id, args, ty, evidence);
+    }
+
+    fn providedId(self: *Reifier, provided: Provided, region: base.Region) Error!ir.PrimId {
+        const name = prims.namedOfExport(provided.name) orelse
+            return self.rejectError(.unresolved_reference, region, "a builtin with no owner in its name");
+        return self.bld().namedPrimWithRole(name.owner, name.method, provided.role);
+    }
+
+    /// An operation of an opaque type or a function in the site's cut
+    /// (N8h), with the evidence of its call (D7), of the type `ty`.
+    fn foreignPrim(self: *Reifier, name: ForeignName, args: []const Ref, ty: TyId, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const id = try b.declaredPrim(name.definition, name.owner, name.method, name.intrinsic);
+        const evidence = try self.primEvidence(name.evidence, region);
+        defer self.gpa.free(evidence);
+        return b.primWith(id, args, ty, evidence);
+    }
+
+    /// What the call whose callee reference is `func` recorded for the
+    /// callee's `where` requirements, or null where it recorded nothing.
+    fn callRecorded(self: *Reifier, func: CheckedExprId) ?Recorded {
+        const entries = self.plans.siteEvidence(func) orelse return null;
+        return .{ .reader = self, .entries = entries, .scope = self.evidence };
+    }
+
+    /// The refusal of a primitive call whose `where` evidence the checker
+    /// left to a later stage: the walk does not guess the answer (D7).
+    const unrecorded_evidence = "a call whose `where` evidence the compiler did not record";
+
+    /// The evidence of a call of a primitive (D7), as `ir.EvidenceWords`
+    /// reads it: for each `where` requirement of the primitive's scheme, in
+    /// the scheme's order, the method the checker chose at the call. Empty
+    /// for a primitive with no requirement. The caller frees it.
+    fn primEvidence(self: *Reifier, evidence: PrimEvidence, region: base.Region) Error![]u32 {
+        if (evidence.scheme.len == 0) return &.{};
+        var words: std.ArrayList(u32) = .empty;
+        errdefer words.deinit(self.gpa);
+        try self.evidenceEntries(&words, evidence, region);
+        return words.toOwnedSlice(self.gpa);
+    }
+
+    /// The count of `evidence`'s requirements, then one entry for each
+    /// (`ir.EvidenceWords`). Each entry reads only what the checker
+    /// recorded: a target it names is classified as a callee is (D1), a
+    /// derivation is `derived`, and an obligation no value reaches is
+    /// `unreachable_`. An answer left to a later stage is refused. Where the
+    /// compiler's own derivation reached the primitive, the checker records
+    /// nothing by construction, and the receiver answers (`receiverEvidence`).
+    fn evidenceEntries(self: *Reifier, words: *std.ArrayList(u32), evidence: PrimEvidence, region: base.Region) Error!void {
+        try words.append(self.gpa, @intCast(evidence.scheme.len));
+        if (evidence.scheme.len == 0) return;
+        const recorded = evidence.recorded orelse {
+            const receiver = evidence.receiver orelse return self.rejectError(.unsupported_expression, region, unrecorded_evidence);
+            return self.receiverEvidence(words, evidence, receiver, region);
         };
+        // The checker records one entry per requirement, in its order.
+        std.debug.assert(recorded.entries.len == evidence.scheme.len);
+        const names = evidence.names.?;
+        for (evidence.scheme, recorded.entries) |param, entry| {
+            const method = try self.rt().name(names.names.methodNameText(param.method));
+            // The type the requirement dispatches on, where the call fixed it.
+            const ty = try recorded.reader.tyOf(entry.dispatcher_ty, region);
+            try words.appendSlice(self.gpa, &.{ method.index(), ty.index() });
+            var supplied = recorded.reader.suppliedEntry(entry, recorded.scope);
+            var shared = false;
+            if (supplied.evidence.resolution == .constraint) {
+                if (sharedTarget(supplied.evidence.resolution.constraint, recorded.scope)) |slot| {
+                    supplied = slot;
+                    shared = true;
+                }
+            }
+            switch (supplied.evidence.resolution) {
+                .direct => |node_id| {
+                    const node = supplied.reader.plans.evidenceNode(node_id);
+                    const edge: DispatchEdge = .{ .reader = supplied.reader, .node = node, .scope = supplied.scope };
+                    // A shared slot's target is related to the use's own
+                    // callable, not to the slot's edge. That callable's first
+                    // parameter is the dispatcher, so the receiver fixes the
+                    // target's instance (`receiverInstantiation`), and a
+                    // variable only the rest of the callable fixes is refused.
+                    const fixing: MethodFixing = if (shared)
+                        .{ .receiver = recorded.reader.resolvedType(entry.dispatcher_ty) }
+                    else
+                        .{ .edge = edge };
+                    const callee = try self.methodTargetCallee(supplied.reader, node.target, fixing, region, .described);
+                    try self.calleeEvidence(words, callee, shared, region);
+                },
+                .structural => try words.appendSlice(self.gpa, &.{ @backingInt(ir.EvidenceKind.derived), method.index() }),
+                .unreachable_value => try words.append(self.gpa, @backingInt(ir.EvidenceKind.unreachable_)),
+                // An entry that forwards to evidence no enclosing call of the
+                // walk supplied, or whose answer the checker derives later.
+                .constraint, .from_callable, .from_scheme => return self.rejectError(.unsupported_expression, region, unrecorded_evidence),
+                .checked_error => invariant("a site the checker rejected reached the walk"),
+            }
+        }
+    }
+
+    /// The target part of one entry for the callee a requirement resolved
+    /// to: a primitive with its own entries, or a row of the site, built at
+    /// the evidence's instance as any callee is. `shared` says the entry is
+    /// a slot `sharedTarget` named, whose target has no requirement of its
+    /// own.
+    fn calleeEvidence(self: *Reifier, words: *std.ArrayList(u32), callee: DispatchCallee, shared: bool, region: base.Region) Error!void {
+        switch (callee) {
+            .provided => |provided| {
+                std.debug.assert(!shared or provided.evidence.scheme.len == 0);
+                try words.appendSlice(self.gpa, &.{ @backingInt(ir.EvidenceKind.prim), (try self.providedId(provided, region)).index() });
+                try self.evidenceEntries(words, provided.evidence, region);
+            },
+            .foreign => |name| {
+                std.debug.assert(!shared or name.evidence.scheme.len == 0);
+                const id = try self.bld().declaredPrim(name.definition, name.owner, name.method, name.intrinsic);
+                try words.appendSlice(self.gpa, &.{ @backingInt(ir.EvidenceKind.prim), id.index() });
+                try self.evidenceEntries(words, name.evidence, region);
+            },
+            .definition => |target| {
+                const row = try self.calledRow(target);
+                try words.appendSlice(self.gpa, &.{ @backingInt(ir.EvidenceKind.row), row.index() });
+            },
+            .none => return self.rejectError(.unresolved_reference, region, "a method this call names no target for"),
+        }
+    }
+
+    /// The refusals of a requirement a derivation reached that the receiver
+    /// does not answer by the checker's rule (`receiverEntry`).
+    const receiver_composite = "a `where` requirement on a composite type, reached by a derivation";
+    const receiver_variable = "a `where` requirement on a type variable, reached by a derivation";
+    const receiver_undeclared = "a `where` requirement whose method no module in reach declares, reached by a derivation";
+    const receiver_structural = "a `where` requirement on a structural type that permits no derived equality or hash, reached by a derivation";
+
+    /// The entries of `evidence` where the compiler's own derivation reached
+    /// the primitive (a derived `==` reaching `List.is_eq`): it planned no
+    /// call, so the checker recorded nothing, by construction. The receiver
+    /// fixes the template's quantified variables (`receiverInstantiation`),
+    /// so each requirement's dispatcher is the variable its `slot` names,
+    /// and `receiverEntry` resolves it.
+    fn receiverEvidence(self: *Reifier, words: *std.ArrayList(u32), evidence: PrimEvidence, receiver: FramedType, region: base.Region) Error!void {
+        const names = evidence.names.?;
+        const template = evidence.template.?;
+        var instance = (try names.receiverInstantiation(template, receiver, region)) orelse
+            invariant("a primitive with a `where` requirement has no quantified variable");
+        defer instance.substitution.deinit(self.gpa);
+        const scheme_vars = names.schemeVars(template);
+        for (evidence.scheme) |param| {
+            const text = names.names.methodNameText(param.method);
+            const method = try self.rt().name(text);
+            const slot = param.slot orelse return self.rejectError(.unsupported_expression, region, receiver_composite);
+            // `receiverInstantiation` binds every quantified variable or refuses.
+            const dispatcher = instance.substitution.get(scheme_vars[slot]) orelse
+                invariant("a receiver instantiation left a quantified variable unbound");
+            const ty = try dispatcher.reader.tyOfIn(dispatcher.frame, dispatcher.id, region);
+            try words.appendSlice(self.gpa, &.{ method.index(), ty.index() });
+            try self.receiverEntry(words, param, text, method, dispatcher, region);
+        }
+    }
+
+    /// The target part of one entry `receiverEvidence` reads, by the rule the
+    /// checker applies to a dispatcher of that type (checked_artifact.zig
+    /// `resolveObligationStep`), which Monotype applies to the same
+    /// derivation's components (monotype/lower.zig
+    /// `synthesizeComponentEvidenceAtNodeForPurpose`):
+    ///
+    /// | Dispatcher | Entry |
+    /// |---|---|
+    /// | nominal, registry target is a procedure | that target, as `dispatchTarget` reads a derivation's dispatch |
+    /// | nominal, registry target is structural | `derived` |
+    /// | record, tuple, tag union, `{}`, function | `derived`, where the requirement permits a derived equality or hash |
+    ///
+    /// Anything else is refused by name: a nominal no registry in reach
+    /// declares the method for, a type variable, and a structural type whose
+    /// requirement is a codec or a map (Monotype then reads inhabitedness,
+    /// which the walk does not).
+    fn receiverEntry(
+        self: *Reifier,
+        words: *std.ArrayList(u32),
+        param: static_dispatch.EvidenceParamRecord,
+        text: []const u8,
+        method: NameId,
+        dispatcher: FramedType,
+        region: base.Region,
+    ) Error!void {
+        const reader = dispatcher.reader;
+        switch (reader.types.payload(dispatcher.id)) {
+            .alias => |alias| return self.receiverEntry(words, param, text, method, reader.resolvedTypeIn(dispatcher.frame, alias.backing), region),
+            .nominal => {
+                const target = receiverMethod(dispatcher, text) orelse
+                    return self.rejectError(.unsupported_type, region, receiver_undeclared);
+                if (std.meta.activeTag(target.kind) == .structural) {
+                    return words.appendSlice(self.gpa, &.{ @backingInt(ir.EvidenceKind.derived), method.index() });
+                }
+                const callee = try reader.methodTargetCallee(reader, target, .{ .receiver = dispatcher }, region, .described);
+                return self.calleeEvidence(words, callee, false, region);
+            },
+            .record, .tuple, .tag_union, .empty_record, .empty_tag_union, .function => {
+                const kind = param.structural orelse return self.rejectError(.unsupported_type, region, receiver_structural);
+                return switch (static_dispatch.unpinnedDispatchResolution(kind)) {
+                    .structural => words.appendSlice(self.gpa, &.{ @backingInt(ir.EvidenceKind.derived), method.index() }),
+                    .unreachable_value => self.rejectError(.unsupported_type, region, receiver_structural),
+                };
+            },
+            .flex, .rigid => return self.rejectError(.unresolved_type, region, receiver_variable),
+            .pending, .err => return self.rejectError(.unresolved_type, region, "an unresolved type"),
+        }
+    }
+
+    /// The entry of `scope` a forwarded requirement names where the use
+    /// relates the slot's target to its own callable (`independent_callable`),
+    /// and the slot's entry is the whole answer: the checker shares the
+    /// slot's target identity with the use. A target with no requirement of
+    /// its own (no nested evidence), a derivation and an unreachable
+    /// obligation are then the whole answer. A walked target's row is built
+    /// at the instance the use's own callable fixes, which no table records:
+    /// the caller reads it off the dispatcher, the callable's first
+    /// parameter (`receiverInstantiation`), and refuses a target with a
+    /// variable only the rest of the callable fixes. Null for any other
+    /// entry, which the caller refuses.
+    fn sharedTarget(forwarded: static_dispatch.ConstraintEvidenceRef, scope: SuppliedEvidence) ?SuppliedEntry {
+        if (!forwarded.independent_callable or forwarded.index.depth != 0) return null;
+        if (forwarded.index.index >= scope.entries.len) return null;
+        const slot = scope.entries[forwarded.index.index];
+        return switch (slot.evidence.resolution) {
+            .direct => |node_id| switch (slot.reader.plans.evidenceNode(node_id).nested) {
+                .resolved => |nested| if (nested.len == 0) slot else null,
+                .from_callable, .through_alias => null,
+            },
+            .structural, .unreachable_value => slot,
+            .constraint, .from_callable, .from_scheme, .checked_error => null,
+        };
+    }
+
+    /// `name`, carrying the `where` requirements `evidence` of its call.
+    fn withEvidence(name: ForeignName, evidence: PrimEvidence) ForeignName {
+        var out = name;
+        out.evidence = evidence;
+        return out;
+    }
+
+    /// The expression that constructed a function, and the reader of the
+    /// module that wrote it.
+    const Constructor = struct {
+        reader: *Reifier,
+        expr: CheckedExprId,
+    };
+
+    /// The call one expression constructed a function with: the call itself,
+    /// the one a held binding remembers, or the definition of a top-level
+    /// value that computes the function.
+    fn constructorCall(self: *Reifier, func: CheckedExprId, region: base.Region) Error!?Constructor {
+        const callee = self.bodies.expr(func);
+        switch (callee.data) {
+            .lookup_local => |local| {
+                const binder = self.bodies.patternBinderForCheckedPattern(local.pattern) orelse
+                    return null;
+                const binding = self.lookupBinding(binder) orelse return self.computedConstructor(local.resolved, region);
+                return switch (binding.kind) {
+                    .function => |bound| if (self.lambdaOf(bound) == null) .{ .reader = self, .expr = bound } else null,
+                    .value, .constant, .callee => null,
+                };
+            },
+            .lookup_external, .lookup_required => |reference| return self.computedConstructor(reference, region),
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .row_coerce,
+            .bytes_literal,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => return if (self.constructsFunction(func)) .{ .reader = self, .expr = func } else null,
+        }
+    }
+
+    /// What a top-level value that computes a function was written as, where
+    /// the name is such a value of a module the walk reads.
+    fn computedConstructor(self: *Reifier, resolved: ?checked.ResolvedValueRefId, region: base.Region) Error!?Constructor {
+        const id = resolved orelse return null;
+        const computed = try self.computedFunction(id, region) orelse return null;
+        const written = computed.written;
+        // A value written as another such value, `renamed = doubler`, is the
+        // one it names. The definition is marked while the walk follows it, so
+        // a value that reaches itself ends at its own definition.
+        const data = written.reader.bodies.expr(written.body).data;
+        const named: ?checked.ResolvedValueRefId = if (data == .lookup_local)
+            data.lookup_local.resolved
+        else if (data == .lookup_external)
+            data.lookup_external
+        else if (data == .lookup_required)
+            data.lookup_required
+        else
+            null;
+        if (named != null and !written.reader.folding.contains(written.body)) {
+            try written.reader.folding.put(written.reader.gpa, written.body, {});
+            defer _ = written.reader.folding.remove(written.body);
+            if (try written.reader.computedConstructor(named, region)) |inner| return inner;
+        }
+        return .{ .reader = written.reader, .expr = written.body };
     }
 
     /// One `Call` for a definition that hands back a function and a use that
@@ -3685,43 +6253,47 @@ pub const Reifier = struct {
     /// Null when the callee is not a curried definition, which is every other
     /// call.
     fn curriedCall(self: *Reifier, func: CheckedExprId, operands: []const CheckedExprId, at: TyId, region: base.Region) Error!?Ref {
-        const constructor = self.constructorCall(func) orelse return null;
-        const built = self.bodies.expr(constructor).data;
+        const constructor = try self.constructorCall(func, region) orelse return null;
+        // The constructor is read where it was written. For a name bound in
+        // the row that is this reader, and for a top-level value it is the
+        // reader of the module that defines the value.
+        const writer = constructor.reader;
+        const built = writer.bodies.expr(constructor.expr).data;
         if (built == .call) {
             const call = built.call;
-            const resolved = try self.calleeTarget(call.func, region);
+            const resolved = try writer.calleeTarget(call.func, region);
             if (resolved != .definition) return null;
             var callee = resolved.definition;
-            if (self.plans.siteEvidence(call.func)) |supplied| {
-                callee.evidence = .{ .reader = self, .entries = supplied };
+            if (writer.plans.siteEvidence(call.func)) |supplied| {
+                callee.evidence = try writer.supply(supplied, writer.evidence);
             }
-            return self.flattenedCall(callee, call.args, operands, at);
+            return self.flattenedCall(callee, .{ .reader = writer, .exprs = call.args }, operands, at);
         }
         if (built != .dispatch_call and built != .type_dispatch_call) return null;
         const id = (if (built == .dispatch_call) built.dispatch_call else built.type_dispatch_call) orelse return null;
-        const plan = self.plans.plans[@backingInt(id)];
-        const found = try self.dispatchTarget(DispatchSpec.ofPlan(plan), region);
+        const plan = writer.plans.plans[@backingInt(id)];
+        const found = try writer.dispatchTarget(DispatchSpec.ofPlan(plan), region, .described);
         const callee = switch (found) {
             .definition => |target| target,
-            // A builtin or a function of another package carries no body to
+            // A builtin or a function in the site's cut carries no body to
             // flatten a curried call through.
             .provided, .foreign, .none => return null,
         };
-        const constructed = try self.dispatchExprs(plan, region);
+        const constructed = try writer.dispatchExprs(plan, region);
         defer self.gpa.free(constructed);
-        return self.flattenedCall(callee, constructed, operands, at);
+        return self.flattenedCall(callee, .{ .reader = writer, .exprs = constructed }, operands, at);
     }
 
     /// One `Call` over both argument groups, against the row that gathers
     /// both lambdas' parameters. Takes the callee's instantiation either way.
-    fn flattenedCall(self: *Reifier, callee: CalleeTarget, constructed: []const CheckedExprId, operands: []const CheckedExprId, at: TyId) Error!?Ref {
+    fn flattenedCall(self: *Reifier, callee: CalleeTarget, constructed: ArgumentGroup, operands: []const CheckedExprId, at: TyId) Error!?Ref {
         var target = callee;
         if (!target.reader.isCurried(target.key.body)) {
             if (target.instantiation) |*fixed| fixed.substitution.deinit(self.gpa);
             return null;
         }
         target.key.curried = true;
-        return try self.callOf(target, &.{ constructed, operands }, at);
+        return try self.callOf(target, &.{ constructed, .{ .reader = self, .exprs = operands } }, at);
     }
 
     /// One dispatch's operands as checked expressions. The caller owns the
@@ -3747,18 +6319,20 @@ pub const Reifier = struct {
     /// callee is an `Apply`, which a known closure resolves once the caller
     /// is simplified (N8i).
     fn bindCallees(self: *Reifier, target: *CalleeTarget, operands: []const CheckedExprId, region: base.Region) Error!void {
-        var bound = std.ArrayList(BoundCallee).empty;
+        // A lifted lambda arrives with the names it captured already bound.
+        var bound = std.ArrayList(BoundCallee).fromOwnedSlice(target.bound);
+        target.bound = &.{};
         errdefer {
             self.releaseBound(bound.items);
             bound.deinit(self.gpa);
         }
+        const before = bound.items.len;
         for (operands, 0..) |operand, index| {
             if (self.functionOf(self.bodies.expr(operand).ty) == null) continue;
             const passed = try self.passedArgument(operand, region) orelse continue;
-            try bound.append(self.gpa, .{ .param = @intCast(index), .target = passed });
+            try bound.append(self.gpa, .{ .param = .{ .position = @intCast(index) }, .target = passed });
         }
-        if (bound.items.len == 0) return;
-        target.key.callees = boundCalleesKey(bound.items);
+        if (bound.items.len != before) target.key.callees = boundCalleesKey(bound.items);
         target.bound = try bound.toOwnedSlice(self.gpa);
     }
 
@@ -3778,13 +6352,18 @@ pub const Reifier = struct {
     /// that names no definition.
     fn passedArgument(self: *Reifier, operand: CheckedExprId, region: base.Region) Error!?CalleeTarget {
         if (self.lambdaOf(operand) != null) {
-            if (self.capturesOf(operand).len != 0) return null;
-            return .{ .key = .{ .artifact = self.artifact.bytes, .body = operand }, .reader = self };
+            // A lambda that captures only names a call fixed captures no
+            // value: it is the definitions those names stand for.
+            const captures = self.capturesOf(operand);
+            for (captures) |capture| {
+                if (self.calleeInScope(capture.pattern) == null) return null;
+            }
+            return try self.enclosedLambda(operand, null, captures);
         }
         return switch (try self.calleeTarget(operand, region)) {
             .definition => |definition| definition,
             .value => null,
-            .provided, .foreign => self.rejectError(.unsupported_expression, region, "a builtin or a function of another package, passed as an argument"),
+            .provided, .foreign => self.rejectError(.unsupported_expression, region, "a builtin or a function in the translator's cut, passed as an argument"),
         };
     }
 
@@ -3794,7 +6373,16 @@ pub const Reifier = struct {
     fn boundCalleesKey(bound: []const BoundCallee) [32]u8 {
         var hasher = std.crypto.hash.Blake3.init(.{});
         for (bound) |entry| {
-            hasher.update(std.mem.asBytes(&entry.param));
+            switch (entry.param) {
+                .position => |position| {
+                    hasher.update(&[_]u8{0});
+                    hasher.update(std.mem.asBytes(&position));
+                },
+                .capture => |pattern| {
+                    hasher.update(&[_]u8{1});
+                    hasher.update(std.mem.asBytes(&pattern));
+                },
+            }
             hasher.update(&entry.target.key.artifact);
             hasher.update(std.mem.asBytes(&entry.target.key.body));
             hasher.update(&entry.target.key.instantiation);
@@ -3817,21 +6405,22 @@ pub const Reifier = struct {
     /// The arguments one call still passes, leaving out every one that fixed a
     /// function parameter. The caller owns the slice.
     fn keptOperands(self: *Reifier, operands: []const CheckedExprId, bound: []const BoundCallee) Allocator.Error![]CheckedExprId {
-        const kept = try self.gpa.alloc(CheckedExprId, operands.len - bound.len);
-        errdefer self.gpa.free(kept);
-        var next: usize = 0;
+        var kept = std.ArrayList(CheckedExprId).empty;
+        errdefer kept.deinit(self.gpa);
         for (operands, 0..) |operand, index| {
             if (fixesCallee(bound, index)) continue;
-            kept[next] = operand;
-            next += 1;
+            try kept.append(self.gpa, operand);
         }
-        return kept;
+        return kept.toOwnedSlice(self.gpa);
     }
 
     /// Whether one argument position fixed a function parameter.
     fn fixesCallee(bound: []const BoundCallee, index: usize) bool {
         for (bound) |entry| {
-            if (entry.param == index) return true;
+            switch (entry.param) {
+                .position => |position| if (position == index) return true,
+                .capture => {},
+            }
         }
         return false;
     }
@@ -3848,11 +6437,11 @@ pub const Reifier = struct {
             const local = callee.data.lookup_local;
             const binder = self.bodies.patternBinderForCheckedPattern(local.pattern) orelse
                 return self.rejectError(.unresolved_reference, region, "this call");
-            if (self.lookupBinding(binder)) |binding| return self.liftedTarget(binding, callee.ty, region);
-            if (try self.replayBinding(binder)) |binding| return self.liftedTarget(binding, callee.ty, region);
+            if (self.lookupBinding(binder)) |binding| return self.liftedTarget(binding, callee.ty, func, region);
+            if (try self.replayBinding(binder)) |binding| return self.liftedTarget(binding, callee.ty, func, region);
             const resolved = local.resolved orelse
                 return self.rejectError(.unresolved_reference, region, "this call");
-            return self.resolvedTarget(resolved, binder, region);
+            return self.resolvedTarget(resolved, binder, region, .described);
         }
         const resolved = switch (callee.data) {
             .lookup_external, .lookup_required => |reference| reference orelse
@@ -3905,7 +6494,484 @@ pub const Reifier = struct {
             .run_low_level,
             => return .value,
         };
-        return self.resolvedTarget(resolved, null, region);
+        return self.resolvedTarget(resolved, null, region, .described);
+    }
+
+    /// The definition a use of a template names (D1): a lookup of a
+    /// procedure, or a dispatch whose plan names its target. What the use
+    /// fixes the template's variables to is read in this reader's frame, and
+    /// what it supplies for the template's `where` obligations is composed
+    /// with this reader's evidence, as a call's is. Null for a use that names
+    /// no definition the walk builds a row for. A primitive with an
+    /// inventory (a method of a `::` type) is that definition here, as
+    /// `usedTemplate` reads it (`CalleeUse.instance_table`).
+    fn useTarget(self: *Reifier, use: CheckedExprId, region: base.Region) Error!?CalleeTarget {
+        if (try self.usedConstant(use)) |constant| return try self.constantTarget(constant, region);
+        switch (self.bodies.expr(use).data) {
+            .lookup_local => |local| {
+                const resolved = local.resolved orelse return null;
+                const binder = self.bodies.patternBinderForCheckedPattern(local.pattern);
+                const callee = try self.resolvedTarget(resolved, binder, region, .instance_table);
+                var target = switch (callee) {
+                    .definition => |target| target,
+                    .provided, .foreign, .value => return null,
+                };
+                if (self.plans.siteEvidence(use)) |supplied| target.evidence = try self.supply(supplied, self.evidence);
+                return target;
+            },
+            .lookup_external => |reference| {
+                const resolved = reference orelse return null;
+                const callee = try self.resolvedTarget(resolved, null, region, .instance_table);
+                var target = switch (callee) {
+                    .definition => |target| target,
+                    .provided, .foreign, .value => return null,
+                };
+                if (self.plans.siteEvidence(use)) |supplied| target.evidence = try self.supply(supplied, self.evidence);
+                return target;
+            },
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => {
+                const spec = (try self.dispatchOfUse(use)) orelse return null;
+                return switch (try self.dispatchTarget(spec, region, .instance_table)) {
+                    .definition => |target| target,
+                    .provided, .foreign, .none => null,
+                };
+            },
+        }
+    }
+
+    /// The template a use names (D1), without what it fixes: the reader of
+    /// the module that defines it, its template id and its body. Null for a
+    /// use that names no procedure of a module the walk reads, or where the
+    /// reference does not resolve; such a use has no inventory.
+    fn usedTemplate(self: *Reifier, use: CheckedExprId) Allocator.Error!?UsedTemplate {
+        const outer_rejection = self.walk.rejection;
+        defer self.walk.rejection = outer_rejection;
+        return self.usedTemplateOrRefused(use) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.Rejected, error.Diverged => null,
+        };
+    }
+
+    const UsedTemplate = struct {
+        reader: *Reifier,
+        template: canonical.CheckedProcedureTemplateId,
+        body: CheckedExprId,
+    };
+
+    /// A constant a use reads, which evaluation computes at each type a use
+    /// fixes (Q16): the reader of its module, the entry template its
+    /// evaluation runs, which holds its inventory, its body, and the type
+    /// the use fixes, or null where the use fixes none.
+    const UsedConstant = struct {
+        reader: *Reifier,
+        template: canonical.CheckedProcedureTemplateId,
+        body: CheckedExprId,
+        requested: ?CheckedTypeId,
+    };
+
+    fn usedConstant(self: *Reifier, use: CheckedExprId) Allocator.Error!?UsedConstant {
+        switch (self.bodies.expr(use).data) {
+            .lookup_local, .lookup_external => {},
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => return null,
+        }
+        const resolved = self.lookupResolved(use) orelse return null;
+        const const_use = switch (self.value_refs.callableTarget(resolved).ref) {
+            .top_level_const, .imported_const => |const_use| const_use,
+            .local_param,
+            .local_value,
+            .local_mutable_version,
+            .pattern_binder,
+            .local_proc,
+            .selected_hoisted_const,
+            .top_level_proc,
+            .imported_proc,
+            .hosted_proc,
+            .platform_required_declaration,
+            .platform_required_checked_error,
+            .platform_required_const,
+            .platform_required_proc,
+            .promoted_top_level_proc,
+            => return null,
+        };
+        const reader = if (std.meta.eql(const_use.const_ref.artifact.bytes, self.artifact.bytes)) self else blk: {
+            const away = self.walk.foreign.findConstant(const_use.const_ref) orelse return null;
+            break :blk try self.walk.reader(away.module);
+        };
+        const eval = switch (reader.const_templates.get(const_use.const_ref).state) {
+            .eval_template => |eval| eval,
+            .stored_const, .reserved, .unimplemented => return null,
+        };
+        if (!std.meta.eql(eval.entry_template.artifact.bytes, reader.artifact.bytes)) invariant("a constant's entry template is in another module");
+        return .{
+            .reader = reader,
+            .template = eval.entry_template.template,
+            .body = reader.const_bodies.get(eval.body).body_expr,
+            .requested = const_use.requested_source_ty_payload,
+        };
+    }
+
+    /// What a use of a constant fixes the variables of its entry template
+    /// to: the template's scheme, at the value the template returns, read
+    /// together with the type the use requests.
+    fn constantTarget(self: *Reifier, constant: UsedConstant, region: base.Region) Error!CalleeTarget {
+        const reader = constant.reader;
+        const requested = constant.requested orelse invariant("a constant use an inventory names fixes no type");
+        const template = reader.procedure_templates.templates.items[@backingInt(constant.template)];
+        const value_ty = switch (reader.types.payload(template.checked_fn_root)) {
+            .function => |function| function.ret,
+            .pending,
+            .err,
+            .flex,
+            .rigid,
+            .alias,
+            .record,
+            .tuple,
+            .nominal,
+            .empty_record,
+            .tag_union,
+            .empty_tag_union,
+            => invariant("a constant's entry template is no function"),
+        };
+        const instance = try reader.instantiationOf(.{ .vars = reader.schemeVars(template), .root = value_ty }, self, requested, null, region, .call);
+        return .{
+            .key = .{
+                .artifact = reader.artifact.bytes,
+                .body = constant.body,
+                .instantiation = if (instance) |fixed| fixed.key else @as([32]u8, @splat(0)),
+            },
+            .reader = reader,
+            .instantiation = instance,
+        };
+    }
+
+    fn usedTemplateOrRefused(self: *Reifier, use: CheckedExprId) Error!?UsedTemplate {
+        const region = self.bodies.expr(use).source_region;
+        switch (self.bodies.expr(use).data) {
+            .lookup_local, .lookup_external => {
+                if (try self.usedConstant(use)) |constant| return .{ .reader = constant.reader, .template = constant.template, .body = constant.body };
+                const resolved = self.lookupResolved(use) orelse return null;
+                const target = switch (self.value_refs.callableTarget(resolved).ref) {
+                    .top_level_proc, .imported_proc, .promoted_top_level_proc => |target| target,
+                    .local_param,
+                    .local_value,
+                    .local_mutable_version,
+                    .pattern_binder,
+                    .local_proc,
+                    .selected_hoisted_const,
+                    .top_level_const,
+                    .imported_const,
+                    .hosted_proc,
+                    .platform_required_declaration,
+                    .platform_required_checked_error,
+                    .platform_required_const,
+                    .platform_required_proc,
+                    => return null,
+                };
+                // A procedure of a module the walk does not read (a builtin,
+                // the host, the platform) has no inventory.
+                switch (target.binding) {
+                    .top_level => {},
+                    .imported => |imported| if (self.walk.foreign.findExported(imported.artifact, imported.def) == null and
+                        self.walk.foreign.findExportedAlias(imported.artifact, imported.def) == null) return null,
+                    .hosted, .platform_required => return null,
+                }
+                const written_binder: ?PatternBinderId = switch (self.bodies.expr(use).data) {
+                    .lookup_local => |local| self.bodies.patternBinderForCheckedPattern(local.pattern),
+                    .pending,
+                    .numeral,
+                    .str_from_quote,
+                    .code_from_lambda,
+                    .str_segment,
+                    .str,
+                    .bytes_literal,
+                    .lookup_external,
+                    .lookup_required,
+                    .list,
+                    .empty_list,
+                    .tuple,
+                    .match_,
+                    .if_,
+                    .call,
+                    .record,
+                    .empty_record,
+                    .block,
+                    .tag,
+                    .nominal,
+                    .zero_argument_tag,
+                    .closure,
+                    .lambda,
+                    .binop,
+                    .unary_minus,
+                    .unary_not,
+                    .field_access,
+                    .dispatch_call,
+                    .interpolation,
+                    .structural_eq,
+                    .structural_hash,
+                    .method_eq,
+                    .type_dispatch_call,
+                    .tuple_access,
+                    .runtime_error,
+                    .crash,
+                    .dbg,
+                    .expect_err,
+                    .expect,
+                    .ellipsis,
+                    .anno_only,
+                    .break_,
+                    .return_,
+                    .row_coerce,
+                    .for_,
+                    .hosted_lambda,
+                    .run_low_level,
+                    => null,
+                };
+                // An intrinsic has no body, so it has no inventory.
+                if (try self.intrinsicCallee(target.binding) != null) return null;
+                const reached = try self.reachedProcedure(target.binding, written_binder, region);
+                return .{ .reader = reached.reader, .template = reached.template.template_id, .body = reached.body };
+            },
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => {
+                const spec = (try self.dispatchOfUse(use)) orelse return null;
+                const direct = switch (spec.resolution) {
+                    .direct_closed, .direct_parametric => |direct| direct,
+                    .direct_pending, .evidence_dependent, .structural, .checked_error, .@"unreachable" => return null,
+                };
+                const node = self.plans.evidenceNode(direct.evidence);
+                const procedure = switch (node.target.kind) {
+                    .procedure => |procedure| procedure,
+                    .local_proc, .structural => return null,
+                };
+                // An intrinsic has no body, so it has no inventory.
+                if (try self.intrinsicOfTemplate(procedure.template.artifact, node.target.def_idx) != null) return null;
+                const found = self.methodDefinition(procedure.template, node.target.def_idx) orelse return null;
+                const reader = switch (found) {
+                    .provided => return null,
+                    .here, .here_builtin => self,
+                    .away => |definition| try self.walk.reader(definition.module),
+                };
+                return .{ .reader = reader, .template = found.template().template_id, .body = found.body() };
+            },
+        }
+    }
+
+    /// Whether `type_id` mentions a variable of `vars`: a variable is a
+    /// flex or rigid type id, and it is read where it stands, through
+    /// records, tag unions, tuples, functions, aliases and a nominal's
+    /// arguments.
+    fn mentionsAny(self: *Reifier, type_id: CheckedTypeId, vars: *const RowVars) Allocator.Error!bool {
+        if (vars.count() == 0) return false;
+        var seen: RowVars = .empty;
+        defer seen.deinit(self.gpa);
+        return self.mentionsIn(type_id, vars, &seen);
+    }
+
+    /// Every flex or rigid variable `type_id` mentions, read as `mentionsIn`
+    /// reads them.
+    fn collectVars(self: *Reifier, type_id: CheckedTypeId, out: *RowVars) Allocator.Error!void {
+        var seen: RowVars = .empty;
+        defer seen.deinit(self.gpa);
+        var work = std.ArrayList(CheckedTypeId).empty;
+        defer work.deinit(self.gpa);
+        try work.append(self.gpa, type_id);
+        while (work.pop()) |id| {
+            if ((try seen.getOrPut(self.gpa, id)).found_existing) continue;
+            switch (self.types.payload(id)) {
+                .flex, .rigid => |variable| {
+                    try out.put(self.gpa, id, {});
+                    for (variable.constraints) |constraint| try work.append(self.gpa, constraint.fn_ty);
+                },
+                .alias => |alias| try work.append(self.gpa, alias.backing),
+                .function => |fn_ty| {
+                    try work.appendSlice(self.gpa, fn_ty.args);
+                    try work.append(self.gpa, fn_ty.ret);
+                },
+                .nominal => |nominal| try work.appendSlice(self.gpa, nominal.args),
+                .tuple => |parts| try work.appendSlice(self.gpa, parts),
+                .record => |record| {
+                    for (record.fields) |field| try work.append(self.gpa, field.ty);
+                    try work.append(self.gpa, record.ext);
+                },
+                .tag_union => |union_ty| {
+                    for (union_ty.tags) |variant| try work.appendSlice(self.gpa, variant.argsSlice(self.types));
+                    try work.append(self.gpa, union_ty.ext);
+                },
+                .empty_record, .empty_tag_union, .pending, .err => {},
+            }
+        }
+    }
+
+    fn mentionsIn(self: *Reifier, id: CheckedTypeId, vars: *const RowVars, seen: *RowVars) Allocator.Error!bool {
+        if ((try seen.getOrPut(self.gpa, id)).found_existing) return false;
+        switch (self.types.payload(id)) {
+            .flex, .rigid => |variable| {
+                if (vars.contains(id)) return true;
+                for (variable.constraints) |constraint| if (try self.mentionsIn(constraint.fn_ty, vars, seen)) return true;
+                return false;
+            },
+            .alias => |alias| return self.mentionsIn(alias.backing, vars, seen),
+            .function => |fn_ty| {
+                for (fn_ty.args) |arg| if (try self.mentionsIn(arg, vars, seen)) return true;
+                return self.mentionsIn(fn_ty.ret, vars, seen);
+            },
+            .nominal => |nominal| {
+                for (nominal.args) |arg| if (try self.mentionsIn(arg, vars, seen)) return true;
+                return false;
+            },
+            .tuple => |parts| {
+                for (parts) |part| if (try self.mentionsIn(part, vars, seen)) return true;
+                return false;
+            },
+            .record => |record| {
+                for (record.fields) |field| if (try self.mentionsIn(field.ty, vars, seen)) return true;
+                return self.mentionsIn(record.ext, vars, seen);
+            },
+            .tag_union => |union_ty| {
+                for (union_ty.tags) |variant| {
+                    for (variant.argsSlice(self.types)) |arg| if (try self.mentionsIn(arg, vars, seen)) return true;
+                }
+                return self.mentionsIn(union_ty.ext, vars, seen);
+            },
+            .empty_record, .empty_tag_union, .pending, .err => return false,
+        }
     }
 
     /// A lambda the block bound, lifted into a row of its own (N8b), or the
@@ -3914,28 +6980,18 @@ pub const Reifier = struct {
     /// A lambda the block generalized is built at the type `use`, the type
     /// the lookup instantiated its scheme to, so each type it is called at
     /// keys a row of its own.
-    fn liftedTarget(self: *Reifier, binding: Binding, use: CheckedTypeId, region: base.Region) Error!Callee {
+    fn liftedTarget(self: *Reifier, binding: Binding, use: CheckedTypeId, use_expr: ?CheckedExprId, region: base.Region) Error!Callee {
         const bound = switch (binding.kind) {
             .function => |expr_id| expr_id,
             .callee => |index| return .{ .definition = try self.boundTarget(self.bound[index].target) },
             .value, .constant => return .value,
         };
         if (self.lambdaOf(bound) == null) return .value;
-        var instance = if (self.localScheme(bound)) |scheme|
-            try self.instantiationOf(scheme, self, use, region, .call)
+        const instance = if (self.localScheme(bound)) |scheme|
+            try self.instantiationOf(scheme, self, use, use_expr, region, .call)
         else
             null;
-        errdefer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
-        return .{ .definition = .{
-            .key = .{
-                .artifact = self.artifact.bytes,
-                .body = bound,
-                .instantiation = if (instance) |fixed| fixed.key else @as([32]u8, @splat(0)),
-            },
-            .reader = self,
-            .instantiation = instance,
-            .captures = self.capturesOf(bound),
-        } };
+        return .{ .definition = try self.enclosedLambda(bound, instance, self.capturesOf(bound)) };
     }
 
     /// One bound callee, copied for the call that names it.
@@ -3959,14 +7015,20 @@ pub const Reifier = struct {
     }
 
     /// What a resolved reference reaches: a definition and the reader that
-    /// walks it, a builtin, or a function of another package.
+    /// walks it, a builtin, or a function in the site's cut.
     ///
     /// Every hop is a ref the producer recorded: the reference names a
     /// binding, the binding names a template, and the template holds the body.
     ///
     /// `written_binder` is what the call site's own name binds, which names a
     /// definition of this module.
-    fn resolvedTarget(self: *Reifier, resolved: checked.ResolvedValueRefId, written_binder: ?PatternBinderId, region: base.Region) Error!Callee {
+    fn resolvedTarget(self: *Reifier, resolved: checked.ResolvedValueRefId, written_binder: ?PatternBinderId, region: base.Region, use_kind: CalleeUse) Error!Callee {
+        // A top-level value that computes a function is no definition. A call
+        // on it is the call of the definition it is written as when that is a
+        // curried call (`curriedCall`), and otherwise an `Apply` of the value
+        // it is written as, which the builder resolves once the value is a
+        // known closure.
+        if (try self.computedFunction(resolved, region) != null) return .value;
         const use = switch (self.value_refs.callableTarget(resolved).ref) {
             // A promoted local function is a procedure of the module with a
             // binding of its own, which captures nothing: the checker proved
@@ -3987,24 +7049,52 @@ pub const Reifier = struct {
             .platform_required_proc,
             => return .value,
         };
+        // An intrinsic has no body: it is a `Prim` at every site, whatever
+        // the site's cut says, and an instance table names no definition
+        // for it.
+        if (try self.intrinsicCallee(use.binding)) |intrinsic| {
+            return .{ .foreign = withEvidence(intrinsic.name, intrinsic.requirements()) };
+        }
         const reached = try self.reachedProcedure(use.binding, written_binder, region);
         const reader = reached.reader;
-        // A definition of another module is a builtin by its export name, a
-        // function of another package by its module and name (N8h), and
-        // otherwise the definition to walk.
-        if (!std.meta.eql(reader.artifact.bytes, self.artifact.bytes)) {
-            if (reader.env.module_role == .builtin) {
+        // A primitive (D1) is named: a builtin by its export name, an
+        // operation of an opaque type by its qualified name. A function in
+        // the site's cut is named by its qualified name (N8h), and every
+        // other function, in any package, is the definition to walk (N8l).
+        // A builtin is named wherever it is called, the builtin module's own
+        // bodies included. A first stage walks the Roc definition of a
+        // builtin that hands back a function, and names every other. An
+        // instance table names no primitive and no cut.
+        const primitive: ?Primitive = if (use_kind == .instance_table)
+            null
+        else if (reader.names.procBase(reached.template.proc_base).source_def_idx) |def|
+            try reader.primitiveOf(@fromBackingInt(def), reached.template.checked_fn_root)
+        else if (reader.env.module_role == .builtin) .builtin else null;
+        // A primitive's `where` requirements are its template's, which the
+        // call answers (D7).
+        const requirements = PrimEvidence.of(reader, reached.template);
+        if (primitive) |found| switch (found) {
+            .builtin => if (!self.walk.open_builtins) {
                 const export_name = providedName(reader.names, reached.template) orelse
                     return self.rejectError(.unsupported_expression, region, "a call to a function the compiler provides");
-                return .{ .provided = export_name.text };
-            }
-            if (!samePackage(self.env, reader.env)) {
-                const binder = reached.binder orelse return reader.rejectError(.unresolved_reference, region, "this call");
-                return .{ .foreign = .{ .owner = reader.env.module_name, .method = reader.binderName(binder) } };
-            }
+                return .{ .provided = .{ .name = export_name.text, .role = roleOf(use.iterator_procedure), .evidence = requirements } };
+            },
+            .operation => |name| return .{ .foreign = withEvidence(name, requirements) },
+        } else if (use_kind == .described) {
+            if (self.inCut(reader, reached.body)) |name| return .{ .foreign = withEvidence(name, requirements) };
         }
-        var instance = try reader.instantiationOf(reader.templateScheme(reached.template), self, use.source_fn_ty_payload, region, .call);
+        // What the use copied the procedure's variables to is keyed by the
+        // use, and only a use of the procedure's own scheme has it.
+        const written = self.value_refs.records[@backingInt(resolved)];
+        const use_expr = if (reached.forwarded or written.ref == .local_proc) null else written.expr;
+        var instance = if (reached.alias) |hop|
+            try self.instantiationThroughAlias(reader, reached.template, hop, written.expr)
+        else
+            try reader.instantiationOf(reader.templateScheme(reached.template), self, use.source_fn_ty_payload, use_expr, region, .call);
         errdefer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
+        // The use recorded the type it instantiated the scheme at, which is
+        // what Monotype specializes a direct call's target at.
+        const signature: ?FramedType = if (instance == null) null else if (use.source_fn_ty_payload) |payload| self.resolvedType(payload) else null;
         return .{ .definition = .{
             .key = .{
                 .artifact = reader.artifact.bytes,
@@ -4013,6 +7103,7 @@ pub const Reifier = struct {
             },
             .reader = reader,
             .instantiation = instance,
+            .signature = signature,
         } };
     }
 
@@ -4023,9 +7114,14 @@ pub const Reifier = struct {
         reader: *Reifier,
         body: CheckedExprId,
         template: checked.CheckedProcedureTemplate,
-        /// What the procedure's own name binds in `reader`'s module. A call
-        /// to a function of another package names the function by it.
+        /// What the procedure's own name binds in `reader`'s module.
         binder: ?PatternBinderId,
+        /// Whether an exact alias was followed to get here. A use then
+        /// instantiates the alias's scheme, not the procedure's.
+        forwarded: bool = false,
+        /// The first lookup of the chain of exact aliases followed, the one
+        /// the binding the use names forwards through, when `forwarded`.
+        alias: ?AliasHop = null,
     };
 
     fn reachedProcedure(
@@ -4061,13 +7157,18 @@ pub const Reifier = struct {
             // A top-level value whose definition computes a function. The
             // checker records the lookup an exact alias of a function,
             // `same = add_one`, forwards to, and that lookup names the
-            // procedure. Any other such value is the function the compiler
-            // evaluates, so no definition names it and there is no row for a
-            // call on it to name.
+            // procedure. Any other such value reaches here only as the
+            // function a site itself names: a use inside a description is
+            // read as the definition (`computedFunction`), but a site's root
+            // needs a lambda whose parameters it can list, and a value that
+            // computes a function has none.
             .callable_eval_template => |id| {
-                const lookup = self.callable_eval_templates.templates[@backingInt(id)].forwarded_lookup orelse
-                    return self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function");
-                return self.forwardedProcedure(lookup, region);
+                const template = self.callable_eval_templates.templates[@backingInt(id)];
+                const lookup = template.forwarded_lookup orelse
+                    return self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function, named as the function to describe");
+                var reached = try self.forwardedProcedure(lookup, region);
+                reached.alias = self.bindingHop(template, lookup);
+                return reached;
             },
             .checked_error => return self.rejectError(.unresolved_reference, region, "this call"),
         };
@@ -4077,7 +7178,12 @@ pub const Reifier = struct {
         const template = templates[raw];
         const body = switch (template.body) {
             .checked_body => |body_id| self.bodies.body(body_id).root_expr,
-            .intrinsic_wrapper, .entry_wrapper, .unimplemented => return self.rejectError(.unresolved_reference, region, "this call"),
+            .intrinsic_wrapper, .entry_wrapper => return self.rejectError(.unresolved_reference, region, "this call"),
+            // The walk never asks for an intrinsic's body (`intrinsicCallee`).
+            .unimplemented => {
+                std.debug.assert(!self.templateIsIntrinsic(template));
+                return self.rejectError(.unresolved_reference, region, "this call");
+            },
         };
         return .{ .reader = self, .body = body, .template = template, .binder = binder };
     }
@@ -4101,7 +7207,9 @@ pub const Reifier = struct {
         const alias = self.walk.foreign.findExportedAlias(binding_ref.artifact, binding_ref.def) orelse
             return self.rejectError(.unsupported_expression, region, "a call to a function in a module this one does not read");
         const reader = try self.walk.reader(alias.module);
-        return reader.forwardedProcedure(alias.lookup, region);
+        var reached = try reader.forwardedProcedure(alias.lookup, region);
+        reached.alias = reader.bindingHop(reader.callable_eval_templates.templates[@backingInt(alias.template)], alias.lookup);
+        return reached;
     }
 
     /// The procedure the lookup an exact alias forwards to names. The
@@ -4130,7 +7238,31 @@ pub const Reifier = struct {
         };
         const data = self.bodies.expr(lookup).data;
         const binder = if (data == .lookup_local) self.bodies.patternBinderForCheckedPattern(data.lookup_local.pattern) else null;
-        return self.reachedProcedure(use.binding, binder, region);
+        var reached = try self.reachedProcedure(use.binding, binder, region);
+        reached.forwarded = true;
+        return reached;
+    }
+
+    /// A builtin the walk names instead of walking: its export name, and the
+    /// role the checker gave it when it is a procedure of the iterator
+    /// protocol (N11k).
+    const Provided = struct {
+        name: []const u8,
+        role: ir.IteratorRole = .none,
+        /// Its `where` requirements and what the call recorded for them (D7).
+        evidence: PrimEvidence = .{},
+    };
+
+    /// The role of the iterator procedure the checker recorded, when the walk
+    /// has a rule for it.
+    fn roleOf(procedure: ?checked.IteratorProcedureId) ir.IteratorRole {
+        return switch (procedure orelse return .none) {
+            .identity => .identity,
+            .next => .next,
+            .list_iter => .list_iter,
+            .map => .map,
+            .custom, .single, .list_iter_rev, .str_iter_utf8, .keep_if, .drop_if, .take_first, .drop_first, .concat, .append, .with_index, .step_by, .from_iter, .range_iter, .numeric_range_iter, .numeric_to, .numeric_until, .from_step, .range_done => .none,
+        };
     }
 
     /// The name a function the compiler provides answers to.
@@ -4163,7 +7295,7 @@ pub const Reifier = struct {
     };
 
     /// A static dispatch: `Call` of the method's row, a `Prim` for a builtin
-    /// or a method of another package, or the derivation the checker chose.
+    /// or a method in the site's cut, or the derivation the checker chose.
     /// `!=` on a written `is_eq` is `Bool.not` of the call (N1k).
     fn dispatchExpr(self: *Reifier, plan_id: ?static_dispatch.StaticDispatchPlanId, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
         const id = plan_id orelse return self.rejectError(.unresolved_reference, region, "this call");
@@ -4194,56 +7326,124 @@ pub const Reifier = struct {
         const operands = plan.argsSlice(self.plans);
         const args = try self.gpa.alloc(Ref, operands.len);
         defer self.gpa.free(args);
-        var generated = false;
+        var generated: Generated = .none;
         for (operands, args) |operand, *arg| arg.* = switch (operand) {
             .checked_expr => |child| try self.exprRef(child),
             .generated_numeral => |numeral_operand| blk: {
-                generated = true;
-                break :blk try self.generatedNumeral(numeral_operand, region);
+                generated = .{ .numeral = numeral_operand };
+                break :blk try self.numeralArgument(numeral_operand, try self.conversionParam(plan, region));
             },
             .generated_quote => |literal| blk: {
-                generated = true;
+                generated = .quote;
                 break :blk try self.bld().litStr(self.bodies.stringLiteral(literal));
             },
-            .generated_interpolation_segments => return self.rejectError(.unsupported_expression, region, "a custom string interpolation"),
+            .generated_interpolation_segments => invariant("an interpolation's plan is walked by its literal"),
         };
         return self.dispatchWithArgs(DispatchSpec.ofPlan(plan), args, generated, result_ty, region);
     }
 
-    /// The literal the compiler hands to a `from_numeral` conversion, in the
-    /// widest form a `Lit` holds: `I128` for a whole number, `F64` for a
-    /// fractional one. It is the argument only of a builtin or a method of
-    /// another package, whose `Prim` takes it as the number it is.
-    fn generatedNumeral(self: *Reifier, literal: ModuleEnv.NumeralLiteral, region: base.Region) Error!Ref {
-        const exact = self.env.exactNumeral(literal);
-        const primitive: checked.CheckedBuiltinNominal = if (exact.is_fractional) .f64 else .i128;
-        const ty = if (exact.is_fractional) try self.rt().floatTy(.f64) else try self.rt().intTy(.i128);
-        return self.numeralLit(literal, primitive, ty, region);
+    /// The `Num.Numeral` the compiler hands to a `from_numeral` conversion,
+    /// of the type `ty` the conversion's parameter has: one `Lit` of the sign
+    /// and the digits the literal spells, the value Monotype builds
+    /// (`lowerNumeralValue`).
+    fn numeralArgument(self: *Reifier, literal: ModuleEnv.NumeralLiteral, ty: TyId) Error!Ref {
+        if (!literal.isMaterialized()) invariant("a from_numeral argument literal was not materialized");
+        return self.bld().litNumeral(
+            ty,
+            literal.isNegative(),
+            self.env.numeralDigitsBefore(literal),
+            self.env.numeralDigitsAfter(literal),
+            literal.after_decimal_digit_count,
+        );
+    }
+
+    /// The type of the one parameter of the conversion a plan calls: the
+    /// `Num.Numeral` the callable the checker solved takes.
+    fn conversionParam(self: *Reifier, plan: static_dispatch.StaticDispatchCallPlan, region: base.Region) Error!TyId {
+        const function = self.functionOf(plan.callable_ty) orelse invariant("a from_numeral callable is not a function");
+        if (function.args.len != 1) invariant("a from_numeral callable does not take one argument");
+        return self.tyOf(function.args[0], region);
+    }
+
+    /// The value a conversion's `Try` holds: its `Ok` payload, or, where the
+    /// conversion rejected the literal, the crash that rejection is when the
+    /// program runs. That crash is the compiler's, not the author's, so it is
+    /// a rejected literal's crash (`ir.CrashKind`), which N13w may drop.
+    fn convertedLiteral(self: *Reifier, converted: Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        return self.convertedWith(converted, null, result_ty, region);
+    }
+
+    /// `convertedLiteral`, where the `Ok` payload is a function that the
+    /// literal applies to `values`, an interpolated literal's list.
+    fn convertedWith(self: *Reifier, converted: Ref, values: ?Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const ty = try self.tyOf(result_ty, region);
+        const found = try self.readable(converted);
+        const ok = try self.rt().name("Ok");
+        const names = try self.memberNames(self.irs().refTy(b.row, found), region);
+        defer self.gpa.free(names);
+        const arms = try self.gpa.alloc(RegionId, names.len);
+        defer self.gpa.free(arms);
+        for (arms, names) |*arm, name| {
+            arm.* = try b.openTagArm(found, name);
+            const delivered = if (name == ok)
+                if (values) |list| try b.apply(try b.payload(found, ok, 0), &.{list}, ty) else try b.payload(found, ok, 0)
+            else
+                try b.rejectedLiteral(ty, try b.litStr("this literal was rejected by its conversion"));
+            try b.close(.{ .value = &.{delivered} });
+        }
+        return b.switchOn(found, arms, &.{}, &.{ty}, &.{});
     }
 
     /// A dispatch over operands already built.
     fn dispatchWith(self: *Reifier, spec: DispatchSpec, args: []const Ref, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
-        return self.dispatchWithArgs(spec, args, false, result_ty, region);
+        return self.dispatchWithArgs(spec, args, .none, result_ty, region);
     }
 
-    /// `generated` says an operand is one the compiler wrote, which only a
-    /// `Prim` takes: a row's parameter has the type the method declares.
-    fn dispatchWithArgs(self: *Reifier, spec: DispatchSpec, args: []const Ref, generated: bool, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
+    /// The operand of a literal's conversion that the compiler wrote, which
+    /// makes the dispatch a conversion of a literal.
+    const Generated = union(enum) {
+        none,
+        /// The number the literal spells.
+        numeral: ModuleEnv.NumeralLiteral,
+        /// The text between the quotes, a `Str`.
+        quote,
+    };
+
+    /// `generated` says an operand is one the compiler wrote: the
+    /// `Num.Numeral` literal of a number (`numeralArgument`), or the text of
+    /// a quote. A `Prim` takes it as its signature says. A row's parameter
+    /// has the type the method declares, so the numeral is built at that
+    /// type, and the row's `Try` is read as the checker reads
+    /// a conversion: the `Ok` payload is the literal's value, and an `Err`
+    /// is a literal the conversion rejected.
+    fn dispatchWithArgs(self: *Reifier, spec: DispatchSpec, args: []const Ref, generated: Generated, result_ty: CheckedTypeId, region: base.Region) Error!Ref {
         const b = self.bld();
-        switch (try self.dispatchTarget(spec, region)) {
+        const inline_call = generated == .none and try self.walksInline(result_ty, region);
+        self.walk.open_builtins = inline_call;
+        const found = self.dispatchTarget(spec, region, .described) catch |err| {
+            self.walk.open_builtins = false;
+            return err;
+        };
+        self.walk.open_builtins = false;
+        switch (found) {
             .definition => |target| {
-                if (generated) {
-                    var refused = target;
-                    if (refused.instantiation) |*fixed| fixed.substitution.deinit(self.gpa);
-                    return self.rejectError(.unsupported_expression, region, "a conversion whose argument the compiler generates");
-                }
+                if (inline_call) return self.inlineCall(target, args, null, region);
                 // A method takes no captures, so its row's parameters are the
                 // dispatch's operands.
                 const row = try self.calledRow(target);
-                return b.callRow(row, args);
+                switch (generated) {
+                    .none => return b.callRow(row, args),
+                    .quote => return self.convertedLiteral(try b.callRow(row, args), result_ty, region),
+                    .numeral => |literal| {
+                        const param = self.irs().tySlice(self.irs().row(row).params)[0];
+                        const converted = try b.callRow(row, &.{try self.numeralArgument(literal, param)});
+                        return self.convertedLiteral(converted, result_ty, region);
+                    },
+                }
             },
-            .provided => |export_name| return self.providedPrim(export_name, args, result_ty, region),
-            .foreign => |name| return b.primOf(try b.namedPrim(name.owner, name.method), args, try self.tyOf(result_ty, region)),
+            .provided => |provided| return self.providedPrim(provided, args, result_ty, region),
+            .foreign => |name| return self.foreignPrim(name, args, try self.tyOf(result_ty, region), region),
             .none => return self.rejectError(.unresolved_reference, region, "a method this call names no target for"),
         }
     }
@@ -4253,6 +7453,9 @@ pub const Reifier = struct {
     const DispatchEdge = struct {
         reader: *Reifier,
         node: static_dispatch.EvidenceNode,
+        /// The evidence the walk held where the edge was recorded, which the
+        /// node's nested evidence forwards into.
+        scope: SuppliedEvidence,
     };
 
     /// The instantiation edge this dispatch was discharged through, or null
@@ -4260,17 +7463,17 @@ pub const Reifier = struct {
     fn dispatchEdge(self: *Reifier, resolution: static_dispatch.CheckedCallResolution) ?DispatchEdge {
         switch (resolution) {
             .direct_closed, .direct_parametric => |direct| {
-                return .{ .reader = self, .node = self.plans.evidenceNode(direct.evidence) };
+                return .{ .reader = self, .node = self.plans.evidenceNode(direct.evidence), .scope = self.evidence };
             },
             // The body forwards the obligation to its own evidence param, so
             // the target is named by the call that instantiated the body and
             // recorded in that call's own tables.
             .evidence_dependent => |forwarded| {
                 if (forwarded.index.depth != 0) return null;
-                const caller = self.evidence.reader orelse return null;
                 if (forwarded.index.index >= self.evidence.entries.len) return null;
-                return switch (self.evidence.entries[forwarded.index.index].resolution) {
-                    .direct => |node_id| .{ .reader = caller, .node = caller.plans.evidenceNode(node_id) },
+                const entry = self.evidence.entries[forwarded.index.index];
+                return switch (entry.evidence.resolution) {
+                    .direct => |node_id| .{ .reader = entry.reader, .node = entry.reader.plans.evidenceNode(node_id), .scope = entry.scope },
                     .constraint,
                     .structural,
                     .from_callable,
@@ -4284,89 +7487,166 @@ pub const Reifier = struct {
         }
     }
 
+    /// The slot a dispatch that forwards to an evidence param shares its
+    /// target with, where the supplied entry relates the slot's target to its
+    /// own callable (`sharedTarget`), or null for any other dispatch.
+    fn sharedDispatch(self: *Reifier, resolution: static_dispatch.CheckedCallResolution) ?SuppliedEntry {
+        const forwarded = switch (resolution) {
+            .evidence_dependent => |forwarded| forwarded,
+            .direct_closed, .direct_parametric, .direct_pending, .structural, .checked_error, .@"unreachable" => return null,
+        };
+        if (forwarded.index.depth != 0 or forwarded.index.index >= self.evidence.entries.len) return null;
+        const entry = self.evidence.entries[forwarded.index.index];
+        const constraint = switch (entry.evidence.resolution) {
+            .constraint => |constraint| constraint,
+            .direct, .structural, .from_callable, .from_scheme, .checked_error, .unreachable_value => return null,
+        };
+        return sharedTarget(constraint, entry.scope);
+    }
+
     /// What a dispatch's callee is from the walk's side.
     const DispatchCallee = union(enum) {
         /// A body the walk builds a row for.
         definition: CalleeTarget,
         /// A builtin, by its export name.
-        provided: []const u8,
-        /// A method of another package (N8h), or of an opaque nominal.
+        provided: Provided,
+        /// An operation of an opaque type (D1), or a method in the site's
+        /// cut (N8h).
         foreign: ForeignName,
         /// Nothing the walk reaches.
         none,
     };
 
-    fn dispatchTarget(self: *Reifier, spec: DispatchSpec, region: base.Region) Error!DispatchCallee {
+    fn dispatchTarget(self: *Reifier, spec: DispatchSpec, region: base.Region, use_kind: CalleeUse) Error!DispatchCallee {
         const method = self.names.methodNameText(spec.method);
         if (self.dispatchEdge(spec.resolution)) |edge| {
-            return self.methodTargetCallee(edge.reader, edge.node.target, .{ .edge = edge.node }, method, spec.dispatcher_ty, region);
+            return self.methodTargetCallee(edge.reader, edge.node.target, .{ .edge = edge }, region, use_kind);
         }
+        // A requirement the alias's own annotation forwards relates the
+        // slot's target to this use's callable (`independent_callable`). The
+        // target is the slot's, and the dispatcher this call fixes names the
+        // instance, as Monotype rebuilds the target without the slot's
+        // instantiation.
+        if (self.sharedDispatch(spec.resolution)) |slot| switch (slot.evidence.resolution) {
+            .direct => |node_id| {
+                const node = slot.reader.plans.evidenceNode(node_id);
+                return slot.reader.methodTargetCallee(slot.reader, node.target, .{ .receiver = self.resolvedType(spec.dispatcher_ty) }, region, use_kind);
+            },
+            .structural, .unreachable_value => return .none,
+            .constraint, .from_callable, .from_scheme, .checked_error => invariant("a shared slot is a target, a derivation or unreachable"),
+        };
         // A body the compiler's own derivation reached is fixed by its
         // receiver, and no call supplied evidence for what it forwards. The
         // receiver fixed the dispatcher too, so the target is the method its
         // nominal declares, read from the registry the derivation read.
         if (spec.resolution == .evidence_dependent and self.evidence.reader == null) {
             const fixed = self.fixedType(spec.dispatcher_ty) orelse return .none;
-            const nominal = fixed.reader.nominalOf(fixed.id) orelse return .none;
-            const target = self.walk.foreign.findMethod(fixed.reader.foreignNominal(nominal), method) orelse return .none;
-            return fixed.reader.methodTargetCallee(fixed.reader, target, .{ .receiver = fixed }, method, fixed.id, region);
+            const target = receiverMethod(fixed, method) orelse return .none;
+            return fixed.reader.methodTargetCallee(fixed.reader, target, .{ .receiver = fixed }, region, use_kind);
         }
         return .none;
+    }
+
+    /// The target the method registries declare for `method` on the nominal
+    /// `fixed` is, the lookup a dispatch the compiler's own derivation reached
+    /// makes. Null where `fixed` is no nominal or no registry in reach
+    /// declares the method.
+    fn receiverMethod(fixed: FramedType, method: []const u8) ?static_dispatch.MethodTarget {
+        const nominal = fixed.reader.nominalOf(fixed.id) orelse return null;
+        return fixed.reader.walk.foreign.findMethod(fixed.reader.foreignNominal(nominal), method);
     }
 
     /// How a call fixes a method's quantified variables and discharges its
     /// obligations: off the dispatch's edge, or, for a method the compiler's
     /// own derivation reached, off the receiver's type.
     const MethodFixing = union(enum) {
-        edge: static_dispatch.EvidenceNode,
-        receiver: TypeRef,
+        edge: DispatchEdge,
+        receiver: FramedType,
     };
 
     /// What one method target is from the walk's side.
     ///
     /// `owner` is the reader of the module that recorded the target, which is
-    /// the module whose ids the target is named in; `dispatcher_ty` is the
-    /// type the method is called on, whose name a method of another package
-    /// is owned by.
+    /// the module whose ids the target is named in.
     fn methodTargetCallee(
         self: *Reifier,
         owner: *Reifier,
         target: static_dispatch.MethodTarget,
         fixing: MethodFixing,
-        method: []const u8,
-        dispatcher_ty: CheckedTypeId,
         region: base.Region,
+        use_kind: CalleeUse,
     ) Error!DispatchCallee {
         const procedure = switch (target.kind) {
             .procedure => |procedure| procedure,
             .local_proc, .structural => return .none,
         };
-        // A method of an opaque nominal reads the representation the type
-        // hides, and a stage is outside the type's module, so the method is
-        // named rather than walked, as its values are.
-        if (self.nominalOf(dispatcher_ty)) |nominal| {
-            if (nominal.is_opaque and nominal.builtin == null) {
-                return .{ .foreign = .{ .owner = self.names.typeNameText(nominal.name), .method = method } };
-            }
+        // A method bound to another function by name (`method = f`) is
+        // reached through that alias: the edge fixes the alias's quantified
+        // variables and answers the alias's requirements, not the target's
+        // (`EvidenceNested.through_alias`). The alias is declared beside the
+        // target's template, so that module's reader holds the definition,
+        // and the target's own evidence is composed through the alias.
+        const defining = if (target.alias != null)
+            try owner.templateReader(procedure.template.artifact) orelse return .none
+        else
+            owner;
+        // An intrinsic has no body: it is a `Prim` at every site, whatever
+        // the site's cut says, and an instance table names no definition
+        // for it.
+        if (try defining.intrinsicOfTemplate(procedure.template.artifact, target.def_idx)) |intrinsic| {
+            const aliased = try aliasedEvidence(owner, defining, target, fixing);
+            return .{ .foreign = withEvidence(intrinsic.name, answeredBy(intrinsic.requirements(), owner, fixing, aliased)) };
         }
-        const found = owner.methodDefinition(procedure.template, target.def_idx) orelse return .none;
+        const found = defining.methodDefinition(procedure.template, target.def_idx) orelse return .none;
         const reader = switch (found) {
-            .provided => |name| return .{ .provided = name },
-            .here => owner,
-            .away => |definition| blk: {
-                if (!samePackage(self.env, definition.module.env)) {
-                    const type_name = self.typeName(dispatcher_ty) orelse
-                        return self.rejectError(.unresolved_type, region, "the type a method of another package is called on");
-                    return .{ .foreign = .{ .owner = type_name, .method = method } };
-                }
-                break :blk try self.walk.reader(definition.module);
-            },
+            .provided => |builtin| try self.walk.reader(builtin.definition.module),
+            .here, .here_builtin => defining,
+            .away => |definition| try self.walk.reader(definition.module),
         };
+        const aliased = try aliasedEvidence(owner, defining, target, fixing);
+        // A primitive (D1) is named as the direct call of the same
+        // definition names it: a builtin by its export name, an operation of
+        // an opaque type by its qualified name. A method in the site's cut is
+        // named by its qualified name (N8h); every other method, in any
+        // package, is walked (N8l).
+        // A primitive's `where` requirements are its template's, and the
+        // edge's nested evidence answers them (D7). An edge that derives
+        // that evidence from its callable records none. A method the
+        // compiler's own derivation reached records none by construction,
+        // and its receiver answers them (`receiverEvidence`).
+        // An instance table names no primitive and no cut.
+        if (use_kind == .described) {
+            const requirements = answeredBy(PrimEvidence.of(reader, found.template()), owner, fixing, aliased);
+            if (try reader.primitiveOf(target.def_idx, found.template().checked_fn_root)) |primitive| switch (primitive) {
+                .builtin => if (!self.walk.open_builtins) {
+                    const name = switch (found) {
+                        .provided => |builtin| builtin.name,
+                        .here_builtin => |builtin| builtin.name,
+                        .here, .away => invariant("a function of the builtin module is read as a builtin"),
+                    };
+                    return .{ .provided = .{ .name = name, .role = roleOf(procedure.runtime_target.iteratorProcedure()), .evidence = requirements } };
+                },
+                .operation => |name| return .{ .foreign = withEvidence(name, requirements) },
+            } else if (self.inCut(reader, found.body())) |name| return .{ .foreign = withEvidence(name, requirements) };
+        }
         var instance = switch (fixing) {
-            .edge => |node| try owner.dispatchInstantiation(reader, found.template(), node, region),
+            .edge => |edge| switch (edge.node.nested) {
+                .resolved, .from_callable => try owner.dispatchInstantiation(reader, found.template(), edge.node, region),
+                .through_alias => try owner.aliasInstantiation(reader, found.template(), edge.node, target.alias.?, defining),
+            },
             .receiver => |receiver| try reader.receiverInstantiation(found.template(), receiver, region),
         };
         errdefer if (instance) |*fixed| fixed.substitution.deinit(self.gpa);
+        // The edge recorded the callable it related the target to, which is
+        // what Monotype specializes the target at. A derivation records none,
+        // and a definition with no variables has the one type.
+        const signature: ?FramedType = if (instance == null) null else switch (fixing) {
+            .edge => |edge| switch (edge.node.instantiation) {
+                .callable, .alias, .derived_from_callable => |callable| owner.resolvedType(callable),
+                .monomorphic => null,
+            },
+            .receiver => null,
+        };
         return .{
             .definition = .{
                 .key = .{
@@ -4376,13 +7656,15 @@ pub const Reifier = struct {
                 },
                 .reader = reader,
                 .instantiation = instance,
+                .signature = signature,
                 .evidence = switch (fixing) {
-                    .edge => |node| switch (node.nested) {
-                        .resolved => .{ .reader = owner, .entries = owner.plans.nestedEvidence(node) },
+                    .edge => |edge| switch (edge.node.nested) {
+                        .resolved => try owner.supply(owner.plans.nestedEvidence(edge.node), edge.scope),
                         // The edge derives the target's evidence from its
                         // callable rather than recording it, so the walk of the
                         // body has no answer to read.
                         .from_callable => .{},
+                        .through_alias => if (aliased) |recorded| try recorded.reader.supply(recorded.entries, recorded.scope) else .{},
                     },
                     // A derivation records no evidence, because the checker
                     // planned no call.
@@ -4392,26 +7674,63 @@ pub const Reifier = struct {
         };
     }
 
+    /// What a method bound to another function by name (`method = f`) answers
+    /// its target's requirements with, composed through the alias, or null
+    /// for an edge that is no such method.
+    fn aliasedEvidence(owner: *Reifier, defining: *Reifier, target: static_dispatch.MethodTarget, fixing: MethodFixing) Error!?Recorded {
+        const edge = switch (fixing) {
+            .edge => |edge| edge,
+            .receiver => return null,
+        };
+        if (edge.node.nested != .through_alias) return null;
+        const held = try owner.supply(owner.plans.aliasScopeEvidence(edge.node), edge.scope);
+        return try defining.evidenceThroughAlias(target.alias.?, held);
+    }
+
+    /// A method target's `where` requirements `requirements`, with what its
+    /// edge recorded for them, or with the receiver that answers them where
+    /// the compiler's own derivation reached the target.
+    fn answeredBy(requirements: PrimEvidence, owner: *Reifier, fixing: MethodFixing, aliased: ?Recorded) PrimEvidence {
+        var answered = requirements;
+        switch (fixing) {
+            .edge => |edge| answered.recorded = switch (edge.node.nested) {
+                .resolved => .{ .reader = owner, .entries = owner.plans.nestedEvidence(edge.node), .scope = edge.scope },
+                .from_callable => null,
+                .through_alias => aliased,
+            },
+            // The receiver answers what a derivation's call records nothing for.
+            .receiver => |receiver| answered.receiver = receiver,
+        }
+        return answered;
+    }
+
     /// Where a method's body lives: this module's tables, another module's
     /// export rows, or the builtin module, whose function carries its name.
     const MethodDefinition = union(enum) {
         here: struct { template: checked.CheckedProcedureTemplate, body: CheckedExprId },
+        /// A builtin of the module being read: the name it answers to, and
+        /// its definition.
+        here_builtin: struct { name: []const u8, template: checked.CheckedProcedureTemplate, body: CheckedExprId },
         away: ForeignDefinition,
-        provided: []const u8,
+        /// A builtin: the name it answers to, and its definition, which a
+        /// first stage walks.
+        provided: struct { name: []const u8, definition: ForeignDefinition },
 
         fn template(self: MethodDefinition) checked.CheckedProcedureTemplate {
             return switch (self) {
                 .here => |local| local.template,
+                .here_builtin => |builtin| builtin.template,
                 .away => |definition| definition.template,
-                .provided => unreachable,
+                .provided => |builtin| builtin.definition.template,
             };
         }
 
         fn body(self: MethodDefinition) CheckedExprId {
             return switch (self) {
                 .here => |local| local.body,
+                .here_builtin => |builtin| builtin.body,
                 .away => |definition| definition.body,
-                .provided => unreachable,
+                .provided => |builtin| builtin.definition.body,
             };
         }
     };
@@ -4427,15 +7746,220 @@ pub const Reifier = struct {
             const template = templates[raw];
             const body_id = switch (template.body) {
                 .checked_body => |body| body,
-                .intrinsic_wrapper, .entry_wrapper, .unimplemented => return null,
+                .intrinsic_wrapper, .entry_wrapper => return null,
+                // The walk never asks for an intrinsic's body.
+                .unimplemented => {
+                    std.debug.assert(!self.templateIsIntrinsic(template));
+                    return null;
+                },
             };
-            return .{ .here = .{ .template = template, .body = self.bodies.body(body_id).root_expr } };
+            const body = self.bodies.body(body_id).root_expr;
+            if (self.env.module_role == .builtin) {
+                return .{ .here_builtin = .{ .name = (providedName(self.names, template) orelse return null).text, .template = template, .body = body } };
+            }
+            return .{ .here = .{ .template = template, .body = body } };
         }
         const definition = self.walk.foreign.findExported(template_ref.artifact, def_idx) orelse return null;
         if (definition.module.env.module_role == .builtin) {
-            return .{ .provided = (providedName(definition.module.sources.names, definition.template) orelse return null).text };
+            return .{ .provided = .{
+                .name = (providedName(definition.module.sources.names, definition.template) orelse return null).text,
+                .definition = definition,
+            } };
         }
         return .{ .away = definition };
+    }
+
+    /// The reader of the module whose artifact is `artifact`, or null when the
+    /// walk cannot read it.
+    fn templateReader(self: *Reifier, artifact: canonical.ArtifactRef) Allocator.Error!?*Reifier {
+        if (std.meta.eql(artifact.bytes, self.artifact.bytes)) return self;
+        const module = self.walk.foreign.findModule(&artifact.bytes) orelse return null;
+        return try self.walk.reader(module);
+    }
+
+    /// One lookup of the chain a method bound by name forwards through: the
+    /// reader of the module that holds it, and the lookup.
+    const AliasHop = struct {
+        reader: *Reifier,
+        lookup: CheckedExprId,
+        /// The quantified variables of the scope the alias owns, which an
+        /// edge through it fixes and its lookup's recorded substitution is
+        /// written in.
+        scope_vars: []const CheckedTypeId,
+    };
+
+    /// The hop of a top-level alias binding's template, which `self` holds.
+    fn bindingHop(self: *Reifier, template: checked.CallableEvalTemplate, lookup: CheckedExprId) AliasHop {
+        const wrapper = self.entry_wrappers.lookupByRoot(template.root) orelse
+            invariant("a method alias binding has an entry wrapper");
+        std.debug.assert(std.meta.eql(wrapper.template.artifact.bytes, self.artifact.bytes));
+        const scope_template = self.procedure_templates.templates.items[@backingInt(wrapper.template.template)];
+        return .{ .reader = self, .lookup = lookup, .scope_vars = self.schemeVars(scope_template) };
+    }
+
+    /// The hop of a block-local alias, which `self` holds.
+    fn localHop(self: *Reifier, lookup: CheckedExprId, dispatch_scope: ?checked.DispatchScopeId) AliasHop {
+        const scope_id = dispatch_scope orelse return .{ .reader = self, .lookup = lookup, .scope_vars = &.{} };
+        const scope = &self.procedure_templates.dispatch_scopes[@backingInt(scope_id)];
+        return .{ .reader = self, .lookup = lookup, .scope_vars = self.procedure_templates.scopeSchemeVars(scope) };
+    }
+
+    /// The first lookup of a method alias, which `self` declares.
+    fn firstAliasHop(self: *Reifier, alias: static_dispatch.MethodAlias) AliasHop {
+        switch (alias) {
+            .top_level => |pattern| {
+                for (self.callable_eval_templates.templates) |template| {
+                    if (template.pattern != pattern) continue;
+                    return self.bindingHop(template, template.forwarded_lookup orelse invariant("a method alias binding is an exact procedure alias"));
+                }
+                invariant("a method alias binding has a callable-eval template");
+            },
+            .local => |local| return self.localHop(local.lookup, local.dispatch_scope),
+        }
+    }
+
+    /// The lookup the alias lookup `hop` forwards to when that is itself an
+    /// exact alias, or null when it names the procedure the chain ends at.
+    fn nextAliasHop(hop: AliasHop) Allocator.Error!?AliasHop {
+        const reader = hop.reader;
+        const resolved = reader.value_refs.lookupIdByCheckedExpr(hop.lookup) orelse
+            invariant("an alias forwards to a lookup with no resolved reference");
+        const use = switch (reader.value_refs.records[@backingInt(resolved)].ref) {
+            .local_proc => |local| return if (local.is_alias) reader.localHop(local.expr, local.dispatch_scope) else null,
+            .top_level_proc, .imported_proc, .promoted_top_level_proc => |use| use,
+            .hosted_proc, .platform_required_proc => return null,
+            .local_param,
+            .local_value,
+            .local_mutable_version,
+            .pattern_binder,
+            .selected_hoisted_const,
+            .top_level_const,
+            .imported_const,
+            .platform_required_declaration,
+            .platform_required_checked_error,
+            .platform_required_const,
+            => invariant("an alias forwards to a lookup that names no procedure"),
+        };
+        switch (use.binding) {
+            .top_level => |top_level| {
+                std.debug.assert(std.meta.eql(top_level.artifact.bytes, reader.artifact.bytes));
+                const id = switch (reader.procedure_bindings.get(top_level.binding).body) {
+                    .callable_eval_template => |id| id,
+                    .direct_template, .checked_error => return null,
+                };
+                const template = reader.callable_eval_templates.templates[@backingInt(id)];
+                const lookup = template.forwarded_lookup orelse return null;
+                return reader.bindingHop(template, lookup);
+            },
+            .imported => |imported| {
+                const alias = reader.walk.foreign.findExportedAlias(imported.artifact, imported.def) orelse return null;
+                const aliased = try reader.walk.reader(alias.module);
+                return aliased.bindingHop(aliased.callable_eval_templates.templates[@backingInt(alias.template)], alias.lookup);
+            },
+            .hosted, .platform_required => return null,
+        }
+    }
+
+    /// What the chain of lookups a method alias forwards through recorded
+    /// for the evidence of the procedure it ends at, or null when the last
+    /// lookup recorded none. `held` is what the edge answered for the alias's
+    /// own requirements: each lookup's entries forward into it, and the next
+    /// lookup's entries forward into what those supply, as Monotype's
+    /// `composeThroughAlias` composes the evidence alias by alias.
+    fn evidenceThroughAlias(self: *Reifier, alias: static_dispatch.MethodAlias, held: SuppliedEvidence) Allocator.Error!?Recorded {
+        var hop = self.firstAliasHop(alias);
+        var scope = held;
+        while (true) {
+            const entries = hop.reader.plans.siteEvidence(hop.lookup);
+            const next = try nextAliasHop(hop) orelse {
+                const last = entries orelse return null;
+                return .{ .reader = hop.reader, .entries = last, .scope = scope };
+            };
+            scope = if (entries) |recorded| try hop.reader.supply(recorded, scope) else .{};
+            hop = next;
+        }
+    }
+
+    /// What the edge fixes the quantified variables of the procedure a method
+    /// alias ends at to. The edge's substitution fixes the alias's own
+    /// variables, and each lookup of the chain recorded what it copied the
+    /// next scope's variables to, written in the variables of the scope it
+    /// stands in. Reading each recorded type in a frame holding the scope's
+    /// binding composes the two alias by alias, as Monotype's
+    /// `composeThroughAlias` does, so a variable only a `where` obligation
+    /// names is fixed by the lookup that recorded it.
+    fn aliasInstantiation(
+        self: *Reifier,
+        reader: *Reifier,
+        template: checked.CheckedProcedureTemplate,
+        node: static_dispatch.EvidenceNode,
+        alias: static_dispatch.MethodAlias,
+        defining: *Reifier,
+    ) Error!?Instantiation {
+        const target_vars = reader.schemeVars(template);
+        if (target_vars.len == 0) return null;
+        const hop = defining.firstAliasHop(alias);
+        const edge_fixed = self.plans.targetSubstitution(node);
+        if (edge_fixed.len != hop.scope_vars.len) invariant("an edge through a method alias fixes the alias scope's variables");
+        var scope: Substitution = .empty;
+        defer scope.deinit(self.gpa);
+        for (hop.scope_vars, edge_fixed) |scope_var, use| try scope.put(self.gpa, scope_var, self.resolvedType(use));
+        return self.composedThroughHops(hop, scope, target_vars);
+    }
+
+    /// What the variables of the procedure a chain of alias lookups ends at
+    /// are fixed to, given `scope`: what the first hop's own variables are
+    /// fixed to. Each lookup recorded what it copied the next scope's
+    /// variables to, written in the variables of the scope it stands in.
+    fn composedThroughHops(
+        self: *Reifier,
+        first: AliasHop,
+        first_scope: Substitution,
+        target_vars: []const CheckedTypeId,
+    ) Error!?Instantiation {
+        var hop = first;
+        var scope = try first_scope.clone(self.gpa);
+        defer scope.deinit(self.gpa);
+        while (true) {
+            const frame = try self.walk.pushFrame(scope);
+            const copied = hop.reader.plans.siteSubstitution(hop.lookup) orelse &.{};
+            const next = try nextAliasHop(hop);
+            const next_vars = if (next) |following| following.scope_vars else target_vars;
+            if (copied.len != next_vars.len) invariant("an alias lookup records one type per variable of the scope it instantiates");
+            var composed: Substitution = .empty;
+            errdefer composed.deinit(self.gpa);
+            for (next_vars, copied) |next_var, copy| {
+                try composed.put(self.gpa, next_var, hop.reader.resolvedTypeIn(frame, copy));
+            }
+            if (next) |following| {
+                scope.deinit(self.gpa);
+                scope = composed;
+                hop = following;
+                continue;
+            }
+            return .{ .substitution = composed, .key = try instantiationKey(composed, target_vars) };
+        }
+    }
+
+    /// What a use of a binding that is an exact alias fixes the quantified
+    /// variables of the procedure the alias ends at to. The use recorded what
+    /// it copied the alias's own variables to, and the lookups of the chain
+    /// compose the rest, as a method alias is composed (`aliasInstantiation`).
+    fn instantiationThroughAlias(
+        self: *Reifier,
+        reader: *Reifier,
+        template: checked.CheckedProcedureTemplate,
+        hop: AliasHop,
+        use_expr: CheckedExprId,
+    ) Error!?Instantiation {
+        const target_vars = reader.schemeVars(template);
+        if (target_vars.len == 0) return null;
+        const copied = self.plans.siteSubstitution(use_expr) orelse &.{};
+        if (copied.len != hop.scope_vars.len) invariant("a use of an alias records one type per variable of the alias's scope");
+        var scope: Substitution = .empty;
+        defer scope.deinit(self.gpa);
+        for (hop.scope_vars, copied) |scope_var, use| try scope.put(self.gpa, scope_var, self.resolvedType(use));
+        return self.composedThroughHops(hop, scope, target_vars);
     }
 
     /// What this dispatch fixes the method's quantified variables to, or null
@@ -4459,16 +7983,17 @@ pub const Reifier = struct {
         for (scheme_vars, fixed) |scheme_var, use| {
             try substitution.put(self.gpa, scheme_var, self.resolvedType(use));
         }
-        return .{ .substitution = substitution, .key = instantiationKey(substitution, scheme_vars) };
+        return .{ .substitution = substitution, .key = try instantiationKey(substitution, scheme_vars) };
     }
 
     /// What the receiver fixes a generic method's quantified variables to, or
     /// null when the method has none: the method's first parameter matched
-    /// against the receiver's type, with every variable bound or a report.
+    /// against the receiver's type, with every variable but a row bound or a
+    /// report.
     fn receiverInstantiation(
         self: *Reifier,
         template: checked.CheckedProcedureTemplate,
-        receiver: TypeRef,
+        receiver: FramedType,
         region: base.Region,
     ) Error!?Instantiation {
         const scheme_vars = self.schemeVars(template);
@@ -4481,12 +8006,16 @@ pub const Reifier = struct {
         var substitution: Substitution = .empty;
         errdefer substitution.deinit(self.gpa);
         try self.matchType(&substitution, scheme_vars, scheme_fn.args[0], receiver);
+        // A row variable is left unbound, as `instantiationOf` leaves it: no
+        // description names one.
+        var rows = try self.rowVars(template.checked_fn_root);
+        defer rows.deinit(self.gpa);
         for (scheme_vars) |scheme_var| {
-            if (!substitution.contains(scheme_var)) {
+            if (!substitution.contains(scheme_var) and !rows.contains(scheme_var)) {
                 return self.rejectError(.unresolved_type, region, "a generic method this receiver does not fix");
             }
         }
-        return .{ .substitution = substitution, .key = instantiationKey(substitution, scheme_vars) };
+        return .{ .substitution = substitution, .key = try instantiationKey(substitution, scheme_vars) };
     }
 
     /// A call the checker discharged with a derived implementation. Equality
@@ -4521,15 +8050,58 @@ pub const Reifier = struct {
         }
     }
 
+    /// The evidence `entries`, recorded in this module, supply where the walk
+    /// holds `scope`. An entry that forwards to an evidence param of the
+    /// definition being walked is answered by the entry the call that
+    /// instantiated the definition supplied, as Monotype reads a forwarded
+    /// requirement off its lexical evidence chain, so a generic definition
+    /// that calls another hands it what its own caller discharged.
+    fn supply(self: *Reifier, entries: []const static_dispatch.CheckedEvidence, scope: SuppliedEvidence) Allocator.Error!SuppliedEvidence {
+        const supplied = try self.walk.site.?.evidence.allocator().alloc(SuppliedEntry, entries.len);
+        for (entries, supplied) |entry, *slot| slot.* = self.suppliedEntry(entry, scope);
+        return .{ .reader = self, .entries = supplied };
+    }
+
+    /// One entry of `supply`. A forwarded entry the walk's evidence does not
+    /// answer stays as recorded, so the dispatch it reaches names no target.
+    fn suppliedEntry(self: *Reifier, evidence: static_dispatch.CheckedEvidence, scope: SuppliedEvidence) SuppliedEntry {
+        const recorded: SuppliedEntry = .{ .reader = self, .evidence = evidence, .scope = scope };
+        const forwarded = switch (evidence.resolution) {
+            .constraint => |constraint| constraint,
+            .direct, .structural, .from_callable, .from_scheme, .checked_error, .unreachable_value => return recorded,
+        };
+        if (forwarded.index.depth != 0) return recorded;
+        if (forwarded.index.index >= scope.entries.len) return recorded;
+        const found = scope.entries[forwarded.index.index];
+        // The use's own contract for the slot, where the slot carries
+        // per-use contracts, is recorded beside the slot's evidence.
+        if (forwarded.callable_contract) |contract| {
+            const contracts = found.evidence.callable_contracts;
+            if (contracts.len != 0) {
+                std.debug.assert(contract < contracts.len);
+                const recorded_contract = found.reader.plans.evidence_refs[contracts.start + contract];
+                return found.reader.suppliedEntry(recorded_contract, found.scope);
+            }
+        }
+        // An independent callable relation rebuilds the target's nested
+        // evidence from this use's own callable, which no table records for
+        // the walk to read.
+        if (forwarded.independent_callable) return recorded;
+        return found;
+    }
+
     /// The compiler-derived implementation the instantiating call supplied for
     /// one forwarded obligation, or null when it supplied a Roc body instead.
     fn forwardedDerivation(self: *Reifier, chain: static_dispatch.EvidenceChainIndex) ?static_dispatch.StructuralDerivation {
         if (chain.depth != 0) return null;
         if (chain.index >= self.evidence.entries.len) return null;
-        return switch (self.evidence.entries[chain.index].resolution) {
+        return switch (self.evidence.entries[chain.index].evidence.resolution) {
             .structural => |structural| structural.derivation,
+            .constraint => |constraint| switch ((sharedTarget(constraint, self.evidence.entries[chain.index].scope) orelse return null).evidence.resolution) {
+                .structural => |structural| structural.derivation,
+                .direct, .constraint, .from_callable, .from_scheme, .checked_error, .unreachable_value => null,
+            },
             .direct,
-            .constraint,
             .from_callable,
             .from_scheme,
             .checked_error,
@@ -4576,17 +8148,28 @@ pub const Reifier = struct {
             .record => |record| blk: {
                 var fields = std.ArrayList(FieldRef).empty;
                 defer fields.deinit(self.gpa);
-                try self.collectRecordFields(&fields, record.fields, record.ext, region);
+                var bound = std.ArrayList(BoundNominal).empty;
+                defer releaseBoundNominals(self.gpa, &bound);
+                try self.collectRecordFields(&fields, &bound, record.fields, record.ext, region);
+                sortFieldsByLabel(fields.items);
                 const l = try self.readable(lhs);
                 const r = try self.readable(rhs);
                 var parts = std.ArrayList(EqPart).empty;
                 defer parts.deinit(self.gpa);
                 for (fields.items) |field| {
                     const name = field.reader.names.recordFieldLabelText(field.field.name);
-                    try parts.append(self.gpa, .{
+                    const ty: FramedType = .{ .reader = field.reader, .id = field.field.ty, .frame = field.frame };
+                    // An optional field is read as its `OptField`, the `Try`
+                    // that says whether the record holds it.
+                    try parts.append(self.gpa, if (field.field.kind.tag == .optional) .{
+                        .lhs = try self.optionalFieldRead(l, try self.fieldIndex(l, name, region)),
+                        .rhs = try self.optionalFieldRead(r, try self.fieldIndex(r, name, region)),
+                        .ty = ty,
+                        .optional = true,
+                    } else .{
                         .lhs = try b.field(l, try self.fieldIndex(l, name, region)),
                         .rhs = try b.field(r, try self.fieldIndex(r, name, region)),
-                        .ty = .{ .reader = field.reader, .id = field.field.ty },
+                        .ty = ty,
                     });
                 }
                 break :blk try self.conjunction(parts.items, region);
@@ -4599,29 +8182,92 @@ pub const Reifier = struct {
                 for (elements, 0..) |element, k| try parts.append(self.gpa, .{
                     .lhs = try b.index(l, @intCast(k)),
                     .rhs = try b.index(r, @intCast(k)),
-                    .ty = .{ .reader = self, .id = element },
+                    .ty = .{ .reader = self, .id = element, .frame = self.frame },
                 });
                 break :blk try self.conjunction(parts.items, region);
             },
-            .tag_union => |tag_union| self.tagUnionEq(lhs, rhs, tag_union, region),
+            .tag_union => |tag_union| self.tagUnionEq(lhs, rhs, tag_union, resolved.id, region),
             // One inhabitant, so both operands hold it.
             .empty_record => b.litBool(true),
-            .empty_tag_union => self.rejectError(.unsupported_type, region, "derived equality on an empty tag union"),
-            .flex, .rigid => self.rejectError(.unresolved_type, region, "a type variable"),
+            // No inhabitant, so no pair of values reaches the comparison: the
+            // compiler derives it over no variants, and it is left to the
+            // stage, as every derivation the walk does not expand is.
+            .empty_tag_union => self.derivedEq(lhs, rhs, resolved.id, region),
+            .flex, .rigid => |variable| blk: {
+                const sealed = try self.sealedVariable(resolved.id, variable, region) orelse break :blk self.rejectOpen(type_id, region);
+                break :blk b.primOf(try b.namedPrim(primitiveOwnerText(defaultBuiltin(sealed)).?, "is_eq"), &.{ lhs, rhs }, try self.rt().boolTy());
+            },
             .pending, .err => self.rejectError(.unresolved_type, region, "an unresolved type"),
             .function => self.rejectError(.unsupported_type, region, "derived equality on a function"),
         };
     }
 
-    /// Two components a derived `==` compares, and their checked type.
-    const EqPart = struct { lhs: Ref, rhs: Ref, ty: TypeRef };
+    /// Two components a derived `==` compares, and their checked type. The
+    /// components of an `optional` part are the `OptField` reads of an
+    /// optional record field, and `ty` is the field's value type.
+    const EqPart = struct { lhs: Ref, rhs: Ref, ty: FramedType, optional: bool = false };
+
+    /// The comparison of one part of a derived `==`.
+    fn partEq(part: EqPart, region: base.Region) Error!Ref {
+        if (part.optional) return part.ty.reader.optionalFieldEq(part.lhs, part.rhs, part.ty.id, region);
+        return part.ty.reader.eqOver(part.lhs, part.rhs, part.ty.id, region);
+    }
+
+    /// `OptField(record, index)`: the optional field `index` of `record`, as
+    /// the `Try(value, [MissingField])` a `.?` read of it gives.
+    fn optionalFieldRead(self: *Reifier, record: Ref, index: u32) Error!Ref {
+        const types = self.rt();
+        const value_ty = types.tySlice(types.memberSlice(types.get(self.irs().refTy(self.bld().row, record)).record)[index].tys)[0];
+        return self.bld().optField(record, index, try self.missingFieldTry(value_ty));
+    }
+
+    /// A derived `==` over one optional record field, from the `OptField`
+    /// read of each operand. The compiler stores the field as the tagged
+    /// slot `[#Missing, #Present(value)]` and derives `is_eq` over that slot
+    /// as over every tag union (`EqDeriver`, `src/postcheck/monotype/lower.zig`):
+    /// the fields are equal where both records hold them with equal values,
+    /// and where neither record holds them. So this is `tagUnionEq` over the
+    /// `Try`: a switch on the left read, and in each arm a switch on the
+    /// right read. Two `Ok` arms compare the values at `value_ty`, two `Err`
+    /// arms are `True`, as two `#Missing` tags with no payload are, and the
+    /// other arms are `False`.
+    fn optionalFieldEq(self: *Reifier, lhs: Ref, rhs: Ref, value_ty: CheckedTypeId, region: base.Region) Error!Ref {
+        const b = self.bld();
+        const l = try self.readable(lhs);
+        const r = try self.readable(rhs);
+        const ok = try self.rt().name("Ok");
+        const bool_ty = try self.rt().boolTy();
+        const l_names = try self.memberNames(self.irs().refTy(b.row, l), region);
+        defer self.gpa.free(l_names);
+        const r_names = try self.memberNames(self.irs().refTy(b.row, r), region);
+        defer self.gpa.free(r_names);
+        const left_arms = try self.gpa.alloc(RegionId, l_names.len);
+        defer self.gpa.free(left_arms);
+        const right_arms = try self.gpa.alloc(RegionId, r_names.len);
+        defer self.gpa.free(right_arms);
+        for (left_arms, l_names) |*left_arm, l_name| {
+            left_arm.* = try b.openTagArm(l, l_name);
+            for (right_arms, r_names) |*right_arm, r_name| {
+                right_arm.* = try b.openTagArm(r, r_name);
+                const same = if (l_name != r_name)
+                    try b.litBool(false)
+                else if (l_name == ok)
+                    try self.eqOver(try b.payload(l, ok, 0), try b.payload(r, ok, 0), value_ty, region)
+                else
+                    try b.litBool(true);
+                try b.close(.{ .value = &.{same} });
+            }
+            try b.close(.{ .value = &.{try b.switchOn(r, right_arms, &.{}, &.{bool_ty}, &.{})} });
+        }
+        return b.switchOn(l, left_arms, &.{}, &.{bool_ty}, &.{});
+    }
 
     /// `And` over the comparisons of `parts`, each after the first built in
     /// an operand region, so it runs only where the ones before it held.
     fn conjunction(self: *Reifier, parts: []const EqPart, region: base.Region) Error!Ref {
         const b = self.bld();
         if (parts.len == 0) return b.litBool(true);
-        const first = try parts[0].ty.reader.eqOver(parts[0].lhs, parts[0].rhs, parts[0].ty.id, region);
+        const first = try partEq(parts[0], region);
         if (parts.len == 1) return first;
         const operands = try self.gpa.alloc(RegionId, parts.len - 1);
         defer self.gpa.free(operands);
@@ -4630,7 +8276,7 @@ pub const Reifier = struct {
         try earlier.append(self.gpa, first);
         for (parts[1..], operands) |part, *operand| {
             operand.* = try b.openOperand(earlier.items, .and_);
-            const compare = part.ty.reader.eqOver(part.lhs, part.rhs, part.ty.id, region) catch |err| switch (err) {
+            const compare = partEq(part, region) catch |err| switch (err) {
                 error.Diverged => invariant("a derived equality diverged"),
                 error.Rejected, error.OutOfMemory => |e| return e,
             };
@@ -4642,16 +8288,16 @@ pub const Reifier = struct {
     /// A derived `==` over a tag union: a switch on the left operand, and in
     /// each arm a switch on the right one whose matching arm compares the
     /// payloads and whose other arms are `False`.
-    fn tagUnionEq(self: *Reifier, lhs: Ref, rhs: Ref, tag_union: checked.CheckedTagUnionType, region: base.Region) Error!Ref {
-        var variants = std.ArrayList(checked.CheckedTag).empty;
+    fn tagUnionEq(self: *Reifier, lhs: Ref, rhs: Ref, tag_union: checked.CheckedTagUnionType, subject_id: CheckedTypeId, region: base.Region) Error!Ref {
+        var variants = std.ArrayList(VariantRef).empty;
         defer variants.deinit(self.gpa);
         try self.collectVariants(&variants, tag_union.tags, tag_union.ext, region);
-        if (variants.items.len == 0) return self.rejectError(.unsupported_type, region, "derived equality on an empty tag union");
+        if (variants.items.len == 0) return self.derivedEq(lhs, rhs, subject_id, region);
         // Each variant's name as the type table interns it, so a tag of an
         // operand finds its variant by name.
         const variant_names = try self.gpa.alloc(NameId, variants.items.len);
         defer self.gpa.free(variant_names);
-        for (variants.items, variant_names) |variant, *name| name.* = try self.rt().name(self.names.tagLabelText(variant.name));
+        for (variants.items, variant_names) |variant, *name| name.* = try self.rt().name(variant.reader.names.tagLabelText(variant.tag.name));
         const tags: Variants = .{ .checked = variants.items, .names = variant_names };
         const b = self.bld();
         const l = try self.readable(lhs);
@@ -4698,21 +8344,21 @@ pub const Reifier = struct {
 
     /// The variants of a checked tag union with their interned names.
     const Variants = struct {
-        checked: []const checked.CheckedTag,
+        checked: []const VariantRef,
         names: []const NameId,
     };
 
     /// Whether the payloads of one variant agree, under the arms that found
     /// both operands to be it.
-    fn variantEq(self: *Reifier, l: Ref, r: Ref, name: NameId, variant: checked.CheckedTag, region: base.Region) Error!Ref {
+    fn variantEq(self: *Reifier, l: Ref, r: Ref, name: NameId, variant: VariantRef, region: base.Region) Error!Ref {
         const b = self.bld();
-        const args = variant.argsSlice(self.types);
+        const args = variant.tag.argsSlice(variant.reader.types);
         const parts = try self.gpa.alloc(EqPart, args.len);
         defer self.gpa.free(parts);
         for (args, parts, 0..) |arg, *part, k| part.* = .{
             .lhs = try b.payload(l, name, @intCast(k)),
             .rhs = try b.payload(r, name, @intCast(k)),
-            .ty = .{ .reader = self, .id = arg },
+            .ty = .{ .reader = variant.reader, .id = arg, .frame = variant.frame },
         };
         return self.conjunction(parts, region);
     }
@@ -4736,12 +8382,23 @@ pub const Reifier = struct {
             .undeclared => return self.rejectError(.unsupported_type, region, self.names.typeNameText(nominal.name)),
         }
         if (nominal.builtin != null) return self.rejectError(.unsupported_type, region, "derived equality on this builtin type");
-        if (nominal.is_opaque) return self.rejectError(.unsupported_type, region, self.names.typeNameText(nominal.name));
+        // An opaque type's `Ty` names it without its backing, and the
+        // derivation is that backing's comparison, so expanding it here would
+        // describe a representation the description hides everywhere else.
+        // The stage gets the derivation, as `to_hash` through one does.
+        if (nominal.is_opaque) return self.derivedEq(lhs, rhs, type_id, region);
         const backing = self.types.nominalBackingTemplateForPayload(nominal) orelse
             return self.rejectError(.unsupported_type, region, self.names.typeNameText(nominal.name));
-        var bound_args = try self.bindNominalArgs(nominal);
+        var bound_args = try self.bindNominalArgs(self.frame, nominal);
         defer self.releaseNominalArgs(&bound_args);
         return self.eqOver(try self.unwrapOnce(lhs), try self.unwrapOnce(rhs), backing, region);
+    }
+
+    /// A derived `is_eq` left for the stage to expand: `Derived` over the
+    /// two operands, of the type they share.
+    fn derivedEq(self: *Reifier, lhs: Ref, rhs: Ref, subject_id: CheckedTypeId, region: base.Region) Error!Ref {
+        const subject = try self.tyOf(subject_id, region);
+        return self.bld().derived("is_eq", subject, &.{ lhs, rhs }, try self.rt().boolTy());
     }
 
     /// What a nominal's declaration says about one method.
@@ -4768,7 +8425,7 @@ pub const Reifier = struct {
     ) Error!NominalMethod {
         const target = self.walk.foreign.findMethod(self.foreignNominal(nominal), method) orelse return .undeclared;
         if (std.meta.activeTag(target.kind) == .structural) return .derived;
-        return .{ .written = try self.writtenMethodCall(method, receiver, target, args, result, region) };
+        return .{ .written = try self.writtenMethodCall(receiver, target, args, result, region) };
     }
 
     /// A nominal named the way the registries of any module can read it.
@@ -4783,7 +8440,6 @@ pub const Reifier = struct {
     /// The call to a method a nominal writes, fixed by the receiver's type.
     fn writtenMethodCall(
         self: *Reifier,
-        method: []const u8,
         receiver: CheckedTypeId,
         target: static_dispatch.MethodTarget,
         args: []const Ref,
@@ -4792,17 +8448,13 @@ pub const Reifier = struct {
     ) Error!Ref {
         const b = self.bld();
         const fixing: MethodFixing = .{ .receiver = self.resolvedType(receiver) };
-        return switch (try self.methodTargetCallee(self, target, fixing, method, receiver, region)) {
+        return switch (try self.methodTargetCallee(self, target, fixing, region, .described)) {
             .definition => |found| blk: {
                 const row = try self.calledRow(found);
                 break :blk try b.callRow(row, args);
             },
-            .provided => |export_name| blk: {
-                const name = prims.namedOfExport(export_name) orelse
-                    break :blk self.rejectError(.unresolved_reference, region, "a builtin with no owner in its name");
-                break :blk try b.primOf(try b.namedPrim(name.owner, name.method), args, result);
-            },
-            .foreign => |name| try b.primOf(try b.namedPrim(name.owner, name.method), args, result),
+            .provided => |provided| try self.providedPrimAt(provided, args, result, region),
+            .foreign => |name| try self.foreignPrim(name, args, result, region),
             .none => self.rejectError(.unresolved_reference, region, "a method its nominal names no target for"),
         };
     }
@@ -4845,20 +8497,34 @@ pub const Reifier = struct {
                 }
                 if (nominal.is_opaque) return null;
                 const backing = self.types.nominalBackingTemplateForPayload(nominal) orelse return null;
-                var bound_args = try self.bindNominalArgs(nominal);
+                var bound_args = try self.bindNominalArgs(self.frame, nominal);
                 defer self.releaseNominalArgs(&bound_args);
                 return self.hashOver(try self.unwrapOnce(value), acc, backing, writer, hasher_ty, region);
             },
             .record => |record| {
                 var fields = std.ArrayList(FieldRef).empty;
                 defer fields.deinit(self.gpa);
-                try self.collectRecordFields(&fields, record.fields, record.ext, region);
+                var bound = std.ArrayList(BoundNominal).empty;
+                defer releaseBoundNominals(self.gpa, &bound);
+                try self.collectRecordFields(&fields, &bound, record.fields, record.ext, region);
+                sortFieldsByLabel(fields.items);
+                // The compiler hashes an optional field as its tagged slot
+                // `[#Missing, #Present(value)]`, and the walk leaves the hash
+                // of a tag union to the stage.
+                for (fields.items) |field| {
+                    if (field.field.kind.tag == .optional) return null;
+                }
                 const subject = try self.readable(value);
                 var threaded = acc;
                 for (fields.items) |field| {
                     const name = field.reader.names.recordFieldLabelText(field.field.name);
                     const component = try b.field(subject, try self.fieldIndex(subject, name, region));
-                    threaded = try field.reader.hashOver(component, threaded, field.field.ty, writer, hasher_ty, region) orelse return null;
+                    threaded = blk: {
+                        const outer_frame = field.reader.frame;
+                        field.reader.frame = field.frame;
+                        defer field.reader.frame = outer_frame;
+                        break :blk try field.reader.hashOver(component, threaded, field.field.ty, writer, hasher_ty, region) orelse return null;
+                    };
                 }
                 return threaded;
             },
@@ -4893,7 +8559,7 @@ pub const Reifier = struct {
             .alias => |alias| subject_ty = alias.backing,
             .nominal => |nominal| {
                 const target = self.walk.foreign.findInspectOverride(self.foreignNominal(nominal)) orelse break;
-                return self.writtenMethodCall("to_inspect", subject_ty, target, &.{value}, try self.tyOf(result_ty, region), region);
+                return self.writtenMethodCall(subject_ty, target, &.{value}, try self.tyOf(result_ty, region), region);
             },
             .pending, .err, .flex, .rigid, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => break,
         };
@@ -4988,29 +8654,52 @@ pub const Reifier = struct {
     /// `Nominal(name, backing)`, and a reference back to a nominal the walk
     /// is inside is `Recursive(name)`; a builtin the normal form has no shape
     /// for, and an opaque nominal, is `Opaque(name, args)`.
+    /// `tyOf` read in `frame`: the frame a type reference names its variables
+    /// in, which need not be the frame the walk is in (D2).
+    fn tyOfIn(self: *Reifier, frame: FrameId, type_id: CheckedTypeId, region: base.Region) Error!TyId {
+        const outer_frame = self.frame;
+        self.frame = frame;
+        defer self.frame = outer_frame;
+        return self.tyOf(type_id, region);
+    }
+
     fn tyOf(self: *Reifier, type_id: CheckedTypeId, region: base.Region) Error!TyId {
+        const ty = try self.tyInNominals(type_id, region);
+        // Outside every nominal the type is closed, and a recursive one gets
+        // its one spelling there (roc-reify-normal-form.md 2.1). Inside one,
+        // a part may still name a nominal around it, and the cache can hand
+        // back a part spelled at its own root, so a part is left as built.
+        if (self.walk.open_nominals.items.len != 0) return ty;
+        return self.rt().canonical(ty);
+    }
+
+    /// `tyOf` while the walk may be inside a nominal: a correct spelling,
+    /// not yet the canonical one. `Types.canonical` alone decides T1.
+    fn tyInNominals(self: *Reifier, type_id: CheckedTypeId, region: base.Region) Error!TyId {
         // Resolving at the leaf is enough: a composite holding a variable is
         // reached by recursion into the variable itself.
         if (self.fixedType(type_id)) |fixed| {
             self.substitution_uses += 1;
-            return fixed.reader.tyOf(fixed.id, region);
+            const outer_through = self.walk.through;
+            if (outer_through == null) self.walk.through = .{ .reader = self, .id = type_id, .frame = self.frame };
+            defer self.walk.through = outer_through;
+            return fixed.reader.tyOfIn(fixed.frame, fixed.id, region);
         }
         if (self.ty_cache.get(type_id)) |cached| return cached;
-        const frame = TypeFrame{ .instance = self.nominal_instance, .id = type_id };
+        const frame = TypeFrame{ .depth = self.walk.open_nominals.items.len, .id = type_id };
         if (self.type_in_progress.contains(frame)) {
             return self.rejectError(.unsupported_type, region, "a recursive type");
         }
         try self.type_in_progress.put(self.gpa, frame, {});
         defer _ = self.type_in_progress.remove(frame);
 
-        const open_before = self.open_recursions.count();
         const uses_before = self.substitution_uses;
         const ty = try self.buildTy(type_id, region);
-        // Cache only a type that stands alone: one still holding an open
-        // `Recursive` means something else outside the nominal it was built
-        // under, and one a substitution answered inside means something else
-        // at the next instantiation.
-        if (self.open_recursions.count() == open_before and self.substitution_uses == uses_before) {
+        // Cache only a type that stands alone. A substitution that answered
+        // inside means something else at the next instantiation, and a
+        // `Recursive` inside counts as one (`nominalTy`): it means something
+        // else under other enclosing nominals.
+        if (self.substitution_uses == uses_before) {
             try self.ty_cache.put(self.gpa, type_id, ty);
         }
         return ty;
@@ -5021,15 +8710,21 @@ pub const Reifier = struct {
         const payload = self.types.payload(type_id);
         return switch (payload) {
             .alias => |alias| self.tyOf(alias.backing, region),
-            // A row variable nothing pins is the row default lowering seals it
-            // to (design.md "Row Coercion Primitive": a value keeps its own
-            // row, so a tag built before its widening holds the variable in
-            // its own type).
-            .flex => |variable| if (payload.variableSealsToRowDefault()) switch (variable.row_default.?) {
-                .empty_record => types.recordTy(&.{}),
-                .empty_tag_union => types.tagUnionTy(&.{}),
-            } else self.rejectError(.unresolved_type, region, "a type variable"),
-            .rigid => self.rejectError(.unresolved_type, region, "a type variable"),
+            .flex, .rigid => |variable| blk: {
+                if (try self.sealedVariable(type_id, variable, region)) |target| break :blk switch (target) {
+                    .dec => types.decTy(),
+                    .str => types.strTy(),
+                };
+                // A row variable nothing pins is the row default lowering
+                // seals it to (design.md "Row Coercion Primitive": a value
+                // keeps its own row, so a tag built before its widening holds
+                // the variable in its own type).
+                if (payload == .flex and payload.variableSealsToRowDefault()) break :blk switch (variable.row_default.?) {
+                    .empty_record => types.recordTy(&.{}),
+                    .empty_tag_union => types.tagUnionTy(&.{}),
+                };
+                break :blk self.rejectOpen(type_id, region);
+            },
             .pending, .err => self.rejectError(.unresolved_type, region, "an unresolved type"),
             .empty_record => types.recordTy(&.{}),
             .record => |record| self.recordTy(record.fields, record.ext, region),
@@ -5044,55 +8739,75 @@ pub const Reifier = struct {
                 defer self.gpa.free(params);
                 break :blk try types.funcTy(params, try self.tyOf(function.ret, region));
             },
-            .nominal => |nominal| self.nominalTy(type_id, nominal, region),
+            .nominal => |nominal| self.nominalTy(nominal, region),
             .tag_union => |tag_union| self.tagUnionTy(tag_union.tags, tag_union.ext, region),
             .empty_tag_union => types.tagUnionTy(&.{}),
         };
     }
 
     fn tysOf(self: *Reifier, ids: []const CheckedTypeId, region: base.Region) Error![]TyId {
+        return self.tysOfIn(self.frame, ids, region);
+    }
+
+    /// `tysOf` in `frame`.
+    fn tysOfIn(self: *Reifier, frame: FrameId, ids: []const CheckedTypeId, region: base.Region) Error![]TyId {
         const tys = try self.gpa.alloc(TyId, ids.len);
         errdefer self.gpa.free(tys);
-        for (ids, tys) |id, *ty| ty.* = try self.tyOf(id, region);
+        for (ids, tys) |id, *ty| ty.* = try self.tyOfIn(frame, id, region);
         return tys;
     }
 
     /// A tag union's variants, following its extension.
     fn tagUnionTy(self: *Reifier, tags: []const checked.CheckedTag, ext: CheckedTypeId, region: base.Region) Error!TyId {
-        var collected = std.ArrayList(checked.CheckedTag).empty;
+        var collected = std.ArrayList(VariantRef).empty;
         defer collected.deinit(self.gpa);
         try self.collectVariants(&collected, tags, ext, region);
         const specs = try self.gpa.alloc(reify.types.TagSpec, collected.items.len);
         defer self.gpa.free(specs);
         var filled: usize = 0;
         defer for (specs[0..filled]) |spec| self.gpa.free(spec.payload);
-        for (collected.items, specs) |checked_tag, *spec| {
-            spec.* = .{ .name = self.names.tagLabelText(checked_tag.name), .payload = try self.tysOf(checked_tag.argsSlice(self.types), region) };
+        for (collected.items, specs) |variant, *spec| {
+            spec.* = .{ .name = variant.reader.names.tagLabelText(variant.tag.name), .payload = try variant.reader.tysOfIn(variant.frame, variant.tag.argsSlice(variant.reader.types), region) };
             filled += 1;
         }
         return self.rt().tagUnionTy(specs);
     }
 
+    /// One variant a tag union's extension chain reached, with the module
+    /// and frame its payload types are read in.
+    const VariantRef = struct {
+        reader: *Reifier,
+        frame: FrameId,
+        tag: checked.CheckedTag,
+    };
+
     /// Every variant of a tag union, following its extension.
     ///
-    /// An extension the checker closed ends it. Closing a row leaves a variable
-    /// behind rather than an `empty_tag_union`, marked with the default that
-    /// says what it closed to, so `checkedRowVariableClosesTagRow` is the one
-    /// reading of a variable found here. A variable without that mark names a
-    /// row still open, and a normal form is monomorphic.
+    /// A chain ending in a variable the site fixed carries on in the site's
+    /// module, as `collectRecordFields` does for a record: the definition
+    /// wrote the variants it named and the site's union holds the rest. That
+    /// union holds the named variants too, so a variant already collected is
+    /// dropped where it comes round a second time.
+    ///
+    /// A variable nothing fixed ends the chain, sealed to the empty union the
+    /// way Monotype seals a row (`lowerCheckedTypeVariable`): a variable the
+    /// checker closed carries the default that says so, and one nothing closed
+    /// stands for the variants the definition names and no others.
     fn collectVariants(
         self: *Reifier,
-        collected: *std.ArrayList(checked.CheckedTag),
+        collected: *std.ArrayList(VariantRef),
         tags: []const checked.CheckedTag,
         ext: CheckedTypeId,
         region: base.Region,
     ) Error!void {
+        var reader = self;
+        var frame = self.frame;
         var link_tags = tags;
         var link_ext: ?CheckedTypeId = ext;
         while (true) {
-            try collected.appendSlice(self.gpa, link_tags);
+            for (link_tags) |tag| try self.collectVariant(collected, reader, frame, tag);
             const next = link_ext orelse break;
-            switch (self.types.payload(next)) {
+            switch (reader.types.payload(next)) {
                 .empty_tag_union => break,
                 .tag_union => |more| {
                     link_tags = more.tags;
@@ -5102,11 +8817,15 @@ pub const Reifier = struct {
                     link_tags = &.{};
                     link_ext = alias.backing;
                 },
-                .flex, .rigid => |variable| {
-                    if (!checked.checkedRowVariableClosesTagRow(variable)) {
-                        return self.rejectError(.unresolved_type, region, "an open tag union");
-                    }
-                    break;
+                .flex, .rigid => {
+                    const bound = reader.fixedTypeIn(frame, next) orelse break;
+                    // The variants from here on are what one site fixed, so
+                    // the frame that asked declines to cache this type.
+                    self.substitution_uses += 1;
+                    reader = bound.reader;
+                    frame = bound.frame;
+                    link_tags = &.{};
+                    link_ext = bound.id;
                 },
                 .pending, .err => return self.rejectError(.unresolved_type, region, "an unresolved type"),
                 .record,
@@ -5119,7 +8838,16 @@ pub const Reifier = struct {
         }
     }
 
-    fn nominalTy(self: *Reifier, type_id: CheckedTypeId, nominal: checked.CheckedNominalType, region: base.Region) Error!TyId {
+    /// Collect one variant, unless a link nearer the front of the chain
+    /// already named it.
+    fn collectVariant(self: *Reifier, collected: *std.ArrayList(VariantRef), reader: *Reifier, frame: FrameId, tag: checked.CheckedTag) Allocator.Error!void {
+        for (collected.items) |seen| {
+            if (seen.reader.sameTagLabel(seen.tag.name, reader, tag.name)) return;
+        }
+        try collected.append(self.gpa, .{ .reader = reader, .frame = frame, .tag = tag });
+    }
+
+    fn nominalTy(self: *Reifier, nominal: checked.CheckedNominalType, region: base.Region) Error!TyId {
         const types = self.rt();
         if (nominal.builtin) |builtin_nominal| {
             switch (builtin_nominal) {
@@ -5166,37 +8894,80 @@ pub const Reifier = struct {
             return self.opaqueTy(nominal, region);
         const name = self.names.typeNameText(nominal.name);
 
+        // A `Recursive(name)` refers to the nearest enclosing nominal of
+        // that name, so this use closes only where that nominal is this
+        // instance. Under any other one it expands again (T1). The key reads
+        // this use's arguments under the bindings around it, before this use
+        // binds its own: `Pair(b, a)` inside `Pair(a, b)` is another instance.
+        const instance = self.nominalInstanceKey(nominal);
+        const open = &self.walk.open_nominals;
+        if (nearestOpen(open.items, self, nominal.name)) |at| {
+            if (open.items[at].instance.eql(instance)) {
+                // What this means depends on the nominals around it, so the
+                // frames that asked decline to cache it.
+                self.substitution_uses += 1;
+                return types.recursiveTy(name);
+            }
+        }
+        if (expansionRepeats(open.items, self, nominal.name, instance)) {
+            return self.rejectError(.unsupported_type, region, "a recursive type with no finite description");
+        }
+        try open.append(self.gpa, .{ .reader = self, .name = nominal.name, .instance = instance });
+        defer _ = open.pop();
+
+        // The arguments are inside the nominal, as its backing is, so an
+        // argument that holds this instance refers back to it (T1). They are
+        // read before this use binds its own variables, as the key is.
+        const args = try self.tysOf(nominal.args, region);
+        defer self.gpa.free(args);
+
         // The backing is the declaration's template, written in the nominal's
         // own variables, and `args` is what this use fixed them to.
-        var bound_args = try self.bindNominalArgs(nominal);
+        var bound_args = try self.bindNominalArgs(self.frame, nominal);
         defer self.releaseNominalArgs(&bound_args);
 
-        // The backing is where a nominal reaches itself, and the nominal this
-        // builds is what such a reference names, so open the reference before
-        // descending and close it after.
-        const instance = self.nominalInstanceKey(nominal);
-        if (self.nominal_in_progress.get(instance)) |open| {
-            try self.open_recursions.put(self.gpa, open, {});
-            // What this answers depends on what the enclosing use fixed, so
-            // the frame that asked declines to cache it.
-            self.substitution_uses += 1;
-            return types.recursiveTy(name);
-        }
-        try self.nominal_in_progress.put(self.gpa, instance, type_id);
-        defer _ = self.nominal_in_progress.remove(instance);
-
-        const enclosing = self.nominal_instance;
-        self.nominal_instance = instance;
-        defer self.nominal_instance = enclosing;
-
         const backing_ty = try self.tyOf(backing, region);
-        _ = self.open_recursions.remove(type_id);
-        return self.rt().nominalTy(name, backing_ty);
+        return self.rt().nominalTy(name, try self.nominalOrigin(nominal), args, backing_ty);
+    }
+
+    /// The position of the nearest nominal that `open` holds with the name
+    /// that `name` of the store of `reader` names.
+    fn nearestOpen(open: []const Walk.OpenNominal, reader: *Reifier, name: canonical.TypeNameId) ?usize {
+        var at = open.len;
+        while (at > 0) {
+            at -= 1;
+            if (open[at].reader.sameTypeName(open[at].name, reader, name)) return at;
+        }
+        return null;
+    }
+
+    /// Whether expanding `instance` inside `open` repeats an expansion that
+    /// `open` already holds: the same instance, with the same nearest nominal
+    /// for each name. What an expansion builds depends only on these, so a
+    /// repeat builds itself again inside itself, and the T1 tree of the type
+    /// is infinite. `Pair(a, b) := [Leaf(a), Node(Pair(b, a))]` is one.
+    ///
+    /// Instances and names are finite, so a walk that expands only where
+    /// this is false ends.
+    fn expansionRepeats(open: []const Walk.OpenNominal, reader: *Reifier, name: canonical.TypeNameId, instance: NominalInstanceKey) bool {
+        for (open, 0..) |earlier, j| {
+            if (!earlier.reader.sameTypeName(earlier.name, reader, name) or !earlier.instance.eql(instance)) continue;
+            // The nearest nominal of each name now is the nearest before `j`,
+            // except for a name expanded at or after `j`.
+            const since = open[j..];
+            const same = for (since, 0..) |entry, i| {
+                if (nearestOpen(since[i + 1 ..], entry.reader, entry.name) != null) continue;
+                const before = nearestOpen(open[0..j], entry.reader, entry.name) orelse break false;
+                if (!open[before].instance.eql(entry.instance)) break false;
+            } else true;
+            if (same) return true;
+        }
+        return false;
     }
 
     /// A key for one nominal at one instantiation: the declaration, and what
     /// this use fixed its variables to.
-    fn nominalInstanceKey(self: *Reifier, nominal: checked.CheckedNominalType) [32]u8 {
+    fn nominalInstanceKey(self: *Reifier, nominal: checked.CheckedNominalType) NominalInstanceKey {
         var hasher = std.crypto.hash.Blake3.init(.{});
         hasher.update(std.mem.asBytes(&@backingInt(nominal.origin_module)));
         hasher.update(std.mem.asBytes(&@backingInt(nominal.name)));
@@ -5205,31 +8976,41 @@ pub const Reifier = struct {
             const bound = self.resolvedType(arg);
             hasher.update(&bound.reader.types.rootKey(bound.id).bytes);
         }
-        var key: [32]u8 = undefined;
-        hasher.final(&key);
+        var key: NominalInstanceKey = undefined;
+        hasher.final(&key.bytes);
         return key;
     }
+
+    /// The key `nominalInstanceKey` gives one nominal at one instantiation.
+    const NominalInstanceKey = struct {
+        bytes: [32]u8,
+
+        /// Integer equality over the digest: a single 256-bit compare.
+        fn eql(a: NominalInstanceKey, b: NominalInstanceKey) bool {
+            return @as(u256, @bitCast(a.bytes)) == @as(u256, @bitCast(b.bytes));
+        }
+    };
 
     /// What one parametric nominal bound, and what stood in its place before.
     const NominalArgs = struct {
         formals: []const CheckedTypeId = &.{},
-        outer: []?TypeRef = &.{},
+        outer: []?FramedType = &.{},
     };
 
     /// Bind a parametric nominal's declared variables to what this use fixed
     /// them to. Binds nothing when the nominal declares no variables, or when
     /// the declaration and the use disagree on how many there are.
-    fn bindNominalArgs(self: *Reifier, nominal: checked.CheckedNominalType) Allocator.Error!NominalArgs {
+    fn bindNominalArgs(self: *Reifier, frame: FrameId, nominal: checked.CheckedNominalType) Allocator.Error!NominalArgs {
         if (nominal.args.len == 0) return .{};
         const declaration = self.types.nominalDeclarationForPayload(nominal) orelse return .{};
         const formals = declaration.formalArgs(self.types);
         if (formals.len != nominal.args.len) return .{};
         // Every use is read before any formal is bound, so one formal's
         // binding cannot answer another's.
-        const fixed = try self.gpa.alloc(TypeRef, nominal.args.len);
+        const fixed = try self.gpa.alloc(FramedType, nominal.args.len);
         defer self.gpa.free(fixed);
-        for (nominal.args, fixed) |arg, *use| use.* = self.resolvedType(arg);
-        const outer = try self.gpa.alloc(?TypeRef, formals.len);
+        for (nominal.args, fixed) |arg, *use| use.* = self.resolvedTypeIn(frame, arg);
+        const outer = try self.gpa.alloc(?FramedType, formals.len);
         errdefer self.gpa.free(outer);
         for (formals, fixed, outer) |formal, use, *saved| {
             saved.* = self.nominal_args.get(formal);
@@ -5255,7 +9036,248 @@ pub const Reifier = struct {
     fn opaqueTy(self: *Reifier, nominal: checked.CheckedNominalType, region: base.Region) Error!TyId {
         const args = try self.tysOf(nominal.args, region);
         defer self.gpa.free(args);
-        return self.rt().opaqueTy(self.names.typeNameText(nominal.name), args);
+        return self.rt().opaqueTy(self.opaqueName(nominal), try self.nominalOrigin(nominal), args);
+    }
+
+    /// The name an `Opaque` gives a nominal (Q10): a builtin's is the owner
+    /// its functions' `Prim`s have (`Dict`, `Box`, `Num.U8x16`), and any
+    /// other nominal's is its name as the checker holds it.
+    fn opaqueName(self: *Reifier, nominal: checked.CheckedNominalType) []const u8 {
+        const name = self.names.typeNameText(nominal.name);
+        return if (self.isBuiltinNominal(nominal)) reify.prims.ownerOfTypeName(name) else name;
+    }
+
+    /// Whether the builtin module declares a nominal (Q10): one the checker
+    /// marks as a builtin (`Dict`), or any other the builtin module declares
+    /// (`Hasher`), known by the role of the module its identity names.
+    fn isBuiltinNominal(self: *Reifier, nominal: checked.CheckedNominalType) bool {
+        return nominal.builtin != null or
+            self.walk.foreign.isBuiltinModule(self.names.moduleIdentityBytes(nominal.origin_module));
+    }
+
+    /// The bits of the `Code.PrimId` of the definition the reference `arg`
+    /// of a `Code.prim` call names, following exact aliases as a callee is
+    /// followed: the id a `Prim` node of that definition carries. Null for a
+    /// reference to no function or constant a description can name.
+    fn primIdentity(self: *Reifier, arg: CheckedExprId, source: CIR.Expr.Idx) Allocator.Error!?u128 {
+        const resolved = self.lookupResolved(arg) orelse return self.derivedMethodPrim(source);
+        // An intrinsic is keyed by its declaration, as any other definition
+        // of a package is.
+        if (try self.listedIntrinsic(resolved)) |intrinsic| {
+            return reify.identity.declaredPrim(intrinsic.name.definition);
+        }
+        const named = try self.listedMember(resolved) orelse return null;
+        if (named.reader.env.module_role != .builtin) {
+            return reify.identity.declaredPrim(.{ .module = named.reader.artifact.bytes, .def = @backingInt(named.def) });
+        }
+        // A builtin is named by its export name, which is the name its
+        // definition binds (`Builtin.Str.concat`), as `providedName` reads it.
+        const env = named.reader.env;
+        const ident = switch (env.store.getPattern(env.store.getDef(named.def).pattern)) {
+            .assign => |assign| assign.ident,
+            .var_assign,
+            .as,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .deferred_import_ref,
+            .record_destructure,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .num_from_numeral_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => invariant("a builtin function binds one name"),
+        };
+        const export_name = reify.prims.namedOfExport(env.getIdentText(ident)) orelse
+            invariant("a builtin's export name has an owner and a method");
+        return reify.identity.builtinPrim(export_name.owner, export_name.method);
+    }
+
+    /// The bits of the `Code.PrimId` of the compiler-derived method (`is_eq :
+    /// _`) the `Code.prim` argument `source` names, which resolves to no
+    /// value. It is the id of the `Prim` the walk gives a call of the method,
+    /// as `nominalEq` builds it: `is_eq` of a scalar builtin (`F64`) is that
+    /// builtin's `Prim`. Any other derived method is a `Derived` or the
+    /// comparison of its backing, which no `Prim` names, so it is null.
+    fn derivedMethodPrim(self: *Reifier, source: CIR.Expr.Idx) ?u128 {
+        const foreign = self.walk.foreign;
+        const target = foreign.resolve_lookup_target(foreign.context, source) orelse return null;
+        const derived = switch (target.env.store.getExpr(target.env.store.getDef(target.def).expr)) {
+            .e_derived_method => |derived| derived,
+            .e_num,
+            .e_frac_f32,
+            .e_frac_f64,
+            .e_dec,
+            .e_dec_small,
+            .e_num_from_numeral,
+            .e_typed_int,
+            .e_typed_frac,
+            .e_typed_num_from_numeral,
+            .e_str_segment,
+            .e_str,
+            .e_bytes_literal,
+            .e_lookup_local,
+            .e_lookup_external,
+            .e_deferred_import_ref,
+            .e_lookup_associated_local,
+            .e_lookup_associated,
+            .e_lookup_associated_resolved,
+            .e_lookup_required,
+            .e_list,
+            .e_empty_list,
+            .e_tuple,
+            .e_match,
+            .e_if,
+            .e_call,
+            .e_record,
+            .e_empty_record,
+            .e_block,
+            .e_tag,
+            .e_nominal,
+            .e_nominal_external,
+            .e_zero_argument_tag,
+            .e_closure,
+            .e_lambda,
+            .e_binop,
+            .e_unary_minus,
+            .e_field_access,
+            .e_method_call,
+            .e_dispatch_call,
+            .e_interpolation,
+            .e_structural_eq,
+            .e_structural_hash,
+            .e_method_eq,
+            .e_type_method_call,
+            .e_type_dispatch_call,
+            .e_tuple_access,
+            .e_runtime_error,
+            .e_crash,
+            .e_dbg,
+            .e_expect_err,
+            .e_expect,
+            .e_ellipsis,
+            .e_anno_only,
+            .e_return,
+            .e_break,
+            .e_for,
+            .e_hosted_lambda,
+            .e_run_low_level,
+            => return null,
+        };
+        if (derived.kind != .equality) return null;
+        const builtin_nominal = checked.checkedBuiltinNominalForSourceDecl(target.env, @backingInt(derived.owner)) orelse return null;
+        if (!isScalarEq(builtin_nominal)) return null;
+        return reify.identity.builtinPrim(primitiveOwnerText(builtin_nominal).?, "is_eq");
+    }
+
+    /// The bits of the `Code.TypeId` of the type the proxy `arg` of a
+    /// `Code.type_id` call stands for, read off the argument's solved type.
+    /// Null where that type is open or is no nominal.
+    fn typeIdIdentity(self: *Reifier, arg: CheckedExprId) ?u128 {
+        // The proxy's type in the frame the walk reads: in a generic
+        // function, what the closing use fixed it to (Q8).
+        var ref: FramedType = .{ .reader = self, .id = self.proxyTarget(arg), .frame = self.frame };
+        while (true) {
+            if (ref.reader.fixedTypeIn(ref.frame, ref.id)) |fixed| {
+                ref = fixed;
+                continue;
+            }
+            switch (ref.reader.types.payload(ref.id)) {
+                .alias => |alias| ref.id = alias.backing,
+                .nominal => |nominal| return ref.reader.typeIdentity(nominal),
+                .pending, .err, .flex, .rigid, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => return null,
+            }
+        }
+    }
+
+    /// The type `t` of the `Code.Proxy(t)` that the argument `arg` of a
+    /// `Code.type_id` or `Code.ty_of` call is, as checking typed it.
+    fn proxyTarget(self: *Reifier, arg: CheckedExprId) CheckedTypeId {
+        const proxy = switch (self.types.payload(self.throughAliases(self.bodies.expr(arg).ty))) {
+            .nominal => |nominal| nominal,
+            .pending,
+            .err,
+            .flex,
+            .rigid,
+            .alias,
+            .record,
+            .tuple,
+            .function,
+            .empty_record,
+            .tag_union,
+            .empty_tag_union,
+            => invariant("the argument of Code.type_id or Code.ty_of is a Code.Proxy, as checking typed it"),
+        };
+        std.debug.assert(proxy.args.len == 1);
+        return proxy.args[0];
+    }
+
+    /// The `Code.Ty` of a `Code.ty_of` call's proxy, as the `result` of
+    /// `|x| x` at that type describes it, written into this module's store
+    /// (D6). A type variable the frame leaves open is `ty_of_not_closed`;
+    /// a type the walk has no description for is the walk's own refusal.
+    fn tyOfProxy(self: *Reifier, arg: CheckedExprId, region: base.Region) Allocator.Error!Outcome {
+        self.walk.body = self;
+        const ty = self.tyOf(self.proxyTarget(arg), region) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.Diverged => invariant("a type description diverged"),
+            error.Rejected => {
+                const rejection = self.walk.rejection.?;
+                if (rejection.open == null) return .{ .rejected = rejection };
+                return .{ .rejected = .{ .kind = .ty_of_not_closed, .region = region, .module = self.rejectionModule(), .detail = "" } };
+            },
+        };
+        return .{ .reified = try self.walk.emitTy(ty) };
+    }
+
+    /// `id` with every alias at its head replaced by its backing.
+    fn throughAliases(self: *Reifier, id: CheckedTypeId) CheckedTypeId {
+        var current = id;
+        while (true) switch (self.types.payload(current)) {
+            .alias => |alias| current = alias.backing,
+            .pending,
+            .err,
+            .flex,
+            .rigid,
+            .record,
+            .tuple,
+            .nominal,
+            .function,
+            .empty_record,
+            .tag_union,
+            .empty_tag_union,
+            => return current,
+        };
+    }
+
+    /// The bits of the `Code.TypeId` of a nominal, as an `Opaque` of it
+    /// carries them (`code_emit`).
+    fn typeIdentity(self: *Reifier, nominal: checked.CheckedNominalType) u128 {
+        if (self.isBuiltinNominal(nominal)) return reify.identity.builtinType(self.opaqueName(nominal));
+        return reify.identity.declaredType(.{
+            .module = self.names.moduleIdentityBytes(nominal.origin_module).*,
+            .decl = nominal.source_decl,
+        });
+    }
+
+    /// What a nominal is apart from its name (F2): a builtin, known by its
+    /// declaring module and not by its name, or the declaration its declaring
+    /// module makes, as `foreignNominal` names it to every module's
+    /// registries. A package nominal with a builtin's name is a declaration.
+    fn nominalOrigin(self: *Reifier, nominal: checked.CheckedNominalType) Allocator.Error!reify.types.Origin {
+        if (self.isBuiltinNominal(nominal)) return .builtin;
+        return self.rt().declared(.{
+            .module = self.names.moduleIdentityBytes(nominal.origin_module).*,
+            .decl = nominal.source_decl,
+        });
     }
 
     /// A record type's fields, following its extension. A field is optional
@@ -5264,7 +9286,9 @@ pub const Reifier = struct {
     fn recordTy(self: *Reifier, fields: []const checked.CheckedRecordField, ext: ?CheckedTypeId, region: base.Region) Error!TyId {
         var collected = std.ArrayList(FieldRef).empty;
         defer collected.deinit(self.gpa);
-        try self.collectRecordFields(&collected, fields, ext, region);
+        var bound = std.ArrayList(BoundNominal).empty;
+        defer releaseBoundNominals(self.gpa, &bound);
+        try self.collectRecordFields(&collected, &bound, fields, ext, region);
         const specs = try self.gpa.alloc(reify.types.FieldSpec, collected.items.len);
         defer self.gpa.free(specs);
         for (collected.items, specs) |field, *spec| {
@@ -5275,11 +9299,389 @@ pub const Reifier = struct {
             };
             spec.* = .{
                 .name = field.reader.names.recordFieldLabelText(field.field.name),
-                .ty = try field.reader.tyOf(field.field.ty, region),
+                .ty = try field.reader.tyOfIn(field.frame, field.field.ty, region),
                 .optional = optional,
+                .default = try field.reader.fieldDefault(field.field.kind),
             };
         }
         return self.rt().recordTy(specs);
+    }
+
+    /// What a field's type says about its default (D5): its value where the
+    /// walk describes the default as a literal, or an aggregate, tag or
+    /// nominal of literals, and `computed` for any other default. The
+    /// default is read in the module that declares it, by the identity the
+    /// field's kind carries.
+    fn fieldDefault(self: *Reifier, kind: checked.CheckedFieldKind) Allocator.Error!reify.types.Default {
+        const identity = kind.defaultIdentity() orelse return .none;
+        const origin = identity.origin() orelse invariant("a defaulted field names the module that declares its default");
+        const holder = try self.moduleOfIdentity(self.names.moduleIdentityBytes(origin));
+        const expr = holder.bodies.defaultExpr(identity.expr_node) orelse
+            invariant("the module that declares a field default archives its expression");
+        // A default is a closed expression, typed on its own: no frame of
+        // the walk names its variables.
+        const outer_frame = holder.frame;
+        holder.frame = empty_frame;
+        defer holder.frame = outer_frame;
+        const value = try holder.defaultValue(expr, .own) orelse return .computed;
+        return .of(value);
+    }
+
+    /// The reader of the module of content identity `identity`: one the
+    /// walk has open, or one in reach of the module being published.
+    fn moduleOfIdentity(self: *Reifier, identity: *const [32]u8) Allocator.Error!*Reifier {
+        for (self.walk.readers.items) |open| {
+            const own = open.env.contentIdentityHash() orelse continue;
+            if (base.ModuleIdentity.eql(own, identity)) return open;
+        }
+        const module = self.walk.foreign.findModuleByIdentity(identity) orelse
+            invariant("the module that declares a field default is in reach of every module that reads the field");
+        return self.walk.reader(module);
+    }
+
+    /// Where a default's expression stands, as the walk builds it: at its
+    /// own type, as the backing of a `Bool`, or as the backing of another
+    /// nominal, which the nominal wraps (`nominalExpr`).
+    const DefaultPlace = enum { own, bool_backing, nominal_backing };
+
+    /// What a checked type is, for the value of a default: the walk's type
+    /// classes (`nominalTy`), read without building the type.
+    const ValueClass = enum { bool_, str, scalar, list, record, tuple, tag_union, wrap, other };
+
+    fn valueClass(self: *Reifier, type_id: CheckedTypeId) ValueClass {
+        return switch (self.types.payload(self.throughAliases(type_id))) {
+            .nominal => |nominal| if (nominal.builtin) |builtin| switch (builtin) {
+                .bool => .bool_,
+                .str => .str,
+                .dec, .f32, .f64, .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => .scalar,
+                .list => .list,
+                .try_ => .wrap,
+                .u8x16,
+                .i8x16,
+                .u16x8,
+                .i16x8,
+                .u32x4,
+                .i32x4,
+                .u64x2,
+                .i64x2,
+                .box,
+                .dict,
+                .set,
+                .iter,
+                .stream,
+                .parse_tag_union_spec,
+                .fields,
+                .field,
+                .crypto_sha256_digest,
+                .crypto_sha256_hasher,
+                .crypto_blake3_digest,
+                .crypto_blake3_hasher,
+                => .other,
+            } else if (nominal.is_opaque or self.types.nominalBackingTemplateForPayload(nominal) == null) .other else .wrap,
+            .record, .empty_record => .record,
+            .tuple => .tuple,
+            .tag_union, .empty_tag_union => .tag_union,
+            .pending, .err, .alias, .flex, .rigid, .function => .other,
+        };
+    }
+
+    /// The `Code.Value` of a field default that the walk describes as a
+    /// literal (D5), or null for one it describes otherwise: a call, a
+    /// literal of a type of the author's own (its conversion call), a
+    /// constant of an opaque type (a `Prim`), a value of an opaque type, or
+    /// a record that leaves out a field. A record that leaves out an
+    /// optional field is null too: a field default does not use
+    /// `Code.Value.Absent`, which only a captured value holds (D8).
+    fn defaultValue(self: *Reifier, expr_id: CheckedExprId, place: DefaultPlace) Allocator.Error!?reify.types.ValueId {
+        const types = self.rt();
+        const expr = self.bodies.expr(expr_id);
+        switch (expr.data) {
+            .numeral => |data| {
+                const primitive = self.builtinNominalOf(expr.ty) orelse return null;
+                const exact = self.env.exactNumeral(data.literal);
+                return switch (primitive) {
+                    .f32 => try types.fracValue(@bitCast(@as(f64, try numeral.floatBits(f32, self.gpa, exact)))),
+                    .f64 => try types.fracValue(@bitCast(try numeral.floatBits(f64, self.gpa, exact))),
+                    .dec => if (try numeral.decBits(self.gpa, exact)) |bits| try types.decValue(bits) else null,
+                    .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => blk: {
+                        const bits = numeral.intBits(exact, intTarget(primitive).?) orelse break :blk null;
+                        // `Code.Value` is `U128` for a `U128` and `Int` for every other width.
+                        if (primitive == .u128) break :blk try types.u128Value(switch (bits) {
+                            .i128 => |signed| @intCast(signed),
+                            .u128 => |magnitude| magnitude,
+                        });
+                        break :blk try types.intValue(switch (bits) {
+                            .i128 => |signed| signed,
+                            .u128 => |magnitude| @intCast(magnitude),
+                        });
+                    },
+                    .bool,
+                    .try_,
+                    .str,
+                    .u8x16,
+                    .i8x16,
+                    .u16x8,
+                    .i16x8,
+                    .u32x4,
+                    .i32x4,
+                    .u64x2,
+                    .i64x2,
+                    .list,
+                    .box,
+                    .dict,
+                    .set,
+                    .iter,
+                    .stream,
+                    .parse_tag_union_spec,
+                    .fields,
+                    .field,
+                    .crypto_sha256_digest,
+                    .crypto_sha256_hasher,
+                    .crypto_blake3_digest,
+                    .crypto_blake3_hasher,
+                    => null,
+                };
+            },
+            .str_segment => |literal| return try types.strValue(self.bodies.stringLiteral(literal)),
+            .str_from_quote => |quote| {
+                if (self.builtinNominalOf(expr.ty) != .str) return null;
+                return try types.strValue(self.bodies.stringLiteral(quote.literal));
+            },
+            .str => |segments| {
+                var text = std.ArrayList(u8).empty;
+                defer text.deinit(self.gpa);
+                for (segments) |segment| switch (self.bodies.expr(segment).data) {
+                    .str_segment => |literal| try text.appendSlice(self.gpa, self.bodies.stringLiteral(literal)),
+                    .pending,
+                    .numeral,
+                    .str_from_quote,
+                    .code_from_lambda,
+                    .str,
+                    .bytes_literal,
+                    .lookup_local,
+                    .lookup_external,
+                    .lookup_required,
+                    .list,
+                    .empty_list,
+                    .tuple,
+                    .match_,
+                    .if_,
+                    .call,
+                    .record,
+                    .empty_record,
+                    .block,
+                    .tag,
+                    .nominal,
+                    .zero_argument_tag,
+                    .closure,
+                    .lambda,
+                    .binop,
+                    .unary_minus,
+                    .unary_not,
+                    .field_access,
+                    .dispatch_call,
+                    .interpolation,
+                    .structural_eq,
+                    .structural_hash,
+                    .method_eq,
+                    .type_dispatch_call,
+                    .tuple_access,
+                    .runtime_error,
+                    .crash,
+                    .dbg,
+                    .expect_err,
+                    .expect,
+                    .ellipsis,
+                    .anno_only,
+                    .break_,
+                    .return_,
+                    .row_coerce,
+                    .for_,
+                    .hosted_lambda,
+                    .run_low_level,
+                    => return null,
+                };
+                return try types.strValue(text.items);
+            },
+            .bytes_literal => |literal| {
+                const bytes = self.bodies.stringLiteral(literal);
+                const items = try self.gpa.alloc(reify.types.ValueId, bytes.len);
+                defer self.gpa.free(items);
+                for (bytes, items) |byte, *item| item.* = try types.intValue(byte);
+                return try types.listValue(items);
+            },
+            .empty_list => return try types.listValue(&.{}),
+            .list, .tuple => |parts| {
+                const items = try self.defaultValues(parts) orelse return null;
+                defer self.gpa.free(items);
+                return if (expr.data == .list) try types.listValue(items) else try types.tupleValue(items);
+            },
+            .empty_record => return try types.recordValue(&.{}),
+            .record => |record| {
+                // A record that unsets a field or leaves out an optional
+                // field is not a literal default: a default does not use
+                // `Code.Value.Absent` (D8). A field left out with a default
+                // the type carries is that default (Q18).
+                if (record.ext != null or record.unsets.len != 0) return null;
+                var fields = std.ArrayList(checked.CheckedRecordField).empty;
+                defer fields.deinit(self.gpa);
+                if (!try self.recordTypeFields(expr.ty, &fields)) return null;
+                std.mem.sort(checked.CheckedRecordField, fields.items, self, struct {
+                    fn lt(r: *Reifier, a: checked.CheckedRecordField, b: checked.CheckedRecordField) bool {
+                        return r.names.recordFieldLabelTextLessThan(a.name, b.name);
+                    }
+                }.lt);
+                const items = try self.gpa.alloc(reify.types.ValueId, fields.items.len);
+                defer self.gpa.free(items);
+                for (fields.items, items) |field, *item| {
+                    const written = for (record.fields) |candidate| {
+                        if (candidate.label == field.name) break candidate.value;
+                    } else null;
+                    if (written) |value_expr| {
+                        item.* = try self.defaultValue(value_expr, .own) orelse return null;
+                    } else {
+                        item.* = (try self.fieldDefault(field.kind)).value() orelse return null;
+                    }
+                }
+                const value = try types.recordValue(items);
+                return if (place == .own and self.valueClass(expr.ty) == .wrap) try types.wrapValue(value) else value;
+            },
+            .tag => |tag_expr| return self.tagValue(tag_expr.name, tag_expr.args, expr.ty, place),
+            .zero_argument_tag => |tag_expr| return self.tagValue(tag_expr.name, &.{}, expr.ty, place),
+            .nominal => |nominal| return switch (self.valueClass(expr.ty)) {
+                .bool_ => self.defaultValue(nominal.backing_expr, .bool_backing),
+                .wrap => blk: {
+                    const backing = try self.defaultValue(nominal.backing_expr, .nominal_backing) orelse break :blk null;
+                    break :blk try types.wrapValue(backing);
+                },
+                .str, .scalar, .list => self.defaultValue(nominal.backing_expr, .nominal_backing),
+                // A value of an opaque type, built from its fields.
+                .record, .tuple, .tag_union, .other => null,
+            },
+            .row_coerce => |coerce| return self.defaultValue(coerce.value, place),
+            // A name is the value the definition it names holds, unless the
+            // walk names it as a primitive: a constant of an opaque type.
+            .lookup_local => |lookup| return self.namedDefaultValue(lookup.resolved, place),
+            .lookup_external, .lookup_required => |reference| return self.namedDefaultValue(reference, place),
+            .pending,
+            .code_from_lambda,
+            .match_,
+            .if_,
+            .call,
+            .block,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => return null,
+        }
+    }
+
+    fn defaultValues(self: *Reifier, parts: []const CheckedExprId) Allocator.Error!?[]reify.types.ValueId {
+        const items = try self.gpa.alloc(reify.types.ValueId, parts.len);
+        errdefer self.gpa.free(items);
+        for (parts, items) |part, *item| {
+            item.* = try self.defaultValue(part, .own) orelse {
+                self.gpa.free(items);
+                return null;
+            };
+        }
+        return items;
+    }
+
+    /// A tag in a default: a `Bool`, a variant, or a variant wrapped in the
+    /// nominal its type is (`tagExpr`).
+    fn tagValue(self: *Reifier, name: canonical.TagLabelId, args: []const CheckedExprId, ty: CheckedTypeId, place: DefaultPlace) Allocator.Error!?reify.types.ValueId {
+        const types = self.rt();
+        const class = self.valueClass(ty);
+        if (place == .bool_backing or (place == .own and class == .bool_)) {
+            const flag = self.bool_tags.value(name) orelse return null;
+            return try types.boolValue(flag);
+        }
+        switch (class) {
+            .wrap, .tag_union => {},
+            .bool_, .str, .scalar, .list, .record, .tuple, .other => return null,
+        }
+        const payloads = try self.defaultValues(args) orelse return null;
+        defer self.gpa.free(payloads);
+        const variant = try types.tagValue(self.names.tagLabelText(name), payloads);
+        return if (place == .own and class == .wrap) try types.wrapValue(variant) else variant;
+    }
+
+    /// The default value of the definition a name holds (`foldedConstant`).
+    fn namedDefaultValue(self: *Reifier, resolved: ?checked.ResolvedValueRefId, place: DefaultPlace) Allocator.Error!?reify.types.ValueId {
+        const definition = try self.constantDefinition(resolved) orelse return null;
+        const reader = definition.reader;
+        if (definition.named) |named| {
+            if (try reader.primitiveOf(named.def, named.ty)) |primitive| switch (primitive) {
+                .operation => return null,
+                .builtin => invariant("a constant of the builtin module is no primitive"),
+            };
+        }
+        if (reader.folding.contains(definition.body)) return null;
+        try reader.folding.put(reader.gpa, definition.body, {});
+        defer _ = reader.folding.remove(definition.body);
+        const outer_frame = reader.frame;
+        reader.frame = empty_frame;
+        defer reader.frame = outer_frame;
+        return reader.defaultValue(definition.body, place);
+    }
+
+    /// The fields of a closed record type, or of the record a nominal is
+    /// backed by, into `out`; false for an open one.
+    fn recordTypeFields(self: *Reifier, type_id: CheckedTypeId, out: *std.ArrayList(checked.CheckedRecordField)) Allocator.Error!bool {
+        var current = type_id;
+        while (true) switch (self.types.payload(current)) {
+            .alias => |alias| current = alias.backing,
+            .nominal => |nominal| current = self.types.nominalBackingTemplateForPayload(nominal) orelse return false,
+            .record => |record| {
+                try out.appendSlice(self.gpa, record.fields);
+                current = record.ext;
+            },
+            .empty_record => return true,
+            // A row tail nothing pins is sealed to the empty record.
+            .flex => |variable| return self.types.payload(current).variableSealsToRowDefault() and variable.row_default.? == .empty_record,
+            .pending, .err, .rigid, .tuple, .function, .tag_union, .empty_tag_union => return false,
+        };
+    }
+
+    /// The bindings a record-backed nominal in a record's extension chain
+    /// made for its declared variables. They stay bound while the caller reads
+    /// the collected field types, which are written in those variables.
+    const BoundNominal = struct {
+        reader: *Reifier,
+        args: NominalArgs,
+    };
+
+    /// Put back the bindings of every nominal an extension chain opened, the
+    /// last opened first.
+    fn releaseBoundNominals(gpa: Allocator, bound: *std.ArrayList(BoundNominal)) void {
+        while (bound.pop()) |entry| {
+            var args = entry.args;
+            entry.reader.releaseNominalArgs(&args);
+        }
+        bound.deinit(gpa);
     }
 
     /// Every field of a record type, following its extension.
@@ -5288,18 +9690,25 @@ pub const Reifier = struct {
     /// module: the definition wrote the fields it named and the site's record
     /// holds the rest. That record holds the named fields too, so a field
     /// already collected is dropped where it comes round a second time.
+    ///
+    /// A record-backed `:=` nominal in the chain contributes its backing's
+    /// fields at this use's arguments, as Monotype's `flattenRecordRow` reads
+    /// it: its name is not kept (design.md "Record Extension
+    /// Well-Formedness").
     fn collectRecordFields(
         self: *Reifier,
         collected: *std.ArrayList(FieldRef),
+        opened: *std.ArrayList(BoundNominal),
         fields: []const checked.CheckedRecordField,
         ext: ?CheckedTypeId,
         region: base.Region,
     ) Error!void {
         var reader = self;
+        var frame = self.frame;
         var link_fields = fields;
         var link_ext = ext;
         while (true) {
-            for (link_fields) |field| try self.collectField(collected, reader, field);
+            for (link_fields) |field| try self.collectField(collected, reader, frame, field);
             const next = link_ext orelse break;
             switch (reader.types.payload(next)) {
                 .empty_record => break,
@@ -5311,41 +9720,181 @@ pub const Reifier = struct {
                     link_fields = &.{};
                     link_ext = alias.backing;
                 },
-                .flex, .rigid => {
-                    const bound = reader.fixedType(next) orelse
+                .flex, .rigid => |variable| {
+                    const bound = reader.fixedTypeIn(frame, next) orelse {
+                        // A row variable nothing fixes is the row default
+                        // lowering seals it to, as `buildTy` reads one.
+                        const payload = reader.types.payload(next);
+                        if (payload == .flex and payload.variableSealsToRowDefault() and variable.row_default.? == .empty_record) break;
                         return self.rejectError(.unresolved_type, region, "an open record");
+                    };
                     // The fields from here on are what one site fixed, so the
                     // frame that asked declines to cache this type.
                     self.substitution_uses += 1;
                     reader = bound.reader;
+                    frame = bound.frame;
                     link_fields = &.{};
                     link_ext = bound.id;
+                },
+                .nominal => |nominal| {
+                    // The checker admits only a record-backed `:=` nominal
+                    // here (design.md "Record Extension Well-Formedness").
+                    std.debug.assert(nominal.builtin == null and !nominal.is_opaque);
+                    const backing = reader.types.nominalBackingTemplateForPayload(nominal) orelse unreachable; // a `:=` nominal a program declared has a backing
+                    try opened.ensureUnusedCapacity(self.gpa, 1);
+                    opened.appendAssumeCapacity(.{ .reader = reader, .args = try reader.bindNominalArgs(frame, nominal) });
+                    link_fields = &.{};
+                    link_ext = backing;
                 },
                 .pending, .err => return self.rejectError(.unresolved_type, region, "an unresolved type"),
                 .tuple,
                 .function,
-                .nominal,
                 .tag_union,
                 .empty_tag_union,
-                => return self.rejectError(.unsupported_type, region, "a record extended by a type that is not a record"),
+                => unreachable, // the checker refuses every other type in an extension slot (design.md "Record Extension Well-Formedness")
             }
         }
     }
 
+    /// Put `fields` in label order, the order of a record's fields in
+    /// `Code.Ty` and in Monotype (`addRecordFields`). The links of a checked
+    /// row can name the fields in another order, so a derivation that walks
+    /// the fields one by one sorts them first: it compares and hashes them
+    /// in the compiler's order, whatever links the checker made.
+    fn sortFieldsByLabel(fields: []FieldRef) void {
+        std.mem.sort(FieldRef, fields, {}, fieldLabelLessThan);
+    }
+
+    /// Whether the label of `a` comes before the label of `b` in the
+    /// compiler's label order (`Ident.textOrder`). Labels of one store
+    /// compare by that store's rank. Two stores intern independently, so
+    /// labels of two stores compare by their texts in that order.
+    fn fieldLabelLessThan(_: void, a: FieldRef, b: FieldRef) bool {
+        if (a.reader == b.reader) return a.reader.names.recordFieldLabelTextLessThan(a.field.name, b.field.name);
+        return base.Ident.textLessThan(a.reader.names.recordFieldLabelText(a.field.name), b.reader.names.recordFieldLabelText(b.field.name));
+    }
+
+    /// `fieldLabelLessThan` for the variants of a tag union.
+    fn tagLabelLessThan(_: void, a: VariantRef, b: VariantRef) bool {
+        if (a.reader == b.reader) return a.reader.names.tagLabelTextLessThan(a.tag.name, b.tag.name);
+        return base.Ident.textLessThan(a.reader.names.tagLabelText(a.tag.name), b.reader.names.tagLabelText(b.tag.name));
+    }
+
     /// Collect one field, unless a link nearer the front of the chain already
     /// named it.
-    fn collectField(self: *Reifier, collected: *std.ArrayList(FieldRef), reader: *Reifier, field: checked.CheckedRecordField) Allocator.Error!void {
+    fn collectField(self: *Reifier, collected: *std.ArrayList(FieldRef), reader: *Reifier, frame: FrameId, field: checked.CheckedRecordField) Allocator.Error!void {
         for (collected.items) |seen| {
             if (seen.reader.sameFieldLabel(seen.field.name, reader, field.name)) return;
         }
-        try collected.append(self.gpa, .{ .reader = reader, .field = field });
+        try collected.append(self.gpa, .{ .reader = reader, .frame = frame, .field = field });
+    }
+
+    /// Refuse a `Code` value met inside a walked body, naming the constant the
+    /// walk was folding when it met it (D7).
+    fn rejectCodeValue(self: *Reifier, region: base.Region) error{Rejected} {
+        return self.rejectError(.code_value, region, self.walk.constant orelse "");
     }
 
     fn rejectError(self: *Reifier, kind: Rejection.Kind, region: base.Region, detail: []const u8) error{Rejected} {
         if (self.walk.rejection == null) {
-            self.walk.rejection = .{ .kind = kind, .region = region, .detail = detail };
+            self.walk.rejection = .{ .kind = kind, .region = region, .module = self.walk.bodyModule(), .detail = detail };
         }
         return error.Rejected;
+    }
+
+    /// This reader's module, as a refusal names it.
+    fn rejectionModule(self: *const Reifier) Rejection.Module {
+        return .{ .artifact = self.artifact, .env = self.env };
+    }
+
+    /// Make this reader's module the one whose source the walk reads, so a
+    /// refusal from here on is placed in it. The caller restores the result
+    /// with `leave` when it is done with this module's source.
+    fn enter(self: *Reifier) ?*Reifier {
+        const outer = self.walk.body;
+        self.walk.body = self;
+        return outer;
+    }
+
+    fn leave(self: *Reifier, outer: ?*Reifier) void {
+        self.walk.body = outer;
+    }
+
+    /// Refuse a type variable, naming it and the place in the signature it
+    /// stands in. A variable reached through a substitution is named by the
+    /// quantified variable the annotation wrote, and the use left it open.
+    fn rejectOpen(self: *Reifier, type_id: CheckedTypeId, region: base.Region) error{Rejected} {
+        const named = self.walk.through orelse FramedType{ .reader = self, .id = type_id, .frame = self.frame };
+        const variable = switch (named.reader.types.payload(named.id)) {
+            .flex, .rigid => |variable| variable,
+            .pending,
+            .err,
+            .alias,
+            .record,
+            .tuple,
+            .nominal,
+            .function,
+            .empty_record,
+            .tag_union,
+            .empty_tag_union,
+            => invariant("a substitution answered for a type that is not a variable"),
+        };
+        // Through a use, the definition's own variable says whether an
+        // annotation wrote it: an annotation names each variable, and
+        // checking names none it infers. What the use put in its place says
+        // only that the use left it open.
+        const own = self.types.payload(type_id);
+        const cause: OpenVariable.Cause = if (self.walk.through != null) switch (own) {
+            .rigid => .use_leaves_open,
+            .flex => |own_variable| if (own_variable.name != null) .use_leaves_open else .inferred_use_leaves_open,
+            .pending, .err, .alias, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => invariant("a type variable was refused at a type that is not a variable"),
+        } else if (own == .rigid)
+            .annotation_leaves_open
+        else
+            .inferred;
+        const at, const module, const place: OpenVariable.Place = switch (self.walk.place) {
+            .expression => .{ region, self.walk.bodyModule(), .expression },
+            .result => .{ region, self.walk.bodyModule(), .result },
+            .parameter => |param| blk: {
+                const pattern = param.reader.bodies.pattern(param.pattern);
+                const binder = param.reader.bodies.patternBinderForCheckedPattern(param.pattern);
+                const single = binder != null and (pattern.data == .assign or pattern.data == .as);
+                break :blk .{ pattern.source_region, param.reader.rejectionModule(), .{ .parameter = if (single)
+                    .{ .name = param.reader.binderName(binder.?) }
+                else
+                    .{ .position = param.position + 1 } } };
+            },
+        };
+        if (self.walk.rejection == null) {
+            self.walk.rejection = .{
+                .kind = .unresolved_type,
+                .region = at,
+                .module = module,
+                .detail = "a type variable",
+                .open = .{ .name = variable.name, .place = place, .cause = cause },
+            };
+        }
+        return error.Rejected;
+    }
+
+    /// What a variable no substitution fixed seals to (`defaultedVariable`),
+    /// null for one with no default, or a refusal for one whose default does
+    /// not fit the dispatch that selected it.
+    fn sealedVariable(self: *Reifier, type_id: CheckedTypeId, variable: checked.CheckedTypeVariable, region: base.Region) error{Rejected}!?checked.literal_defaulting.DefaultTarget {
+        const sealed = defaultedVariable(variable) orelse return null;
+        if (self.unfit.contains(type_id)) {
+            return self.rejectError(.unresolved_type, region, "a type variable whose numeric default has no method that fits how it is used");
+        }
+        return sealed;
+    }
+
+    /// Build a signature type with the walk told where in the signature it
+    /// stands, so a refusal at a type variable names the place.
+    fn placedTy(self: *Reifier, type_id: CheckedTypeId, region: base.Region, place: TypePlace) Error!TyId {
+        const outer = self.walk.place;
+        self.walk.place = place;
+        defer self.walk.place = outer;
+        return self.tyOf(type_id, region);
     }
 
     fn functionOf(self: *Reifier, type_id: CheckedTypeId) ?checked.CheckedFunctionType {
@@ -5378,20 +9927,21 @@ pub const Reifier = struct {
 
     /// The builtin a checked type is, through an alias and through what the
     /// instantiation fixed a variable to.
-    fn primitiveOf(self: *Reifier, type_id: CheckedTypeId) ?checked.CheckedBuiltinNominal {
+    fn builtinNominalOf(self: *Reifier, type_id: CheckedTypeId) ?checked.CheckedBuiltinNominal {
         const resolved = self.resolvedType(type_id);
-        if (resolved.reader != self) return resolved.reader.primitiveOf(resolved.id);
+        if (resolved.reader != self) return resolved.reader.builtinNominalOf(resolved.id);
         return switch (self.types.payload(resolved.id)) {
-            .alias => |alias| self.primitiveOf(alias.backing),
+            .alias => |alias| self.builtinNominalOf(alias.backing),
             .nominal => |nominal| nominal.builtin,
-            .pending, .err, .flex, .rigid, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => null,
+            .flex, .rigid => |variable| if (self.unfit.contains(resolved.id)) null else if (defaultedVariable(variable)) |sealed| defaultBuiltin(sealed) else null,
+            .pending, .err, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => null,
         };
     }
 
     /// The builtin module a checked type's methods belong to, as `Builtin.roc`
     /// exports it, when the type is a scalar builtin.
     fn primitiveOwner(self: *Reifier, type_id: CheckedTypeId) ?[]const u8 {
-        return primitiveOwnerText(self.primitiveOf(type_id) orelse return null);
+        return primitiveOwnerText(self.builtinNominalOf(type_id) orelse return null);
     }
 
     /// The scalar builtin a site type is.
@@ -5436,6 +9986,7 @@ pub const Reifier = struct {
         scheme: Scheme,
         caller: *Reifier,
         fixed: ?CheckedTypeId,
+        use_expr: ?CheckedExprId,
         region: base.Region,
         unfixed: Unfixed,
     ) Error!?Instantiation {
@@ -5456,6 +10007,20 @@ pub const Reifier = struct {
         errdefer substitution.deinit(self.gpa);
         try self.matchType(&substitution, scheme_vars, scheme.root, caller.resolvedType(payload));
 
+        // A variable only a `where` obligation names, such as the literal's
+        // in `f = |x| x * 2`, is not in `f`'s type, so the match cannot reach
+        // it. The checker recorded what the use copied every variable to, and
+        // the dispatch that obligation selected fixed the copy.
+        if (use_expr) |expr| {
+            if (caller.plans.siteSubstitution(expr)) |copied| {
+                if (copied.len != scheme_vars.len) invariant("a use's recorded substitution disagrees with its scheme's variables");
+                for (scheme_vars, copied) |scheme_var, copy| {
+                    if (substitution.contains(scheme_var)) continue;
+                    try substitution.put(self.gpa, scheme_var, caller.resolvedType(copy));
+                }
+            }
+        }
+
         var rows = try self.rowVars(scheme.root);
         defer rows.deinit(self.gpa);
 
@@ -5466,9 +10031,36 @@ pub const Reifier = struct {
         for (scheme_vars) |scheme_var| {
             if (substitution.contains(scheme_var)) continue;
             if (rows.contains(scheme_var)) continue;
-            return self.rejectError(.unresolved_type, region, unfixed.partial);
+            const variable = switch (self.types.payload(scheme_var)) {
+                .flex, .rigid => |variable| variable,
+                .pending,
+                .err,
+                .alias,
+                .record,
+                .tuple,
+                .nominal,
+                .function,
+                .empty_record,
+                .tag_union,
+                .empty_tag_union,
+                => invariant("a scheme quantifies over a type that is not a variable"),
+            };
+            if (self.walk.rejection == null) {
+                self.walk.rejection = .{
+                    .kind = .unresolved_type,
+                    .region = region,
+                    .module = self.walk.bodyModule(),
+                    .detail = unfixed.partial,
+                    .open = .{
+                        .name = variable.name,
+                        .place = .{ .use = unfixed.use },
+                        .cause = if (self.types.payload(scheme_var) == .rigid) .use_leaves_open else .inferred,
+                    },
+                };
+            }
+            return error.Rejected;
         }
-        return .{ .substitution = substitution, .key = instantiationKey(substitution, scheme_vars) };
+        return .{ .substitution = substitution, .key = try instantiationKey(substitution, scheme_vars) };
     }
 
     /// The variables one scheme type stands a row on.
@@ -5511,7 +10103,10 @@ pub const Reifier = struct {
                 }
                 try self.collectRowTail(found, seen, union_ty.ext);
             },
-            .empty_record, .empty_tag_union, .flex, .rigid, .pending, .err => {},
+            // A `where` obligation is part of the scheme, and a row its
+            // method's type stands on is a row of the scheme too.
+            .flex, .rigid => |variable| for (variable.constraints) |constraint| try self.collectRowVars(found, seen, constraint.fn_ty),
+            .empty_record, .empty_tag_union, .pending, .err => {},
         }
     }
 
@@ -5556,7 +10151,7 @@ pub const Reifier = struct {
         substitution: *Substitution,
         scheme_vars: []const CheckedTypeId,
         scheme_id: CheckedTypeId,
-        use: TypeRef,
+        use: FramedType,
     ) Allocator.Error!void {
         for (scheme_vars) |scheme_var| {
             if (scheme_var != scheme_id) continue;
@@ -5569,38 +10164,48 @@ pub const Reifier = struct {
                 const use_fn = use.reader.functionOf(use.id) orelse return;
                 if (use_fn.args.len != scheme_fn.args.len) return;
                 for (scheme_fn.args, use_fn.args) |arg, fixed| {
-                    try self.matchType(substitution, scheme_vars, arg, use.reader.resolvedType(fixed));
+                    try self.matchType(substitution, scheme_vars, arg, use.reader.resolvedTypeIn(use.frame, fixed));
                 }
-                try self.matchType(substitution, scheme_vars, scheme_fn.ret, use.reader.resolvedType(use_fn.ret));
+                try self.matchType(substitution, scheme_vars, scheme_fn.ret, use.reader.resolvedTypeIn(use.frame, use_fn.ret));
             },
             .nominal => |scheme_nominal| {
                 const use_nominal = use.reader.nominalOf(use.id) orelse return;
                 if (use_nominal.args.len != scheme_nominal.args.len) return;
                 for (scheme_nominal.args, use_nominal.args) |arg, fixed| {
-                    try self.matchType(substitution, scheme_vars, arg, use.reader.resolvedType(fixed));
+                    try self.matchType(substitution, scheme_vars, arg, use.reader.resolvedTypeIn(use.frame, fixed));
                 }
             },
             .tuple => |scheme_elements| {
                 const use_elements = use.reader.tupleOf(use.id) orelse return;
                 if (use_elements.len != scheme_elements.len) return;
                 for (scheme_elements, use_elements) |element, fixed| {
-                    try self.matchType(substitution, scheme_vars, element, use.reader.resolvedType(fixed));
+                    try self.matchType(substitution, scheme_vars, element, use.reader.resolvedTypeIn(use.frame, fixed));
                 }
             },
-            .record => |scheme_record| try self.matchRecord(
-                substitution,
-                scheme_vars,
-                scheme_record.fields,
-                scheme_record.ext,
-                use,
-            ),
-            .tag_union => |scheme_union| try self.matchTagUnion(
-                substitution,
-                scheme_vars,
-                scheme_union.tags,
-                scheme_union.ext,
-                use,
-            ),
+            // The checker lifts a structural record or tag union into a
+            // nominal it meets (unify.zig `mergeToNominal`), so where the use
+            // holds a nominal the scheme's structure stands for that nominal
+            // at this use. The structure is no variable, so the lift is an
+            // entry of its own, and the key names it (`instantiationKey`).
+            .record, .tag_union => if (use.reader.nominalOf(use.id) != null) {
+                if (!substitution.contains(scheme_id)) try substitution.put(self.gpa, scheme_id, use);
+            } else switch (self.types.payload(scheme_id)) {
+                .record => |scheme_record| try self.matchRecord(
+                    substitution,
+                    scheme_vars,
+                    scheme_record.fields,
+                    scheme_record.ext,
+                    use,
+                ),
+                .tag_union => |scheme_union| try self.matchTagUnion(
+                    substitution,
+                    scheme_vars,
+                    scheme_union.tags,
+                    scheme_union.ext,
+                    use,
+                ),
+                .alias, .function, .nominal, .tuple, .empty_record, .empty_tag_union, .flex, .rigid, .pending, .err => unreachable, // the outer switch reached this for a record or a tag union only
+            },
             // A row variable is left unbound on purpose: `Ty` has no form for
             // a row, so a description of one would be a description of
             // something else.
@@ -5622,7 +10227,7 @@ pub const Reifier = struct {
         scheme_vars: []const CheckedTypeId,
         fields: []const checked.CheckedRecordField,
         ext: ?CheckedTypeId,
-        use: TypeRef,
+        use: FramedType,
     ) Allocator.Error!void {
         var scheme_fields = std.ArrayList(checked.CheckedRecordField).empty;
         defer scheme_fields.deinit(self.gpa);
@@ -5632,7 +10237,8 @@ pub const Reifier = struct {
         defer use_fields.deinit(self.gpa);
         switch (use.reader.types.payload(use.id)) {
             .record => |use_record| try use.reader.recordFields(&use_fields, use_record.fields, use_record.ext),
-            .alias,
+            // A use written through an alias is its backing (D2).
+            .alias => |alias| return self.matchRecord(substitution, scheme_vars, fields, ext, use.reader.resolvedTypeIn(use.frame, alias.backing)),
             .empty_record,
             .tuple,
             .function,
@@ -5649,7 +10255,7 @@ pub const Reifier = struct {
         for (scheme_fields.items) |field| {
             for (use_fields.items) |fixed| {
                 if (!self.sameFieldLabel(field.name, use.reader, fixed.name)) continue;
-                try self.matchType(substitution, scheme_vars, field.ty, use.reader.resolvedType(fixed.ty));
+                try self.matchType(substitution, scheme_vars, field.ty, use.reader.resolvedTypeIn(use.frame, fixed.ty));
                 break;
             }
         }
@@ -5736,7 +10342,7 @@ pub const Reifier = struct {
         scheme_vars: []const CheckedTypeId,
         tags: []const checked.CheckedTag,
         ext: CheckedTypeId,
-        use: TypeRef,
+        use: FramedType,
     ) Allocator.Error!void {
         var scheme_tags = std.ArrayList(checked.CheckedTag).empty;
         defer scheme_tags.deinit(self.gpa);
@@ -5767,9 +10373,42 @@ pub const Reifier = struct {
                 const fixed_payloads = fixed.argsSlice(use.reader.types);
                 if (payloads.len != fixed_payloads.len) break;
                 for (payloads, fixed_payloads) |payload, fixed_payload| {
-                    try self.matchType(substitution, scheme_vars, payload, use.reader.resolvedType(fixed_payload));
+                    try self.matchType(substitution, scheme_vars, payload, use.reader.resolvedTypeIn(use.frame, fixed_payload));
                 }
                 break;
+            }
+        }
+
+        // The row the scheme stands on is the variants the use has beyond the
+        // ones the scheme named, bound to the use's whole union as a record's
+        // row is (`matchRecord`): `collectVariants` drops a variant a nearer
+        // link already named.
+        const row = self.tagRowTail(ext) orelse return;
+        for (scheme_vars) |scheme_var| {
+            if (scheme_var != row) continue;
+            if (!substitution.contains(row)) try substitution.put(self.gpa, row, use);
+            return;
+        }
+    }
+
+    /// The variable one tag union type stands its row on, or null where its
+    /// extension chain ends closed.
+    fn tagRowTail(self: *Reifier, ext: CheckedTypeId) ?CheckedTypeId {
+        var link = ext;
+        while (true) {
+            switch (self.types.payload(link)) {
+                .flex, .rigid => return link,
+                .tag_union => |more| link = more.ext,
+                .alias => |alias| link = alias.backing,
+                .pending,
+                .err,
+                .tuple,
+                .nominal,
+                .function,
+                .record,
+                .empty_record,
+                .empty_tag_union,
+                => return null,
             }
         }
     }
@@ -5826,6 +10465,19 @@ pub const Reifier = struct {
         return here == other_label;
     }
 
+    /// Whether a type name of this store and a type name of another store
+    /// are the same name, as `sameFieldLabel` does for field labels.
+    fn sameTypeName(
+        self: *Reifier,
+        name: canonical.TypeNameId,
+        other: *Reifier,
+        other_name: canonical.TypeNameId,
+    ) bool {
+        if (self == other) return name == other_name;
+        const here = other.names.lookupTypeName(self.names.typeNameText(name)) orelse return false;
+        return here == other_name;
+    }
+
     /// Whether a tag label of this store names the variant a label of another
     /// store names.
     fn sameTagLabel(
@@ -5848,7 +10500,7 @@ pub const Reifier = struct {
     fn instantiationKey(
         substitution: Substitution,
         scheme_vars: []const CheckedTypeId,
-    ) [32]u8 {
+    ) Allocator.Error![32]u8 {
         var hasher = std.crypto.hash.Blake3.init(.{});
         for (scheme_vars) |scheme_var| {
             // An unbound variable is a row, which no description names, so
@@ -5857,26 +10509,436 @@ pub const Reifier = struct {
                 hasher.update(&@as([32]u8, @splat(0)));
                 continue;
             };
-            hasher.update(&bound.reader.types.rootKey(bound.id).bytes);
+            try hashBinding(&hasher, bound);
+        }
+        // A structure the use lifted into a nominal (`matchType`) is keyed
+        // too, by the nominal it stands for: a use that lifts it and one that
+        // does not are two types the definition is called at. The structure's
+        // id is canonical in the defining module, which every use shares, and
+        // the entries are in the order the match met them, which the scheme
+        // fixes.
+        var entries = substitution.constIterator();
+        while (entries.next()) |entry| {
+            const in_scheme = for (scheme_vars) |scheme_var| {
+                if (scheme_var == entry.key_ptr.*) break true;
+            } else false;
+            if (in_scheme) continue;
+            hasher.update(std.mem.asBytes(&@backingInt(entry.key_ptr.*)));
+            try hashBinding(&hasher, entry.value_ptr.*);
         }
         var key: [32]u8 = undefined;
         hasher.final(&key);
         return key;
     }
 
+    /// Digest one binding: its type, and what each variable in that type
+    /// stands for in the frame the binding names (D2). Two instances of an
+    /// outer definition bind an inner row to one record id whose tail is the
+    /// outer row, so the id alone would give both one key. A frame's bindings
+    /// were made in earlier frames, so the descent ends.
+    fn hashBinding(hasher: *std.crypto.hash.Blake3, bound: FramedType) Allocator.Error!void {
+        if (try hashRecordBinding(hasher, bound)) return;
+        if (try hashTagBinding(hasher, bound)) return;
+        hasher.update(&bound.reader.types.rootKey(bound.id).bytes);
+        if (bound.frame == empty_frame) return;
+        const reader = bound.reader;
+        var variables = std.ArrayList(CheckedTypeId).empty;
+        defer variables.deinit(reader.gpa);
+        var seen: RowVars = .empty;
+        defer seen.deinit(reader.gpa);
+        try reader.collectVariables(&variables, &seen, bound.id);
+        for (variables.items) |variable| {
+            const fixed = reader.walk.frameSubstitution(bound.frame).get(variable) orelse continue;
+            std.debug.assert(fixed.frame < bound.frame);
+            try hashBinding(hasher, fixed);
+        }
+    }
+
+    /// Digest a binding that is a record as the record its extension chain
+    /// reaches through the frames: its fields by name, each once, the nearest
+    /// link's first, and what the chain ends at. A recursive call of an
+    /// open-row helper binds its row to its own parameter record, whose tail
+    /// is the row the call above bound, so one type is written a new way at
+    /// each depth. Digesting what the chain reaches gives every depth one key,
+    /// and the walk meets the row it opened (D2). False when the binding is
+    /// not a record.
+    fn hashRecordBinding(hasher: *std.crypto.hash.Blake3, bound: FramedType) Allocator.Error!bool {
+        var id = bound.id;
+        while (bound.reader.types.payload(id) == .alias) id = bound.reader.types.payload(id).alias.backing;
+        const record = switch (bound.reader.types.payload(id)) {
+            .record => |record| record,
+            .pending,
+            .err,
+            .flex,
+            .rigid,
+            .alias,
+            .tuple,
+            .nominal,
+            .function,
+            .empty_record,
+            .tag_union,
+            .empty_tag_union,
+            => return false,
+        };
+        const gpa = bound.reader.gpa;
+        var fields = std.ArrayList(FieldRef).empty;
+        defer fields.deinit(gpa);
+        var reader = bound.reader;
+        var frame = bound.frame;
+        var link_fields = record.fields;
+        var link_ext: ?CheckedTypeId = record.ext;
+        var tail: ?FramedType = null;
+        while (true) {
+            for (link_fields) |field| try reader.collectField(&fields, reader, frame, field);
+            const next = link_ext orelse break;
+            switch (reader.types.payload(next)) {
+                .empty_record => break,
+                .record => |link| {
+                    link_fields = link.fields;
+                    link_ext = link.ext;
+                },
+                .alias => |alias| {
+                    link_fields = &.{};
+                    link_ext = alias.backing;
+                },
+                .flex, .rigid => {
+                    const fixed = reader.fixedTypeIn(frame, next) orelse {
+                        tail = .{ .reader = reader, .id = next, .frame = frame };
+                        break;
+                    };
+                    reader = fixed.reader;
+                    frame = fixed.frame;
+                    link_fields = &.{};
+                    link_ext = fixed.id;
+                },
+                .nominal, .tuple, .function, .tag_union, .empty_tag_union, .pending, .err => {
+                    tail = .{ .reader = reader, .id = next, .frame = frame };
+                    break;
+                },
+            }
+        }
+        std.mem.sort(FieldRef, fields.items, {}, fieldLabelLessThan);
+        hasher.update("record");
+        for (fields.items) |field| {
+            const label = field.reader.names.recordFieldLabelText(field.field.name);
+            hasher.update(std.mem.asBytes(&label.len));
+            hasher.update(label);
+            hasher.update(std.mem.asBytes(&@backingInt(field.field.kind.tag)));
+            try hashBinding(hasher, field.reader.resolvedTypeIn(field.frame, field.field.ty));
+        }
+        if (tail) |end| try hashBinding(hasher, end) else hasher.update("closed");
+        return true;
+    }
+
+    /// `hashRecordBinding` for a tag union: its variants by name, each once,
+    /// the nearest link's first, and what the chain ends at. A recursive call
+    /// of an open-row helper over a tag union binds its row the same way a
+    /// record helper does (D2). False when the binding is not a tag union.
+    fn hashTagBinding(hasher: *std.crypto.hash.Blake3, bound: FramedType) Allocator.Error!bool {
+        var id = bound.id;
+        while (bound.reader.types.payload(id) == .alias) id = bound.reader.types.payload(id).alias.backing;
+        const tag_union = switch (bound.reader.types.payload(id)) {
+            .tag_union => |tag_union| tag_union,
+            .pending,
+            .err,
+            .flex,
+            .rigid,
+            .alias,
+            .record,
+            .tuple,
+            .nominal,
+            .function,
+            .empty_record,
+            .empty_tag_union,
+            => return false,
+        };
+        const gpa = bound.reader.gpa;
+        var variants = std.ArrayList(VariantRef).empty;
+        defer variants.deinit(gpa);
+        var reader = bound.reader;
+        var frame = bound.frame;
+        var link_tags = tag_union.tags;
+        var link_ext: ?CheckedTypeId = tag_union.ext;
+        var tail: ?FramedType = null;
+        while (true) {
+            for (link_tags) |tag| try reader.collectVariant(&variants, reader, frame, tag);
+            const next = link_ext orelse break;
+            switch (reader.types.payload(next)) {
+                .empty_tag_union => break,
+                .tag_union => |link| {
+                    link_tags = link.tags;
+                    link_ext = link.ext;
+                },
+                .alias => |alias| {
+                    link_tags = &.{};
+                    link_ext = alias.backing;
+                },
+                .flex, .rigid => {
+                    const fixed = reader.fixedTypeIn(frame, next) orelse {
+                        tail = .{ .reader = reader, .id = next, .frame = frame };
+                        break;
+                    };
+                    reader = fixed.reader;
+                    frame = fixed.frame;
+                    link_tags = &.{};
+                    link_ext = fixed.id;
+                },
+                .nominal, .tuple, .function, .record, .empty_record, .pending, .err => {
+                    tail = .{ .reader = reader, .id = next, .frame = frame };
+                    break;
+                },
+            }
+        }
+        std.mem.sort(VariantRef, variants.items, {}, tagLabelLessThan);
+        hasher.update("tag_union");
+        for (variants.items) |variant| {
+            const label = variant.reader.names.tagLabelText(variant.tag.name);
+            hasher.update(std.mem.asBytes(&label.len));
+            hasher.update(label);
+            const payloads = variant.tag.argsSlice(variant.reader.types);
+            hasher.update(std.mem.asBytes(&payloads.len));
+            for (payloads) |payload| try hashBinding(hasher, variant.reader.resolvedTypeIn(variant.frame, payload));
+        }
+        if (tail) |end| try hashBinding(hasher, end) else hasher.update("closed");
+        return true;
+    }
+
     /// The concrete type a checked id names here, which for a quantified
     /// variable is what the call being walked fixed it to.
-    fn resolvedType(self: *Reifier, type_id: CheckedTypeId) TypeRef {
-        return self.fixedType(type_id) orelse .{ .reader = self, .id = type_id };
+    fn resolvedType(self: *Reifier, type_id: CheckedTypeId) FramedType {
+        return self.resolvedTypeIn(self.frame, type_id);
+    }
+
+    /// `resolvedType` in `frame`, where a type reference names its variables.
+    fn resolvedTypeIn(self: *Reifier, frame: FrameId, type_id: CheckedTypeId) FramedType {
+        return self.fixedTypeIn(frame, type_id) orelse .{ .reader = self, .id = type_id, .frame = frame };
     }
 
     /// What a variable stands for here: what the call fixed a quantified
     /// variable to, or what a use fixed a nominal's declared variable to.
-    fn fixedType(self: *Reifier, type_id: CheckedTypeId) ?TypeRef {
-        if (self.substitution.get(type_id)) |fixed| return fixed;
-        return self.nominal_args.get(type_id);
+    fn fixedType(self: *Reifier, type_id: CheckedTypeId) ?FramedType {
+        return self.fixedTypeIn(self.frame, type_id);
+    }
+
+    /// `fixedType` in `frame`.
+    fn fixedTypeIn(self: *Reifier, frame: FrameId, type_id: CheckedTypeId) ?FramedType {
+        if (self.walk.frameSubstitution(frame).get(type_id)) |fixed| return fixed;
+        if (self.nominal_args.get(type_id)) |fixed| return fixed;
+        return self.related.get(type_id);
+    }
+
+    /// Relate every monomorphic dispatch target that publication selected for
+    /// a callable checking never instantiated to that callable, once per
+    /// module.
+    ///
+    /// Such an edge is `derived_from_callable`: publication chose the target
+    /// (the numeric default owner of a dispatcher no edge pins, the procedure
+    /// an alias reaches, or a literal conversion), and the edge's contract is
+    /// that specialization relates the target's type to the callable. That is
+    /// what fixes `y` in `|x, y| x + y`: `x` seals to `Dec`, publication
+    /// selected `Dec.plus`, and `Dec.plus : Dec, Dec -> Dec` fixes the other
+    /// argument and the result. Monotype honours the contract when it lowers
+    /// the dispatch, and a description is the same specialization read
+    /// without lowering, so the walk honours it here. A generic target fixes
+    /// none of the callable's variables by its own type, so it is not related.
+    fn relateSelectedTargets(self: *Reifier) Allocator.Error!void {
+        if (self.related_ready) return;
+        self.related_ready = true;
+        var variables = std.ArrayList(CheckedTypeId).empty;
+        defer variables.deinit(self.gpa);
+        var seen: RowVars = .empty;
+        defer seen.deinit(self.gpa);
+        for (self.plans.evidence_nodes) |node| {
+            const callable = switch (node.instantiation) {
+                .derived_from_callable => |callable| callable,
+                .monomorphic, .callable, .alias => continue,
+            };
+            const procedure = switch (node.target.kind) {
+                .procedure => |procedure| procedure,
+                .local_proc, .structural => continue,
+            };
+            const target = try self.targetTemplate(procedure.template, node.target.def_idx) orelse continue;
+            if (target.reader.schemeVars(target.template).len != 0) continue;
+            const target_fn: FramedType = .{ .reader = target.reader, .id = target.template.checked_fn_root, .frame = empty_frame };
+            if (!self.fitsTarget(callable, target_fn)) {
+                if (node.dispatcher_ty) |dispatcher| try self.unfit.put(self.gpa, dispatcher, {});
+                continue;
+            }
+            variables.clearRetainingCapacity();
+            seen.clearRetainingCapacity();
+            try self.collectVariables(&variables, &seen, callable);
+            try self.matchType(&self.related, variables.items, callable, target_fn);
+        }
+    }
+
+    /// Whether a monomorphic target's type agrees with a callable everywhere
+    /// the callable is not a variable, so relating the two fixes the
+    /// callable's variables rather than contradicting its concrete parts.
+    fn fitsTarget(self: *Reifier, callable: CheckedTypeId, target: FramedType) bool {
+        const use = target.reader.resolvedTypeIn(target.frame, target.id);
+        const use_payload = use.reader.types.payload(use.id);
+        switch (use_payload) {
+            .alias => |alias| return self.fitsTarget(callable, .{ .reader = use.reader, .id = alias.backing, .frame = use.frame }),
+            // The target leaves this part to the callable.
+            .flex, .rigid => return true,
+            .pending, .err => return false,
+            .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => {},
+        }
+        return switch (self.types.payload(callable)) {
+            .flex, .rigid => true,
+            .alias => |alias| self.fitsTarget(alias.backing, use),
+            .pending, .err => false,
+            .empty_record => use_payload == .empty_record,
+            .empty_tag_union => use_payload == .empty_tag_union,
+            .function => |fn_ty| blk: {
+                const use_fn = switch (use_payload) {
+                    .function => |use_fn| use_fn,
+                    .pending, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .empty_record, .tag_union, .empty_tag_union => break :blk false,
+                };
+                if (fn_ty.args.len != use_fn.args.len) break :blk false;
+                for (fn_ty.args, use_fn.args) |arg, use_arg| {
+                    if (!self.fitsTarget(arg, .{ .reader = use.reader, .id = use_arg, .frame = use.frame })) break :blk false;
+                }
+                break :blk self.fitsTarget(fn_ty.ret, .{ .reader = use.reader, .id = use_fn.ret, .frame = use.frame });
+            },
+            .nominal => |nominal| blk: {
+                const use_nominal = switch (use_payload) {
+                    .nominal => |use_nominal| use_nominal,
+                    .pending, .err, .flex, .rigid, .alias, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
+                };
+                // Ids are each store's own, so this side's names are looked
+                // up in the target's store.
+                if (use.reader.names.lookupModuleIdentity(self.names.moduleIdentityBytes(nominal.origin_module)) != use_nominal.origin_module) break :blk false;
+                if (use.reader.names.lookupTypeName(self.names.typeNameText(nominal.name)) != use_nominal.name) break :blk false;
+                if (nominal.args.len != use_nominal.args.len) break :blk false;
+                for (nominal.args, use_nominal.args) |arg, use_arg| {
+                    if (!self.fitsTarget(arg, .{ .reader = use.reader, .id = use_arg, .frame = use.frame })) break :blk false;
+                }
+                break :blk true;
+            },
+            .tuple => |parts| blk: {
+                const use_parts = switch (use_payload) {
+                    .tuple => |use_parts| use_parts,
+                    .pending, .err, .flex, .rigid, .alias, .record, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
+                };
+                if (parts.len != use_parts.len) break :blk false;
+                for (parts, use_parts) |part, use_part| {
+                    if (!self.fitsTarget(part, .{ .reader = use.reader, .id = use_part, .frame = use.frame })) break :blk false;
+                }
+                break :blk true;
+            },
+            .record => |record| blk: {
+                const use_record = switch (use_payload) {
+                    .record => |use_record| use_record,
+                    .pending, .err, .flex, .rigid, .alias, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
+                };
+                if (record.fields.len != use_record.fields.len) break :blk false;
+                for (record.fields) |field| {
+                    const name = use.reader.names.lookupRecordFieldLabel(self.names.recordFieldLabelText(field.name)) orelse break :blk false;
+                    const match = for (use_record.fields) |use_field| {
+                        if (use_field.name == name) break use_field;
+                    } else break :blk false;
+                    if (!self.fitsTarget(field.ty, .{ .reader = use.reader, .id = match.ty, .frame = use.frame })) break :blk false;
+                }
+                break :blk self.fitsTarget(record.ext, .{ .reader = use.reader, .id = use_record.ext, .frame = use.frame });
+            },
+            .tag_union => |union_ty| blk: {
+                const use_union = switch (use_payload) {
+                    .tag_union => |use_union| use_union,
+                    .pending, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .function, .empty_record, .empty_tag_union => break :blk false,
+                };
+                if (union_ty.tags.len != use_union.tags.len) break :blk false;
+                for (union_ty.tags) |variant| {
+                    const name = use.reader.names.lookupTagLabel(self.names.tagLabelText(variant.name)) orelse break :blk false;
+                    const match = for (use_union.tags) |use_variant| {
+                        if (use_variant.name == name) break use_variant;
+                    } else break :blk false;
+                    const args = variant.argsSlice(self.types);
+                    const use_args = match.argsSlice(use.reader.types);
+                    if (args.len != use_args.len) break :blk false;
+                    for (args, use_args) |arg, use_arg| {
+                        if (!self.fitsTarget(arg, .{ .reader = use.reader, .id = use_arg, .frame = use.frame })) break :blk false;
+                    }
+                }
+                break :blk self.fitsTarget(union_ty.ext, .{ .reader = use.reader, .id = use_union.ext, .frame = use.frame });
+            },
+        };
+    }
+
+    /// The template one method target names and the reader of the module that
+    /// declares it, or null for a module the walk cannot read.
+    fn targetTemplate(
+        self: *Reifier,
+        template_ref: canonical.ProcedureTemplateRef,
+        def_idx: CIR.Def.Idx,
+    ) Allocator.Error!?struct { reader: *Reifier, template: checked.CheckedProcedureTemplate } {
+        if (std.meta.eql(template_ref.artifact.bytes, self.artifact.bytes)) {
+            const templates = self.procedure_templates.templates.items;
+            const raw = @backingInt(template_ref.template);
+            if (raw >= templates.len) return null;
+            return .{ .reader = self, .template = templates[raw] };
+        }
+        const definition = self.walk.foreign.findExported(.{ .bytes = template_ref.artifact.bytes }, def_idx) orelse return null;
+        return .{ .reader = try self.walk.reader(definition.module), .template = definition.template };
+    }
+
+    /// Every type variable one checked type reaches, in this reader's store.
+    fn collectVariables(self: *Reifier, found: *std.ArrayList(CheckedTypeId), seen: *RowVars, id: CheckedTypeId) Allocator.Error!void {
+        if ((try seen.getOrPut(self.gpa, id)).found_existing) return;
+        switch (self.types.payload(id)) {
+            .flex, .rigid => try found.append(self.gpa, id),
+            .alias => |alias| try self.collectVariables(found, seen, alias.backing),
+            .function => |fn_ty| {
+                for (fn_ty.args) |arg| try self.collectVariables(found, seen, arg);
+                try self.collectVariables(found, seen, fn_ty.ret);
+            },
+            .nominal => |nominal| for (nominal.args) |arg| try self.collectVariables(found, seen, arg),
+            .tuple => |parts| for (parts) |part| try self.collectVariables(found, seen, part),
+            .record => |record| {
+                for (record.fields) |field| try self.collectVariables(found, seen, field.ty);
+                try self.collectVariables(found, seen, record.ext);
+            },
+            .tag_union => |union_ty| {
+                for (union_ty.tags) |variant| {
+                    for (variant.argsSlice(self.types)) |arg| try self.collectVariables(found, seen, arg);
+                }
+                try self.collectVariables(found, seen, union_ty.ext);
+            },
+            .empty_record, .empty_tag_union, .pending, .err => {},
+        }
     }
 };
+
+/// Where in a row's signature a type stands. The pattern of a parameter is
+/// named in the module of `reader`.
+const TypePlace = union(enum) {
+    expression,
+    parameter: struct { reader: *Reifier, pattern: CheckedPatternId, position: u32 },
+    result,
+};
+
+/// The builtin a type variable stands for where nothing fixed it, or null for
+/// one with no default.
+///
+/// The walk describes a function the way Monotype specializes one: a variable
+/// a substitution fixes is read through it first (`fixedType`), and a variable
+/// still open after that is sealed by the default checking published on it,
+/// by the rule `lowerCheckedTypeVariable` seals it by. So `x` in `|x| x * 2`
+/// describes at `Dec`, and `x` in `same = |x| x`, which carries no default,
+/// stays open and is refused.
+fn defaultedVariable(variable: checked.CheckedTypeVariable) ?checked.literal_defaulting.DefaultTarget {
+    const phase = variable.numeric_default_phase orelse return null;
+    return checked.literal_defaulting.defaultTargetForPhase(phase) orelse
+        invariant("a checking-finalized numeric variable reached publication unresolved");
+}
+
+/// The builtin a default seals a variable to.
+fn defaultBuiltin(target: checked.literal_defaulting.DefaultTarget) checked.CheckedBuiltinNominal {
+    return switch (target) {
+        .dec => .dec,
+        .str => .str,
+    };
+}
 
 /// Stop on a broken invariant of the walk: a state no input reaches.
 fn invariant(comptime message: []const u8) noreturn {
@@ -5889,17 +10951,6 @@ fn positionOf(comptime Id: type, ids: []const Id, id: Id) ?usize {
         if (each == id) return index;
     }
     return null;
-}
-
-/// Whether two modules belong to one package, by the name the workspace gives
-/// each (N8h). A module no coordinator placed in a package belongs to the
-/// unnamed one.
-fn samePackage(a: *const ModuleEnv, b: *const ModuleEnv) bool {
-    return std.mem.eql(u8, packageText(a), packageText(b));
-}
-
-fn packageText(env: *const ModuleEnv) []const u8 {
-    return env.package_name;
 }
 
 /// The method an arithmetic or comparison operator desugars to.
@@ -6173,49 +11224,13 @@ fn exprFormName(data: checked.CheckedExprData) []const u8 {
     };
 }
 
-/// Whether a binder's name is the one its author wrote.
-///
-/// A binder's name is read back from its region, which holds for a binding
-/// written in the source and not for one the compiler introduced while
-/// desugaring: the `Ok` binder `x ?? default` produces carries the whole
-/// expression's region. A translator emits these names into its own target,
-/// so a name that is not one is refused rather than carried.
-/// The identifier an `as` pattern's region ends with.
-///
-/// The region covers the pattern being renamed as well, and only the name is
-/// wanted. Scanning back over the characters a name may hold finds it without
-/// the walk having to know what the pattern before it was written as.
-/// The name inside a string pattern's `${name}`, or the text as it stands.
-///
-/// A capture's region is the whole interpolation, and `${x}` is no name a
-/// target accepts, so the walk would invent one where the author wrote `x`.
-fn interpolatedIdentifier(text: []const u8) []const u8 {
-    if (text.len < 3) return text;
-    if (text[0] != '$' or text[1] != '{' or text[text.len - 1] != '}') return text;
-    return text[2 .. text.len - 1];
-}
-
-fn trailingIdentifier(text: []const u8) []const u8 {
-    var start = text.len;
-    while (start > 0 and isNameChar(text[start - 1])) start -= 1;
-    return text[start..];
-}
-
-fn isNameChar(char: u8) bool {
-    // `$` starts a `var`'s name, which Roc requires and which the
-    // description carries the way it carries every other source spelling.
-    return std.ascii.isAlphanumeric(char) or char == '_' or char == '!' or char == '$';
-}
-
 fn patternFormName(data: checked.CheckedPatternData) []const u8 {
     return switch (data) {
         .list => "a list pattern",
         .str_interpolation => "a string interpolation pattern",
         .runtime_error => "a pattern that failed to compile",
-        // The checked artifact keeps an `as` binder without the identifier it
-        // was written with, so there is no name for a translator to emit.
-        .as => "an `as` pattern",
         .pending,
+        .as,
         .assign,
         .applied_tag,
         .nominal,
@@ -6281,8 +11296,280 @@ pub const SiteProvenance = struct {
 /// description, and either the description or the reason the walk stopped.
 pub const SiteOutcome = struct {
     expr: CheckedExprId,
+    /// The site's region in its module, where a refusal in another module's
+    /// source is reported from.
+    region: base.Region,
     outcome: Outcome,
+    /// The site's input slots, in slot order. Empty unless the site's
+    /// translator returns a `Code.Bound` and the description reads a value
+    /// that exists only at run time.
+    slots: []SlotSource = &.{},
+    /// The call that binds the site's input slots, as the checker recorded
+    /// it, or null.
+    bound_call: ?u32 = null,
+    /// The conversion roots of the custom literals the walk met, which
+    /// lowering reads where the site stands. Owned.
+    reads: []checked.CheckedCodeRead = &.{},
 };
+
+/// What the program supplies for one input slot: a run-time name, read
+/// through these projections at the call (N18b).
+pub const SlotSource = struct {
+    leaf: PatternBinderId,
+    steps: []const SlotStep,
+    /// The slot type's shape (`slotShape`), which the site lowering checks
+    /// the value it builds against in debug builds. An encoded slot's shape
+    /// is the one word `encoded`.
+    shape: []const u32,
+    /// The encoder of a slot whose type holds an opaque type: the expression
+    /// `T.encoder_for(fmt.default())` of the capture read the slot is.
+    encoder: ?CheckedExprId = null,
+};
+
+/// One capture read of a lambda at a `Code.Binds` position, as a slot path:
+/// the captured name and the projections the read applies, with the
+/// encoder the checker required for the read (rule "Bound Capture
+/// Encoding").
+pub const CaptureRead = struct {
+    leaf: PatternBinderId,
+    steps: []const SlotStep,
+    encoder: CheckedExprId,
+};
+
+/// The capture reads of the lambda `site`, as slot paths. Owned.
+fn captureReads(gpa: Allocator, bodies: *const checked.CheckedBodyStore, site: CheckedExprId) Allocator.Error![]CaptureRead {
+    const bound = bodies.boundCaptureExprsForSite(site);
+    const out = try gpa.alloc(CaptureRead, bound.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |read| gpa.free(read.steps);
+        gpa.free(out);
+    }
+    var steps = std.ArrayList(SlotStep).empty;
+    defer steps.deinit(gpa);
+    for (bound) |entry| {
+        steps.clearRetainingCapacity();
+        var current = entry.read;
+        const leaf: ?PatternBinderId = while (true) {
+            switch (bodies.expr(current).data) {
+                .lookup_local => |lookup| break bodies.patternBinderForCheckedPattern(lookup.pattern) orelse
+                    invariant("a capture read names a pattern with no binder"),
+                .field_access => |access| {
+                    var i = access.segments.len;
+                    while (i > 0) {
+                        i -= 1;
+                        try steps.append(gpa, .{ .field = access.segments[i].field_name });
+                    }
+                    current = access.receiver;
+                },
+                .tuple_access => |access| {
+                    try steps.append(gpa, .{ .index = access.elem_index });
+                    current = access.tuple;
+                },
+                // A capture read that failed to check is an error, and the
+                // site is left to it.
+                .pending,
+                .numeral,
+                .str_from_quote,
+                .code_from_lambda,
+                .str_segment,
+                .str,
+                .bytes_literal,
+                .lookup_external,
+                .lookup_required,
+                .list,
+                .empty_list,
+                .tuple,
+                .match_,
+                .if_,
+                .call,
+                .record,
+                .empty_record,
+                .block,
+                .tag,
+                .nominal,
+                .zero_argument_tag,
+                .closure,
+                .lambda,
+                .binop,
+                .unary_minus,
+                .unary_not,
+                .dispatch_call,
+                .interpolation,
+                .structural_eq,
+                .structural_hash,
+                .method_eq,
+                .type_dispatch_call,
+                .runtime_error,
+                .crash,
+                .dbg,
+                .expect_err,
+                .expect,
+                .ellipsis,
+                .anno_only,
+                .break_,
+                .return_,
+                .row_coerce,
+                .for_,
+                .hosted_lambda,
+                .run_low_level,
+                => break null,
+            }
+        };
+        if (leaf == null) continue;
+        std.mem.reverse(SlotStep, steps.items);
+        out[made] = .{ .leaf = leaf.?, .steps = try gpa.dupe(SlotStep, steps.items), .encoder = entry.encoder_expr };
+        made += 1;
+    }
+    return gpa.realloc(out, made);
+}
+
+fn freeCaptureReads(gpa: Allocator, reads: []CaptureRead) void {
+    for (reads) |read| gpa.free(read.steps);
+    gpa.free(reads);
+}
+
+/// Whether a slot type holds an opaque type anywhere, so that the program
+/// binds it as the bytes of its encoder (`Code.Value.Encoded`).
+fn holdsOpaque(gpa: Allocator, types: *const Types, ty: TyId) Allocator.Error!bool {
+    var pending = std.ArrayList(TyId).empty;
+    defer pending.deinit(gpa);
+    try pending.append(gpa, ty);
+    while (pending.pop()) |current| {
+        switch (types.get(current)) {
+            .opaque_ => return true,
+            .func, .int, .float, .dec, .bool_, .str, .recursive => {},
+            .list => |elem| try pending.append(gpa, elem),
+            .nominal => |n| try pending.append(gpa, n.backing),
+            .tuple => |span| try pending.appendSlice(gpa, types.tySlice(span)),
+            .record => |span| for (types.memberSlice(span)) |field| try pending.appendSlice(gpa, types.tySlice(field.tys)),
+            .tag_union => |span| for (types.memberSlice(span)) |tag| try pending.appendSlice(gpa, types.tySlice(tag.tys)),
+        }
+    }
+    return false;
+}
+
+/// One projection of a slot source.
+pub const SlotStep = union(enum) {
+    field: canonical.RecordFieldLabelId,
+    index: u32,
+    unwrap,
+};
+
+fn sameSteps(a: []const SlotStep, b: []const SlotStep) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const same = switch (x) {
+            .field => |label| y == .field and y.field == label,
+            .index => |k| y == .index and y.index == k,
+            .unwrap => y == .unwrap,
+        };
+        if (!same) return false;
+    }
+    return true;
+}
+
+/// Why a slot whose type holds an opaque type has no encoder: the site is no
+/// `Code.Binds` position, or the slot is a value the description reads other
+/// than as a capture read (`{ at } = order`, then `at`).
+fn opaqueSlotRefusal(binds: bool, steps: []const SlotStep) []const u8 {
+    if (!binds) return "a captured value of an opaque type, which a translator binds only through a `Code.Binds` parameter that names its format";
+    for (steps) |step| switch (step) {
+        .unwrap => return "a value of an opaque type inside a captured nominal value; read the captured value itself",
+        .field, .index => {},
+    };
+    return "a value of an opaque type that the function does not read as a captured name or a field of one; read it as the field path itself, such as `order.at` instead of `{ at } = order` and `at`";
+}
+
+/// The words that say the shape of a slot of type `ty`, in pre-order, which
+/// the site lowering compares with the type it builds a `Code.Value` at in
+/// debug builds (`CodeValueShape` in `checked_artifact.zig` names the
+/// words). Returns why the type holds a shape no `Code.Value` expresses, or
+/// null.
+fn slotShape(
+    gpa: Allocator,
+    types: *const Types,
+    names: *const canonical.CanonicalNameStore,
+    ty: TyId,
+    out: *std.ArrayList(u32),
+) Allocator.Error!?[]const u8 {
+    const S = checked.CodeValueShape;
+    const Item = union(enum) { ty: TyId, word: u32 };
+    var pending = std.ArrayList(Item).empty;
+    defer pending.deinit(gpa);
+    try pending.append(gpa, .{ .ty = ty });
+    while (pending.pop()) |item| {
+        const current = switch (item) {
+            .word => |word| {
+                try out.append(gpa, word);
+                continue;
+            },
+            .ty => |current| current,
+        };
+        switch (types.get(current)) {
+            .func => return "a captured function value",
+            .opaque_ => return "a captured value of an opaque type",
+            .int => |int| try out.appendSlice(gpa, &.{ @backingInt(S.int), @backingInt(int) }),
+            .float => |float| try out.appendSlice(gpa, &.{ @backingInt(S.frac), @intFromBool(float == .f64) }),
+            .dec => try out.append(gpa, @backingInt(S.dec)),
+            .bool_ => try out.append(gpa, @backingInt(S.bool_)),
+            .str => try out.append(gpa, @backingInt(S.str)),
+            .recursive => try out.append(gpa, @backingInt(S.recursive)),
+            .list => |elem| {
+                try out.append(gpa, @backingInt(S.list));
+                try pending.append(gpa, .{ .ty = elem });
+            },
+            .nominal => |n| {
+                try out.append(gpa, @backingInt(S.wrap));
+                try pending.append(gpa, .{ .ty = n.backing });
+            },
+            .tuple => |span| {
+                const items = types.tySlice(span);
+                try out.appendSlice(gpa, &.{ @backingInt(S.tuple), @intCast(items.len) });
+                var i = items.len;
+                while (i > 0) {
+                    i -= 1;
+                    try pending.append(gpa, .{ .ty = items[i] });
+                }
+            },
+            .record => |span| {
+                const fields = types.memberSlice(span);
+                try out.appendSlice(gpa, &.{ @backingInt(S.record), @intCast(fields.len) });
+                var i = fields.len;
+                while (i > 0) {
+                    i -= 1;
+                    const field = fields[i];
+                    const label = names.lookupRecordFieldLabel(types.nameText(field.name)) orelse
+                        invariant("a field of a slot type has no label in the site's module");
+                    try pending.append(gpa, .{ .ty = types.tySlice(field.tys)[0] });
+                    // An optional field's value may be absent (`Code.Value.Absent`).
+                    if (field.optional) try pending.append(gpa, .{ .word = @backingInt(S.opt_field) });
+                    try pending.append(gpa, .{ .word = @backingInt(label) });
+                }
+            },
+            .tag_union => |span| {
+                const tags = types.memberSlice(span);
+                try out.appendSlice(gpa, &.{ @backingInt(S.tag_union), @intCast(tags.len) });
+                var i = tags.len;
+                while (i > 0) {
+                    i -= 1;
+                    const tag = tags[i];
+                    const label = names.lookupTagLabel(types.nameText(tag.name)) orelse
+                        invariant("a tag of a slot type has no label in the site's module");
+                    const payloads = types.tySlice(tag.tys);
+                    var p = payloads.len;
+                    while (p > 0) {
+                        p -= 1;
+                        try pending.append(gpa, .{ .ty = payloads[p] });
+                    }
+                    try pending.append(gpa, .{ .word = @intCast(payloads.len) });
+                    try pending.append(gpa, .{ .word = @backingInt(label) });
+                }
+            },
+        }
+    }
+    return null;
+}
 
 /// The checked body a constant template holds, or null when the compiler did
 /// not fix a value for it.
@@ -6320,6 +11607,16 @@ pub const ForeignModule = struct {
 pub const ForeignAlias = struct {
     module: ForeignModule,
     lookup: CheckedExprId,
+    /// The alias's binding in that module, whose entry wrapper owns the
+    /// scope the alias's quantified variables belong to.
+    template: checked.CallableEvalTemplateId,
+};
+
+/// A top-level value another module exports that computes a function: the
+/// module that holds it, and the checked expression it was written as.
+pub const ForeignComputed = struct {
+    module: ForeignModule,
+    body: CheckedExprId,
 };
 
 /// A definition another module exports, resolved to what the walk reads.
@@ -6388,6 +11685,14 @@ pub const ForeignLookup = struct {
         artifact: canonical.ArtifactRef,
         def: CIR.Def.Idx,
     ) ?ForeignAlias,
+    /// A top-level value of a named artifact that computes a function,
+    /// `doubler = make(2.0)`: the module that holds it, and the checked
+    /// expression it was written as.
+    resolve_exported_computed: *const fn (
+        context: *const anyopaque,
+        artifact: canonical.ArtifactRef,
+        def: CIR.Def.Idx,
+    ) ?ForeignComputed,
     /// A constant another module fixed, named by the ref the checker resolved
     /// the use to. A constant is reached by ref rather than by import index
     /// because the name that reads it may be written in a third module.
@@ -6419,6 +11724,37 @@ pub const ForeignLookup = struct {
         context: *const anyopaque,
         owner: ForeignNominal,
     ) ?static_dispatch.MethodTarget,
+    /// Whether the module of content identity `module` is the builtin
+    /// module, by its role (Q10). A nominal names its declaring module only
+    /// by identity, and the builtin module declares nominals the checker
+    /// marks as no builtin (`Hasher`), so the walk asks rather than reads
+    /// the name.
+    resolve_builtin_module: *const fn (
+        context: *const anyopaque,
+        module: *const [32]u8,
+    ) bool,
+    /// The definition a lookup of the module being walked names, as checking
+    /// resolved it: the module that declares it and the definition. Null for
+    /// a lookup of a local name or of no definition.
+    resolve_lookup_target: *const fn (
+        context: *const anyopaque,
+        expr_idx: CIR.Expr.Idx,
+    ) ?checked.LookupTarget,
+    /// A module in reach by its key: the module a recipe's root lives in
+    /// (D1), which may be one the module of a closing use never imported.
+    resolve_module: *const fn (
+        context: *const anyopaque,
+        key: *const [32]u8,
+    ) ?ForeignModule,
+    /// Whether a module in reach has an inventory (D1), so a module with no
+    /// site of its own may hold a closing use.
+    resolve_any_instances: *const fn (context: *const anyopaque) bool,
+    /// A module in reach by its content identity, as a field default names
+    /// its declaring module (D5).
+    resolve_identity_module: *const fn (
+        context: *const anyopaque,
+        identity: *const [32]u8,
+    ) ?ForeignModule,
 
     /// A lookup that reaches nothing, for a walk with no modules behind it.
     pub const none = ForeignLookup{
@@ -6427,10 +11763,28 @@ pub const ForeignLookup = struct {
         .resolve_alias = resolveNothingImportedAlias,
         .resolve_exported = resolveNothingExported,
         .resolve_exported_alias = resolveNothingAlias,
+        .resolve_exported_computed = resolveNothingComputed,
         .resolve_constant = resolveNothingConstant,
         .resolve_method = resolveNothingMethod,
         .resolve_inspect_override = resolveNothingInspectOverride,
+        .resolve_builtin_module = resolveNothingBuiltinModule,
+        .resolve_lookup_target = resolveNothingLookupTarget,
+        .resolve_module = resolveNothingModule,
+        .resolve_any_instances = resolveNoInstances,
+        .resolve_identity_module = resolveNothingModule,
     };
+
+    fn resolveNoInstances(_: *const anyopaque) bool {
+        return false;
+    }
+
+    fn resolveNothingModule(_: *const anyopaque, _: *const [32]u8) ?ForeignModule {
+        return null;
+    }
+
+    fn resolveNothingLookupTarget(_: *const anyopaque, _: CIR.Expr.Idx) ?checked.LookupTarget {
+        return null;
+    }
 
     fn resolveNothing(_: *const anyopaque, _: CIR.Import.Idx, _: u32) ?ForeignDefinition {
         return null;
@@ -6448,6 +11802,10 @@ pub const ForeignLookup = struct {
         return null;
     }
 
+    fn resolveNothingComputed(_: *const anyopaque, _: canonical.ArtifactRef, _: CIR.Def.Idx) ?ForeignComputed {
+        return null;
+    }
+
     fn resolveNothingConstant(_: *const anyopaque, _: checked.ConstRef) ?ForeignConstant {
         return null;
     }
@@ -6458,6 +11816,15 @@ pub const ForeignLookup = struct {
 
     fn resolveNothingInspectOverride(_: *const anyopaque, _: ForeignNominal) ?static_dispatch.MethodTarget {
         return null;
+    }
+
+    fn resolveNothingBuiltinModule(_: *const anyopaque, _: *const [32]u8) bool {
+        return false;
+    }
+
+    /// Whether `module` is the content identity of the builtin module.
+    fn isBuiltinModule(self: ForeignLookup, module: *const [32]u8) bool {
+        return self.resolve_builtin_module(self.context, module);
     }
 
     /// The target a nominal's declaration names for one method.
@@ -6509,6 +11876,27 @@ pub const ForeignLookup = struct {
     ) ?ForeignAlias {
         return self.resolve_exported_alias(self.context, artifact, def);
     }
+
+    fn findModule(self: ForeignLookup, key: *const [32]u8) ?ForeignModule {
+        return self.resolve_module(self.context, key);
+    }
+
+    fn findModuleByIdentity(self: ForeignLookup, identity: *const [32]u8) ?ForeignModule {
+        return self.resolve_identity_module(self.context, identity);
+    }
+
+    /// Whether a module in reach has an inventory (D1).
+    fn anyInstances(self: ForeignLookup) bool {
+        return self.resolve_any_instances(self.context);
+    }
+
+    fn findExportedComputed(
+        self: ForeignLookup,
+        artifact: canonical.ArtifactRef,
+        def: CIR.Def.Idx,
+    ) ?ForeignComputed {
+        return self.resolve_exported_computed(self.context, artifact, def);
+    }
 };
 
 /// One site's walk, across every module it reaches.
@@ -6531,11 +11919,53 @@ pub const Walk = struct {
     definitions: std.AutoHashMapUnmanaged(DefinitionKey, Definition) = .empty,
     /// The rows the walk is inside, outermost first.
     rows: std.ArrayList(RowId) = .empty,
+    /// How many interpolated literals' first stage the walk is inside (see
+    /// `interpolationExpr`). Zero inside every row, so the rows a stage
+    /// builds are ordinary rows.
+    stage_one: u32 = 0,
+    /// Whether the call being resolved reaches the Roc definition of a
+    /// builtin, rather than naming it, which only a first stage does.
+    open_builtins: bool = false,
+    /// The lambdas a first stage wrote, by the row each is a closure of: what
+    /// the walk applies where it stands (`appliedInline`).
+    closure_targets: collections.DenseMapUnmanaged(RowId, Reifier.CalleeTarget) = .empty,
     /// The root row of the site last emitted, which a test dumps.
     root: ?RowId = null,
     rejection: ?Rejection = null,
+    /// The reader whose module's source the walk is reading: the site's, or
+    /// that of the callee or constant it entered (`Reifier.enter`). A refusal
+    /// is placed in this module, because its region indexes this source.
+    body: ?*Reifier = null,
+    /// The part of a row's signature whose type `tyOf` is building, which a
+    /// refusal at a type variable names. `.expression` everywhere else.
+    place: TypePlace = .expression,
+    /// The quantified variable whose substitution `tyOf` is inside, the
+    /// outermost one, or null outside every substitution. A variable the
+    /// use left open is named by the one the annotation wrote.
+    through: ?Reifier.FramedType = null,
+    /// The nominals `tyOf` is part way through building, outermost first,
+    /// in every reader: a `Recursive` refers to the nearest one of its name,
+    /// whichever module's reader opened it.
+    open_nominals: std.ArrayList(OpenNominal) = .empty,
+    /// The frames of the site being walked: frame `n` is `frames[n - 1]`,
+    /// the substitution of one instance the walk entered, and frame 0
+    /// (`Reifier.empty_frame`) is the empty one. A type reference names its
+    /// frame, so a binding is read in the frame it was made in (D2). Freed
+    /// when the next site starts.
+    frames: std.ArrayList(Reifier.Substitution) = .empty,
     /// The view the site being walked declares (plan 1.5, V6).
     view: View = .graph,
+    /// The name of the outermost top-level constant the walk is folding, or
+    /// null outside every one. A refusal of a `Code` value names it (D7).
+    constant: ?[]const u8 = null,
+    /// The site's cut (I14, N8h): each function the `code_primitives` item of
+    /// its translator's type lists, by what a callee resolves to, with the
+    /// name its `Prim` carries. Every other function is walked (N8l).
+    cut: std.AutoHashMapUnmanaged(Reifier.CutKey, Reifier.ForeignName) = .empty,
+    /// Where set, the walk measures K (`ROC_REIFY_OUTLINE_STATS`): `finish`
+    /// prints the size of the site's `outline` view at this K and emits
+    /// nothing.
+    measure_k: ?u32 = null,
     /// Per view, digest of the rows a site's walk built, and digest of
     /// their nodes' origins: the `Graph` their normal form wrote in that
     /// view, and the origins of its nodes (P1). The walk is deterministic,
@@ -6553,11 +11983,49 @@ pub const Walk = struct {
 
     /// How many sites were normalized, which P1's counter reads.
     normalizations: u32 = 0,
+    /// Where set, the site's translator returns a `Code.Bound`, so a run-time
+    /// name the root reads is an input slot rather than a refusal.
+    inputs: ?Inputs = null,
+    /// The input slots of the site last finished, in slot order: what the
+    /// program supplies for each. Owned; `takeSlots` hands it over.
+    slots: []SlotSource = &.{},
+    /// The conversion roots of the custom literals the site's walk met, in
+    /// the order it met them, once each. `takeReads` hands them over.
+    reads: std.ArrayList(checked.CheckedCodeRead) = .empty,
+    /// The key of the instance of the template that holds the site being
+    /// walked, for an instance site (D1), or null. A site key mixes it in,
+    /// so each instance's description has a key of its own.
+    instance: ?[32]u8 = null,
 
-    /// A normal form P1 keeps: its `Graph`, and its nodes' origins.
+    /// The run-time names a site that binds inputs reads.
+    pub const Inputs = struct {
+        /// The reader of the site's own module, the only module whose
+        /// run-time names the call can supply.
+        reader: *Reifier,
+        /// Each leaf the walk numbered, by its number (`ir.Slot.Source.leaf`).
+        leaves: std.ArrayList(PatternBinderId) = .empty,
+        /// The capture reads of a lambda at a `Code.Binds` position, with the
+        /// encoder the checker required for each (`captureReads`). Owned.
+        captures: []CaptureRead = &.{},
+    };
+
+    /// One nominal `tyOf` is building: the name its `Recursive` carries, in
+    /// the name store of the reader of its module, and its declaration with
+    /// what this use fixed its variables to.
+    const OpenNominal = struct {
+        reader: *Reifier,
+        name: canonical.TypeNameId,
+        instance: Reifier.NominalInstanceKey,
+    };
+
+    /// A normal form P1 keeps: its `Graph`, its nodes' origins, and the
+    /// slots its root reads, in slot order.
     const Normalized = struct {
         graph: ConstNodeId,
+        /// The digests of the nodes of an `inline` view (V5a); null for `graph`.
+        digests: ?ConstNodeId,
         origins: reify.provenance.Emitted,
+        slot_order: []ir.SlotId,
     };
 
     /// What one site is built into.
@@ -6565,6 +12033,9 @@ pub const Walk = struct {
         store: ir.Store,
         types: Types,
         builder: Builder,
+        /// The evidence the site's calls supplied (`Reifier.supply`), which
+        /// lives as long as the rows that read it.
+        evidence: std.heap.ArenaAllocator,
     };
 
     pub fn init(gpa: Allocator, store: *ConstStore, foreign: ForeignLookup) Walk {
@@ -6578,15 +12049,34 @@ pub const Walk = struct {
         }
         self.readers.deinit(self.gpa);
         self.endSite();
+        self.cut.deinit(self.gpa);
         self.definitions.deinit(self.gpa);
         self.rows.deinit(self.gpa);
+        self.open_nominals.deinit(self.gpa);
+        self.clearClosureTargets();
+        self.closure_targets.deinit(self.gpa);
+        self.clearFrames();
+        self.frames.deinit(self.gpa);
         var memo = self.normalized.valueIterator();
-        while (memo.next()) |m| m.origins.deinit(self.gpa);
+        while (memo.next()) |m| {
+            m.origins.deinit(self.gpa);
+            self.gpa.free(m.slot_order);
+        }
         self.normalized.deinit(self.gpa);
+        self.endInputs();
+        self.freeSlots();
+        self.reads.deinit(self.gpa);
         self.sources.deinit(self.gpa);
         self.source_ids.deinit(self.gpa);
         for (self.published.items) |*p| p.deinit(self.gpa);
         self.published.deinit(self.gpa);
+    }
+
+    /// The module whose source the walk is reading, where a refusal is
+    /// placed. Every walk reads some module's source before it can refuse.
+    fn bodyModule(self: *const Walk) Rejection.Module {
+        const body = self.body orelse invariant("a refusal before the walk read any module's source");
+        return body.rejectionModule();
     }
 
     /// The origin of what a reader of `module` builds for the source at
@@ -6618,9 +12108,127 @@ pub const Walk = struct {
 
     /// Start a site whose declared type selects `view`, so a site refused for
     /// one reason does not report the reason an earlier site was refused for.
-    pub fn beginSite(self: *Walk, view: View) void {
+    /// `binds_inputs` says whether its translator returns a `Code.Bound`, so
+    /// that a run-time name the root reads is an input slot, and
+    /// `site_reader` is the site module's reader.
+    pub fn beginSite(self: *Walk, view: View, binds_inputs: bool, site_reader: *Reifier) void {
         self.view = view;
+        self.cut.clearRetainingCapacity();
         self.rejection = null;
+        self.constant = null;
+        self.endInputs();
+        self.freeSlots();
+        self.reads.clearRetainingCapacity();
+        self.body = site_reader;
+        if (binds_inputs) self.inputs = .{ .reader = site_reader };
+    }
+
+    /// Take the cut of the site begun last from its translator (I14): the
+    /// function that `call`, a call `site_reader` checked, names. The
+    /// nominal type that has that function as an associated item declares
+    /// the cut with its `code_primitives` item, which publication of the
+    /// type's module checked. A translator that is no such function, or whose
+    /// type declares no cut, leaves the cut empty.
+    pub fn useCut(self: *Walk, site_reader: *Reifier, call: CheckedExprId) Allocator.Error!void {
+        const function = try site_reader.translatorFunction(call) orelse return;
+        const owner = function.reader;
+        const owned = owner.ownerOf(function.def) orelse return;
+        const members = owner.code_cuts.membersOf(@backingInt(owned.decl)) orelse return;
+        for (members) |raw| {
+            const member_resolved = owner.lookupResolved(@fromBackingInt(raw)) orelse
+                invariant("a cut member is a lookup, which publication checked");
+            const member = try owner.listedMember(member_resolved) orelse
+                invariant("a cut member names a function or a constant, which publication checked");
+            try self.cut.put(self.gpa, .{ .artifact = member.reader.artifact.bytes, .body = member.body }, member.reader.qualifiedName(member.def));
+        }
+    }
+
+    /// Note that the walk met a literal whose conversion is a compile-time
+    /// root of `module`, so lowering reads that root where the site stands.
+    fn noteRead(self: *Walk, module: checked.CheckedModuleArtifactKey, root: checked.ComptimeRootId) Allocator.Error!void {
+        for (self.reads.items) |read| {
+            if (read.root == @backingInt(root) and module.eql(.{ .bytes = read.module })) return;
+        }
+        try self.reads.append(self.gpa, .{ .module = module.bytes, .root = @backingInt(root) });
+    }
+
+    /// The roots of the site last finished, which the caller now owns.
+    pub fn takeReads(self: *Walk) Allocator.Error![]checked.CheckedCodeRead {
+        return self.reads.toOwnedSlice(self.gpa);
+    }
+
+    fn endInputs(self: *Walk) void {
+        if (self.inputs) |*inputs| {
+            inputs.leaves.deinit(self.gpa);
+            freeCaptureReads(self.gpa, inputs.captures);
+        }
+        self.inputs = null;
+    }
+
+    /// Give the site begun last the capture reads of its lambda at a
+    /// `Code.Binds` position, which bind a slot whose type holds an opaque
+    /// type. Takes `captures`.
+    pub fn useCaptureReads(self: *Walk, captures: []CaptureRead) void {
+        const inputs = &(self.inputs orelse {
+            freeCaptureReads(self.gpa, captures);
+            return;
+        });
+        freeCaptureReads(self.gpa, inputs.captures);
+        inputs.captures = captures;
+    }
+
+    fn freeSlots(self: *Walk) void {
+        for (self.slots) |slot| {
+            self.gpa.free(slot.steps);
+            self.gpa.free(slot.shape);
+        }
+        self.gpa.free(self.slots);
+        self.slots = &.{};
+    }
+
+    /// The input slots of the site last finished, which the caller now owns.
+    pub fn takeSlots(self: *Walk) []SlotSource {
+        const out = self.slots;
+        self.slots = &.{};
+        return out;
+    }
+
+    /// Forget the lambdas a first stage wrote, and free what each holds.
+    fn clearClosureTargets(self: *Walk) void {
+        var targets = self.closure_targets.valueIterator();
+        while (targets.next()) |target| freeTarget(self.gpa, target.*);
+        self.closure_targets.clearRetainingCapacity();
+    }
+
+    /// Free the instantiation and the bound callees a cloned target owns.
+    fn freeTarget(gpa: Allocator, target: Reifier.CalleeTarget) void {
+        if (target.instantiation) |fixed| {
+            var substitution = fixed.substitution;
+            substitution.deinit(gpa);
+        }
+        for (target.bound) |entry| freeTarget(gpa, entry.target);
+        gpa.free(target.bound);
+    }
+
+    /// A frame holding a copy of `substitution`, which the caller keeps.
+    fn pushFrame(self: *Walk, substitution: Reifier.Substitution) Allocator.Error!Reifier.FrameId {
+        var copy = try substitution.clone(self.gpa);
+        errdefer copy.deinit(self.gpa);
+        try self.frames.append(self.gpa, copy);
+        return @intCast(self.frames.items.len);
+    }
+
+    /// The substitution frame `frame` holds.
+    fn frameSubstitution(self: *const Walk, frame: Reifier.FrameId) *const Reifier.Substitution {
+        if (frame == Reifier.empty_frame) return &empty_substitution;
+        return &self.frames.items[frame - 1];
+    }
+
+    const empty_substitution: Reifier.Substitution = .empty;
+
+    fn clearFrames(self: *Walk) void {
+        for (self.frames.items) |*frame| frame.deinit(self.gpa);
+        self.frames.clearRetainingCapacity();
     }
 
     /// Give the site about to be walked a store, a type table and a builder
@@ -6631,9 +12239,14 @@ pub const Walk = struct {
         site.store = ir.Store.init(self.gpa);
         site.types = Types.init(self.gpa);
         site.builder = Builder.init(self.gpa, &site.store, &site.types);
+        site.evidence = std.heap.ArenaAllocator.init(self.gpa);
         self.site = site;
         self.definitions.clearRetainingCapacity();
         self.rows.clearRetainingCapacity();
+        self.clearClosureTargets();
+        self.clearFrames();
+        self.stage_one = 0;
+        self.open_builtins = false;
         self.sources.clearRetainingCapacity();
         self.source_ids.clearRetainingCapacity();
         self.root = null;
@@ -6641,9 +12254,8 @@ pub const Walk = struct {
         for (self.readers.items) |open| {
             open.ty_cache.clearRetainingCapacity();
             open.type_in_progress.clearRetainingCapacity();
-            open.open_recursions.clearRetainingCapacity();
-            open.nominal_in_progress.clearRetainingCapacity();
         }
+        self.open_nominals.clearRetainingCapacity();
     }
 
     fn endSite(self: *Walk) void {
@@ -6651,6 +12263,7 @@ pub const Walk = struct {
         site.builder.deinit();
         site.types.deinit();
         site.store.deinit();
+        site.evidence.deinit();
         self.gpa.destroy(site);
         self.site = null;
     }
@@ -6660,19 +12273,27 @@ pub const Walk = struct {
     /// that needs more simplify rounds than the language version allows is
     /// refused at `region`.
     pub fn normalize(self: *Walk, root: RowId, region: base.Region) error{ Rejected, OutOfMemory }!void {
-        const site = self.site.?;
-        const view: reify.driver.View = switch (self.view) {
-            .graph => .graph,
+        _ = try self.normalizeWith(root, region, viewOf(self.view), .{ .laws = self.view == .lawful });
+    }
+
+    fn viewOf(view: View) reify.driver.View {
+        return switch (view) {
+            .graph, .lawful => .graph,
             .inline_ => .inline_,
+            .outline => .outline,
         };
-        _ = reify.driver.runTo(self.gpa, &site.builder, root, &.{}, view) catch |err| switch (err) {
+    }
+
+    fn normalizeWith(self: *Walk, root: RowId, region: base.Region, view: reify.driver.View, options: reify.driver.Options) error{ Rejected, OutOfMemory }!reify.driver.Stats {
+        const site = self.site.?;
+        return reify.driver.runToWith(self.gpa, &site.builder, root, &.{}, view, options) catch |err| switch (err) {
             error.OutOfMemory => |e| return e,
             error.RoundBoundExceeded => {
-                self.rejection = .{ .kind = .bound_exceeded, .region = region, .detail = "simplify rounds per component" };
+                self.rejection = .{ .kind = .bound_exceeded, .region = region, .module = self.bodyModule(), .detail = "simplify rounds per component" };
                 return error.Rejected;
             },
             error.UnresolvedApply => {
-                self.rejection = .{ .kind = .unsupported_expression, .region = region, .detail = "a call to a function value that no simplification resolves" };
+                self.rejection = .{ .kind = .unsupported_expression, .region = region, .module = self.bodyModule(), .detail = "a call to a function value that no simplification resolves" };
                 return error.Rejected;
             },
             error.MeasureDidNotFall => invariant("a simplify round changed a row without lowering its measure"),
@@ -6687,12 +12308,28 @@ pub const Walk = struct {
     /// rule resolves, is refused at `region`.
     pub fn finish(self: *Walk, root: RowId, site_key: u64, region: base.Region) error{ Rejected, OutOfMemory }!ConstNodeId {
         const site = self.site.?;
+        // `measure_k` is set only under `reify_outline_stats`; without developer diagnostics the
+        // branch is dead, so a build without an `Io` (wasm) does not analyze `std.debug.print`.
+        const measure_k = if (base.dev_diagnostics.available) self.measure_k else null;
+        if (measure_k) |k| {
+            const stats = try self.normalizeWith(root, region, .outline, .{ .outline_min_size = k });
+            std.debug.print("reify outline: site {d}..{d} K={d}: inline {d} nodes and {d} call arguments in {d} rows, outline {d} nodes and {d} call arguments in {d} rows, {d} rows made in {d} passes\n", .{
+                region.start.offset,      region.end.offset,       k,
+                stats.inline_size.nodes,  stats.inline_size.args,  stats.inline_size.rows,
+                stats.outline_size.nodes, stats.outline_size.args, stats.outline_size.rows,
+                stats.outline_rows,       stats.outline_passes,
+            });
+            self.rejection = .{ .kind = .bound_exceeded, .region = region, .module = self.bodyModule(), .detail = "measured, not emitted" };
+            return error.Rejected;
+        }
         const walked = try reify.rows.walkedDigest(self.gpa, &site.store, &site.types, root);
-        const memo_key = .{ self.view, walked, reify.provenance.digest(&site.store) };
+        const memo_key = .{ self.view, walked ^ slotsDigest(&site.store), reify.provenance.digest(&site.store) };
         if (self.normalized.get(memo_key)) |memo| {
+            try self.bindSlots(memo.slot_order, region);
             try self.publish(site_key, &memo.origins);
             var emitter = try code_emit.Emitter.init(self.gpa, self.store, &site.store, &site.types);
             defer emitter.deinit();
+            if (memo.digests) |digests| return emitter.inlinedOf(memo.graph, digests, site_key);
             return emitter.siteOf(memo.graph, site_key);
         }
         try self.normalize(root, region);
@@ -6702,11 +12339,128 @@ pub const Walk = struct {
         defer emitter.deinit();
         self.root = root;
         const graph = try emitter.graph(root);
+        const digests: ?ConstNodeId = switch (self.view) {
+            .graph, .outline, .lawful => null,
+            .inline_ => try emitter.digests(root),
+        };
+        try self.bindSlots(emitter.slot_order, region);
         var origins = try reify.provenance.emitted(self.gpa, &site.store, root);
         errdefer origins.deinit(self.gpa);
+        const slot_order = try self.gpa.dupe(ir.SlotId, emitter.slot_order);
+        errdefer self.gpa.free(slot_order);
         try self.publish(site_key, &origins);
-        try self.normalized.put(self.gpa, memo_key, .{ .graph = graph, .origins = origins });
+        try self.normalized.put(self.gpa, memo_key, .{ .graph = graph, .digests = digests, .origins = origins, .slot_order = slot_order });
+        if (digests) |d| return emitter.inlinedOf(graph, d, site_key);
         return emitter.siteOf(graph, site_key);
+    }
+
+    /// The `Code.Ty` value of `ty`, a type of the site being walked,
+    /// written into this module's store (D6).
+    pub fn emitTy(self: *Walk, ty: TyId) Allocator.Error!ConstNodeId {
+        const site = self.site.?;
+        var emitter = try code_emit.Emitter.init(self.gpa, self.store, &site.store, &site.types);
+        defer emitter.deinit();
+        return emitter.tyValue(ty);
+    }
+
+    /// A digest of the slots the walk made, which the walked rows read only
+    /// by number: two sites whose rows match and whose slots differ are not
+    /// one normal form.
+    fn slotsDigest(store: *const ir.Store) u128 {
+        var hasher = std.hash.Wyhash.init(0x5107);
+        for (store.slots.items) |slot| {
+            hasher.update(std.mem.asBytes(&slot.ty));
+            switch (slot.source) {
+                .leaf => |leaf| hasher.update(&.{ 0, @truncate(leaf), @truncate(leaf >> 8), @truncate(leaf >> 16), @truncate(leaf >> 24) }),
+                .field => |f| hasher.update(std.mem.asBytes(&[_]u32{ 1, f.of.index(), f.k })),
+                .index => |f| hasher.update(std.mem.asBytes(&[_]u32{ 2, f.of.index(), f.k })),
+                .unwrap => |of| hasher.update(std.mem.asBytes(&[_]u32{ 3, of.index() })),
+            }
+        }
+        const h = hasher.final();
+        return @as(u128, h) << 64 | h;
+    }
+
+    /// Record, for each slot the root reads in slot order, the run-time name
+    /// and the projections the program supplies it from, and refuse a slot
+    /// whose type holds a shape no `Code.Value` expresses.
+    fn bindSlots(self: *Walk, order: []const ir.SlotId, region: base.Region) error{ Rejected, OutOfMemory }!void {
+        self.freeSlots();
+        if (order.len == 0) return;
+        const site = self.site.?;
+        const inputs = self.inputs orelse invariant("a site whose translator binds no inputs reads an input slot");
+        const out = try self.gpa.alloc(SlotSource, order.len);
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |made_slot| {
+                self.gpa.free(made_slot.steps);
+                self.gpa.free(made_slot.shape);
+            }
+            self.gpa.free(out);
+        }
+        var steps = std.ArrayList(SlotStep).empty;
+        defer steps.deinit(self.gpa);
+        var shape = std.ArrayList(u32).empty;
+        defer shape.deinit(self.gpa);
+        for (order, out) |slot, *dest| {
+            steps.clearRetainingCapacity();
+            var current = slot;
+            const leaf: u32 = while (true) {
+                const entry = site.store.slots.items[current.index()];
+                switch (entry.source) {
+                    .leaf => |leaf| break leaf,
+                    .field => |f| {
+                        const parent_ty = site.store.slots.items[f.of.index()].ty;
+                        const members = site.types.memberSlice(site.types.get(parent_ty).record);
+                        const text = site.types.nameText(members[f.k].name);
+                        const label = inputs.reader.names.lookupRecordFieldLabel(text) orelse
+                            invariant("a field a slot reads has no label in the site's module");
+                        try steps.append(self.gpa, .{ .field = label });
+                        current = f.of;
+                    },
+                    .index => |f| {
+                        try steps.append(self.gpa, .{ .index = f.k });
+                        current = f.of;
+                    },
+                    .unwrap => |of| {
+                        try steps.append(self.gpa, .unwrap);
+                        current = of;
+                    },
+                }
+            };
+            std.mem.reverse(SlotStep, steps.items);
+            const binder = inputs.leaves.items[leaf];
+            shape.clearRetainingCapacity();
+            const slot_ty = site.store.slots.items[slot.index()].ty;
+            // A slot whose type holds an opaque type is bound as the bytes of
+            // its encoder, which the checker required of a capture read only.
+            const encoder: ?CheckedExprId = if (try holdsOpaque(self.gpa, &site.types, slot_ty)) blk: {
+                const read = for (inputs.captures) |capture| {
+                    if (capture.leaf == binder and sameSteps(capture.steps, steps.items)) break capture;
+                } else {
+                    self.rejection = .{ .kind = .input_not_bound, .region = region, .module = self.bodyModule(), .detail = opaqueSlotRefusal(inputs.captures.len != 0, steps.items) };
+                    return error.Rejected;
+                };
+                try shape.append(self.gpa, @backingInt(checked.CodeValueShape.encoded));
+                break :blk read.encoder;
+            } else blk: {
+                if (try slotShape(self.gpa, &site.types, inputs.reader.names, slot_ty, &shape)) |why| {
+                    self.rejection = .{ .kind = .input_not_bound, .region = region, .module = self.bodyModule(), .detail = why };
+                    return error.Rejected;
+                }
+                break :blk null;
+            };
+            const owned_steps = try self.gpa.dupe(SlotStep, steps.items);
+            errdefer self.gpa.free(owned_steps);
+            dest.* = .{
+                .leaf = binder,
+                .steps = owned_steps,
+                .shape = try self.gpa.dupe(u32, shape.items),
+                .encoder = encoder,
+            };
+            made += 1;
+        }
+        self.slots = out;
     }
 
     // Record the provenance of the site keyed `key`: its sources, and the
@@ -6728,6 +12482,8 @@ pub const Walk = struct {
     }
 };
 
+const no_code_instances: checked.CodeInstanceTable = .{};
+
 /// The checked tables of the module being published, which the walk reads a
 /// site's own bodies, plans and types from.
 pub const LocalSources = struct {
@@ -6740,6 +12496,7 @@ pub const LocalSources = struct {
     procedure_bindings: *const checked.TopLevelProcedureBindingTable,
     procedure_templates: *const checked.CheckedProcedureTemplateTable,
     callable_eval_templates: *const checked.CallableEvalTemplateTable,
+    entry_wrappers: *const checked.EntryWrapperTable,
     const_templates: *const checked.ConstTemplateTable,
     const_bodies: *const checked.CheckedConstBodyTable,
     /// What each top-level value's pattern binds, which leads a named site to
@@ -6749,6 +12506,13 @@ pub const LocalSources = struct {
     /// source variable, and only the module being published still has the
     /// index from a source variable to the checked type it solved for.
     site_types: *const checked.CheckedTypePublication,
+    /// The translators' cuts this module declares, which `moduleCuts` built.
+    code_cuts: *const checked.CodeCutTable,
+    /// This module's inventories (D1), which `reifyModuleSites` fills.
+    code_instances: *const checked.CodeInstanceTable = &no_code_instances,
+    /// This module's methods, which name the templates the compiler calls
+    /// with no written use (Q17).
+    method_registry: *const static_dispatch.MethodRegistry,
 
     fn views(self: LocalSources) Reifier.Sources {
         return .{
@@ -6761,11 +12525,295 @@ pub const LocalSources = struct {
             .procedure_bindings = self.procedure_bindings,
             .procedure_templates = self.procedure_templates,
             .callable_eval_templates = self.callable_eval_templates.view(),
+            .entry_wrappers = self.entry_wrappers,
             .const_templates = self.const_templates,
             .const_bodies = self.const_bodies,
+            .top_level_values = self.top_level_values,
+            .code_cuts = self.code_cuts,
+            .code_instances = self.code_instances,
         };
     }
 };
+
+/// The cuts the module declares (I14), and the entries refused.
+pub const ModuleCuts = struct {
+    /// Owned slices, which the artifact takes.
+    table: checked.CodeCutTable = .{},
+    problems: []Problem = &.{},
+
+    /// An entry of a `code_primitives` item that is no `Code.prim` of a
+    /// function defined as a lambda or of a top-level constant, one that
+    /// names a definition an earlier entry names, or one that names a
+    /// primitive (D3), or an item that is no list of entries: a compile error
+    /// at the entry or the item.
+    pub const Problem = struct {
+        region: base.Region,
+        kind: enum { not_a_function, not_a_list, listed_twice, already_primitive },
+    };
+
+    pub fn deinit(self: *ModuleCuts, gpa: Allocator) void {
+        self.table.deinit(gpa);
+        gpa.free(self.problems);
+    }
+};
+
+/// The argument of each `Code.prim` call the checker accepted in this module,
+/// by the call's checked expression: the reference the call names, which
+/// checking did not instantiate (D7, F7).
+fn primReferences(gpa: Allocator, local: LocalSources, env: *const ModuleEnv) Allocator.Error!collections.DenseMapUnmanaged(CheckedExprId, CheckedExprId) {
+    var references: collections.DenseMapUnmanaged(CheckedExprId, CheckedExprId) = .empty;
+    errdefer references.deinit(gpa);
+    for (env.store.codeIdentityUses()) |use| {
+        if (use.kind != .prim) continue;
+        const call = local.bodies.exprIdAtRawNode(use.call) orelse continue;
+        const arg = local.bodies.exprIdAtRawNode(use.arg) orelse
+            invariant("a published Code.prim call has a published argument");
+        try references.put(gpa, call, arg);
+    }
+    return references;
+}
+
+/// Check each `code_primitives` item of a nominal type this module declares,
+/// and record the cut it declares (I14, roc-reify-normal-form.md 3.8 and
+/// section 12). The item is a `List(Code.PrimId)` (D3): a list of
+/// `Code.prim(f)` entries, or the name of a constant of this module that is
+/// one, so one list can serve several types. Each entry names a top-level
+/// function or constant; an entry that is anything else, that names a
+/// definition an earlier entry names, or that names a primitive (a builtin,
+/// or an operation of an opaque type, D3) is refused at the entry. The walk
+/// reads the references the checker recorded on each `Code.prim` call, not
+/// an evaluated value, so an entry with a `where` needs no instance (F7).
+pub fn moduleCuts(
+    gpa: Allocator,
+    store: *ConstStore,
+    local: LocalSources,
+    env: *const ModuleEnv,
+    foreign: ForeignLookup,
+) Allocator.Error!ModuleCuts {
+    var cuts = std.ArrayList(checked.CodeCutTable.Cut).empty;
+    defer cuts.deinit(gpa);
+    var members = std.ArrayList(u32).empty;
+    defer members.deinit(gpa);
+    var problems = std.ArrayList(ModuleCuts.Problem).empty;
+    defer problems.deinit(gpa);
+    var keys = std.ArrayList(Reifier.CutKey).empty;
+    defer keys.deinit(gpa);
+    var followed = std.ArrayList(CheckedExprId).empty;
+    defer followed.deinit(gpa);
+
+    var walk = Walk.init(gpa, store, foreign);
+    defer walk.deinit();
+    var reifier: ?*Reifier = null;
+    var references = try primReferences(gpa, local, env);
+    defer references.deinit(gpa);
+
+    for (env.method_defs.entries.items) |entry| {
+        if (!entry.key.methodIdent().eql(env.idents.code_primitives)) continue;
+        if (env.store.getStatement(entry.key.owner) != .s_nominal_decl) continue;
+        const reader = reifier orelse try walk.reader(.{ .sources = local.views(), .env = env });
+        reifier = reader;
+        const written = local.bodies.exprIdForSource(env.store.getDef(entry.value.def_idx).expr) orelse
+            invariant("a top-level definition has a checked body");
+        // A name of a constant of this module stands for the list that
+        // constant was written as.
+        followed.clearRetainingCapacity();
+        var item = written;
+        while (true) {
+            try followed.append(gpa, item);
+            const constant = try reader.constantDefinition(reader.lookupResolved(item)) orelse break;
+            if (constant.reader != reader) break;
+            for (followed.items) |seen| {
+                if (seen == constant.body) invariant("a constant whose value is its own name is a checked error");
+            }
+            item = constant.body;
+        }
+        const listed: []const CheckedExprId = switch (reader.bodies.expr(item).data) {
+            .list => |elems| elems,
+            .empty_list => &.{},
+            // Checking rejected the item, and reported it.
+            .runtime_error => continue,
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_local,
+            .lookup_external,
+            .lookup_required,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => {
+                try problems.append(gpa, .{ .region = reader.bodies.expr(written).source_region, .kind = .not_a_list });
+                continue;
+            },
+        };
+        keys.clearRetainingCapacity();
+        const start: u32 = @intCast(members.items.len);
+        for (listed) |member| {
+            const data = reader.bodies.expr(member);
+            // Checking reported an entry it rejected.
+            if (data.data == .runtime_error) continue;
+            const reference = references.get(member);
+            const resolved = if (reference) |arg| reader.lookupResolved(arg) else null;
+            // An intrinsic is a primitive at every site already.
+            if (resolved) |id| if (try reader.listedIntrinsic(id) != null) {
+                try problems.append(gpa, .{ .region = data.source_region, .kind = .already_primitive });
+                continue;
+            };
+            const resolved_member = if (resolved) |id| try reader.listedMember(id) else null;
+            const named = resolved_member orelse {
+                try problems.append(gpa, .{ .region = data.source_region, .kind = .not_a_function });
+                continue;
+            };
+            // The builtin module and the module of an opaque type declare
+            // their own primitives, which every description names already.
+            if (named.reader.env.module_role == .builtin or try named.reader.primitiveOf(named.def, named.ty) != null) {
+                try problems.append(gpa, .{ .region = data.source_region, .kind = .already_primitive });
+                continue;
+            }
+            const key: Reifier.CutKey = .{ .artifact = named.reader.artifact.bytes, .body = named.body };
+            const repeated = for (keys.items) |seen| {
+                if (std.meta.eql(seen, key)) break true;
+            } else false;
+            if (repeated) {
+                try problems.append(gpa, .{ .region = data.source_region, .kind = .listed_twice });
+                continue;
+            }
+            try keys.append(gpa, key);
+            try members.append(gpa, @backingInt(reference.?));
+        }
+        try cuts.append(gpa, .{
+            .owner_decl = @backingInt(entry.key.owner),
+            .members = .{ .start = start, .len = @as(u32, @intCast(members.items.len)) - start },
+        });
+    }
+
+    var result: ModuleCuts = .{};
+    errdefer result.deinit(gpa);
+    result.table.cuts = try cuts.toOwnedSlice(gpa);
+    result.table.members = try members.toOwnedSlice(gpa);
+    result.problems = try problems.toOwnedSlice(gpa);
+    return result;
+}
+
+/// The constant one `Code.prim`, `Code.type_id` or `Code.ty_of` call is
+/// (D6), or why the call has none.
+pub const IdentityOutcome = struct {
+    /// The call, which publication replaces with `node`.
+    call: CheckedExprId,
+    /// The argument, where a refusal is reported.
+    region: base.Region,
+    outcome: union(enum) {
+        node: ConstNodeId,
+        /// `Code.prim` of a reference that names no function or constant a
+        /// description can name: a function the host provides, a builtin
+        /// the compiler writes, a top-level destructure.
+        not_a_definition,
+        /// `Code.type_id` of a proxy whose type the call leaves open, or
+        /// fixes to a type that is no nominal.
+        not_nominal,
+        /// `Code.ty_of` of a proxy whose type the call leaves open, or that
+        /// the walk has no description for.
+        rejected: Rejection,
+    },
+};
+
+/// The constant each `Code.prim`, `Code.type_id` and `Code.ty_of` call of
+/// this module computes, written into `store` as the value of a
+/// `Code.PrimId`, a `Code.TypeId` or a `Code.Ty`. A `Code.prim` id is the id
+/// a `Prim` node carries for the same definition (`reify.identity.prim`), a
+/// `Code.type_id` id the one an `Opaque` of the same nominal carries, and a
+/// `Code.ty_of` description the `result` of `|x| x` at the proxy's type.
+/// A call in `instances` is described at each closing use instead (D1, Q8),
+/// so it is skipped. The caller owns the slice.
+pub fn moduleIdentities(
+    gpa: Allocator,
+    store: *ConstStore,
+    local: LocalSources,
+    env: *const ModuleEnv,
+    foreign: ForeignLookup,
+    instances: []const CheckedExprId,
+) Allocator.Error![]IdentityOutcome {
+    const uses = env.store.codeIdentityUses();
+    if (uses.len == 0) return &.{};
+    var walk = Walk.init(gpa, store, foreign);
+    defer walk.deinit();
+    const reader = try walk.reader(.{ .sources = local.views(), .env = env });
+
+    var outcomes = std.ArrayList(IdentityOutcome).empty;
+    errdefer outcomes.deinit(gpa);
+    for (uses) |use| {
+        // A call in code that publication does not keep has no value to take.
+        const call = local.bodies.exprIdAtRawNode(use.call) orelse continue;
+        const is_instance = for (instances) |instance| {
+            if (instance == call) break true;
+        } else false;
+        if (is_instance) continue;
+        const arg = local.bodies.exprIdAtRawNode(use.arg) orelse
+            invariant("a published Code.prim, Code.type_id or Code.ty_of call has a published argument");
+        const region = reader.bodies.expr(arg).source_region;
+        const outcome: @FieldType(IdentityOutcome, "outcome") = switch (use.kind) {
+            .prim, .type_id => blk: {
+                const bits = switch (use.kind) {
+                    .prim => try reader.primIdentity(arg, @fromBackingInt(@intCast(use.arg))),
+                    .type_id => reader.typeIdIdentity(arg),
+                    .ty_of => unreachable, // the outer switch takes it
+                };
+                if (bits) |value| break :blk .{ .node = try store.append(.{ .record = &.{try store.append(.{ .scalar = .{ .u128 = value } })} }) };
+                break :blk switch (use.kind) {
+                    .prim => .not_a_definition,
+                    .type_id => .not_nominal,
+                    .ty_of => unreachable, // the outer switch takes it
+                };
+            },
+            .ty_of => blk: {
+                walk.beginSite(.graph, false, reader);
+                try walk.startSite();
+                break :blk switch (try reader.tyOfProxy(arg, region)) {
+                    .reified => |node| .{ .node = node },
+                    .rejected => |rejection| .{ .rejected = rejection },
+                };
+            },
+        };
+        try outcomes.append(gpa, .{ .call = call, .region = region, .outcome = outcome });
+    }
+    return outcomes.toOwnedSlice(gpa);
+}
 
 /// Walk every function this module stages into `store`, one description per
 /// recorded site. Publication runs this: the walk reads checked bodies and
@@ -6789,7 +12837,10 @@ pub fn reifyModuleSites(
     foreign: ForeignLookup,
 ) Allocator.Error!ModuleSites {
     const sites = env.store.codeReificationSites();
-    if (sites.len == 0) return .{};
+    // A module with no site of its own can still close a template another
+    // module holds (D1), and a `Code.type_id` or `Code.ty_of` call in a
+    // generic function is described at its closing uses (Q8, D6).
+    if (sites.len == 0 and !foreign.anyInstances() and env.store.codeIdentityUses().len == 0) return .{};
 
     var walk = Walk.init(gpa, store, foreign);
     defer walk.deinit();
@@ -6803,6 +12854,13 @@ pub fn reifyModuleSites(
     var call_values = std.ArrayList(Reifier.TemplateArg).empty;
     defer call_values.deinit(gpa);
 
+    // D1: the module's inventories first. An instance site has no
+    // description of its own, so the site loop skips it, and a closing use
+    // below reads the inventories of this module's templates.
+    var plan = try planInstances(gpa, &walk, reifier, module, local, sites, &results, &call_args);
+    defer plan.deinit(gpa);
+    reifier.code_instances = &plan.table;
+
     for (sites) |site| {
         // A template and the name a template call calls both stand for a
         // description built elsewhere, so nothing is walked for either: the
@@ -6812,42 +12870,1431 @@ pub fn reifyModuleSites(
             .named_function, .inline_lambda, .template_call => {},
         }
         const site_expr = local.bodies.exprIdAtRawNode(site.node_idx) orelse continue;
+        if (plan.handled.contains(site_expr)) continue;
         const region = env.store.getRegionAt(@fromBackingInt(@intCast(site.node_idx)));
-        walk.beginSite(site.view);
-        const outcome: Outcome = switch (site.kind) {
-            .named_function => try reifyNamedSite(&walk, reifier, module, local, site.node_idx, site.fn_var, region),
-            // The lambda is the root, and the site is where it is written, so
-            // the checked expression the node copied to is what the walk
-            // reads, and the `f` beside it is the type to read it at.
-            .inline_lambda => try reifier.reifyLambda(site_expr, .{
-                .scheme = null,
-                .in_block = true,
-                .caller = reifier,
-                .fixed = local.site_types.rootForSourceVar(
-                    module,
-                    ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(site.fn_var)))),
-                ),
-                .region = region,
-            }),
-            .template_call => try reifyTemplateSite(
-                gpa,
-                &walk,
-                reifier,
-                module,
-                local,
-                site.node_idx,
-                region,
-                &call_args,
-                &call_values,
-            ),
-            .template, .template_callee => unreachable,
-        };
-        try results.append(gpa, .{ .expr = site_expr, .outcome = outcome });
+        const bound_call: ?u32 = if (site.bound_call == CodeSiteRecord.no_bound_call) null else site.bound_call;
+        // `ROC_REIFY_OUTLINE_STATS`: the site walked once per K it lists,
+        // each walk measured and dropped, before the walk that counts.
+        if (base.dev_diagnostics.items(.reify_outline_stats)) |list| {
+            var ks = list;
+            while (ks.next()) |text| {
+                const k = std.fmt.parseInt(u32, text, 10) catch continue;
+                if (k < 3) continue;
+                walk.beginSite(site.view, bound_call != null, reifier);
+                try useSiteCut(&walk, reifier, local, site);
+                if (bound_call != null) walk.useCaptureReads(try captureReads(gpa, local.bodies, site_expr));
+                walk.measure_k = k;
+                defer walk.measure_k = null;
+                _ = try walkSite(gpa, &walk, reifier, module, local, site, site_expr, region, &call_args, &call_values);
+                freeSlotSources(gpa, walk.takeSlots());
+                gpa.free(try walk.takeReads());
+            }
+        }
+        walk.beginSite(site.view, bound_call != null, reifier);
+        try useSiteCut(&walk, reifier, local, site);
+        if (bound_call != null) walk.useCaptureReads(try captureReads(gpa, local.bodies, site_expr));
+        const outcome = try walkSite(gpa, &walk, reifier, module, local, site, site_expr, region, &call_args, &call_values);
+        const slots = walk.takeSlots();
+        errdefer freeSlotSources(gpa, slots);
+        const reads = try walk.takeReads();
+        errdefer gpa.free(reads);
+        try results.append(gpa, .{ .expr = site_expr, .region = region, .outcome = outcome, .slots = slots, .bound_call = bound_call, .reads = reads });
     }
+
+    var tables = TableBuilder{ .gpa = gpa, .walk = &walk, .reifier = reifier };
+    defer tables.deinit();
+    var refused = std.ArrayList(RefusedUse).empty;
+    defer refused.deinit(gpa);
+    var uses = std.ArrayList(checked.CodeInstanceTable.Indexed).empty;
+    defer uses.deinit(gpa);
+    try closeUses(&tables, &plan, &uses, &refused);
 
     const outcomes = try results.toOwnedSlice(gpa);
     errdefer gpa.free(outcomes);
-    return .{ .outcomes = outcomes, .provenance = try walk.published.toOwnedSlice(gpa) };
+    const provenance = try walk.published.toOwnedSlice(gpa);
+    errdefer {
+        for (provenance) |*p| p.deinit(gpa);
+        gpa.free(provenance);
+    }
+    var instances = try plan.finish(gpa, &tables, uses.items);
+    errdefer instances.deinit(gpa);
+    const instance_sites = try plan.instance_sites.toOwnedSlice(gpa);
+    errdefer gpa.free(instance_sites);
+    const identities = try plan.identities.toOwnedSlice(gpa);
+    errdefer gpa.free(identities);
+    return .{
+        .outcomes = outcomes,
+        .provenance = provenance,
+        .instances = instances,
+        .instance_sites = instance_sites,
+        .identities = identities,
+        .refused_uses = try refused.toOwnedSlice(gpa),
+    };
+}
+
+const CodeSiteRecord = @import("can").NodeStore.CodeReificationSite;
+const Instances = checked.CodeInstanceTable;
+
+/// A closing use refused (D1): the expression publication makes a runtime
+/// error, the use's region, where the report stands, and the refusal.
+pub const RefusedUse = struct {
+    expr: CheckedExprId,
+    /// For a `for` statement's `iter` use, the statement (see `Occurrence`).
+    statement: ?CheckedStatementId = null,
+    region: base.Region,
+    rejection: Rejection,
+};
+
+/// One site or use a body holds, as the inventory and the closing uses read
+/// them (D1).
+const Occurrence = struct {
+    /// A `Code` site, a use of a procedure, or a `Code.type_id` or
+    /// `Code.ty_of` call, which is described as a site is (Q8, D6).
+    kind: enum { site, use, identity },
+    expr: CheckedExprId,
+    /// The expression a refused use makes a runtime error: the call a callee
+    /// lookup is the callee of, or the use itself.
+    poison: CheckedExprId,
+    /// The template whose body holds it, or null for a body of no template
+    /// of this module.
+    template: ?canonical.CheckedProcedureTemplateId,
+    /// Whether its type mentions a quantified variable of `template`.
+    template_vars: bool,
+    /// Whether its type mentions a quantified variable of a lambda a block
+    /// inside the body generalized (Q5).
+    local_vars: bool,
+    /// The `for` statement a refused `iter` use makes a runtime error, where
+    /// the loop is a statement: it has no expression of its own.
+    statement: ?CheckedStatementId = null,
+    /// The expression a report about the use points at, where it is not
+    /// `expr`: for a `for` loop's `iter` use, the iterable.
+    shown: ?CheckedExprId = null,
+};
+
+/// What publication of a module plans for its own instance sites (D1).
+const InstancePlan = struct {
+    table: Instances = .{},
+    /// Each site the site loop does not walk: an instance site, and an
+    /// instance site refused here.
+    handled: collections.DenseMapUnmanaged(CheckedExprId, void) = .empty,
+    instance_sites: std.ArrayList(CheckedExprId) = .empty,
+    /// Each `Code.type_id` and `Code.ty_of` call the plan described at its
+    /// closing uses, or refused: `moduleIdentities` skips them.
+    identities: std.ArrayList(CheckedExprId) = .empty,
+    /// Every site and use of every body, in body order.
+    occurrences: std.ArrayList(Occurrence) = .empty,
+    /// Each template of this module that is a method the compiler calls
+    /// with no written use, and the method's name (Q17).
+    implicit_methods: collections.DenseMapUnmanaged(canonical.CheckedProcedureTemplateId, []const u8) = .empty,
+
+    fn deinit(self: *InstancePlan, gpa: Allocator) void {
+        self.implicit_methods.deinit(gpa);
+        self.table.deinit(gpa);
+        self.handled.deinit(gpa);
+        self.instance_sites.deinit(gpa);
+        self.identities.deinit(gpa);
+        self.occurrences.deinit(gpa);
+    }
+
+    /// The published table: the inventories, and the tables and closing
+    /// uses `tables` built. Takes the plan's table.
+    fn finish(self: *InstancePlan, gpa: Allocator, tables: *TableBuilder, uses: []Instances.Indexed) Allocator.Error!Instances {
+        std.mem.sort(Instances.Indexed, uses, {}, indexedLessThan);
+        var table = self.table;
+        self.table = .{};
+        errdefer table.deinit(gpa);
+        table.tables = try tables.tables.toOwnedSlice(gpa);
+        table.table_entries = try tables.entries.toOwnedSlice(gpa);
+        table.reads = try tables.reads.toOwnedSlice(gpa);
+        table.uses = try gpa.dupe(Instances.Indexed, uses);
+        return table;
+    }
+};
+
+fn indexedLessThan(_: void, a: Instances.Indexed, b: Instances.Indexed) bool {
+    return @backingInt(a.expr) < @backingInt(b.expr);
+}
+
+/// What a body walk reads for each site: its record and its `f`.
+const SiteInfo = struct {
+    record: CodeSiteRecord,
+    fn_ty: ?CheckedTypeId,
+};
+
+/// A `Code.type_id` or `Code.ty_of` call a body walk reads: its argument,
+/// whose type is the proxy's, and which of the two it is.
+const IdentityInfo = struct {
+    arg: CheckedExprId,
+    kind: Instances.RecipeKind,
+};
+
+const IdentityMap = collections.DenseMapUnmanaged(CheckedExprId, IdentityInfo);
+
+/// Where a refusal of a site or a `Code.type_id` or `Code.ty_of` call is
+/// shown: the site, or the call's proxy.
+fn occurrenceRegion(reifier: *Reifier, site_map: *const collections.DenseMapUnmanaged(CheckedExprId, SiteInfo), occurrence: Occurrence) base.Region {
+    return switch (occurrence.kind) {
+        .site => reifier.env.store.getRegionAt(@fromBackingInt(@intCast(site_map.get(occurrence.expr).?.record.node_idx))),
+        .identity => reifier.bodies.expr(occurrence.expr).source_region,
+        .use => unreachable, // a use is refused at its closing use (`closeUses`)
+    };
+}
+
+/// The inventories of this module's templates (D1), and the refusals of
+/// instance sites that no closing use can describe.
+fn planInstances(
+    gpa: Allocator,
+    walk: *Walk,
+    reifier: *Reifier,
+    module: anytype,
+    local: LocalSources,
+    sites: []const CodeSiteRecord,
+    results: *std.ArrayList(SiteOutcome),
+    call_args: *std.ArrayList(CheckedExprId),
+) Allocator.Error!InstancePlan {
+    var plan = InstancePlan{};
+    errdefer plan.deinit(gpa);
+
+    var site_map: collections.DenseMapUnmanaged(CheckedExprId, SiteInfo) = .empty;
+    defer site_map.deinit(gpa);
+    var identity_map: IdentityMap = .empty;
+    defer identity_map.deinit(gpa);
+    for (reifier.env.store.codeIdentityUses()) |use| {
+        const kind: Instances.RecipeKind = switch (use.kind) {
+            // A `Code.prim` reference is not instantiated, so its id never
+            // depends on a use.
+            .prim => continue,
+            .type_id => .type_id,
+            .ty_of => .ty_of,
+        };
+        const call = local.bodies.exprIdAtRawNode(use.call) orelse continue;
+        const arg = local.bodies.exprIdAtRawNode(use.arg) orelse
+            invariant("a published Code.type_id or Code.ty_of call has a published argument");
+        try identity_map.put(gpa, call, .{ .arg = arg, .kind = kind });
+    }
+    for (sites) |site| {
+        const expr = local.bodies.exprIdAtRawNode(site.node_idx) orelse continue;
+        try site_map.put(gpa, expr, .{
+            .record = site,
+            .fn_ty = local.site_types.rootForSourceVar(module, ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(site.fn_var))))),
+        });
+    }
+
+    // Every body, once: its sites and the uses it makes.
+    for (local.bodies.bodies.items) |body| {
+        const owner: ?canonical.CheckedProcedureTemplateId = if (std.meta.eql(body.owner_template.artifact.bytes, local.artifact.bytes))
+            body.owner_template.template
+        else
+            null;
+        var template_vars: Reifier.RowVars = .empty;
+        defer template_vars.deinit(gpa);
+        if (owner) |template_id| {
+            const raw = @backingInt(template_id);
+            if (raw < reifier.procedure_templates.templates.items.len) {
+                for (reifier.schemeVars(reifier.procedure_templates.templates.items[raw])) |scheme_var| try template_vars.put(gpa, scheme_var, {});
+            }
+        }
+        var scan = OccurrenceScan{
+            .r = reifier,
+            .sites = &site_map,
+            .identities = &identity_map,
+            .template = owner,
+            .template_vars = &template_vars,
+            .out = &plan.occurrences,
+        };
+        defer scan.local_vars.deinit(gpa);
+        try scan.expr(body.root_expr, null);
+    }
+    // A compile-time constant, and a top-level binding whose value
+    // evaluation computes, is no procedure body (Q16). A use in it at a
+    // variable of the binding's own type is at a quantified variable, which
+    // a use of the binding fixes; any other use is a closing use. An
+    // expression a body above already holds is not recorded again.
+    for (local.const_bodies.bodies) |const_body| {
+        // A constant evaluation computes at each type a use fixes runs an
+        // entry template, whose variables are the constant's: a use at them
+        // is a forward entry of that template's inventory.
+        if (constantEntryTemplate(local, const_body.id)) |entry| {
+            var entry_vars: Reifier.RowVars = .empty;
+            defer entry_vars.deinit(gpa);
+            for (reifier.schemeVars(reifier.procedure_templates.templates.items[@backingInt(entry)])) |scheme_var| try entry_vars.put(gpa, scheme_var, {});
+            var scan = OccurrenceScan{ .r = reifier, .sites = &site_map, .identities = &identity_map, .template = entry, .template_vars = &entry_vars, .out = &plan.occurrences };
+            defer scan.local_vars.deinit(gpa);
+            try scan.expr(const_body.body_expr, null);
+            continue;
+        }
+        try scanBinding(gpa, reifier, &site_map, &identity_map, &plan.occurrences, const_body.checked_type, const_body.body_expr);
+    }
+    for (local.callable_eval_templates.templates.items) |eval_template| {
+        try scanBinding(gpa, reifier, &site_map, &identity_map, &plan.occurrences, eval_template.checked_fn_root, eval_template.body);
+    }
+    // A top-level `expect` is a compile-time root that no use reaches and
+    // that quantifies no variable, so each use in it is a closing use.
+    const no_vars: Reifier.RowVars = .empty;
+    for (reifier.env.store.sliceStatements(reifier.env.all_statements)) |statement_idx| {
+        const statement = reifier.env.store.getStatement(statement_idx);
+        if (statement != .s_expect) continue;
+        const body = local.bodies.exprIdForSource(statement.s_expect.body) orelse
+            invariant("a top-level expect has no checked body");
+        var scan = OccurrenceScan{ .r = reifier, .sites = &site_map, .identities = &identity_map, .template = null, .template_vars = &no_vars, .out = &plan.occurrences };
+        defer scan.local_vars.deinit(gpa);
+        try scan.expr(body, null);
+    }
+    try dedupeOccurrences(gpa, &plan.occurrences);
+
+    try implicitMethods(gpa, local, &plan.implicit_methods);
+
+    // A template has an inventory when it holds an instance site, or a use
+    // at its own variables of a template that has one. Uses reach other
+    // templates of this module, so this is a fixpoint.
+    var holders: collections.DenseMapUnmanaged(canonical.CheckedProcedureTemplateId, void) = .empty;
+    defer holders.deinit(gpa);
+    for (plan.occurrences.items) |occurrence| {
+        if (occurrence.kind == .use or !occurrence.template_vars) continue;
+        // A site in a binding that is no procedure is described once.
+        const holder = occurrence.template orelse continue;
+        // A method the compiler calls has no written use to describe its
+        // site at, so the site is refused at the method (Q17).
+        if (plan.implicit_methods.get(holder)) |method| {
+            const region = occurrenceRegion(reifier, &site_map, occurrence);
+            if (occurrence.kind == .identity) try plan.identities.append(gpa, occurrence.expr);
+            try plan.handled.put(gpa, occurrence.expr, {});
+            try results.append(gpa, .{ .expr = occurrence.expr, .region = region, .outcome = .{ .rejected = .{
+                .kind = .implicit_method_instance,
+                .region = region,
+                .module = reifier.rejectionModule(),
+                .detail = method,
+            } } });
+            continue;
+        }
+        try holders.put(gpa, holder, {});
+    }
+    while (true) {
+        var grew = false;
+        for (plan.occurrences.items) |occurrence| {
+            if (occurrence.kind != .use or !occurrence.template_vars or occurrence.local_vars) continue;
+            // A binding that is no procedure has no inventory: a use of it
+            // closes through the binding (Q16).
+            if (occurrence.template == null) continue;
+            if (holders.contains(occurrence.template.?)) continue;
+            // `closeUses` refuses such a use in a method the compiler calls.
+            if (plan.implicit_methods.contains(occurrence.template.?)) continue;
+            const used = try reifier.usedTemplate(occurrence.expr) orelse continue;
+            const has = if (used.reader == reifier) holders.contains(used.template) else used.reader.code_instances.inventoryOf(used.template) != null;
+            if (!has) continue;
+            try holders.put(gpa, occurrence.template.?, {});
+            grew = true;
+        }
+        if (!grew) break;
+    }
+    if (holders.count() == 0) return plan;
+
+    var inventories = std.ArrayList(Instances.Inventory).empty;
+    defer inventories.deinit(gpa);
+    var entries = std.ArrayList(Instances.Entry).empty;
+    defer entries.deinit(gpa);
+    var indexed_sites = std.ArrayList(Instances.Indexed).empty;
+    defer indexed_sites.deinit(gpa);
+    var forwards = std.ArrayList(Instances.Indexed).empty;
+    defer forwards.deinit(gpa);
+    var recipes = RecipeBuilder{ .gpa = gpa };
+    defer recipes.deinit();
+
+    // One inventory per holder, its entries in body order.
+    var ordered = std.ArrayList(canonical.CheckedProcedureTemplateId).empty;
+    defer ordered.deinit(gpa);
+    var key_iterator = holders.keyIterator();
+    while (key_iterator.next()) |template_id| try ordered.append(gpa, template_id.*);
+    std.mem.sort(canonical.CheckedProcedureTemplateId, ordered.items, {}, templateIdLessThan);
+    for (ordered.items) |template_id| {
+        const start: u32 = @intCast(entries.items.len);
+        for (plan.occurrences.items) |occurrence| {
+            if (occurrence.template == null or occurrence.template.? != template_id) continue;
+            if (!occurrence.template_vars) continue;
+            const index: u32 = @as(u32, @intCast(entries.items.len)) - start;
+            switch (occurrence.kind) {
+                .site => {
+                    const info = site_map.get(occurrence.expr).?;
+                    try plan.handled.put(gpa, occurrence.expr, {});
+                    const region = reifier.env.store.getRegionAt(@fromBackingInt(@intCast(info.record.node_idx)));
+                    // A site whose translator binds its inputs has one slot
+                    // order at its call, which no instance shares (Q4).
+                    if (info.record.bound_call != CodeSiteRecord.no_bound_call) {
+                        try results.append(gpa, .{ .expr = occurrence.expr, .region = region, .outcome = .{ .rejected = .{
+                            .kind = .bound_instance,
+                            .region = region,
+                            .module = reifier.rejectionModule(),
+                            .detail = "",
+                        } } });
+                        continue;
+                    }
+                    const recipe = switch (try recipes.resolve(walk, reifier, module, local, info, occurrence.expr, region, call_args)) {
+                        .recipe => |recipe| recipe,
+                        .rejected => |rejection| {
+                            try results.append(gpa, .{ .expr = occurrence.expr, .region = region, .outcome = .{ .rejected = rejection } });
+                            continue;
+                        },
+                    };
+                    try indexed_sites.append(gpa, .{ .expr = occurrence.expr, .index = index });
+                    try plan.instance_sites.append(gpa, occurrence.expr);
+                    try entries.append(gpa, .{ .kind = .site, .expr = occurrence.expr, .recipe = recipe });
+                },
+                // A `Code.type_id` or `Code.ty_of` call is computed at each
+                // closing use, as an instance site is described (Q8, D6).
+                .identity => {
+                    const info = identity_map.get(occurrence.expr).?;
+                    try plan.handled.put(gpa, occurrence.expr, {});
+                    try plan.identities.append(gpa, occurrence.expr);
+                    const region = reifier.bodies.expr(info.arg).source_region;
+                    try recipes.recipes.append(gpa, .{
+                        .kind = info.kind,
+                        .view = @backingInt(CodeSiteRecord.View.graph),
+                        .fn_ty = reifier.bodies.expr(info.arg).ty,
+                        .region_start = region.start.offset,
+                        .region_end = region.end.offset,
+                        .root_module = Instances.none,
+                        .root_body = info.arg,
+                        .scheme_vars = .{},
+                        .scheme_root = Instances.none,
+                        .in_block = 0,
+                        .use = Instances.none,
+                        .translator = Instances.none,
+                        .args = .{},
+                    });
+                    try indexed_sites.append(gpa, .{ .expr = occurrence.expr, .index = index });
+                    try entries.append(gpa, .{ .kind = .site, .expr = occurrence.expr, .recipe = @intCast(recipes.recipes.items.len - 1) });
+                },
+                .use => {
+                    if (occurrence.local_vars) continue;
+                    const used = try reifier.usedTemplate(occurrence.expr) orelse continue;
+                    const has = if (used.reader == reifier) holders.contains(used.template) else used.reader.code_instances.inventoryOf(used.template) != null;
+                    if (!has) continue;
+                    try forwards.append(gpa, .{ .expr = occurrence.expr, .index = index });
+                    try entries.append(gpa, .{ .kind = .forward, .expr = occurrence.expr, .recipe = Instances.none });
+                },
+            }
+        }
+        try inventories.append(gpa, .{ .template = template_id, .entries = .{ .start = start, .len = @as(u32, @intCast(entries.items.len)) - start } });
+    }
+    std.mem.sort(Instances.Indexed, indexed_sites.items, {}, indexedLessThan);
+    std.mem.sort(Instances.Indexed, forwards.items, {}, indexedLessThan);
+
+    plan.table = .{
+        .inventories = try inventories.toOwnedSlice(gpa),
+        .entries = try entries.toOwnedSlice(gpa),
+        .sites = try indexed_sites.toOwnedSlice(gpa),
+        .forwards = try forwards.toOwnedSlice(gpa),
+        .recipes = try recipes.recipes.toOwnedSlice(gpa),
+        .scheme_vars = try recipes.scheme_vars.toOwnedSlice(gpa),
+        .exprs = try recipes.exprs.toOwnedSlice(gpa),
+        .modules = try recipes.modules.toOwnedSlice(gpa),
+    };
+    return plan;
+}
+
+/// The methods the compiler calls with no written use (Q17): inspection
+/// calls `to_inspect`, and a derived method over a structure that holds the
+/// type calls the type's own method of the same name.
+const implicit_method_names = [_][]const u8{
+    "to_inspect",
+    base.Ident.IS_EQ_METHOD_NAME,
+    base.Ident.TO_HASH_METHOD_NAME,
+    base.Ident.ENCODER_FOR_METHOD_NAME,
+    base.Ident.PARSER_FOR_METHOD_NAME,
+};
+
+/// Each template of this module that the module's method registry names as
+/// one of `implicit_method_names`, with the name. A procedure target is
+/// always a template of this module: the registry follows a method bound by
+/// value (`to_inspect = render`) only through this module's bindings
+/// (`referencedProcedureTargetForMethodBinding`,
+/// `src/check/static_dispatch_registry.zig:1150`). A method bound to a
+/// function of another module gets no entry, so the compiler never calls it
+/// (`test/cli/StagedFragmentImplicitAcross/`).
+fn implicitMethods(
+    gpa: Allocator,
+    local: LocalSources,
+    out: *collections.DenseMapUnmanaged(canonical.CheckedProcedureTemplateId, []const u8),
+) Allocator.Error!void {
+    // A name the store does not hold names no method of the registry.
+    var implicit_method_ids: [implicit_method_names.len]?canonical.MethodNameId = undefined;
+    for (&implicit_method_ids, implicit_method_names) |*id, name| id.* = local.names.lookupMethodName(name);
+    for (local.method_registry.entries) |entry| {
+        const target = entry.target orelse continue;
+        const procedure = switch (target.kind) {
+            .procedure => |procedure| procedure,
+            .local_proc, .structural => continue,
+        };
+        std.debug.assert(procedure.template.artifact.eql(.{ .bytes = local.artifact.bytes }));
+        for (implicit_method_names, implicit_method_ids) |name, id| {
+            if (id == entry.key.method) {
+                try out.put(gpa, procedure.template.template, name);
+                break;
+            }
+        }
+    }
+}
+
+fn templateIdLessThan(_: void, a: canonical.CheckedProcedureTemplateId, b: canonical.CheckedProcedureTemplateId) bool {
+    return @backingInt(a) < @backingInt(b);
+}
+
+/// The recipes of a module's instance sites (D1), and the pools they span.
+const RecipeBuilder = struct {
+    gpa: Allocator,
+    recipes: std.ArrayList(Instances.Recipe) = .empty,
+    scheme_vars: std.ArrayList(CheckedTypeId) = .empty,
+    exprs: std.ArrayList(CheckedExprId) = .empty,
+    modules: std.ArrayList(checked.CheckedModuleArtifactKey) = .empty,
+
+    fn deinit(self: *RecipeBuilder) void {
+        self.recipes.deinit(self.gpa);
+        self.scheme_vars.deinit(self.gpa);
+        self.exprs.deinit(self.gpa);
+        self.modules.deinit(self.gpa);
+    }
+
+    /// The `modules` index of `reader`'s module, or `none` for the site's
+    /// own module.
+    fn moduleOf(self: *RecipeBuilder, site: *Reifier, reader: *Reifier) Allocator.Error!u32 {
+        if (reader == site) return Instances.none;
+        for (self.modules.items, 0..) |key, index| {
+            if (std.meta.eql(key.bytes, reader.artifact.bytes)) return @intCast(index);
+        }
+        try self.modules.append(self.gpa, reader.artifact);
+        return @intCast(self.modules.items.len - 1);
+    }
+
+    fn schemeSpan(self: *RecipeBuilder, scheme: ?Reifier.Scheme) Allocator.Error!struct { vars: Instances.Span, root: u32 } {
+        const known = scheme orelse return .{ .vars = .{}, .root = Instances.none };
+        const start: u32 = @intCast(self.scheme_vars.items.len);
+        try self.scheme_vars.appendSlice(self.gpa, known.vars);
+        return .{ .vars = .{ .start = start, .len = @intCast(known.vars.len) }, .root = @backingInt(known.root) };
+    }
+
+    /// Resolve one instance site to what a closing use's walk reads, or the
+    /// reason no closing use can describe it.
+    fn resolve(
+        self: *RecipeBuilder,
+        walk: *Walk,
+        reifier: *Reifier,
+        module: anytype,
+        local: LocalSources,
+        info: SiteInfo,
+        site_expr: CheckedExprId,
+        region: base.Region,
+        call_args: *std.ArrayList(CheckedExprId),
+    ) Allocator.Error!union(enum) { recipe: u32, rejected: Rejection } {
+        const site = info.record;
+        const translator: u32 = if (site.translator == CodeSiteRecord.no_translator)
+            Instances.none
+        else if (local.bodies.exprIdAtRawNode(site.translator)) |call| @backingInt(call) else Instances.none;
+        var recipe: Instances.Recipe = .{
+            .kind = .inline_lambda,
+            .view = @backingInt(site.view),
+            .fn_ty = info.fn_ty.?,
+            .region_start = region.start.offset,
+            .region_end = region.end.offset,
+            .root_module = Instances.none,
+            .root_body = site_expr,
+            .scheme_vars = .{},
+            .scheme_root = Instances.none,
+            .in_block = 1,
+            .use = Instances.none,
+            .translator = translator,
+            .args = .{},
+        };
+        switch (site.kind) {
+            .inline_lambda => {},
+            .named_function => {
+                walk.rejection = null;
+                const root = switch (try namedRoot(walk, reifier, module, local, site.node_idx, region)) {
+                    .root => |root| root,
+                    .rejected => |rejection| return .{ .rejected = rejection },
+                };
+                const scheme = try self.schemeSpan(root.scheme);
+                recipe.kind = .named_function;
+                recipe.root_module = try self.moduleOf(reifier, root.reader);
+                recipe.root_body = root.body;
+                recipe.scheme_vars = scheme.vars;
+                recipe.scheme_root = scheme.root;
+                recipe.in_block = @intFromBool(root.in_block);
+                recipe.use = if (root.use) |use| @backingInt(use) else Instances.none;
+            },
+            .template_call => {
+                const call = try templateCall(self.gpa, module, local, site.node_idx, call_args, walk.foreign) orelse
+                    return .{ .rejected = unreachableDefinition(reifier, region, "a template this module cannot read").rejected };
+                const root_reader, const body, const template = switch (call.template) {
+                    .here => |definition| .{ reifier, definition.body, definition.template },
+                    .away => |definition| .{ try walk.reader(definition.module), definition.body, definition.template },
+                };
+                const callee = call.callee orelse
+                    return .{ .rejected = unreachableDefinition(reifier, region, "a template this module cannot read").rejected };
+                const scheme = try self.schemeSpan(root_reader.templateScheme(template));
+                const args_start: u32 = @intCast(self.exprs.items.len);
+                try self.exprs.appendSlice(self.gpa, call.args);
+                recipe.kind = .template_call;
+                recipe.root_module = try self.moduleOf(reifier, root_reader);
+                recipe.root_body = body;
+                recipe.scheme_vars = scheme.vars;
+                recipe.scheme_root = scheme.root;
+                recipe.in_block = 0;
+                recipe.use = @backingInt(callee);
+                recipe.args = .{ .start = args_start, .len = @intCast(call.args.len) };
+            },
+            .template, .template_callee => unreachable, // the site map holds walked sites only
+        }
+        try self.recipes.append(self.gpa, recipe);
+        return .{ .recipe = @intCast(self.recipes.items.len - 1) };
+    }
+};
+
+/// The entry template the evaluation of the constant with body `body` runs,
+/// or null for a constant evaluation already stored.
+fn constantEntryTemplate(local: LocalSources, body: checked.CheckedConstBodyRef) ?canonical.CheckedProcedureTemplateId {
+    for (local.const_templates.templates.items) |template| switch (template.state) {
+        .eval_template => |eval| if (eval.body == body) {
+            if (!std.meta.eql(eval.entry_template.artifact.bytes, local.artifact.bytes)) invariant("a constant's entry template is in another module");
+            return eval.entry_template.template;
+        },
+        .stored_const, .reserved, .unimplemented => {},
+    };
+    return null;
+}
+
+/// The scan of a top-level binding that is no procedure body, at the
+/// variables of its type `ty` (Q16).
+fn scanBinding(
+    gpa: Allocator,
+    reifier: *Reifier,
+    site_map: *const collections.DenseMapUnmanaged(CheckedExprId, SiteInfo),
+    identity_map: *const IdentityMap,
+    out: *std.ArrayList(Occurrence),
+    ty: CheckedTypeId,
+    body: CheckedExprId,
+) Allocator.Error!void {
+    var vars: Reifier.RowVars = .empty;
+    defer vars.deinit(gpa);
+    try reifier.collectVars(ty, &vars);
+    var scan = OccurrenceScan{ .r = reifier, .sites = site_map, .identities = identity_map, .template = null, .template_vars = &vars, .out = out };
+    defer scan.local_vars.deinit(gpa);
+    try scan.expr(body, null);
+}
+
+/// Keep the first record of each expression: a lambda a constant holds may
+/// also be a body of its own.
+fn dedupeOccurrences(gpa: Allocator, occurrences: *std.ArrayList(Occurrence)) Allocator.Error!void {
+    var seen: collections.DenseMapUnmanaged(CheckedExprId, void) = .empty;
+    defer seen.deinit(gpa);
+    var kept: usize = 0;
+    for (occurrences.items) |occurrence| {
+        if ((try seen.getOrPut(gpa, occurrence.expr)).found_existing) continue;
+        occurrences.items[kept] = occurrence;
+        kept += 1;
+    }
+    occurrences.shrinkRetainingCapacity(kept);
+}
+
+/// One body's walk for D1: each site it holds, and each use of a procedure
+/// it makes, with whether each one's type mentions a variable the body's
+/// template or a lambda a block generalized quantifies over. A site is not
+/// entered: what its lambda calls is described, not run.
+const OccurrenceScan = struct {
+    r: *Reifier,
+    sites: *const collections.DenseMapUnmanaged(CheckedExprId, SiteInfo),
+    identities: *const IdentityMap,
+    template: ?canonical.CheckedProcedureTemplateId,
+    template_vars: *const Reifier.RowVars,
+    /// The quantified variables of every generalized lambda the walk is
+    /// inside.
+    local_vars: Reifier.RowVars = .empty,
+    out: *std.ArrayList(Occurrence),
+
+    fn mentions(s: *OccurrenceScan, ty: CheckedTypeId) Allocator.Error!struct { template: bool, local: bool } {
+        return .{
+            .template = try s.r.mentionsAny(ty, s.template_vars),
+            .local = try s.r.mentionsAny(ty, &s.local_vars),
+        };
+    }
+
+    fn record(s: *OccurrenceScan, kind: @FieldType(Occurrence, "kind"), id: CheckedExprId, poison: CheckedExprId, types: []const CheckedTypeId) Allocator.Error!void {
+        var template_vars = false;
+        var local_vars = false;
+        for (types) |ty| {
+            const found = try s.mentions(ty);
+            template_vars = template_vars or found.template;
+            local_vars = local_vars or found.local;
+        }
+        try s.out.append(s.r.gpa, .{
+            .kind = kind,
+            .expr = id,
+            .poison = poison,
+            .template = s.template,
+            .template_vars = template_vars,
+            .local_vars = local_vars,
+        });
+    }
+
+    fn exprs(s: *OccurrenceScan, ids: []const CheckedExprId) Allocator.Error!void {
+        for (ids) |id| try s.expr(id, null);
+    }
+
+    /// `call` is the call `id` is the callee of, or null.
+    fn expr(s: *OccurrenceScan, id: CheckedExprId, call: ?CheckedExprId) Allocator.Error!void {
+        const r = s.r;
+        if (s.sites.get(id)) |info| {
+            // A template's lambda and the name a template call calls stand
+            // for descriptions built elsewhere, and run nothing here.
+            switch (info.record.kind) {
+                .named_function, .inline_lambda, .template_call => if (info.fn_ty) |fn_ty| try s.record(.site, id, id, &.{fn_ty}),
+                .template, .template_callee => {},
+            }
+            return;
+        }
+        if (s.identities.get(id)) |info| {
+            try s.record(.identity, id, id, &.{r.bodies.expr(info.arg).ty});
+            return;
+        }
+        switch (r.bodies.expr(id).data) {
+            .lookup_local, .lookup_external => {
+                const resolved = r.lookupResolved(id) orelse return;
+                const ty = switch (r.value_refs.callableTarget(resolved).ref) {
+                    .top_level_proc, .imported_proc, .promoted_top_level_proc => |use| use.source_fn_ty_payload,
+                    // A constant evaluation computes at each type a use
+                    // fixes (Q16).
+                    .top_level_const, .imported_const => |use| use.requested_source_ty_payload,
+                    .hosted_proc, .local_proc, .local_param, .local_value, .local_mutable_version, .pattern_binder, .selected_hoisted_const, .platform_required_declaration, .platform_required_checked_error, .platform_required_const, .platform_required_proc => return,
+                };
+                var types = std.ArrayList(CheckedTypeId).empty;
+                defer types.deinit(r.gpa);
+                if (ty) |fixed| try types.append(r.gpa, fixed);
+                if (r.plans.siteSubstitution(id)) |copied| try types.appendSlice(r.gpa, copied);
+                try s.record(.use, id, call orelse id, types.items);
+            },
+            // `a == b` on a written `is_eq`, and `T.method(..)`, are static
+            // dispatches as a method call is.
+            .dispatch_call, .method_eq, .type_dispatch_call => |plan_id| {
+                const plan_ref = plan_id orelse return;
+                const dispatch = r.plans.plans[@backingInt(plan_ref)];
+                switch (dispatch.resolution) {
+                    .direct_closed, .direct_parametric => |direct| {
+                        const node = r.plans.evidenceNode(direct.evidence);
+                        if (node.target.kind == .procedure) try s.record(.use, id, id, r.plans.targetSubstitution(node));
+                    },
+                    .direct_pending, .evidence_dependent, .structural, .checked_error, .@"unreachable" => {},
+                }
+                try s.dispatchOperands(plan_ref);
+            },
+            .lambda => |lambda| try s.scoped(id, lambda.body),
+            .closure => |closure| try s.scoped(id, closure.lambda),
+            .str, .list, .tuple => |items| try s.exprs(items),
+            .match_ => |m| {
+                try s.expr(m.cond, null);
+                for (m.branches) |branch| {
+                    if (branch.guard) |guard| try s.expr(guard, null);
+                    try s.expr(branch.value, null);
+                }
+            },
+            .if_ => |i| {
+                for (i.branches) |branch| {
+                    try s.expr(branch.cond, null);
+                    try s.expr(branch.body, null);
+                }
+                try s.expr(i.final_else, null);
+            },
+            .call => |c| {
+                try s.expr(c.func, id);
+                try s.exprs(c.args);
+            },
+            .record => |rec| {
+                if (rec.ext) |ext| try s.expr(ext, null);
+                for (rec.fields) |field| try s.expr(field.value, null);
+            },
+            .block => |block| {
+                for (block.statements) |stmt| try s.statement(stmt);
+                try s.expr(block.final_expr, null);
+            },
+            .tag => |t| try s.exprs(t.args),
+            .nominal => |n| try s.expr(n.backing_expr, null),
+            .row_coerce => |coerce| try s.expr(coerce.value, null),
+            .binop => |op| {
+                try s.expr(op.lhs, null);
+                try s.expr(op.rhs, null);
+            },
+            .unary_minus, .unary_not, .dbg, .expect => |operand| try s.expr(operand, null),
+            .field_access => |access| try s.expr(access.receiver, null),
+            .tuple_access => |access| try s.expr(access.tuple, null),
+            .interpolation => |interpolation| {
+                try s.exprs(interpolation.segments);
+                try s.exprs(interpolation.values);
+            },
+            .structural_eq => |eq| {
+                try s.expr(eq.lhs, null);
+                try s.expr(eq.rhs, null);
+            },
+            .structural_hash => |hash| {
+                try s.expr(hash.value, null);
+                try s.expr(hash.hasher, null);
+            },
+            .expect_err => |e| try s.expr(e.expr, null),
+            .return_ => |returned| try s.expr(returned.expr, null),
+            .for_ => |loop| {
+                try s.iterUse(loop.plan, loop.body, loop.expr, id, null);
+                try s.expr(loop.expr, null);
+                try s.expr(loop.body, null);
+            },
+            .run_low_level => |run| try s.exprs(run.args),
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .bytes_literal,
+            .lookup_required,
+            .empty_list,
+            .empty_record,
+            .zero_argument_tag,
+            .runtime_error,
+            .crash,
+            .ellipsis,
+            .anno_only,
+            .hosted_lambda,
+            .break_,
+            => {},
+        }
+    }
+
+    /// A lambda's body, inside the scope of the lambda when a block
+    /// generalized it.
+    fn scoped(s: *OccurrenceScan, lambda: CheckedExprId, inner: CheckedExprId) Allocator.Error!void {
+        const r = s.r;
+        var added = std.ArrayList(CheckedTypeId).empty;
+        defer added.deinit(r.gpa);
+        for (r.procedure_templates.dispatch_scopes) |*scope| {
+            if (scope.checked_expr != lambda) continue;
+            for (r.procedure_templates.scopeSchemeVars(scope)) |scheme_var| {
+                if ((try s.local_vars.getOrPut(r.gpa, scheme_var)).found_existing) continue;
+                try added.append(r.gpa, scheme_var);
+            }
+        }
+        defer for (added.items) |scheme_var| {
+            _ = s.local_vars.remove(scheme_var);
+        };
+        try s.expr(inner, null);
+    }
+
+    fn dispatchOperands(s: *OccurrenceScan, plan_id: static_dispatch.StaticDispatchPlanId) Allocator.Error!void {
+        const p = s.r.plans.plans[@backingInt(plan_id)];
+        for (p.argsSlice(s.r.plans)) |operand| switch (operand) {
+            .checked_expr, .generated_interpolation_segments => |child| try s.expr(child, null),
+            .generated_numeral, .generated_quote => {},
+        };
+    }
+
+    /// A `for` loop's `iter` call, a direct static dispatch, keyed by the
+    /// loop's body. A refused use poisons the loop expression, or, for a
+    /// statement, the statement.
+    fn iterUse(s: *OccurrenceScan, plan_id: ?static_dispatch.IteratorForPlanId, body: CheckedExprId, iterable: CheckedExprId, poison: CheckedExprId, statement_id: ?CheckedStatementId) Allocator.Error!void {
+        const plan = s.r.plans.iterator_for_plans[@backingInt(plan_id orelse return)];
+        const direct = switch (plan.iter.resolution) {
+            .direct_closed, .direct_parametric => |direct| direct,
+            .direct_pending, .evidence_dependent, .structural, .checked_error, .@"unreachable" => return,
+        };
+        const node = s.r.plans.evidenceNode(direct.evidence);
+        if (node.target.kind != .procedure) return;
+        try s.record(.use, body, poison, s.r.plans.targetSubstitution(node));
+        s.out.items[s.out.items.len - 1].statement = statement_id;
+        s.out.items[s.out.items.len - 1].shown = iterable;
+    }
+
+    fn statement(s: *OccurrenceScan, id: CheckedStatementId) Allocator.Error!void {
+        switch (s.r.bodies.statement(id).data) {
+            .decl => |decl| try s.expr(decl.expr, null),
+            .var_ => |decl| try s.expr(decl.expr, null),
+            .reassign => |assignment| try s.expr(assignment.expr, null),
+            .dbg, .expr, .expect => |e| try s.expr(e, null),
+            .for_ => |loop| {
+                try s.iterUse(loop.plan, loop.body, loop.expr, loop.body, id);
+                try s.expr(loop.expr, null);
+                try s.expr(loop.body, null);
+            },
+            .while_, .infinite_loop, .breakable_loop => |loop| {
+                try s.expr(loop.cond, null);
+                try s.expr(loop.body, null);
+            },
+            .return_ => |returned| try s.expr(returned.expr, null),
+            // A promoted function's body is its own procedure, which runs
+            // nothing here.
+            .promoted_proc,
+            .pending,
+            .var_uninitialized,
+            .crash,
+            .break_,
+            .import_,
+            .alias_decl,
+            .where_alias_decl,
+            .nominal_decl,
+            .type_anno,
+            .type_var_alias,
+            .runtime_error,
+            => {},
+        }
+    }
+};
+
+/// Find this module's closing uses (D1), build each one's table, and refuse
+/// the uses no table can serve: a use whose `where` evidence names a
+/// template with an inventory (Q14), a use at the variables of a lambda a
+/// block generalized (Q5), and a use whose table holds a refused
+/// description.
+fn closeUses(
+    tables: *TableBuilder,
+    plan: *const InstancePlan,
+    uses: *std.ArrayList(Instances.Indexed),
+    refused: *std.ArrayList(RefusedUse),
+) Allocator.Error!void {
+    const reifier = tables.reifier;
+    const gpa = tables.gpa;
+    for (plan.occurrences.items) |occurrence| {
+        if (occurrence.kind != .use) continue;
+        const region = reifier.bodies.expr(occurrence.shown orelse occurrence.expr).source_region;
+        if (try evidenceReachesInventory(reifier, occurrence.expr)) {
+            try refused.append(gpa, .{ .expr = occurrence.poison, .statement = occurrence.statement, .region = region, .rejection = .{
+                .kind = .instance_through_evidence,
+                .region = region,
+                .module = reifier.rejectionModule(),
+                .detail = "",
+            } });
+            continue;
+        }
+        const used = try reifier.usedTemplate(occurrence.expr) orelse continue;
+        if (used.reader.code_instances.inventoryOf(used.template) == null) continue;
+        if (occurrence.local_vars) {
+            try refused.append(gpa, .{ .expr = occurrence.poison, .statement = occurrence.statement, .region = region, .rejection = .{
+                .kind = .instance_in_local_generic,
+                .region = region,
+                .module = reifier.rejectionModule(),
+                .detail = "",
+            } });
+            continue;
+        }
+        if (occurrence.template_vars) {
+            // A method the compiler calls has no inventory: no written use
+            // closes it (Q17).
+            const method = if (occurrence.template) |template| plan.implicit_methods.get(template) else null;
+            if (method) |name| {
+                try refused.append(gpa, .{ .expr = occurrence.poison, .statement = occurrence.statement, .region = region, .rejection = .{
+                    .kind = .implicit_method_instance,
+                    .region = region,
+                    .module = reifier.rejectionModule(),
+                    .detail = name,
+                } });
+            }
+            // A use at its own template's variables is a forward entry of
+            // that template's inventory, which a closing use of the template
+            // reads.
+            continue;
+        }
+        const steps = [_]ChainStep{.{ .reader = reifier, .use = occurrence.expr }};
+        const table = try tables.build(&steps);
+        if (try tables.firstRejection(table)) |rejection| {
+            try refused.append(gpa, .{ .expr = occurrence.poison, .statement = occurrence.statement, .region = region, .rejection = rejection });
+            continue;
+        }
+        try uses.append(gpa, .{ .expr = occurrence.expr, .index = table });
+        if (base.dev_diagnostics.isSet(.reify_instances)) tables.printTable(region, table, 0);
+    }
+}
+
+/// Whether the `where` evidence a use supplies names, at any depth, a
+/// method whose template has an inventory (Q14): such a method is
+/// specialized through the evidence, which carries no table.
+fn evidenceReachesInventory(reifier: *Reifier, use: CheckedExprId) Allocator.Error!bool {
+    switch (reifier.bodies.expr(use).data) {
+        .lookup_local, .lookup_external => {
+            const entries = reifier.plans.siteEvidence(use) orelse return false;
+            return evidenceEntriesReach(reifier, entries);
+        },
+        .pending,
+        .numeral,
+        .str_from_quote,
+        .code_from_lambda,
+        .str_segment,
+        .str,
+        .bytes_literal,
+        .lookup_required,
+        .list,
+        .empty_list,
+        .tuple,
+        .match_,
+        .if_,
+        .call,
+        .record,
+        .empty_record,
+        .block,
+        .tag,
+        .nominal,
+        .zero_argument_tag,
+        .closure,
+        .lambda,
+        .binop,
+        .unary_minus,
+        .unary_not,
+        .field_access,
+        .dispatch_call,
+        .interpolation,
+        .structural_eq,
+        .structural_hash,
+        .method_eq,
+        .type_dispatch_call,
+        .tuple_access,
+        .runtime_error,
+        .crash,
+        .dbg,
+        .expect_err,
+        .expect,
+        .ellipsis,
+        .anno_only,
+        .break_,
+        .return_,
+        .row_coerce,
+        .for_,
+        .hosted_lambda,
+        .run_low_level,
+        => {
+            const spec = (try reifier.dispatchOfUse(use)) orelse return false;
+            const direct = switch (spec.resolution) {
+                .direct_closed, .direct_parametric => |direct| direct,
+                .direct_pending, .evidence_dependent, .structural, .checked_error, .@"unreachable" => return false,
+            };
+            const node = reifier.plans.evidenceNode(direct.evidence);
+            return switch (node.nested) {
+                .resolved => evidenceEntriesReach(reifier, reifier.plans.nestedEvidence(node)),
+                .through_alias => aliasEvidenceReaches(reifier, node),
+                .from_callable => false,
+            };
+        },
+    }
+}
+
+/// Whether the evidence an edge through a method alias supplies reaches an
+/// inventory: what the edge answered for the alias's requirements, and what
+/// each lookup of the alias chain records for the target's.
+fn aliasEvidenceReaches(reifier: *Reifier, node: static_dispatch.EvidenceNode) Allocator.Error!bool {
+    if (try evidenceEntriesReach(reifier, reifier.plans.aliasScopeEvidence(node))) return true;
+    const procedure = switch (node.target.kind) {
+        .procedure => |procedure| procedure,
+        .local_proc, .structural => return false,
+    };
+    const defining = try reifier.templateReader(procedure.template.artifact) orelse return false;
+    var hop = defining.firstAliasHop(node.target.alias orelse invariant("an edge through a method alias names its alias"));
+    while (true) {
+        if (hop.reader.plans.siteEvidence(hop.lookup)) |entries| {
+            if (try evidenceEntriesReach(hop.reader, entries)) return true;
+        }
+        hop = try Reifier.nextAliasHop(hop) orelse return false;
+    }
+}
+
+fn evidenceEntriesReach(reifier: *Reifier, entries: []const static_dispatch.CheckedEvidence) Allocator.Error!bool {
+    for (entries) |entry| {
+        const node_id = switch (entry.resolution) {
+            .direct => |node_id| node_id,
+            .constraint, .structural, .from_callable, .from_scheme, .checked_error, .unreachable_value => continue,
+        };
+        const node = reifier.plans.evidenceNode(node_id);
+        switch (node.target.kind) {
+            // An intrinsic has no body, so it has no inventory.
+            .procedure => |procedure| if (try reifier.intrinsicOfTemplate(procedure.template.artifact, node.target.def_idx) == null) if (reifier.methodDefinition(procedure.template, node.target.def_idx)) |found| {
+                const reader = switch (found) {
+                    .provided => null,
+                    .here, .here_builtin => reifier,
+                    .away => |definition| try reifier.walk.reader(definition.module),
+                };
+                if (reader) |holder| {
+                    if (holder.code_instances.inventoryOf(found.template().template_id) != null) return true;
+                }
+            },
+            .local_proc, .structural => {},
+        }
+        switch (node.nested) {
+            .resolved => if (try evidenceEntriesReach(reifier, reifier.plans.nestedEvidence(node))) return true,
+            .through_alias => if (try aliasEvidenceReaches(reifier, node)) return true,
+            .from_callable => {},
+        }
+    }
+    return false;
+}
+
+/// One use on the way from a closing use to a table's template: the reader
+/// of the module that holds the use, and the use.
+const ChainStep = struct {
+    reader: *Reifier,
+    use: CheckedExprId,
+};
+
+/// The instance a chain of uses reaches: the template, read by its module's
+/// reader, the frame that holds what the chain fixed its variables to, the
+/// instance's key, and the evidence the last use supplied.
+const Established = struct {
+    reader: *Reifier,
+    template: canonical.CheckedProcedureTemplateId,
+    frame: Reifier.FrameId,
+    key: [32]u8,
+    evidence: Reifier.SuppliedEvidence,
+};
+
+/// What a reader held before a chain set its instance, restored when the
+/// walk ends.
+const SavedStates = struct {
+    gpa: Allocator,
+    saved: std.ArrayList(Saved) = .empty,
+
+    const Saved = struct {
+        reader: *Reifier,
+        frame: Reifier.FrameId,
+        evidence: Reifier.SuppliedEvidence,
+        instance_key: [32]u8,
+    };
+
+    fn set(self: *SavedStates, reader: *Reifier, frame: Reifier.FrameId, evidence: Reifier.SuppliedEvidence, key: [32]u8) Allocator.Error!void {
+        try self.saved.append(self.gpa, .{ .reader = reader, .frame = reader.frame, .evidence = reader.evidence, .instance_key = reader.instance_key });
+        reader.frame = frame;
+        reader.evidence = evidence;
+        reader.instance_key = key;
+    }
+
+    fn restore(self: *SavedStates) void {
+        while (self.saved.pop()) |saved| {
+            saved.reader.frame = saved.frame;
+            saved.reader.evidence = saved.evidence;
+            saved.reader.instance_key = saved.instance_key;
+        }
+        self.saved.deinit(self.gpa);
+    }
+};
+
+/// The tables a module's closing uses build (D1). A table is keyed by its
+/// template and the key of its instance, so two uses at one type share one,
+/// and a recursive use at the template's own types names the table being
+/// built: the tables are a graph.
+const TableBuilder = struct {
+    gpa: Allocator,
+    walk: *Walk,
+    /// The reader of the module whose closing uses are built.
+    reifier: *Reifier,
+    tables: std.ArrayList(Instances.Span) = .empty,
+    entries: std.ArrayList(Instances.TableEntry) = .empty,
+    reads: std.ArrayList(checked.CheckedCodeRead) = .empty,
+    /// The refusal of each table, or null.
+    rejections: std.ArrayList(?Rejection) = .empty,
+    memo: std.AutoHashMapUnmanaged(MemoKey, u32) = .empty,
+
+    const MemoKey = struct {
+        module: [32]u8,
+        template: u32,
+        key: [32]u8,
+    };
+
+    /// `ROC_REIFY_INSTANCES`: a closing use at `region` and its table, one
+    /// line per entry, a nested table indented under its forward entry.
+    fn printTable(self: *const TableBuilder, region: base.Region, table: u32, depth: usize) void {
+        if (depth == 0) std.debug.print("reify instances: use at {d}..{d}, table {d}\n", .{ region.start.offset, region.end.offset, table });
+        const span = self.tables.items[table];
+        for (self.entries.items[span.start..][0..span.len], 0..) |entry, index| {
+            for (0..depth + 1) |_| std.debug.print("  ", .{});
+            switch (entry.kind) {
+                .node => std.debug.print("{d}: node {d}\n", .{ index, entry.value }),
+                .table => {
+                    std.debug.print("{d}: table {d}\n", .{ index, entry.value });
+                    self.printTable(region, entry.value, depth + 1);
+                },
+            }
+        }
+    }
+
+    fn deinit(self: *TableBuilder) void {
+        self.tables.deinit(self.gpa);
+        self.entries.deinit(self.gpa);
+        self.reads.deinit(self.gpa);
+        self.rejections.deinit(self.gpa);
+        self.memo.deinit(self.gpa);
+    }
+
+    /// Fix the instance `chain` reaches in a walk begun by the caller.
+    fn establish(self: *TableBuilder, chain: []const ChainStep, saved: *SavedStates) Reifier.Error!Established {
+        var frame: Reifier.FrameId = Reifier.empty_frame;
+        var key: [32]u8 = @splat(0);
+        var evidence: Reifier.SuppliedEvidence = .{};
+        var reader: *Reifier = undefined;
+        var body: CheckedExprId = undefined;
+        for (chain, 0..) |step, index| {
+            if (index != 0) try saved.set(step.reader, frame, evidence, key);
+            self.walk.body = step.reader;
+            const region = step.reader.bodies.expr(step.use).source_region;
+            var target = (try step.reader.useTarget(step.use, region)) orelse
+                invariant("a use an inventory or a closing use names reaches no template");
+            defer step.reader.releaseBound(target.bound);
+            defer if (target.instantiation) |*fixed| fixed.substitution.deinit(self.gpa);
+            frame = try target.reader.instanceFrame(target.instantiation, target.signature, target.key.body, target.key.curried);
+            key = if (target.instantiation) |fixed| fixed.key else @splat(0);
+            evidence = target.evidence;
+            reader = target.reader;
+            body = target.key.body;
+        }
+        return .{
+            .reader = reader,
+            .template = templateOfBody(reader, body) orelse invariant("a template with an inventory has a checked body"),
+            .frame = frame,
+            .key = key,
+            .evidence = evidence,
+        };
+    }
+
+    /// The table of the instance `chain` reaches, built or shared. A refusal
+    /// is recorded on the table rather than returned, because a table a
+    /// recursive use shares is still being built when the use names it.
+    fn build(self: *TableBuilder, chain: []const ChainStep) Allocator.Error!u32 {
+        self.walk.beginSite(.graph, false, self.reifier);
+        try self.walk.startSite();
+        var saved = SavedStates{ .gpa = self.gpa };
+        const reached = self.establish(chain, &saved);
+        saved.restore();
+        const est = reached catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.Rejected => return self.refusedTable(self.walk.rejection.?),
+            error.Diverged => invariant("a divergence escaped before any row was built"),
+        };
+        const memo_key = MemoKey{ .module = est.reader.artifact.bytes, .template = @backingInt(est.template), .key = est.key };
+        if (self.memo.get(memo_key)) |existing| return existing;
+        const index: u32 = @intCast(self.tables.items.len);
+        try self.tables.append(self.gpa, .{});
+        try self.rejections.append(self.gpa, null);
+        try self.memo.put(self.gpa, memo_key, index);
+
+        const holder = est.reader;
+        const inventory = holder.code_instances.inventoryOf(est.template) orelse
+            invariant("a closing use or a forward entry names a template with no inventory");
+        var entries = std.ArrayList(Instances.TableEntry).empty;
+        defer entries.deinit(self.gpa);
+        for (inventory) |entry| switch (entry.kind) {
+            .site => {
+                const recipe = holder.code_instances.recipes[entry.recipe];
+                const outcome = try self.describe(chain, holder, recipe);
+                const reads = try self.walk.takeReads();
+                defer self.gpa.free(reads);
+                switch (outcome) {
+                    .reified => |node| {
+                        const reads_start: u32 = @intCast(self.reads.items.len);
+                        try self.reads.appendSlice(self.gpa, reads);
+                        try entries.append(self.gpa, .{
+                            .kind = .node,
+                            .value = @backingInt(node),
+                            .reads = .{ .start = reads_start, .len = @intCast(reads.len) },
+                        });
+                    },
+                    .rejected => |rejection| {
+                        self.rejections.items[index] = rejection;
+                        break;
+                    },
+                }
+            },
+            .forward => {
+                const nested = try self.gpa.alloc(ChainStep, chain.len + 1);
+                defer self.gpa.free(nested);
+                @memcpy(nested[0..chain.len], chain);
+                nested[chain.len] = .{ .reader = holder, .use = entry.expr };
+                const child = try self.build(nested);
+                try entries.append(self.gpa, .{ .kind = .table, .value = child, .reads = .{} });
+            },
+        };
+        const start: u32 = @intCast(self.entries.items.len);
+        try self.entries.appendSlice(self.gpa, entries.items);
+        self.tables.items[index] = .{ .start = start, .len = @intCast(entries.items.len) };
+        return index;
+    }
+
+    fn refusedTable(self: *TableBuilder, rejection: Rejection) Allocator.Error!u32 {
+        const index: u32 = @intCast(self.tables.items.len);
+        try self.tables.append(self.gpa, .{});
+        try self.rejections.append(self.gpa, rejection);
+        return index;
+    }
+
+    /// The first refusal among the tables `root` reaches, or null.
+    fn firstRejection(self: *TableBuilder, root: u32) Allocator.Error!?Rejection {
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(self.gpa);
+        var pending = std.ArrayList(u32).empty;
+        defer pending.deinit(self.gpa);
+        try pending.append(self.gpa, root);
+        while (pending.pop()) |table| {
+            if ((try seen.getOrPut(self.gpa, table)).found_existing) continue;
+            if (self.rejections.items[table]) |rejection| return rejection;
+            const span = self.tables.items[table];
+            for (self.entries.items[span.start..][0..span.len]) |entry| {
+                if (entry.kind == .table) try pending.append(self.gpa, entry.value);
+            }
+        }
+        return null;
+    }
+
+    /// Describe one instance site of `holder` at the instance `chain`
+    /// reaches, in this module's store.
+    fn describe(self: *TableBuilder, chain: []const ChainStep, holder: *Reifier, recipe: Instances.Recipe) Allocator.Error!Outcome {
+        const walk = self.walk;
+        walk.beginSite(@fromBackingInt(@intCast(recipe.view)), false, self.reifier);
+        try walk.startSite();
+        var saved = SavedStates{ .gpa = self.gpa };
+        defer saved.restore();
+        const est = self.establish(chain, &saved) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.Rejected => return .{ .rejected = walk.rejection.? },
+            error.Diverged => invariant("a divergence escaped before any row was built"),
+        };
+        std.debug.assert(est.reader == holder);
+        // The holder reads the site in the instance the chain fixed.
+        try saved.set(holder, est.frame, est.evidence, est.key);
+        walk.instance = est.key;
+        defer walk.instance = null;
+        if (recipe.translator != Instances.none) try walk.useCut(holder, @fromBackingInt(recipe.translator));
+        const region: base.Region = .{ .start = .{ .offset = recipe.region_start }, .end = .{ .offset = recipe.region_end } };
+        const root_reader = if (recipe.root_module == Instances.none)
+            holder
+        else
+            try walk.reader(walk.foreign.findModule(&holder.code_instances.modules[recipe.root_module].bytes) orelse
+                invariant("a recipe's root module is in reach of every module that reaches the recipe"));
+        walk.body = holder;
+        try holder.relateSelectedTargets();
+        try root_reader.relateSelectedTargets();
+        const scheme: ?Reifier.Scheme = if (recipe.scheme_root == Instances.none) null else .{
+            .vars = holder.code_instances.scheme_vars[recipe.scheme_vars.start..][0..recipe.scheme_vars.len],
+            .root = @fromBackingInt(recipe.scheme_root),
+        };
+        const use: ?CheckedExprId = if (recipe.use == Instances.none) null else @fromBackingInt(recipe.use);
+        const root_body: CheckedExprId = recipe.root_body;
+        switch (recipe.kind) {
+            .inline_lambda => return root_reader.outcomeOf(root_reader.rootSite(root_body, .{
+                .scheme = null,
+                .in_block = true,
+                .caller = holder,
+                .fixed = recipe.fn_ty,
+                .region = region,
+                .enclosing = .{ .frame = est.frame, .key = est.key, .evidence = est.evidence },
+            }), region),
+            .named_function => return root_reader.outcomeOf(root_reader.rootSite(root_body, .{
+                .scheme = scheme,
+                .in_block = recipe.in_block != 0,
+                .caller = holder,
+                .fixed = recipe.fn_ty,
+                .use = use,
+                .region = region,
+            }), region),
+            // The proxy's type in the instance the chain fixed (Q8, D6).
+            .type_id => {
+                const bits = holder.typeIdIdentity(root_body) orelse return .{ .rejected = .{
+                    .kind = .type_id_not_nominal,
+                    .region = region,
+                    .module = holder.rejectionModule(),
+                    .detail = "",
+                } };
+                const store = walk.store;
+                return .{ .reified = try store.append(.{ .record = &.{try store.append(.{ .scalar = .{ .u128 = bits } })} }) };
+            },
+            .ty_of => return holder.tyOfProxy(root_body, region),
+            .template_call => {
+                var values = std.ArrayList(Reifier.TemplateArg).empty;
+                defer values.deinit(self.gpa);
+                defer holder.releaseTemplateArgs(values.items);
+                const args = holder.code_instances.exprs[recipe.args.start..][0..recipe.args.len];
+                if (try holder.reifyConstants(args, &values, self.gpa)) |rejection| return .{ .rejected = rejection };
+                return root_reader.outcomeOf(root_reader.templateSite(root_body, .{
+                    .scheme = scheme.?,
+                    .caller = holder,
+                    .fixed = holder.bodies.expr(use.?).ty,
+                    .use = use,
+                }, values.items, region), region);
+            },
+        }
+    }
+};
+
+/// The template whose checked body is `body`, in `reader`'s module.
+fn templateOfBody(reader: *Reifier, body: CheckedExprId) ?canonical.CheckedProcedureTemplateId {
+    for (reader.procedure_templates.templates.items) |template| {
+        const body_id = switch (template.body) {
+            .checked_body => |id| id,
+            .intrinsic_wrapper, .entry_wrapper, .unimplemented => continue,
+        };
+        if (reader.bodies.body(body_id).root_expr == body) return template.template_id;
+    }
+    // A constant's evaluation runs its entry template, which has no checked
+    // body of its own (Q16).
+    for (reader.const_templates.templates.items) |template| switch (template.state) {
+        .eval_template => |eval| if (reader.const_bodies.get(eval.body).body_expr == body) return eval.entry_template.template,
+        .stored_const, .reserved, .unimplemented => {},
+    };
+    return null;
+}
+
+/// The cut of `site`, from the translator its call names (I14).
+fn useSiteCut(walk: *Walk, reifier: *Reifier, local: LocalSources, site: @import("can").NodeStore.CodeReificationSite) Allocator.Error!void {
+    if (site.translator == @import("can").NodeStore.CodeReificationSite.no_translator) return;
+    // A call checking rejected has no checked expression, and the build
+    // already stops at its error.
+    const call = local.bodies.exprIdAtRawNode(site.translator) orelse return;
+    try walk.useCut(reifier, call);
+}
+
+// The walk of one site, by its kind.
+fn walkSite(
+    gpa: Allocator,
+    walk: *Walk,
+    reifier: *Reifier,
+    module: anytype,
+    local: LocalSources,
+    site: @import("can").NodeStore.CodeReificationSite,
+    site_expr: CheckedExprId,
+    region: base.Region,
+    call_args: *std.ArrayList(CheckedExprId),
+    call_values: *std.ArrayList(Reifier.TemplateArg),
+) Allocator.Error!Outcome {
+    return switch (site.kind) {
+        .named_function => try reifyNamedSite(walk, reifier, module, local, site.node_idx, site.fn_var, region),
+        // The lambda is the root, and the site is where it is written, so
+        // the checked expression the node copied to is what the walk
+        // reads, and the `f` beside it is the type to read it at.
+        .inline_lambda => try reifier.reifyLambda(site_expr, .{
+            .scheme = null,
+            .in_block = true,
+            .caller = reifier,
+            .fixed = local.site_types.rootForSourceVar(
+                module,
+                ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(site.fn_var)))),
+            ),
+            .region = region,
+        }),
+        .template_call => try reifyTemplateSite(
+            gpa,
+            walk,
+            reifier,
+            module,
+            local,
+            site.node_idx,
+            region,
+            call_args,
+            call_values,
+        ),
+        .template, .template_callee => unreachable, // the caller skips template and template_callee sites
+    };
+}
+
+fn freeSlotSources(gpa: Allocator, slots: []SlotSource) void {
+    for (slots) |slot| {
+        gpa.free(slot.steps);
+        gpa.free(slot.shape);
+    }
+    gpa.free(slots);
 }
 
 /// What a module's sites came to: each site's outcome, and the provenance of
@@ -6855,8 +14302,28 @@ pub fn reifyModuleSites(
 pub const ModuleSites = struct {
     outcomes: []SiteOutcome = &.{},
     provenance: []SiteProvenance = &.{},
+    /// The module's inventories and the tables of its closing uses (D1).
+    instances: checked.CodeInstanceTable = .{},
+    /// The module's instance sites, which publication leaves with no node
+    /// of their own: each closing use describes them.
+    instance_sites: []CheckedExprId = &.{},
+    /// The closing uses no table serves, which publication reports and
+    /// makes runtime errors.
+    refused_uses: []RefusedUse = &.{},
+    /// The module's `Code.type_id` and `Code.ty_of` calls that each closing
+    /// use computes, or that were refused here (Q8, D6): `moduleIdentities`
+    /// skips them.
+    identities: []CheckedExprId = &.{},
 
     pub fn deinit(self: *ModuleSites, gpa: Allocator) void {
+        self.instances.deinit(gpa);
+        gpa.free(self.instance_sites);
+        gpa.free(self.identities);
+        gpa.free(self.refused_uses);
+        for (self.outcomes) |outcome| {
+            freeSlotSources(gpa, outcome.slots);
+            gpa.free(outcome.reads);
+        }
         gpa.free(self.outcomes);
         for (self.provenance) |*p| p.deinit(gpa);
         gpa.free(self.provenance);
@@ -6880,6 +14347,52 @@ fn reifyNamedSite(
     region: base.Region,
 ) Allocator.Error!Outcome {
     const fixed = local.site_types.rootForSourceVar(module, ModuleEnv.varFrom(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(fn_var)))));
+    const root = switch (try namedRoot(walk, reifier, module, local, node_idx, region)) {
+        .root => |root| root,
+        .rejected => |rejection| return .{ .rejected = rejection },
+    };
+    return root.reader.reifyLambda(root.body, .{
+        .scheme = root.scheme,
+        .in_block = root.in_block,
+        .caller = reifier,
+        .fixed = fixed,
+        .use = root.use,
+        .region = region,
+    });
+}
+
+/// The lambda a named site describes, and how the site fixes it: the reader
+/// of the module that defines it, what it quantifies over, whether it reads
+/// the block around it, and the site's lookup.
+const NamedRoot = struct {
+    reader: *Reifier,
+    body: CheckedExprId,
+    scheme: ?Reifier.Scheme,
+    in_block: bool,
+    use: ?CheckedExprId,
+};
+
+/// Where the name at a named site leads, or the reason it leads nowhere the
+/// walk can read.
+fn namedRoot(
+    walk: *Walk,
+    reifier: *Reifier,
+    module: anytype,
+    local: LocalSources,
+    node_idx: u32,
+    region: base.Region,
+) Allocator.Error!union(enum) { root: NamedRoot, rejected: Rejection } {
+    const use = local.bodies.exprIdAtRawNode(node_idx);
+
+    // An intrinsic has no body, and the walk never asks for one.
+    if (namesIntrinsic(walk, module, node_idx)) {
+        return .{ .rejected = .{
+            .kind = .unsupported_expression,
+            .region = region,
+            .module = reifier.rejectionModule(),
+            .detail = "an intrinsic, a function with no Roc body, named as the function to describe",
+        } };
+    }
 
     // An exact function alias, `same = add_one`, has no body of its own. The
     // checker recorded the lookup it forwards to, and the site describes the
@@ -6890,51 +14403,51 @@ fn reifyNamedSite(
         error.Diverged => invariant("a divergence escaped before any row was built"),
     };
     if (aliased) |reached| {
-        return reached.reader.reifyLambda(reached.body, .{
+        return .{ .root = .{
+            .reader = reached.reader,
+            .body = reached.body,
             .scheme = reached.reader.templateScheme(reached.template),
             .in_block = false,
-            .caller = reifier,
-            .fixed = fixed,
-            .region = region,
-        });
+            .use = null,
+        } };
     }
 
     const data = module.expr(@as(CIR.Expr.Idx, @fromBackingInt(@intCast(node_idx)))).data;
     if (data == .e_lookup_external) {
         const external = data.e_lookup_external;
         const definition = walk.foreign.find(external.module_idx, external.target_node_idx) orelse
-            return unreachableDefinition(region, "a function no module this one imports exports");
+            return .{ .rejected = unreachableDefinition(reifier, region, "a function no module this one imports exports").rejected };
         const away = try walk.reader(definition.module);
-        return away.reifyLambda(definition.body, .{
+        return .{ .root = .{
+            .reader = away,
+            .body = definition.body,
             .scheme = away.templateScheme(definition.template),
             .in_block = false,
-            .caller = reifier,
-            .fixed = fixed,
-            .region = region,
-        });
+            .use = use,
+        } };
     }
 
     if (stagedDefinition(module, local, node_idx)) |staged| {
-        return reifier.reifyLambda(staged.body, .{
+        return .{ .root = .{
+            .reader = reifier,
+            .body = staged.body,
             .scheme = reifier.templateScheme(staged.template),
             .in_block = false,
-            .caller = reifier,
-            .fixed = fixed,
-            .region = region,
-        });
+            .use = use,
+        } };
     }
 
     // A local function the checker promoted is a procedure of its own. It
     // captures nothing, so it describes the way a top-level definition does,
     // through its own template and scheme.
     if (promotedDefinition(module, local, node_idx)) |promoted| {
-        return reifier.reifyLambda(promoted.body, .{
+        return .{ .root = .{
+            .reader = reifier,
+            .body = promoted.body,
             .scheme = reifier.templateScheme(promoted.template),
             .in_block = false,
-            .caller = reifier,
-            .fixed = fixed,
-            .region = region,
-        });
+            .use = use,
+        } };
     }
 
     // Anything else the checker records here is a name a block binds to a
@@ -6942,14 +14455,35 @@ fn reifyNamedSite(
     // site does, and describes at the site's `f` through the scheme the block
     // generalized it to.
     const lambda = blockLambda(module, local, node_idx) orelse
-        return unreachableDefinition(region, "a function this module does not define");
-    return reifier.reifyLambda(lambda, .{
+        return .{ .rejected = unreachableDefinition(reifier, region, "a function this module does not define").rejected };
+    return .{ .root = .{
+        .reader = reifier,
+        .body = lambda,
         .scheme = reifier.localScheme(lambda),
         .in_block = true,
-        .caller = reifier,
-        .fixed = fixed,
-        .region = region,
-    });
+        .use = use,
+    } };
+}
+
+/// Whether the name at `node_idx` names an intrinsic: a definition of this
+/// module, or one that checking resolved an external lookup to.
+fn namesIntrinsic(walk: *Walk, module: anytype, node_idx: u32) bool {
+    const expr_idx: CIR.Expr.Idx = @fromBackingInt(@intCast(node_idx));
+    const data = module.expr(expr_idx).data;
+    if (data == .e_lookup_local) {
+        const env = module.moduleEnvConst();
+        for (module.allDefs()) |def_idx| {
+            if (env.store.getDef(def_idx).pattern != data.e_lookup_local.pattern_idx) continue;
+            return Reifier.defIsIntrinsic(env, def_idx);
+        }
+        return false;
+    }
+    if (data == .e_lookup_external) {
+        const foreign = walk.foreign;
+        const target = foreign.resolve_lookup_target(foreign.context, expr_idx) orelse return false;
+        return Reifier.defIsIntrinsic(target.env, target.def);
+    }
+    return false;
 }
 
 /// The procedure the name at `node_idx` reaches when the name is an exact
@@ -7063,8 +14597,8 @@ fn reifyTemplateSite(
     args: *std.ArrayList(CheckedExprId),
     values: *std.ArrayList(Reifier.TemplateArg),
 ) Allocator.Error!Outcome {
-    const call = try templateCall(gpa, module, local.bodies, node_idx, args, walk.foreign) orelse
-        return unreachableDefinition(region, "a template this module cannot read");
+    const call = try templateCall(gpa, module, local, node_idx, args, walk.foreign) orelse
+        return unreachableDefinition(reifier, region, "a template this module cannot read");
     defer reifier.releaseTemplateArgs(values.items);
 
     // The arguments are written where the call is, so the local walk describes
@@ -7073,28 +14607,44 @@ fn reifyTemplateSite(
         return .{ .rejected = rejection };
     }
 
-    const template = switch (call.template) {
-        .here => |body| body,
+    // The callee's checked type is the template's type at this call, which
+    // fixes the template's quantified variables (Q15).
+    const fixed: ?CheckedTypeId = if (call.callee) |callee| local.bodies.expr(callee).ty else null;
+    switch (call.template) {
+        .here => |definition| return reifier.reifyTemplateCall(definition.body, .{
+            .scheme = reifier.templateScheme(definition.template),
+            .caller = reifier,
+            .fixed = fixed,
+            .use = call.callee,
+        }, values.items, region),
         .away => |definition| {
             const away = try walk.reader(definition.module);
-            return away.reifyTemplateCall(definition.body, values.items, region);
+            return away.reifyTemplateCall(definition.body, .{
+                .scheme = away.templateScheme(definition.template),
+                .caller = reifier,
+                .fixed = fixed,
+                .use = call.callee,
+            }, values.items, region);
         },
-    };
-    return reifier.reifyTemplateCall(template, values.items, region);
+    }
 }
 
-fn unreachableDefinition(region: base.Region, detail: []const u8) Outcome {
+fn unreachableDefinition(site: *const Reifier, region: base.Region, detail: []const u8) Outcome {
     return .{ .rejected = .{
         .kind = .unresolved_reference,
         .region = region,
+        .module = site.rejectionModule(),
         .detail = detail,
     } };
 }
 
 /// One template call's pieces: the function called, and the arguments it fixes.
 const TemplateCall = struct {
-    /// Where the template's body is read from.
-    template: union(enum) { here: CheckedExprId, away: ForeignDefinition },
+    /// Where the template's body and procedure template are read from.
+    template: union(enum) { here: StagedDefinition, away: ForeignDefinition },
+    /// The checked expression of the name the call calls, or null where
+    /// checking left none.
+    callee: ?CheckedExprId,
     args: []const CheckedExprId,
 };
 
@@ -7104,11 +14654,12 @@ const TemplateCall = struct {
 fn templateCall(
     gpa: Allocator,
     module: anytype,
-    bodies: *const checked.CheckedBodyStore,
+    local: LocalSources,
     node_idx: u32,
     args: *std.ArrayList(CheckedExprId),
     foreign: ForeignLookup,
 ) Allocator.Error!?TemplateCall {
+    const bodies = local.bodies;
     const expr_idx: CIR.Expr.Idx = @fromBackingInt(@intCast(node_idx));
     const data = module.expr(expr_idx).data;
     if (data != .e_call) return null;
@@ -7117,8 +14668,8 @@ fn templateCall(
     const callee = module.expr(call.func).data;
     const template: @FieldType(TemplateCall, "template") = blk: {
         if (callee == .e_lookup_local) {
-            const body = definitionBody(module, bodies, callee.e_lookup_local.pattern_idx) orelse return null;
-            break :blk .{ .here = body };
+            const definition = stagedDefinition(module, local, @backingInt(call.func)) orelse return null;
+            break :blk .{ .here = definition };
         }
         if (callee == .e_lookup_external) {
             const external = callee.e_lookup_external;
@@ -7133,21 +14684,7 @@ fn templateCall(
         const arg = bodies.exprIdAtRawNode(@backingInt(arg_idx)) orelse return null;
         try args.append(gpa, arg);
     }
-    return .{ .template = template, .args = args.items };
-}
-
-/// The checked body of the top-level definition this pattern binds.
-fn definitionBody(
-    module: anytype,
-    bodies: *const checked.CheckedBodyStore,
-    pattern_idx: CIR.Pattern.Idx,
-) ?CheckedExprId {
-    for (module.allDefs()) |def_idx| {
-        const def = module.moduleEnvConst().store.getDef(def_idx);
-        if (def.pattern != pattern_idx) continue;
-        return bodies.exprIdAtRawNode(@backingInt(def.expr));
-    }
-    return null;
+    return .{ .template = template, .callee = bodies.exprIdAtRawNode(@backingInt(call.func)), .args = args.items };
 }
 
 /// The checked lambda a staged site names in this module, and the procedure

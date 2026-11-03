@@ -121,7 +121,7 @@ Four properties matter downstream:
 - Closed. There is no environment pointer, so nothing needs a stable heap
   representation for a closure environment. A compile-time constant folds
   into a `Lit`, whether a template argument fixed at the call or a top-level
-  value written as data (`roc-reify-design.md` §2 and §12,
+  value written as data (`roc-reify-design-checklist.md` §2 and §12,
   `src/check/code_reifier.zig:1023`), so a query can be a template over its
   threshold. A value computed at run time is still refused as a capture, and
   so is a top-level value that has to be computed.

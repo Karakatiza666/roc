@@ -191,18 +191,12 @@ MOD NOT FOUND - fuzz_crash_019.md:10:1:10:19
 MOD NOT FOUND - fuzz_crash_019.md:11:1:12:4
 DOES NOT EXIST - fuzz_crash_019.md:93:2:93:7
 TOO FEW ARGS - fuzz_crash_019.md:17:3:18:4
-DECLARATION HAS NO VALUE - fuzz_crash_019.md:22:1:23:2
-DECLARATION HAS NO VALUE - fuzz_crash_019.md:37:1:37:9
 TYPE MISMATCH - fuzz_crash_019.md:39:2:39:3
 TYPE MISMATCH - fuzz_crash_019.md:58:6:58:11
 TYPE MISMATCH - fuzz_crash_019.md:52:2:52:2
-DECLARATION HAS NO VALUE - fuzz_crash_019.md:74:1:74:22
-DECLARATION HAS NO VALUE - fuzz_crash_019.md:113:1:113:7
 TOO FEW ARGS - fuzz_crash_019.md:84:2:86:3
 TYPE MISMATCH - fuzz_crash_019.md:86:11:86:17
-REFERENCE HAS NO VALUE - fuzz_crash_019.md:89:3:89:6
 TYPE MISMATCH - fuzz_crash_019.md:105:2:105:54
-DECLARATION HAS NO VALUE - fuzz_crash_019.md:116:1:116:13
 MISSING METHOD - fuzz_crash_019.md:105:55:105:66
 MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 # PROBLEMS
@@ -1111,28 +1105,6 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 		(document
 			(source-region (file "fuzz_crash_019.md") (start 17 3) (end 18 4) (annotation error) (line-text "\t\tList( #rg\n\t\t),"))))
 	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 22 1) (end 23 2))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_019.md") (start 22 1) (end 23 2) (annotation error) (line-text "line : ( # Cm\n) # Co"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 37 1) (end 37 9))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_019.md") (start 37 1) (end 37 9) (annotation error) (line-text "one : U6"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
 		(severity runtime_error)
 		(title "Type Mismatch")
 		(region (start 39 2) (end 39 3))
@@ -1219,28 +1191,6 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 			(line-break)
 			(reflow "These can never match! Either the pattern or expression has a problem.")))
 	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 74 1) (end 74 22))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_019.md") (start 74 1) (end 74 22) (annotation error) (line-text "main! : Listlt({}, _)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 113 1) (end 113 7))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_019.md") (start 113 1) (end 113 7) (annotation error) (line-text "y : {}"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
 		(severity runtime_error)
 		(title "Too Few Args")
 		(region (start 84 2) (end 86 3))
@@ -1306,17 +1256,6 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 			(annotation-end)))
 	(report
 		(severity runtime_error)
-		(title "Reference Has No Value")
-		(region (start 89 3) (end 89 6))
-		(headline
-			(reflow "This refers to a declaration that has a type annotation but no implementation, so there is no value here to use."))
-		(document
-			(source-region (file "fuzz_crash_019.md") (start 89 3) (end 89 6) (annotation error) (line-text "\t\tone(er, \t\t),\t456, # two"))
-			(line-break)
-			(line-break)
-			(reflow "Give that declaration a value body, or stop referring to it here.")))
-	(report
-		(severity runtime_error)
 		(title "Type Mismatch")
 		(region (start 105 2) (end 105 54))
 		(headline
@@ -1342,17 +1281,6 @@ MISSING METHOD - fuzz_crash_019.md:105:55:105:72
 			(reflow " ")
 			(annotated code "_ =")
 			(reflow ".")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 116 1) (end 116 13))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_019.md") (start 116 1) (end 116 13) (annotation error) (line-text "t : V((a,c))"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
 	(report
 		(severity runtime_error)
 		(title "Missing Method")
@@ -2014,7 +1942,7 @@ expect {
 (can-ir
 	(d-let
 		(p-assign (ident "line"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-tuple)))
 	(d-let
@@ -2074,7 +2002,7 @@ expect {
 		(e-runtime-error (tag "erroneous_value_expr")))
 	(d-let
 		(p-assign (ident "y"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-record)))
 	(d-let

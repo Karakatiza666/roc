@@ -2483,8 +2483,10 @@ pub const InstGraph = struct {
     /// origins (see `LeafScopeJoinedClasses`).
     leaf_scope_joined_classes: std.ArrayList(LeafScopeJoinedClasses) = .empty,
     /// Leaf-scope cells and the memo cells an unread joined class makes them
-    /// one class with (see `queueLeafScopeCellJoins`). They are joined once
-    /// no unification is in progress.
+    /// one class with (see `queueLeafScopeCellJoins`), and the components
+    /// that each further origin of a read leaf class gives, with the
+    /// components of the class (see `expandLeaf`). They are joined once no
+    /// unification is in progress.
     leaf_scope_cell_joins: std.ArrayList(LeafScopeCellJoin) = .empty,
     draining_leaf_scope_cell_joins: bool = false,
     /// Scratch for a joined class's origins.
@@ -4340,8 +4342,10 @@ pub const InstGraph = struct {
     /// would have connected it: a nominal's backing is a fresh cell it owns,
     /// and every other component reconnects through the memo of the leaf's
     /// origin. Each further origin the class gained reads its own components
-    /// the same way, and each is related to the class's, just as relating the
-    /// eager instantiations would have related them. The class denotes the
+    /// the same way, and each is queued to join the class's, just as relating
+    /// the eager instantiations would have related them. The read itself
+    /// changes no other class: the caller drains the queue when no
+    /// unification is in progress. The class denotes the
     /// same type before and after, so no snapshot or resolvedness stamp
     /// changes; the version bump retires containment answers that depended
     /// on the unread leaf.
@@ -4372,7 +4376,13 @@ pub const InstGraph = struct {
                 const alias: InstLeaf = .{ .ty = leaf.ty, .origin = origin };
                 for (components.items, component_nodes) |component, node| {
                     const alias_node = try self.leafComponentNode(root, alias, component);
-                    if (!self.sameClass(alias_node, node)) try self.unifyKnownEqual(alias_node, node);
+                    if (self.sameClass(alias_node, node)) continue;
+                    // A unification can read this leaf while it holds the
+                    // content of other classes. A join here can read those
+                    // classes or move their roots. Thus the join waits
+                    // until the outermost unification is complete, as a
+                    // leaf-scope cell join does (see `rootContent`).
+                    try self.leaf_scope_cell_joins.append(self.allocator, .{ .memo = alias_node, .cell = node });
                 }
             }
         }
@@ -5360,6 +5370,18 @@ pub const InstGraph = struct {
                 .empty_tag_union => return kind == .tag_union,
                 .empty_record => return kind == .record,
                 .unresolved => return false,
+                // A record row extended by a record-backed `:=` nominal goes
+                // on in the nominal's backing, as `flattenRecordRow` reads it
+                // (design.md "Record Extension Well-Formedness").
+                .named => |named| {
+                    if (kind != .record) return false;
+                    const declared_backing = named.backing orelse return false;
+                    if (declared_backing.use != .inspectable) return false;
+                    if ((try seen.getOrPut(current)).found_existing) return false;
+                    const backing = try self.findStructuralBackingNode(declared_backing.node, named);
+                    if (backing.recursive) return false;
+                    current = self.find(backing.node);
+                },
                 .redirect,
                 .leaf,
                 .primitive,
@@ -5367,7 +5389,6 @@ pub const InstGraph = struct {
                 .box,
                 .tuple,
                 .func,
-                .named,
                 .erased,
                 .zst,
                 .hole,

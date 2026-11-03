@@ -1383,8 +1383,13 @@ pub fn parseProgram(
     defer top_level_hoisted_roots.deinit(allocator);
     const hoisted_roots = switch (options.roots) {
         .eval, .inspected, .comptime_repl => roots: {
+            // A nested root stays at run time here, except a call that binds
+            // a lambda site's run-time reads: the program reads that call
+            // only through its root.
             for (selected_hoisted_roots) |root| {
-                if (main_checked.checker.selectedHoistedRootIsTopLevel(root)) {
+                if (main_checked.checker.selectedHoistedRootIsTopLevel(root) or
+                    main_checked.checker.selectedHoistedRootBindsCodeInputs(root))
+                {
                     try top_level_hoisted_roots.append(allocator, root);
                 }
             }
@@ -1521,6 +1526,8 @@ pub fn parseCheckModule(
     }
     if (hosted_transform) {
         try can.HostedCompiler.replaceAnnoOnlyWithHosted(module_env);
+    } else {
+        can.HostedCompiler.markAnnoOnlyAsIntrinsic(module_env);
     }
     const can_elapsed = can_timer.read();
 

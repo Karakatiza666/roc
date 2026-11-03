@@ -55,7 +55,7 @@ the program's meaning.
 |---|---|---|
 | Rename a local | `Local("wave")` becomes `Local("ripple")` | GLSL text changes: the translator emits the Roc name (`examples/reifying/glsl/Glsl.roc:241`) |
 | Reorder two independent bindings | `Let` nesting changes | emitted statements reorder; golden tests and any cache keyed on output bytes change |
-| Reorder two calls to one generic function | row serials `Test.id` and `Test.id#1` swap, because they count in walk order (`roc-reify-design.md:163`) | a translator that names emitted functions after rows swaps them |
+| Reorder two calls to one generic function | row serials `Test.id` and `Test.id#1` swap, because they count in walk order (`roc-reify-design-checklist.md:163`) | a translator that names emitted functions after rows swaps them |
 | Move code, add a comment | every region after the edit shifts | a translator that embeds locations in output changes |
 | Extract a helper | a `Call` and a new row appear | a translator that refuses calls, or a GLSL translator that emits one expression, now refuses the build |
 | Inline a helper | a row disappears | the reverse |
@@ -216,6 +216,18 @@ What it costs:
 | a normalizer and hash-consing inside the reifier | compiler authors |
 | a marker for bodies exposed across packages | the language: one declaration form, new syntax or a header entry |
 | S1 on a cross-package function without the marker is refused | users, who get a message naming the missing marker |
+
+Status, after milestone M13 of `roc-reify-normalization-plan.md`: the
+proposal makes these changes, in its sections 1, 3, 4, 7.2, 7.10 and 13.
+The reach rule of 4.3 and its marker were replaced by the policy of
+`roc-reify-normalization-plan.md` 1.9, so the last two rows of the cost table
+are not paid:
+
+| Item of 4.3 | What the prototype does instead |
+|---|---|
+| a body is read only within a package, or where its author exposed it | every body is read, in any package, except the functions in the translator's cut |
+| a marker for bodies exposed across packages | none. The translator declares its cut with the item `code_primitives` of its type |
+| a cross-package function without the marker is refused | it is walked; a dependency upgrade that changes its operations stops the build at the site |
 
 ---
 

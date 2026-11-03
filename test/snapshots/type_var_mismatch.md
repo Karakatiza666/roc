@@ -129,9 +129,9 @@ NO CHANGE
 					(e-runtime-error (tag "erroneous_value_expr")))
 				(s-let
 					(p-assign (ident "result"))
-					(e-dispatch-call (method "ok_or") (constraint-fn-var 417)
+					(e-dispatch-call (method "ok_or") (constraint-fn-var 498)
 						(receiver
-							(e-call (constraint-fn-var 414)
+							(e-call (constraint-fn-var 495)
 								(e-lookup-external
 									(builtin))
 								(e-lookup-local

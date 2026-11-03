@@ -24,7 +24,7 @@ const max_text_file_size = 4 * MiB;
 const binary_extensions: []const []const u8 = &.{
     ".ico",  ".png",   ".webp", ".jpg",  ".jpeg",  ".gif", ".bin",
     ".o",    ".obj",   ".bc",   ".a",    ".lib",   ".dll", ".so",
-    ".so.6", ".dylib", ".wasm", ".rlib", ".rmeta",
+    ".so.6", ".dylib", ".wasm", ".rlib", ".rmeta", ".cbor",
 };
 
 const TermColor = struct {

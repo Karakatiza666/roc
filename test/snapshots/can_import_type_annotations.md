@@ -44,8 +44,7 @@ combineTrys = |result1, result2|
     }
 ~~~
 # EXPECTED
-DUPLICATE DEFINITION - can_import_type_annotations.md:2:1:2:17
-DUPLICATE DEFINITION - can_import_type_annotations.md:3:1:3:32
+BUILTIN TYPE SHADOWED - can_import_type_annotations.md:2:1:2:17
 BUILTIN TYPE SHADOWED - can_import_type_annotations.md:3:1:3:32
 UNUSED VARIABLE - can_import_type_annotations.md:6:19:6:22
 MOD NOT FOUND - can_import_type_annotations.md:5:18:5:25
@@ -74,46 +73,16 @@ MOD NOT FOUND - can_import_type_annotations.md:28:43:28:46
 (reports
 	(report
 		(severity warning)
-		(title "Duplicate Definition")
+		(title "Builtin Type Shadowed")
 		(region (start 2 1) (end 2 17))
 		(headline
-			(reflow "The name ")
+			(text "The type ")
 			(annotated symbol-unqualified "Json")
-			(reflow " is being redeclared here."))
+			(text " shadows a builtin type."))
 		(document
-			(source-region (file "can_import_type_annotations.md") (start 2 1) (end 2 17) (annotation error) (line-text "import json.Json"))
+			(reflow "This may make the builtin type inaccessible in this scope.")
 			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Json")
-			(reflow " was already defined in ")
-			(source-location
-				(file "can_import_type_annotations.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "can_import_type_annotations.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import http.Client as Http exposing [Request, Response]"))))
-	(report
-		(severity warning)
-		(title "Duplicate Definition")
-		(region (start 3 1) (end 3 32))
-		(headline
-			(reflow "The name ")
-			(annotated symbol-unqualified "Try")
-			(reflow " is being redeclared here."))
-		(document
-			(source-region (file "can_import_type_annotations.md") (start 3 1) (end 3 32) (annotation error) (line-text "import utils.Try exposing [Try]"))
-			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Try")
-			(reflow " was already defined in ")
-			(source-location
-				(file "can_import_type_annotations.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "can_import_type_annotations.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import http.Client as Http exposing [Request, Response]"))))
+			(source-region (file "can_import_type_annotations.md") (start 2 1) (end 2 17) (annotation warning) (line-text "import json.Json"))))
 	(report
 		(severity warning)
 		(title "Builtin Type Shadowed")

@@ -377,6 +377,9 @@ pub const FnTemplate = struct {
     const_evidence: ConstEvidenceSpans = .{},
     const_evidence_frames: Span(check.ConstStore.ConstFnEvidenceFrame) = Span(check.ConstStore.ConstFnEvidenceFrame).empty(),
     const_evidence_frame_head: ?u32 = null,
+    /// The Code instance table the specialization describes its instance
+    /// sites from (D1), retained for compile-time function values.
+    const_instances: ?check.ConstStore.ConstFnInstances = null,
 };
 
 /// Monotype function-specialization metadata.

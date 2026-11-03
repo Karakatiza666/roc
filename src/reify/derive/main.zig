@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) Error!void {
         },
         .ledger => |c| try record(arena, io, stdout, sig, ledger, &res, c.groups, .rejected, c.criterion),
         .file => |c| try record(arena, io, stdout, sig, ledger, &res, c.groups, .open, c.algorithm),
-        .recall => unreachable,
+        .recall => unreachable, // recall is handled and returned above
     }
     try stdout.flush();
     if (!clean and options.command == .none) std.process.exit(1);

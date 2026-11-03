@@ -63,6 +63,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("occurs.zig"));
     std.testing.refAllDecls(@import("problem.zig"));
     std.testing.refAllDecls(@import("problem/context.zig"));
+    std.testing.refAllDecls(@import("reify_only.zig"));
     std.testing.refAllDecls(@import("problem/store.zig"));
     std.testing.refAllDecls(@import("problem/types.zig"));
     std.testing.refAllDecls(@import("report.zig"));
@@ -104,6 +105,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("dispatch_evidence.zig"));
     std.testing.refAllDecls(@import("test/range_test.zig"));
     std.testing.refAllDecls(@import("test/recursive_alias_test.zig"));
+    std.testing.refAllDecls(@import("test/record_extension_test.zig"));
     std.testing.refAllDecls(@import("test/generalize_redirect_test.zig"));
     std.testing.refAllDecls(@import("test/row_union_normalization_test.zig"));
     std.testing.refAllDecls(@import("test/exhaustiveness_test.zig"));
@@ -187,6 +189,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("test/issue_12587_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12677_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12794_test.zig"));
+    std.testing.refAllDecls(@import("test/staged_code_where_test.zig"));
     std.testing.refAllDecls(@import("test/nominal_decl_growth_test.zig"));
     std.testing.refAllDecls(@import("test/frame_owned_judgment_test.zig"));
 

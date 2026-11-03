@@ -456,7 +456,7 @@ returned = |s| {
 				(e-match
 					(match
 						(cond
-							(e-call (constraint-fn-var 600)
+							(e-call (constraint-fn-var 681)
 								(e-lookup-local
 									(p-assign (ident "nested")))
 								(e-lookup-local
@@ -512,7 +512,7 @@ returned = |s| {
 										(e-match
 											(match
 												(cond
-													(e-call (constraint-fn-var 663)
+													(e-call (constraint-fn-var 744)
 														(e-lookup-local
 															(p-assign (ident "nested")))
 														(e-lookup-local
@@ -554,7 +554,7 @@ returned = |s| {
 							(e-match
 								(match
 									(cond
-										(e-call (constraint-fn-var 726)
+										(e-call (constraint-fn-var 807)
 											(e-lookup-local
 												(p-assign (ident "nested")))
 											(e-lookup-local

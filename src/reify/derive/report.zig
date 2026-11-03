@@ -274,7 +274,7 @@ test "every row orients" {
     var out: Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try testing.expect(try writeOrientation(&out.writer, rows));
-    try testing.expect(std.mem.find(u8, out.written(), "| 6 | N13h | first_order | prim | yes |") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "| N13h | first_order | prim | yes |") != null);
 }
 
 test "arguments parse, and an unknown one is refused" {

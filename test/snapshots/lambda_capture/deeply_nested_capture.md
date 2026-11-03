@@ -84,16 +84,16 @@ EndOfFile,
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-call (constraint-fn-var 424)
-	(e-call (constraint-fn-var 416)
-		(e-call (constraint-fn-var 408)
+(e-call (constraint-fn-var 505)
+	(e-call (constraint-fn-var 497)
+		(e-call (constraint-fn-var 489)
 			(e-lambda
 				(args
 					(p-assign (ident "a")))
 				(e-block
 					(s-let
 						(p-assign (ident "a_loc"))
-						(e-dispatch-call (method "times") (constraint-fn-var 395)
+						(e-dispatch-call (method "times") (constraint-fn-var 476)
 							(receiver
 								(e-lookup-local
 									(p-assign (ident "a"))))
@@ -108,7 +108,7 @@ EndOfFile,
 							(e-block
 								(s-let
 									(p-assign (ident "b_loc"))
-									(e-dispatch-call (method "plus") (constraint-fn-var 397)
+									(e-dispatch-call (method "plus") (constraint-fn-var 478)
 										(receiver
 											(e-lookup-local
 												(p-assign (ident "a_loc"))))
@@ -121,7 +121,7 @@ EndOfFile,
 									(e-lambda
 										(args
 											(p-assign (ident "c")))
-										(e-dispatch-call (method "plus") (constraint-fn-var 399)
+										(e-dispatch-call (method "plus") (constraint-fn-var 480)
 											(receiver
 												(e-lookup-local
 													(p-assign (ident "b_loc"))))

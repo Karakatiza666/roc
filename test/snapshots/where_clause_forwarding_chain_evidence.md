@@ -157,7 +157,7 @@ main = f(Named.N("ok"))
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-dispatch-call (method "describe") (constraint-fn-var 461)
+			(e-dispatch-call (method "describe") (constraint-fn-var 542)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -176,7 +176,7 @@ main = f(Named.N("ok"))
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-call (constraint-fn-var 474)
+			(e-call (constraint-fn-var 555)
 				(e-lookup-local
 					(p-assign (ident "h")))
 				(e-lookup-local
@@ -195,7 +195,7 @@ main = f(Named.N("ok"))
 		(e-lambda
 			(args
 				(p-assign (ident "x")))
-			(e-call (constraint-fn-var 486)
+			(e-call (constraint-fn-var 567)
 				(e-lookup-local
 					(p-assign (ident "g")))
 				(e-lookup-local
@@ -223,7 +223,7 @@ main = f(Named.N("ok"))
 				(ty-lookup (name "Str") (builtin)))))
 	(d-let
 		(p-assign (ident "main"))
-		(e-call (constraint-fn-var 519)
+		(e-call (constraint-fn-var 600)
 			(e-lookup-local
 				(p-assign (ident "f")))
 			(e-nominal (nominal "Named")

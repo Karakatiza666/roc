@@ -19,7 +19,17 @@ ROC = sys.argv[1] if len(sys.argv) > 1 else str(HERE.parents[2] / "zig-out" / "b
 def normalized(rows):
     # SQLite computes NUMERIC arithmetic in floating point, and Roc in Dec, so
     # a total can differ in the last few bits. Order is compared separately.
-    return [{k: round(v, 6) if isinstance(v, float) else v for k, v in row.items()} for row in rows]
+    # A blob, such as a `Time` column, is compared as the `{"blob": hex}` that
+    # Roc writes for the bytes `Sql.Param` encodes. A `NULL` column is an
+    # optional field the row does not hold, which `Json.to_str` leaves out.
+    def value(v):
+        if isinstance(v, float):
+            return round(v, 6)
+        if isinstance(v, bytes):
+            return {"blob": v.hex().upper()}
+        return v
+
+    return [{k: value(v) for k, v in row.items() if v is not None} for row in rows]
 
 
 def main():
@@ -38,8 +48,14 @@ def main():
             db.executescript("\n".join(lines))
             continue
         name = header.removeprefix("-- query: ")
-        sql = "\n".join(line for line in lines[1:] if not line.startswith("-- roc:"))
-        cursor = db.execute(sql)
+        # A statement with `?` placeholders carries its values on a line of
+        # their own, and the driver binds them.
+        # A blob, the bytes `Sql.Param` wrote for a value of an opaque type,
+        # is `{"blob": hex}`.
+        blob = lambda v: bytes.fromhex(v["blob"]) if isinstance(v, dict) else v
+        params = [[blob(v) for v in json.loads(line.removeprefix("-- params: "))] for line in lines[1:] if line.startswith("-- params: ")]
+        sql = "\n".join(line for line in lines[1:] if not line.startswith("-- roc:") and not line.startswith("-- params: "))
+        cursor = db.execute(sql, params[0] if params else ())
         columns = [c[0] for c in cursor.description]
         got = normalized([dict(zip(columns, row)) for row in cursor.fetchall()])
         print(f"-- {name}")

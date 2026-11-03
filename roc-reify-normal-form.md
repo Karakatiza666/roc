@@ -103,21 +103,43 @@ it can neither crash nor diverge on any input:
 | a `Call` of a non-recursive row whose body is speculatable | a call to a recursive row; a primitive from another package (3.8) |
 | a `ForRange` or `ForList` (3.11) whose body is speculatable: it runs a bounded number of turns and none of them can fail | a general `Loop` |
 
+A rule that drops or repeats an operand under a speculatable condition reads
+the whole cone of the operand: the node, every node it reads, and every node
+the regions it owns read. The flag of one node covers only that node, and
+`Field` of a loop output is flagged speculatable although the loop it reads is
+not (`src/reify/builder.zig:3080`, `coneSpeculatable`). Rule T1.11 (`x - x`
+is `0`), `x * 0`, and the rules over `speculatable_rest` use it, so a loop
+that can crash on checked-integer overflow is never lost (C2).
+
 A checked integer `plus`, `minus` or `times` whose operands' intervals (N13u)
 prove that the result fits its type cannot crash in the regions those facts
 hold in, so it is speculatable there, and N5b hoists it no further out than
-those regions.
+those regions. The builder records the proof with the innermost region whose
+fact it read (`src/reify/ir.zig`, `NodeRange`; `Store.fitFloor`). Placement
+reads that region as one the node reads, for the node and for a node whose
+regions hold it (`src/reify/place.zig`, `readRegions`). Every other step that
+moves a node out of a region treats a proved node as not speculatable outside
+its facts: N13w (`match.speculatableWithin`), the invariant outputs of N11j
+(`loops.zig`, `invariant`), the rows of layer L (`laws.zig`, `settle`) and the
+holes of V3b (`views.zig`, `movable`). A proof that reads no fact, such as
+`f(x) + 1` where N8k bounds `f`, holds everywhere.
 
 The list is short and explicit, and a builtin not on it is not speculatable,
 which is exact rather than a guess: the only effect of leaving a builtin off
 is that it is not hoisted out of a loop. It answers the proposal's open
 question on crash semantics (`roc-reify-proposal.md:1107-1112`) with one flag
 instead of a crash model.
+The list is the `speculatable` column of `src/reify/prims.zig`. M10 adds
+`List.is_empty`, which reads the length and cannot crash, and leaves
+`List.append`, `List.map`, `List.keep_if`, `List.fold` and `Iter.collect` off
+it, because each one calls a function or allocates.
 
 `crash` written in a body stays a node where it was written, because the
 author put it there. C2 would allow deciding a branch that always crashes as
 unreachable; the normal form does not, so an interpreter target can still
-report it (7.2).
+report it (7.2). The one crash the author did not write is the rejection of
+a literal by its conversion, which the language makes a compile-time error.
+N13w (3.13) decides the branches that reach it, as C2 allows.
 
 ---
 
@@ -125,12 +147,13 @@ report it (7.2).
 
 ```
 Code(fn)
+ ├─ slots             the types of the root's input slots, in slot order (3.18)
  ├─ rows              canonical order, root first
  │   └─ row f_i
  │       ├─ params    positional: p0, p1, ...; types only
  │       ├─ body      a region
  │       │   ├─ nodes n0, n1, ...    one def per operation, in canonical order
- │       │   │   └─ node = op + args (refs to params, earlier nodes, slots) + type + speculatable
+ │       │   │   └─ node = op + args (refs to params, earlier nodes, slots, inputs) + type + speculatable
  │       │   │        op ∈ Lit | Prim | Call(row) | Closure(row) | Record | Tuple | List | Tag
  │       │   │             | Wrap | Unwrap | Field | Index | Payload | Elem | OptField
  │       │   │             | Switch(arms, joins), with one output per value it delivers
@@ -180,6 +203,54 @@ What stays, because it is interface rather than spelling:
 | literal values and their types | they are the computation |
 | `Derived(method, ty)` | it has no body to normalize |
 
+### 2.1 One spelling per type
+
+A type is a tree. A recursive type is infinite, so the tree closes it with
+`Recursive(name)`, a reference to the nearest enclosing `Named` of that name.
+One infinite type has many such trees. A cycle through two nominals can close
+at either nominal, and a tree can unroll the cycle any number of times before
+it closes. The normal form keeps one tree for each type, so one type has one
+`TyId` and type equality stays integer equality.
+
+| Rule | Statement |
+|---|---|
+| T1 | A nominal is `Recursive(name)` exactly where the nearest enclosing `Named` of its name is the same type. Everywhere else it is `Named(name, backing)`. |
+| T2 | The type of a node is spelled from its own root. A field, element, payload, parameter or result of that type is spelled from its own root too, because a record, list, tuple, union or function adds no enclosing `Named`. The backing of a nominal is not: `Unwrap` and `Wrap` use the backing spelled again from its own root. |
+
+For `Person := { links : List(Link) }` and `Link := { row : Person }`:
+
+| Type | Its one tree |
+|---|---|
+| `Person` | `Named(Person, { links : List(Named(Link, { row : Recursive(Person) })) })` |
+| `Link` | `Named(Link, { row : Named(Person, { links : List(Recursive(Link)) }) })` |
+| the backing of `Link`, which `Unwrap` gives | `{ row : P }`, where `P` is the `Person` tree above |
+
+Without T1, the `Person` that a `Link` holds and the `Person` that a walk
+starts at were two `TyId`s. The verifier and the rebuild compare types by
+`TyId`, so they refused or misread equal types. `Types.canonical` and
+`Types.unfold` (`src/reify/types.zig:346`, `:366`) spell a type by T1, and the
+reifier spells each type it gives a node by T1 (`tyOf`,
+`src/check/code_reifier.zig:6309`).
+
+The reifier builds the tree from the checked type before `Types.canonical`
+spells it. Each nominal in that tree is one instance: the declaration and
+what its use fixed the variables to. The walk closes an instance only where
+the nearest enclosing nominal of its name is that instance, and expands it
+again everywhere else (`nominalTy`, `src/check/code_reifier.zig:6456`).
+
+| Declarations | The type | What the walk does |
+|---|---|---|
+| `Wrap(a) := { items : List(a) }`, `A := { x : Wrap(B) }`, `B := { y : Wrap(A) }` | `Wrap(A)` | the `Wrap(A)` inside `B` sits under `Wrap(B)`, so it expands, and its `A` closes: `Named(Wrap, { items : List(Named(A, { x : Named(Wrap, { items : List(Named(B, { y : Named(Wrap, { items : List(Recursive(A)) }) })) }) })) })` |
+| `Pair(a, b) := [Leaf(a), Node(Pair(b, a))]` | `Pair(Str, U64)` | the nearest `Pair` is always the other instance, so no `Recursive(Pair)` closes and the T1 tree is infinite. The walk refuses the site: "a recursive type with no finite description" |
+
+An expansion depends only on its instance and on the nearest instance of
+each name around it. The walk refuses an expansion that repeats one that
+encloses it with these same (`expansionRepeats`,
+`src/check/code_reifier.zig:6551`), because the repeat builds itself inside
+itself again. The checker refuses a recursive use that wraps a variable,
+such as `Nest(List(a))` inside `Nest(a)`, so a type has finitely many
+instances and names, and the walk ends.
+
 ---
 
 ## 3. Normalization steps
@@ -206,6 +277,7 @@ them into R.
 | N14 | scalar replacement | `f(a, b)` versus `f({ a, b })` versus `f((a, b))` for private helpers; a record-valued `var` versus one `var` per field |
 | N15 | flattening associative chains; leaf order | grouping of `Str.concat`, `List.concat`, wrapping arithmetic, bitwise operations, `and`, `or`; `a + 1` versus `1 + a` |
 | N16 | builtin laws, opt-in layer L | a `for` loop versus `List.map`, `List.keep_if`, `List.fold`; `map` of `map` versus one `map` |
+| L | a lift into a nominal is a `Wrap` (3.13, `roc-reify-tag-names.md` 2.4) | where a structural tag union becomes a nominal: a tag written at the nominal versus a value of the union that a `row_coerce` reads at the nominal; both arrive in a `Wrap` |
 
 ### 3.0 Order of the steps
 
@@ -251,20 +323,29 @@ dominating facts N13 uses are that region's. So a fact applies to a node
 exactly when it dominates every use, whether the source wrote the node inside
 a branch or before it, and no rule reads where the source put a node. The
 number phase then only hoists speculatable nodes out of loops (3.5), which
-changes no region's contents and so enables no rule. Rules that compare
+changes no region's contents and so enables no rule. N11j reads a value
+N5b hoists out of a loop as one outside it, so the hoist exposes no
+`Break` value for N11j to match. Rules that compare
 regions, such as N7's merge into `And` and `Or`, compare each region's end and
 what it depends on structurally, pairing the parameters of the regions bound
-inside the two. A content digest cannot stand in for that comparison, because
+inside the two. They also compare, one by one in the order they were built,
+each region's loops that can end the row in `Return`, whether a value reads
+them or not, because such a loop decides the row's value
+(`src/reify/live.zig`, `exits`; `src/reify/equal.zig`, `Comparison.regions`).
+So `if c { for x in xs { if x == k { return x } }; k } else k` keeps both
+arms. A content digest cannot stand in for that comparison, because
 it names a parameter by the region that binds it, so two arms that bind equal
 regions of their own digest apart.
 
 Every rule in the simplify phase decreases one measure, ordered
-lexicographically: first the number of loops (N16 removes loops), then the
-number of general `Loop`s (N11 raises them to `ForRange` and `ForList`), then
-aggregate-typed parameters and slots (N14), then loop slots (N11o), then
-`Apply` nodes (N8i), then switches (N7, and N13's case-of-case), then
+lexicographically: first the calls a row makes to itself when N12 applies to it
+(N12 removes them all at the price of one loop), then the number of loops (N16
+removes loops), then the number of general `Loop`s (N11 raises them to `ForRange` and `ForList`), then
+aggregate-typed parameters and slots (N14), then the slots and outputs of loops (N11g to N11j, N11o), then the
+`Return` terminators on the paths of loops (N11j turns one into `Break`), then
+`Apply` nodes (N8i), then the tests in an order `match.before` rejects (N7b hoists them), then switches (N7, and N13's case-of-case), then
 `Bool.not` nodes over an `And`, an `Or` or a `Bool` switch (N13t), then calls
-of a row that only calls another row over its parameters (N8c), then nodes,
+of a row that only calls another row over its parameters (N8c), then `List.get` calls (N13m turns a bounded one into `Ok(Elem(..))`, which adds nodes), then nodes,
 where each read of a parameter counts as one
 (N13, N15, N11), then `is_gt` and `is_gte` nodes (N1l), then the integer
 `is_lte` leaves of scrutinees (N13q), then the `Bool` switches whose
@@ -310,7 +391,7 @@ graphs with shared nodes.
 
 The reifier resolves most of this already. `x + y` and `x.plus(y)` are one
 `Binop` (`Builtin.roc`, `Ir.Binop` docs), and `Str.concat(a, b)` and
-`a.concat(b)` are one `Call` (`roc-reify-design.md:155-160`). The normal form
+`a.concat(b)` are one `Call` (`roc-reify-design-checklist.md:155-160`). The normal form
 goes the rest of the way:
 
 | Written | Normal form |
@@ -329,6 +410,13 @@ goes the rest of the way:
 | `{ ..r, y: 3 }` | `Record` with `y: 3` and `Field(r, f)` for every other field `f` of the type; reified bodies are monomorphic (proposal rule 4), so the field set is closed and known |
 | a record literal that omits a field declared `port : U16 ?? 8080` | the same `Record` with `port: 8080` written in, so omitting a default and writing it are one form |
 | `.port` read from a type with a default | `Field(port)`, because every construction now carries the field |
+| `{ a: v, b: _ }`, or `{ a: v }`, where `b` is `b ?: T` | a `Record` that sets `a` only: its arguments are the fields it sets, and `aux` lists their positions in the type's order. A node that sets every field lists none |
+| `{ ..r, a: v }` where `r` has an optional field `b` | a `Switch` on `Unwrap(OptField(r, b))`: the `Ok` arm is a `Record` that sets `b` to the payload, the `Err` arm one that leaves it unset. One level of switch for each such field |
+| `{ a, ..rest }` in a pattern | `rest` is the `Record` of the fields the pattern did not name, each read with `Field` from the matched record, or by the `OptField` switch above for an optional field |
+| `r.?a.b`, `r.?a.?b` | a `Switch` on `Unwrap(OptField(r, a))` whose `Err` arm is `Err(MissingField)` of the path's `Try` and whose `Ok` arm reads the rest. A last optional segment is its own `OptField`, whose `Try` is the path's |
+| `"a${x}b${y}"` as a pattern | `Prim("Str.starts_with")` and `Prim("Str.drop_prefix")` for the prefix, `Prim("Str.split_first")` and a `Switch` on its `Try` for each delimiter, and `Prim("Str.is_empty")` for an exact end |
+| a literal of your own type whose `from_numeral` or `from_quote` is a Roc function | a `Call` of its row, then a `Switch` on the `Try`: the `Ok` payload is the value, and the `Err` arm is a `Crash`. A quote passes its text as a `Str`. A numeral passes one `Lit(Numeral(n))`, the `Num.Numeral` the compiler builds from the digits the source spells, at the type of the row's parameter |
+| a literal of your own type whose `from_numeral` is a builtin or a function in the cut | the `Prim` of the conversion over the same `Lit(Numeral(n))`, at the type of the first parameter of the callable the checker solved, then the same `Switch` |
 | `expect cond` inside a body | nothing: an assertion for Roc's own test run has no meaning in a target (`roc-reify-proposal.md:1187-1192`) |
 
 Evaluation order inside one operation follows the operator's definition, so
@@ -417,7 +505,17 @@ A node that is not speculatable is never hoisted: moving it out of a branch or
 a loop would speculate. The hoist step runs after the fixpoint, because a node
 hoisted out of a branch inside a loop would leave the facts of that branch
 before N13 could use them. It ends by merging the identical nodes it brought
-into one region, which changes no content digest.
+into one region, which changes no content digest, and by the second case of
+the merge table over what it brought into the arms of a switch: a literal
+hoisted out of a loop in one arm is one node with the same literal of every
+other arm, as it is when it was written before the loop (`src/reify/place.zig`,
+`planWith`). A node merged so is hoisted again from the switch's region.
+
+One gap remains: hash-consing merges a node into an identical one of an
+enclosing region when the walk builds it, and when a later round removes the
+reader of the enclosing one, the merged node stays one node read from two
+arms, where the same nodes written in those arms alone stay apart. A literal
+`0` that a `while` over a list's indices started from shows it.
 
 This is Click's schedule (1995): as late as possible, then no deeper in loops
 than necessary. The earliest region of a node that is not speculatable depends
@@ -470,7 +568,22 @@ only on which arm each input reaches:
    that established them, numbered by N9.
 
 N7 is defined over nested `Switch` nodes, not over patterns, which are gone
-after the walk. The walk builds a `match` as a cascade of switches in source
+after the walk. N7b covers the part of a tree that N7a does not: `Builder.interchange`
+(`src/reify/builder.zig`) takes a value switch with one output whose arm ends
+in a switch on a position of the same root that `match.before` puts before the
+position the switch tests, and builds the switch on that position first. Each of
+its arms holds the inner arm for that constructor, or a copy of the arm that
+does not test it. The positions go in the order of the field index, then the tag
+name, then the payload index. It leaves alone two `Bool` switches (N7d and
+N13o own their order), switches on two roots that are not both parameters of
+the root row, a guard, which is not a position, and a switch with a join or
+with more than one output. Two parameters of the root row are roots in
+parameter order, the parameter half of N15c (`match.rootedBefore`), so
+`match a { P => match t { .. }, .. }` and the match on `t` first meet when `a`
+and `t` are the root's parameters. Other roots have no order that no
+unrelated edit moves, so their switches stay as written. It never copies an arm that holds a loop, an `Apply`, a `Lambda` or a `Closure` (`match.copyable`), because the measure counts those before the switches a copy adds. `match.inversions` counts the tests left
+out of order in a switch whose arms it may copy, and the measure above uses it before it counts switches, because
+copying an arm adds switches. The walk builds a `match` as a cascade of switches in source
 order, where the first arm whose tests hold wins, and N7 rebuilds every
 tree of switches whose scrutinees are positions of one node into the canonical
 tree. So the rule also applies to trees that exist only after simplification:
@@ -541,7 +654,7 @@ N7 is the most expensive step and the one to stage:
 ### 3.8 N8: rows
 
 A row is a function the root reaches, specialized to one type instantiation,
-as today (`roc-reify-design.md:163-170`). The normal form changes three things
+as today (`roc-reify-design-checklist.md:163-170`). The normal form changes three things
 about rows: how they are formed, how they are identified, and their parameter
 order.
 
@@ -593,13 +706,17 @@ needed. The rule is exact and near linear, with no search over permutations.
 Unison hashes mutually recursive definitions by position in the same way.
 
 A digest is computed from content, not from N9's numbering or from placement,
-so it exists as soon as a component's fixpoint ends (3.0). Two rows are merged
+so it exists as soon as a component's fixpoint ends (3.0). A region's digest
+reads its end and its loops that can return, read or not, as the structural
+comparison does (`src/reify/digest.zig`, `regionDigest`), so a helper with such
+a loop and one without it have two digests. Two rows are merged
 only when their digests are equal and a structural comparison confirms it: a
 hash collision must never merge two computations. The same holds for every
 comparison by region digest.
 
 The cut. A translator declares its cut: the functions it reads as primitives,
-as the item `code_primitives` of the type that owns the translator (section 12). A
+as the item `code_primitives` of the type that owns the translator, a list of
+`Code.prim(f)` calls (`docs/langref/reifying.md`, "The Views"). A
 function in the cut of the site is not a row. It is a `Prim` named by its
 qualified name, such as `Glsl.Vec3.scale`, and its body is never read. The
 translator's own library works this way: `Glsl.roc` maps `Glsl.Vec3.scale` to
@@ -609,7 +726,46 @@ bodies that must not be inlined into the description. The cut belongs to the
 translator, not to the library, because what a target has natively decides it:
 a GLSL translator keeps a math library's `lerp` as GLSL's `mix`, and a SQL
 translator reads its body. Such a primitive is not speculatable, whatever its
-body. Builtins are primitives in every cut (7.2).
+body. The name is the one the function is defined under, the nominal it is an
+associated item of and the item, so a direct call `Glsl.Vec3.scale(v, k)` and
+a method call `v.scale(k)` give one `Prim`. A top-level constant can be in
+the cut too; it is a `Prim` with no arguments where its name is read.
+
+Some definitions are primitives with no cut, because their type declares them
+(`roc-reify-opaque-proposal.md` D1). A cut that lists one is a compile error
+(`already_primitive`, D3):
+
+| Definition | `Prim` name | Why |
+|---|---|---|
+| a function of the builtin module | its export name, `Str.concat` | the builtin module declares its primitives (7.2); a builtin constant folds |
+| a function or top-level constant of a module that declares a `::` nominal `N`, whose checked type mentions `N` at any depth | its qualified name, `Time.is_before`, `Cal.parse`, `Time.epoch` | the body reads the representation `N` hides |
+
+The walk reaches these the same way in each form: `Time.is_before(t, c)`,
+`t.is_before(c)` and `t < c` (through `is_lt`) give a `Prim`, a constant
+`cutoff = Time.from_nanos(5)` folds to `Prim from_nanos(5)`, and `Time.epoch`
+is a `Prim` with no arguments. A definition of that module whose type does
+not mention `N` (`Time.days_in_week : U8`, `Util.double` of
+`Util :: [].{..}`) is walked like any other function. A package primitive has
+no law and is not speculatable (7.2 holds only for builtins).
+
+A site's translator is the function that the call the site is an argument
+of names, as the checker resolved it (`src/check/Check.zig:27537`,
+`translatorCall`; `src/check/code_reifier.zig:4489`, `translatorFunction`).
+The cut is the cut of the type that owns that function:
+
+| How the site reaches the translator | The translator | The cut |
+|---|---|---|
+| a direct call, `Tr.show(t, f)`; a pipe, `t \|> Tr.show(f)`, which is that call | the callee, through its resolved reference, through every alias | its type's |
+| a method call, `t.show(f)` | the method the call dispatches to, from its dispatch plan | its type's |
+| a site in a branch of the argument, `Tr.show(t, if c f else g)` | as for the call | its type's |
+| a template call as the argument, `t.show(mk(k))` | as for the call | its type's |
+| a wrapper, `helper(f)` where `helper = \|c\| Tr.show(t, c)` | `helper`, the function with the `Code(f)` parameter (12) | the cut of the type that owns `helper`; empty when no type owns it |
+| `f.show()`, a method call on a receiver whose type is not yet known, a `Code` in a value annotation or a record field | none: no site | a compile error: a missing method, a type mismatch, or a `Code` outside a parameter (`rejectMisplacedStagedCode`) |
+
+A wrapper is the translator of the sites passed to it, because its
+parameter is the `Code(f)` the site fills, and nothing but its body says
+which translator receives the value next. A wrapper that must keep a cut is
+an item of a type that declares it.
 
 Every function outside the cut is walked by its body, in any package. A
 dependency's body is therefore part of what a translator reads: an upgrade
@@ -622,7 +778,7 @@ a package is pinned by its URL and content hash, and a break names the site.
 Consequences: renaming a helper, moving it to another module of the same
 package, and reordering top-level definitions change no digest. Two helpers
 written identically become one row. The `Test.id#1` serial, which counts in
-walk order (`roc-reify-design.md:163`), disappears.
+walk order (`roc-reify-design-checklist.md:163`), disappears.
 
 Parameter order. The root row keeps its parameter order, because that is the
 type in `Code(fn)`. Every other row's parameters are renumbered in the order
@@ -645,7 +801,12 @@ type records the union of N13u's intervals over its returns. Its callers are
 simplified after it (3.0), so N13u reads the recorded interval as the fact on
 each `Call` of the row. The interval is data the finalize step stores, computed
 from the finalized body; a caller never reads the callee's body for it. A function
-in the cut (N8h) records nothing.
+in the cut (N8h) records nothing. The returns are the body's value and each
+`Return` on the row's paths and in its loops, not in its lambdas. A returned
+literal is its value, a node has the interval N13u gave it when it was built,
+and anything else, a switch output among them, has the type's full range, as
+the source table of 3.13 states (`src/reify/ranges.zig`, `resultRange`). A row
+whose union is the full range records nothing.
 
 ### 3.9 N9: canonical order
 
@@ -660,6 +821,7 @@ alone:
 | a switch's joins | the order the walk of its arms, in the order of 3.7, first reaches each join |
 | rows | the order the walk first reaches a `Call` or `Closure` of each row, starting from the root; a component's members together, by their 3.8 positions |
 | record fields | the type's field order, by name |
+| input slots | the order in which the root first reads each slot: its nodes in index order, each node's arguments and then the ends of the regions it holds, and the body's end last (3.18) |
 
 A walk that starts at the result numbers operands before their users, so every
 def precedes its uses, which is the order a translator emits statements in.
@@ -685,7 +847,21 @@ reads the table, and a translator has no accessor for it. Section 6 uses it.
 | hash-consing finds it again (N5a) | its origins and the new ones |
 | a rebuild copies it | the old node's |
 | a view inlines a call or a closure (V1, V2) | the callee node's, each reached through the call or closure |
-| two rows merge (N8g) | each node's and its partner's |
+| two rows merge (N8g) | its own, and those of every node of the dropped row that the row comparison found equal to it |
+
+When two rows merge (N8g), the nodes are paired by the comparison that
+found the rows equal (`src/reify/equal.zig`, `Comparison.matched`), not by
+their positions in the two numberings. Rows merge before the number stage, so
+two equal rows can share an equal node differently: one literal `3` that two
+arms read, against one `3` in each arm (N5d is not built). The pairing is then
+not one to one.
+
+| What N10 guarantees after a merge | Why |
+|---|---|
+| every node of the dropped row is paired with at least one node of the kept row | the comparison visits every node the numbering reaches: what the region ends read, and its loops that can return, read or not; a debug build asserts it (`src/reify/rows.zig`, `mergeInto`) |
+| a kept node holds the union of the origins of every dropped node paired with it | a shared `3` takes the origins of both per-arm `3`s |
+| a dropped node gives its origins to every kept node paired with it | each per-arm `3` takes the origins of the shared `3` |
+| no origin of the dropped row is lost | it lands on a kept node that computes the same value |
 
 ### 3.11 N11: three loop forms
 
@@ -695,7 +871,7 @@ terminator rather than a value:
 
 ```
 ForRange(start, end, inclusive, slots, body)   body params: the index, then the slots
-ForList(list, slots, body)                     body params: the element, the index, then the slots
+ForList(list, slots, body)                     body params: the index, the element, then the slots
 Loop(slots, body)                              body params: the slots
 
   slots   initial values, one per state slot
@@ -707,6 +883,14 @@ Loop(slots, body)                              body params: the slots
 
 `Return` can end a path of any region of a row, inside a loop or not.
 `Continue` and `Break` end paths of a loop body only.
+
+`ForRange` and `ForList` deliver their slots when the indices run out, and a
+`Break` carries them too, so a bounded loop has one output per slot. A
+general `Loop` ends only through `Break` or `Return`, so what it delivers is
+what its `Break`s carry, and its outputs are its own: the node lists their
+types, `Break` has one value for each, and they need not be the slots. This
+is what lets a tail-recursive row (3.12) be a `Loop` that delivers the row's
+result and no slot.
 
 `ForRange` runs its body once for each index from `start` up to `end`,
 excluding `end` unless `inclusive`; `ForList` runs it once for each element of
@@ -809,8 +993,9 @@ in the simplify phase:
 
 | Pattern | Becomes | Condition, all exact |
 |---|---|---|
-| a `Loop` whose body ends in `Branch` on a `Switch` on `is_lt(s, b)`, where `s` is a slot of a builtin integer type starting at `a` | `ForRange(a, b, False)` with `s` as the index and the other slots kept | `b` does not depend on the slots; the `False` arm is `Break` of the other slots; every `Continue` passes `plus(s, 1)` or `plus(1, s)` for `s`. The checked `plus` cannot overflow under `s < b`, so dropping it is exact. The slot is the one the test reads, so at most one slot can match, and no order among slots is consulted |
+| a `Loop` whose body ends in `Branch` on a `Switch` on `is_lt(s, b)`, where `s` is a slot of a builtin integer type starting at `a` | `ForRange(a, b, False)` with `s` as the index and the other slots kept | `b` does not depend on the slots; the `False` arm is `Break` of the other slots; every `Continue` passes `plus(s, 1)` or `plus(1, s)` for `s`. The checked `plus` cannot overflow under `s < b`, so dropping it is exact. The `False` arm's `Break` may give only some of the other slots, each once, because N11j narrows a general `Loop`'s `Break` to the outputs something reads; the `ForRange` has an output for every slot, and a `Break` in the body gives a slot that no output gave as it stands. The slot is the one the test reads, so at most one slot can match, and no order among slots is consulted. The test may also be `is_lte(b, s)` with the `True` arm leaving, which is how `if s >= b { break }` arrives: N13q turns the test of a value switch into `is_lt`, and an exiting switch keeps the form the walk gave it |
 | `ForRange(Lit(0), List.len(xs), False)` | `ForList(xs)`, with every `Elem(xs, index)` in the body replaced by the element | `xs` does not depend on the slots |
+| a `Loop` with an iterator slot that starts as `List.iter(xs)` (through `Iter.iter`, which is the identity), whose body switches on `Iter.next` of that slot, ends in `Break` of the other slots on `Done`, and passes the `rest` of the step as the iterator on every `Continue` | `ForList(xs)` with the other slots kept; the `item` the body reads is the element | the iterator and the step are read by nothing else. The procedures are recognized by the checker-authored `IteratorProcedureId` on the named primitive, never by a name |
 
 With them, and N13's rule for `List.get` under a bound (3.13):
 
@@ -843,6 +1028,19 @@ overflows when `n` is the type's highest value, and the range does not, so the
 two mean different things in Roc, and it stays a general `Loop`. When N13u's
 interval of `n` is below the type's highest value, the step never overflows
 where the test holds, and the raising rule gives the inclusive `ForRange`.
+The same holds for `if $i > n { break }`, which is `is_lt(n, i)` with the arm
+for `True` leaving. The interval is the builder's at the place the loop is
+built (`loops.Where.below_max`), so a bound that the loop body computes, even
+one that does not change, has no interval yet, and the loop stays a general
+`Loop` (`src/reify/loops.zig`, `raiseCounter`).
+
+A counter read after the loop keeps the loop a general `Loop`, with either
+test. This includes a sum that starts at the counter's initial value and
+steps by 1: N11i merges it with the counter, so `var $s = 0` with
+`$s = $s + 1` in `while $i <= n` stays a `Loop`, while the same sum in a
+`for` over `0..=n` is a `ForRange` with two slots. They do not meet today.
+N11o does not close this gap: it replaces a counter that nothing after the
+loop reads, and this one is the loop's result.
 
 Slots are normalized like nodes:
 
@@ -858,7 +1056,8 @@ wrote it:
 
 | Exit | Rule |
 |---|---|
-| a `Return(v)` terminator in a loop whose value is its row's result | becomes `Break(v)`: both end the row with `v` |
+| a `Return(v)` terminator in a loop whose value is its row's result | becomes `Break(v)`: both end the row with `v`. It applies to a general `Loop` whose one output is the row's result type |
+| an output of a general `Loop` that every `Break` gives as one value defined outside the loop, or as a value N5b hoists out of it: a speculatable node whose operands are such values, and, for a node that owns regions, whose regions read only such values from outside them (`src/reify/loops.zig:678`, `invariant`) | is that value, built before the loop, and the loop no longer delivers it. A loop whose outputs nothing reads is dropped as any unread node is, so the rule assumes a loop ends, as that drop does |
 | `Break(state)` terminators, and the normal end of a bounded loop, in a loop whose value is read only through `Index` or `Field` | each carries only the components that are read, and the reads after the loop are removed. Exactly one exit runs, so the value is computed once, at the same point |
 
 In Roc, `for x in xs` already means a loop over `xs.iter()` that switches on
@@ -893,6 +1092,19 @@ did not. Only the difference can overflow where the body does not, which the
 condition excludes. A step other than 1 would multiply the turn count, whose
 product can overflow where the slot does not, so it stays a slot.
 
+The two rules read these questions so (`src/reify/loops.zig`, `Ctx.decideTest`
+and `Ctx.deriveCounter`):
+
+| Question | Reading |
+|---|---|
+| What an edge is | a `Continue` on the loop's own paths, or an arm of a value switch in the region of that `Continue` that only the `Continue` reads. T3 makes one `Continue` of several (`if c { $done = Bool.True } else { $i = $i + 1 }` is one), so its arms are the edges, and that switch is built as an exiting switch (`Ctx.edgesFrom`) |
+| A value a dominating test decided | a `Bool` literal, or the scrutinee of a `Bool` switch, or the operand of its `Bool.not`, whose arm encloses the edge. The leading test is one of them, so an edge that passes `s` as it is continues (`Ctx.decidedAt`) |
+| The join that holds the exiting arm | it is built where the join rules would put it: at the one edge that exits (T2), or at each edge where the arm has no nodes (T4). An arm with nodes that several edges reach needs a second join of one exiting switch, which an exiting switch cannot carry (as for case-of-case, 3.13), so that loop stays a general `Loop` |
+| An exiting arm that reaches a `Continue`, or reads a node the body computes before the test | the loop stays a general `Loop`: the arm would run where the next turn's computations before the test have not run |
+| N11o over a `ForList` | a `ForList`'s index starts at 0, so N11o reads it as `ForRange(0, List.len(xs))`. Otherwise `for i in 0..<xs.len()` with a second counter would meet `for x in xs` only when N11o ran before the raising rule |
+| No exit reads `j` | no `Break` gives `j` for an output something reads, and no `Return` gives `j`. A node that reads `j` is a read in the body |
+| A `plus_wrap` step | not a derived counter: the sum is checked, and crashes where the wrapping step did not |
+
 #### What a loop iterates over
 
 The lowering erases which construct wrote a loop, and with it the intent a
@@ -905,6 +1117,12 @@ intent, and `Code.Graph.iteration` reads it off the node:
 | `ForList(xs)` | `OverList({ list, item, index, exits_early })`: `item` and `index` are the body's parameters when the body reads them; `exits_early` when a `Break` or `Return` terminator is reachable in the body |
 | `ForRange(a, b, inclusive)` | `OverRange({ start, end, inclusive, index, exits_early })` |
 | `Loop` | `General` |
+
+In the Roc API, `item` and `index` are `Read(Val)` when the body reads the
+parameter and `Unread` when it does not, and `exits_early` is `True` when a
+`Break` of this loop, or a `Return`, ends a path of the body, a nested loop's
+`Break` and a lambda's body not counted. The accessor is
+`Code.Row.iteration(row, node_index)` (`src/build/roc/Builtin.roc`).
 
 Two properties keep the accessor from reopening the remark:
 
@@ -928,7 +1146,9 @@ Non-tail recursion is not a loop at all, so there is nothing to classify.
 
 A row whose every call to itself is in tail position becomes a row whose body
 is a `Loop`. The parameters become slots, a tail call becomes `Continue` with
-the call's arguments, and every other return becomes `Return`. A parameter
+the call's arguments, and every other path end becomes `Break` of the row's
+value. The row's value is the loop. A `Return` in the body becomes a `Break`
+too, by the exit rule of 3.11. A parameter
 every tail call passes unchanged is invariant and is removed from the slots by
 N11, and a loop that counts is raised to `ForRange` or `ForList` by 3.11.
 N12 runs in the simplify phase, so a call that N13 moves into tail position is
@@ -956,7 +1176,8 @@ already known from the graph:
 | `Unwrap(Wrap(v))` | `v` | none |
 | `Switch` on `Tag(t, ...)` or on `Lit` | the arm for `t`, or for the literal | none |
 | `Switch` at a position a dominating arm already decided | that arm | the dominating arm tested the same node at the same position |
-| `Switch` on an output of another switch `s`, where every arm of `s` gives that output as a known `Tag` or `Lit` (case-of-case) | `s`, with each of its arms continuing into the outer arm its value selects: an outer arm that one arm of `s` selects is inlined there, and one that several select becomes a join of `s` they jump to, with the tag's payload and `s`'s other outputs as its parameters | none: every test runs in the order it ran, each outer arm runs in exactly the cases it ran, and nothing is copied |
+| `Switch` on an output of another switch `s`, where every arm of `s` gives that output as a known `Tag` or `Lit` (case-of-case) | `s`, with each of its arms continuing into the outer arm its value selects: an outer arm that one arm of `s` selects is inlined there, and one that several select becomes a join of `s` they jump to, with the tag's payload and `s`'s other outputs as its parameters | none: every test runs in the order it ran, each outer arm runs in exactly the cases it ran, and nothing is copied. The build holds this for a switch `s` with one output, no other reader (the rebuild tells the builder), and arms that select different outer arms. An outer arm that two arms select needs a second join, which an exiting switch cannot carry (3.11), so that case stays a switch on `s`'s output |
+| `Switch` `o` on an output of a value switch `s`, where an arm of `o` ends in the crash of a rejected literal, and every value that `s` gives for the output, through its arms and the value switches they end in, is a known `Tag` or `Lit` that selects such an arm, except one value `v` (N13w) | `o` on `v`; `s` and its tests are dropped | the work `v` needs from inside `s` is speculatable, and `o` is the only reader of the output, as for case-of-case. C2 allows it: a path to a rejected literal crashes, so `v` is the result wherever the body has one, and nothing that can fail is evaluated where it was not |
 | `Switch` on a `Bool` whose arms are `Lit(False)` and `Lit(True)` | the scrutinee | none |
 | `Switch` on a `Bool` whose arms are `Lit(True)` and `Lit(False)` | `Prim("Bool.not")` of the scrutinee | none |
 | `Bool.not(Bool.not(x))` | `x` | none |
@@ -970,14 +1191,39 @@ already known from the graph:
 | `And` with a `Lit(False)` operand, `Or` with a `Lit(True)` operand | that literal | none: C2 lets the other operands' work go |
 | an `And` operand that an earlier operand, or a dominating arm, already decided `True`; an `Or` operand decided `False` | removed; with no operand left, the `And` is `Lit(True)` and the `Or` `Lit(False)` | the same fact rule as for `Switch`. The `Or` half is the dual that N13t needs: `Bool.not(And(a, a))` becomes `Or(Bool.not(a), Bool.not(a))`, and the two meet only if both halves remove the repeated operand |
 | `Prim(p)` over `Lit` arguments, `p` speculatable | the `Lit` the compiler's interpreter computes | none |
+| `Prim(p)` over `Lit` arguments, `p` a float builtin | the `Lit` whose bits Roc's float code gives, with Roc's one `NaN` for any `NaN` | none: `0.1 + 0.2` folds to `0x3fd3333333333334` at `F64` and to `0x3e99999a` at `F32`, and `-0.0 == 0.0` holds |
+| `Str.is_eq` or `Str.concat` over `Str` literals | the `Bool` or `Str` literal | none |
+| a chain of `plus_wrap`, `times_wrap`, `bitwise_and`, `bitwise_or`, `bitwise_xor` or `Str.concat` with two literals side by side | the chain with the two replaced by the literal they compute | none: the order of the other operands is kept |
+| `Bool.not(x)` where a dominating arm or an earlier `And` or `Or` operand decided `x` | the opposite `Lit` | the same fact rule as for `Switch` (`Builder.decidedNot`) |
+| `Try.ok_or(Tag(Ok, v), d)`, `Try.ok_or(Tag(Err, e), d)`, the tag read through one `Wrap` | `v`, `d` | none: `ok_or` is a `match` on its `Try` (`Builtin.roc:5643-5647`), so this is the `Switch` on a known `Tag` above, over the builtin's body (`Builder.knownOkOr`) |
+| a `Bool` that ends an arm or an operand, where a dominating arm or an earlier operand decided it | the `Lit` it decided | the same fact rule as for `Switch` (`Builder.decidedRefs`): `if c a else c` ends its `False` arm in `False` |
 | `Prim(p)` over `Lit` arguments, `p` not speculatable | the `Lit` it computes | only when this evaluation does not fail: `7 // 2` folds, `1 // 0` stays, because folding it into a `Crash` would evaluate where the body might not |
-| `List.get(xs, i)` under a dominating `is_lt(i, List.len(xs))`, `i` a `U64` | `Tag(Ok, Elem(xs, i))` | the index is in bounds |
+| `List.get(xs, i)` under a dominating `is_lt(i, List.len(xs))`, `i` a `U64` | `Tag(Ok, Elem(xs, i))` | the index is in bounds. The bound comes from a dominating arm, from an `And` operand or `Or` operand, from `Bool.not` of the inverse test, or from `is_lte(List.len(xs), i)` in the other arm (`Builder.boundedGet`) |
 | `List.get(xs, i)` in the body of `ForList(xs)` whose index is `i` | `Tag(Ok, element)`, where `element` is the body's element parameter | none |
 | `Bool.not(is_lt(a, b))`, `Bool.not(is_lte(a, b))` | `is_lte(b, a)`, `is_lt(b, a)` | a builtin integer type |
 | `Switch` on `is_lte(a, b)` | `Switch` on `is_lt(b, a)` with the two arms swapped | a builtin integer type |
 | `Bool.not(And(x1, ..., xn))`, `Bool.not(Or(x1, ..., xn))` (N13t) | `Or` and `And` of the negations of `x1` to `xn` | none |
 | `Bool.not` of a `Bool` switch (N13t) | the switch with each arm's value negated | none |
 | `Switch` on a `Bool` `c` with two arms (N13s) | `Switch` on the negation of `c` with the two arms swapped | the negation has fewer `Bool.not` leaves; on a tie, fewer integer `is_lte` leaves; on a tie, `c` is an `Or`, or, when `c` is neither an `And` nor an `Or`, its first leaf is a `Bool.not` or an integer `is_lte` |
+
+N13w is what makes a literal's conversion meet the conversion without its
+rejection. The `Err` of `T.from_numeral`, `T.from_quote` or
+`T.from_interpolation` is a crash that the compiler writes where the literal
+stands (`src/check/code_reifier.zig`, `convertedWith`). The author did not
+write it, so it is a `Crash` of kind `rejected_literal`
+(`src/reify/ir.zig`, `CrashKind`), and a translator sees it as the `Crash`
+it is. The tests of an interpolated literal's first stage run over the
+literal's segments, so a stage that rejects in an `if`, in a `match`, in a
+chain of tests or in a helper that returns a `Try` is a switch, or a tree
+of switches, whose every value but one is the `Err` tag. N13w drops the tree,
+and N13c then takes the `Ok` arm of the conversion's own switch, so every
+spelling of the rejection describes as the conversion that never rejects. A
+rejection whose path stays behind a call that is not inlined stays the
+crash. A crash that the author wrote stays where it was written, and so do
+the tests that reach it. N13w copies nothing: an arm of `o` that several
+values select is a crash, and it is not copied, because `o` keeps its arms.
+The normal-form check fails where N13w still applies
+(`src/reify/match.zig`, `rejectedKept`).
 
 Case-of-case is what makes a helper that returns a tag meet the code it
 replaced. `parse(s)?`, with `parse` an `if ok Ok(v) else Err(e)`, is a switch on
@@ -1038,6 +1284,25 @@ literals stays a computation.
 nothing at run time, but they change a node's type, and the type is interface,
 so the nodes stay where they do not cancel.
 
+Rule L. A structural tag union that Roc lifts into a nominal (the language's
+structural-nominal compatibility, `docs/langref/tag-unions.md`) is a `Wrap` of
+the nominal, wherever the lift is. A tag written at a nominal is `Wrap(Tag)`.
+A value that another node produced at its own structural type, and that a
+`row_coerce` reads at a nominal, is `Wrap` of that value. A lift is not
+conformance: a tag union never widens to a nominal, so a `Wrap` marks every
+place where a value becomes a nominal, and a value of a nominal type is always
+a `Wrap`, an `Unwrap` reader's argument, or a node whose producer has the
+nominal type. Where the lift is below a tag payload or a nominal's backing of
+a value that no constructor built, the walk builds the `match` that does the
+lift: a `Switch` on the value whose arms rebuild each tag at the destination
+and lift each payload. The nodes are the same as that `match` written by hand
+with each payload passed through a function whose body is the lift, for
+example `Some(t) => Some(lift(t))` with `lift : [Ok(I64), Err([Empty])] ->
+Try(I64, [Empty])`. A tag union `[False, True]`, or a narrower one, read at
+`Bool` is the `Switch` whose arms are `Lit(False)` and `Lit(True)`. Section 2.4
+of `roc-reify-tag-names.md` has the steps, and `liftTo`
+(`src/check/code_reifier.zig:2701`) builds them.
+
 A tag is identified by its name, not by its position in its union. A value
 of a narrower tag union conforms to a wider slot: its tags keep their names,
 so no node stands between the value and the slot, and a verifier checks each
@@ -1074,11 +1339,31 @@ Intervals decide nothing on their own. They are conditions that rules read:
 | a checked `plus`, `minus` or `times` proved to fit | speculatable in the regions of its facts (1.1) |
 | N11l on `while $i <= n` | `n` below the type's highest value (3.11) |
 | N11o | the difference `minus(j0, a)` fits |
-| N15a on `plus` | a `plus` chain flattens when the sum of its operands' negative lower bounds and the sum of their positive upper bounds both fit the type, so every partial sum of every grouping fits |
+| N15a on `plus` | a `plus` chain flattens when the sum of its operands' negative lower bounds and the sum of their positive upper bounds both fit the type, so every partial sum of every grouping fits; an operand with an empty interval adds nothing to either sum |
 | tier F rows the rule-derivation tool writes under interval conditions | such as `(x * 2) // 2 -> x` when `x * 2` fits, and `x % n -> x` when `0 <= x < n` (`roc-reify-rule-derivation.md` 3.4) |
 
 Bounds against a value that is not a literal, such as `i < List.len(xs)`,
 stay test facts for N13m. Intervals do not replace them.
+
+The builder holds the sources in `src/reify/ranges.zig` and
+`Builder.rangeOf`, and these readings fix what the table leaves open:
+
+| Question | Reading |
+|---|---|
+| a dominating arm of an `And` or `Or` | the arm where an `And` is `True`, or an `Or` is `False`, gives each operand's fact, as an earlier operand does inside it and as N13m reads a bound |
+| an arm of a literal switch on the node | the keyed arm is the point of its key; the default arm gives nothing |
+| where a node's interval holds | in the innermost region whose fact it read and below; one that read no fact holds everywhere (`ir.NodeRange.holds_in`) |
+| a node found again by hash-consing | it keeps the interval of its first construction, in a region that encloses the one it is read in, met with the facts where it is read |
+| a node placement moves | the rebuild builds it again where it goes, with the facts open there, so its interval is the one that holds there; placement does not move a checked op proved to fit out of the region of its facts (`Store.fitFloor`) |
+| facts that contradict | an empty interval: the region never runs, and it decides no comparison |
+| the comparisons a literal decides | `is_lt`, `is_lte` and `is_eq` with exactly one literal operand; `is_gt` and `is_gte` reach them through N1l |
+| a literal switch on an integer | a key outside the scrutinee's interval selects nothing, so its arm goes, and an interval that is one key's value selects that key's arm, as the comparison with the key would decide |
+| the value a fact compares | the node of the test, or a node of one projection or builtin op with the same payload, types and operands built in another region: the copy an `And` operand builds is not the copy its arm builds (`Builder.sameValue`) |
+
+L5 checks that the intervals only narrow: the reference evaluator, run on
+each fuzz case's input, checks every integer a node with an interval
+computes where that interval holds, and every result of a row with a result
+range (`src/reify/eval.zig`, `check_ranges`).
 
 ### 3.14 N14: scalar replacement
 
@@ -1120,7 +1405,7 @@ A nested chain of one such builtin becomes one n-ary `Prim` with its arguments
 flattened in their written order, and identity literals are dropped. A chain
 with its absorber among its operands is the absorber, where every other
 operand is speculatable, so dropping them drops no failure. A chain left with
-one operand is that operand. Order is kept, because none of these is declared
+one operand is that operand. `Str.concat` and `List.concat` chains flatten the same way, and `""` and `[]` are their identities. Order is kept, because none of these is declared
 commutative in the normal form (section 7.2). Interpolation desugars to
 `Str.concat` (N1), so `"${a}${b}c"` and `a.concat(b.concat("c"))` meet here.
 
@@ -1137,6 +1422,31 @@ overflows, so the regrouped body fails where Roc does not, which C2 forbids.
 A `plus` chain whose operands' intervals prove that no grouping overflows is
 the exception (N13u). Float arithmetic is not associative.
 
+Such a chain is one `Prim` over its operands in order (`Builder.rangeChain`),
+and N15c, which reads two operands, does not apply to it. The chain flattens
+after N15c has put a literal last in each two-operand `plus` it is built
+from, so `(a + b) + c` and `a + (b + c)` meet, and `1 + (a + b)` is
+`plus(a, b, 1)` while `(1 + a) + b` is `plus(a, 1, b)`: a regrouping that also
+moves a literal stays apart, as it does for the chains of the table above. A
+chain of more than two operands is checked `plus` only where N13u proved it
+fits, which the verifier checks.
+
+The condition is monotone in the facts: a narrower interval never stops a
+chain that a wider one let flatten. This is necessary because the facts grow
+between rounds. A chain that one print flattens while an operand is still
+unknown must also flatten in the print where the operand is known from the
+start. The narrowest interval is the empty one. An operand has it when it
+always crashes where it is read, such as `0 - 18` at `U64`, or when its facts
+contradict. Such an operand gives no value, so no partial sum holds it, and it
+adds nothing to the two sums (`ranges.chainFits`). The other operands must
+still fit. Under C2 the regrouping is exact:
+
+| Where | Why the crash is the same |
+|---|---|
+| the operand that crashes | it is the same node in both groupings, and the chain keeps the operands in order, so every operand before it is read before it in both |
+| a partial sum without it | it holds only the other operands, whose sums fit, so it does not overflow before the operand crashes |
+| a partial sum with it | it is never computed in either grouping |
+
 Leaf order (N15c). Commutative operands are not sorted in general (7.2), but
 a literal and two leaves have an order that no unrelated edit can change. A
 two-operand call of integer `plus` or `times`, or of `is_eq` over a builtin
@@ -1152,7 +1462,11 @@ by position would change the order N8 reads, and a helper with reordered
 parameters would stop meeting itself. Floats are excluded, because the bits of
 a `NaN` result can depend on operand order. The root's order is its type, and
 a literal is not a parameter, so N9's numbering stays stable. `a + 1` and
-`1 + a` meet, and so do `x == y` and `y == x` over the root's parameters.
+`1 + a` meet, and so do `x == y` and `y == x` over the root's parameters
+(`Builder.paramOrder`). A root parameter means a parameter of the row whose
+parameters are fixed (`ir.Row.fixed_params`): the root, in every view, where
+an inlined helper's parameters stand for the root's values. A field of a
+record parameter is not a parameter, so `input.x == input.y` stays as written.
 
 `And` and `Or` flatten the same way, with their operands in order:
 `And(a, And(b, c))` and `And(And(a, b), c)` both become `And(a, b, c)`.
@@ -1185,7 +1499,7 @@ structured form a rule can recognize exactly:
 | `List.fold(xs, init, f)` with a known `f` | down, to `ForList(xs)` with `f` inlined | a fold has no structure beyond its loop, and `ForList` keeps the scan visible |
 | `List.map(List.map(xs, f), g)` | to `List.map(xs, g ∘ f)`, where `g ∘ f` is a row built from both bodies | the inner list is read nowhere else |
 | `xs.iter().map(f).collect()` into a `List` | to `List.map(xs, f)` | the iterator adapters carry declared lowering contracts (`design.md:5914-5918`) |
-| `is_eq(List.len(xs), 0)`, `is_lt(0, List.len(xs))` (N16f) | to `List.is_empty(xs)` and `Bool.not(List.is_empty(xs))` | `List.len` is a `U64`, so a length above 0 is one that is not 0 |
+| `is_eq(List.len(xs), 0)`, `is_lte(List.len(xs), 0)`, `is_lt(0, List.len(xs))`, and a literal switch on `List.len(xs)` with the one key 0 (N16f) | to `List.is_empty(xs)`, `Bool.not(List.is_empty(xs))`, and the `Bool` switch on `List.is_empty(xs)` | `List.len` is a `U64`, so a length above 0 is one that is not 0 |
 
 Map fusion interleaves the calls to `f` and `g`, which changes which one fails
 first when both can. C2 does not constrain it: every call still runs on every
@@ -1199,6 +1513,48 @@ form after L, and `iteration` (3.11) is what tells it the loop is a scan.
 The raising laws are recognizers, but not heuristics: each one is a pattern
 over the normal form with an exact condition. A loop that matches is rewritten
 every time, and a loop that does not match is never rewritten.
+
+How a site opts in (M10). "Opt-in per language version" does not say who
+opts in, so the reading here is the one 1.5 of the plan gives every other
+choice of what a site gets: the site's declared type selects it. A site of
+type `Code.Lawful(f)` holds the `graph` view normalized with layer L, and a
+site of type `Code(f)`, `Code.Inlined(f)` or `Code.Outlined(f)` holds its
+view without it. The checker stamps the choice on the site
+(`src/canonicalize/NodeStore.zig`, `View.lawful`), the walk passes it to the
+driver as explicit data (`src/check/code_reifier.zig`, `Options.laws`), and
+the per-site memo key holds the view, so one function reified at two site
+types gives two values. The laws are part of the language version: normal
+form 13 adds them to the fingerprint (`src/reify/mod.zig`), so a change to a
+law moves the version, as a change to any other rule does.
+
+| Law | Side conditions it relies on | Exact, or by C2 |
+|---|---|---|
+| N16a | the loop is a `ForList` over `[]` with one slot; every turn ends in `Continue(List.append(slot, v))`; the slot is read once, by that append; the index is read nowhere; no `Break` or `Return` | exact: `List.map` in `Builtin.roc` calls the function on each element, first to last, and appends what it gives |
+| N16b | as N16a, but the turn ends in `Continue` of a `Bool` switch whose one arm gives `List.append(slot, element)` and computes nothing else, and whose other arm gives the slot and computes nothing; the slot is read twice, by these arms | exact: `List.keep_if` tests each element, first to last |
+| N16a, N16b row | the row the law makes holds the nodes of the loop body that the value reads (the cone); a constant outside the loop is copied; a speculatable node outside the loop that only the cone reads is copied; every other outside value is a capture. A cone that reads the index or the slot is no match | exact: a copied node outside the loop is speculatable, so to compute it once per element, or not at all on `[]`, changes no result and no crash; a capture is computed once, before the loop, as before |
+| N16c | the function is a `Closure` of a known row; the row's body is inlined in the loop unless the row is recursive or can end in `Return` in a nested region, where the loop calls it | exact: `List.fold` in `Builtin.roc` is that loop, one call per element over the state so far |
+| N16d | both functions are `Closure`s of known rows; the outer `map` is the only reader of the inner one; the new row holds `g`'s body over `f`'s body, each inlined as in N16c | by C2: each element now calls `f` and then `g` before the next element, so when two calls can crash, a different one can crash first. The IR has no effect operation, so the crash order is the only change |
+| N16e | the `Iter.map` and the `List.iter` are known by the checker's `IteratorRole`, never by name; the result is a `List` | exact: `Iter.map` then `Iter.collect` calls the function on each element, first to last |
+| N16f | the length is `List.len`, a `U64`, compared with the literal 0 by `is_eq` (either order), `is_lte(len, 0)` or `is_lt(0, len)`, or tested by a literal switch whose one key is 0. N13 writes `!(0 < len)` as `len <= 0`, and N13n writes `if len == 0` as the literal switch, so each of these is a critical pair that N16f joins | exact: `List.is_empty` is `len == 0`, and a `U64` above 0 is one that is not 0. `List.is_empty` cannot crash, so it is on the speculatable list (1.1) |
+
+A row a law makes is simplified and finalized before the closure that names
+it, as a specialization is (N8i). A `Closure` takes its captures first, so
+where finalize orders the parameters otherwise, the closure names a
+wrapper row that keeps that order (`src/reify/rows.zig`, `conventionRow`).
+The measure counts the folds of a closure that N16c can still lower and the
+literal switches on a length that N16f can still rewrite (`law_redexes`,
+after `self_tail_calls`): N16a and N16b remove a loop, N16c removes a fold,
+N16f over a switch removes a literal switch, and N16d, N16e and N16f over a
+comparison remove nodes.
+
+Limits of M10:
+
+| Limit | Why |
+|---|---|
+| layer L applies to the `graph` view only; no `Code.Lawful` form of `inline` or `outline` exists | no translator needs one yet; a type for each pair is a later change of the builtin library |
+| N16a and N16b raise only a loop whose function reads the element and outside values; a loop that reads the index, or a counter of its own, stays a loop | `List.map` and `List.keep_if` give the function no index |
+| a value bound outside the loop that is not speculatable, `k // m` for example, is a capture of the closure, not part of the row | the loop computes it once, before its first turn; the row would compute it once per element |
+| N16c lowers `List.fold` only; `Iter.fold` and folds of other owners stay calls | the laws of 3.16 name `List.fold` only |
 
 ### 3.17 N17: known lists
 
@@ -1214,7 +1570,7 @@ replaced by what their bodies in `Builtin.roc` compute:
 | N17c | `List.get(List(e0..en-1), x)` with `x` not a literal | a literal switch on `x` with keys `0` to `n - 1`, arm `k` giving `Ok(ek)`, and the default giving `Err(OutOfBounds)` | the same body, with `index < len` decided per key |
 | N17d | `concat`, `append`, `prepend`, `single`, `with_capacity`, `set` at a literal index, `drop_first` and `take_first` with a literal count, over known lists | the `List` node of the result's elements | each builtin's body |
 | N17e | `map`, `map2`, `map_with_index` over known lists with a known function; `keep_if` where every `p(ei)` is a `Bool` literal | the `List` node of the calls, in element order, and N8i makes each a direct call; for `keep_if`, the kept elements | the builtins' loops, which call the function once per element, in order |
-| N17f | `fold`, `fold_rev`, `sum`, `any`, `all` over a known list | the chain of calls; `sum` as the `plus` chain from the first element, `(e1 + e2) + e3`, and `default()` for `[]`; `any` and `all` as n-ary `Or` and `And` of the calls | `Builtin.roc:4747-4754`, `:3300-3310`, `:4884`, `:4912` |
+| N17f | `fold`, `fold_rev`, `fold_with_index`, `sum`, `any`, `all` over a known list | the chain of calls, `fold_with_index` with each element's index as a `U64` literal; `sum` as the `plus` chain from the first element, `(e1 + e2) + e3`, and `default()` for `[]`; `any` and `all` as n-ary `Or` and `And` of the calls | `Builtin.roc:4747-4754`, `:3300-3310`, `:4884`, `:4912`, `:4943-4954` |
 | N17g | `ForList(List(e1..en))` with `n` at most B, whose every path ends in `Continue` | the body once per element, in order, with the slots threaded from one copy to the next | the loop's own semantics |
 
 Each row is exact in Roc under C2. A `List` node evaluates all of its
@@ -1224,8 +1580,9 @@ dead, which C2 allows (3.6).
 
 Two steps grow the graph beyond what the author wrote: `List.repeat(x, Lit(n))`
 in N17d, and N17g, which copies a loop body. Each applies only when `n` is at
-most B, a constant of the language version, like K in `outline`. Every other
-step is linear in the list the author wrote.
+most B, a constant of the language version, like K in `outline`. B is 16,
+the elements of a 4 by 4 matrix (`src/reify/lists.zig` `max_unrolled`). Every
+other step is linear in the list the author wrote.
 
 With N17 on, the list refactors below meet:
 
@@ -1234,6 +1591,7 @@ With N17 on, the list refactors below meet:
 | `[c.r, c.g, c.b].map2(weights, \|a, w\| a * w).sum()` with `weights` a known list, and `c.r * w0 + c.g * w1 + c.b * w2` | one `plus` chain in `inline`. In `graph`, the lambda is a row called three times (tier B) |
 | `for x in [a, b, c] { $s = f($s, x) }` and `[a, b, c].fold(s0, f)` | the same three calls |
 | `[a, b].concat([c])` and `[a, b, c]` | one `List` node |
+| `"a${x}b"` at `Str`, the same literal at a type whose `from_interpolation` only wraps `Str.from_interpolation`, and `"a".concat(x).concat("b")` | one flat `Str.concat("a", x, "b")`: N17f makes the assembler's `fold_with_index` its calls, N17b reads each segment, N13c decides `ok_or`, and N15a flattens the chain and drops `""`. A conversion that transforms each value has the transform on each value. With two or more values, the fold's function is one row called per value in `graph` (tier B), and the chain is in `inline` |
 
 What stays apart, or unchanged:
 
@@ -1247,6 +1605,68 @@ What stays apart, or unchanged:
 A translator that has arrays and reads a literal switch whose keys are `0` to
 `n - 1` can emit a constant array for it. That is the translator's choice; the
 normal form keeps one form.
+
+### 3.18 N18: input slots
+
+A site whose translator returns a `Code.Bound` (`roc-reify-proposal.md`
+section 10.1) can read values that exist only when the program runs. Each one
+is an input slot of the root, read as `Input(k)`.
+
+| Rule | Statement |
+|---|---|
+| N18a | A name that the walk cannot replay and that the compiler does not fix is a slot. |
+| N18b | `Field`, `Index` and `Unwrap` of a slot is a slot: the slot of its leaf with one more step. No node reads a slot through a projection, except a whole slot of N18e. |
+| N18c | Only the root row reads a slot. A lifted row receives a slot value as a `Closure` argument. |
+| N18d | The slot list holds exactly the slots the final root reads, in the order of 3.9. |
+| N18e | Let R be the slots the final root reads under N18a to N18c. A slot in R that is a projection of another slot in R is no slot. The outermost slot in R that it is a projection of is a whole slot, and the root reads the value as `Field`, `Index` and `Unwrap` nodes over that slot's `Input`, one per step. A projection of a whole slot is a node, not a slot. |
+
+N18e reads only R, which is explicit in the final root: by N18b, each
+`Input` there is a read of its whole value, by a node other than a
+projection (an `OptField`, a call argument, a switch, a construction) or by
+a region end. So a captured value is one slot exactly when the root reads it
+whole. A value that the root reads only through paths keeps one slot per
+path, because a translator then binds only the parts it reads. N18e is a
+rule of the final form, so a whole read that a rule removes, such as one in
+an arm that N13 decides, makes no whole slot.
+
+| The root reads | Slots | Reads |
+|---|---|---|
+| `place.city`, `place.line` | `place.city`, `place.line` | `Input(0)`, `Input(1)` |
+| `place` (by `OptField`), `place.city` | `place` | `Field(Input(0), city)` |
+| `order.ship.to` whole, `order.ship.to.city`, `order.name` | `order.ship.to`, `order.name` | `Field(Input(0), city)`, `Input(1)` |
+| `pair.0` whole, `pair.0.city`, `pair.1` | `pair.0`, `pair.1` | `Field(Input(0), city)`, `Input(1)` |
+| `places` (a list, by `List.contains`) | `places` | `Input(0)` |
+| `query.kind` (a tag union, by a switch), `query.tags`, `query.name` | all three | one `Input` each |
+
+A list and a tag union have no projection that N18b makes a slot (`Item`
+and `Payload` read the whole value), so they are always whole. A slot whose
+type holds an opaque type is a whole slot as any other: its `Code.Value` is
+`Encoded`, the bytes of the whole value, and the root reads its fields as
+`Field` nodes over it.
+
+N18b keeps two R rows where a slot stands: "bind a value once, or write the
+expression twice" and "destructure a record or tuple, or read its fields". A
+slot has no name. The site keeps, apart from the value, which run-time name and
+which projections each slot reads, as it keeps the provenance table.
+
+How the program binds a slot is not a rule of the normal form: a slot is
+`Input(k)` of its type in every case, so no version changes with it. At a
+site whose translator names a format with `Code.Binds(code, fmt)`
+(`roc-reify-opaque-proposal.md` D5), a slot whose type holds an opaque type
+is bound as `Code.Value.Encoded`, the bytes of the type's `encoder_for` in
+`fmt`. Such a slot must be a capture read of the lambda: its leaf and
+projections are a name the lambda captures and the fields or items the
+lambda's source reads from it (`order.at`). A slot that N18b makes from a
+destructuring (`{ at, .. } = order`, then `at`) has the same leaf and
+projections, but the checker recorded no encoder for that path, so the site
+is refused and the message names the field path to write instead.
+
+| Slot type | Site | Value |
+|---|---|---|
+| holds no opaque type | any binding site | the structural `Code.Value`, as before |
+| holds an opaque type, path is a capture read | `Code.Binds` | `Encoded(bytes)` |
+| holds an opaque type, path is no capture read | `Code.Binds` | refused (`input_not_bound`) |
+| holds an opaque type | no `Code.Binds` | refused (`input_not_bound`) |
 
 ---
 
@@ -1391,37 +1811,110 @@ The rule:
    in the same region or in regions it owns, stopping at parameters, slots, and
    nodes that something outside the cone also reads. A cone is a tree of work
    whose only inputs are its stopping points.
-2. **Shapes.** A cone's shape hash is computed bottom-up from ops, types and
-   argument shapes, with each stopping point replaced by a hole numbered in
-   the order of its first occurrence. So `a * a + b` and `c * c + d` share a
-   shape, and `a * b + c` does not.
-3. **Candidates.** A shape is a candidate if it occurs at two or more
-   non-overlapping places, anywhere in `inline`, and its cone has at least K
-   nodes.
-4. **Selection.** Candidates are taken in order of (occurrences × (size − 1))
-   descending, then size descending, then shape hash. A candidate is taken
-   unless one of its occurrences overlaps an occurrence already taken, in which
-   case only its non-overlapping occurrences count, and it is taken if two
-   remain.
-5. **Rows.** Each chosen shape becomes a row whose parameters are its holes in
-   hole order, and each occurrence becomes a `Call` with the stopping points as
-   arguments. Then the whole rule runs again on the result, so repetition
-   inside the new rows is found too. Each pass removes nodes, so it terminates.
-6. **Numbering.** N9 numbers the result, and rows are identified by digest as
+2. **Places and keys.** A place is a node whose cone has at least K nodes and
+   can be a row (the table below). The key of a place at depth d reads its
+   cone from the root down to depth d: the op, payload, types and immediates
+   of each node at depth d or less, a literal by its type alone, and every
+   other value (a stopping point, a node deeper than d, a region parameter) as
+   a leaf, by its type and its number in the order of first occurrence. One
+   more key, at depth D + 1, is the key at depth D that also reads each
+   literal's value. The places are sorted by their keys at depths 0 to D + 1,
+   then by site order. A group at depth d is a run of two or more places with
+   one key at every depth up to d. A run equal to the run at depth d - 1 that
+   holds it is that group. So groups at different depths hold one another,
+   and a group splits only in this way: selection takes the depth that gains
+   most. The last depth keeps places that differ only in their literals apart
+   from the ones that do not, so a literal hole never hides a row without
+   one. D is 3.
+3. **Generalization.** The generalization of a group is the least general
+   generalization (Plotkin) of its places. A walk visits the cones of all
+   places in step from their roots. It meets tuples of values, one value per
+   place, and gives each tuple one of these kinds:
+
+   | Tuple | Kind |
+   |---|---|
+   | nodes of the places' cones with one op, payload, types, immediates, output and region shape (region kinds, parameter types, end kind, counts) | a node of the generalization; the walk goes on into its arguments and regions |
+   | literals with one value | a literal, copied into the row |
+   | parameters at one place of regions of one node of the generalization | that parameter |
+   | anything else | a hole |
+
+   One tuple is one hole, so a hole that is the same value at every place is
+   one parameter: `a * a + b` and `c * c + d` give `h0 * h0 + h1`, and
+   `a * b + c` with `a * a + d` gives `h0 * h1 + h2`. The values of a hole
+   have one type. Holes are numbered in the order the walk first meets them:
+   depth first, a node's arguments in order, then per region its end and the
+   nodes nothing reads.
+4. **Holes that keep meaning.** A `Call` evaluates its arguments before its
+   body. So a hole moves its values out of the cone into the caller, ahead of
+   the call. These rules make a tuple a hole, or stop it from being one, and
+   the walk runs again until none applies:
+
+   | Rule | Why |
+   |---|---|
+   | a node of a place that the walk meets in two tuples of nodes, or in a tuple of nodes and a hole, is a hole wherever it is met | otherwise the row evaluates it twice where the place evaluated it once |
+   | a node that the value of a hole reads at a place, and that a tuple of nodes holds, is a hole | otherwise the caller and the row both evaluate it |
+   | no speculation: a value of a hole at a place is a stopping point, a literal, a node in the region of the place's root, or a node whose region is inside the cone and that moves: it, and every node it reads in such a region, is speculatable, owns no region, and reads no parameter of a region inside the cone. Otherwise the tuples of nodes that read the hole are holes | a stopping point and a node in the root's region run on every path where the root runs; a literal and a speculatable node cannot crash, so evaluating them where the place did not is allowed. This keeps the promise of this section: nothing that can fail runs where it did not |
+   | a tuple that is not a node at a place that cannot be a hole (a parameter of a region of the generalization, the target of a `Jump` or a `Branch`, a node nothing reads) makes the tuple of nodes that holds the place a hole | such a place is not a value the caller can pass |
+
+   The group has no generalization when its roots become a hole. A place whose
+   image (the nodes its tuples of nodes hold) meets the image of an earlier
+   place in site order, or of a taken occurrence, leaves the group, and the
+   generalization is computed again.
+5. **Candidates.** With c places, s nodes in the generalization (literals not
+   counted) and h holes, the gain is c × (s - 1) - c × h: each place saves its
+   s nodes but one, and passes h arguments. A group is a candidate when c ≥ 2,
+   s ≥ K and the gain is above 0.
+6. **Selection.** Candidates are taken in order of gain descending, then s
+   descending, then the hash of the generalization's shape, then the first
+   place in site order, then the depth. A candidate whose evaluation predates a
+   take is evaluated again against the occurrences taken since, and goes back
+   into the order; a candidate is taken when its evaluation is current.
+7. **Rows.** Each chosen generalization becomes a row whose parameters are its
+   holes in hole order, copied from its first place. Each place becomes a
+   `Call` with the values of its holes as arguments, and a value that moves is
+   built just before the call. Then the whole rule runs again on the result,
+   so repetition inside the new rows is found too.
+8. **Numbering.** N9 numbers the result, and rows are identified by digest as
    in 3.8.
 
 The rule preserves meaning because a `Call` evaluates its body where the cone
-stood: every node runs in the same region as before, so nothing speculates. It never outlines across a recursive component, because
-`inline` never breaks one.
+stood, and its arguments just before: every node of the generalization runs in
+the same region as before, and a value that moves is speculatable (rule 4), so
+nothing that can fail speculates. It never outlines across a recursive
+component, because `inline` never breaks one.
+
+Each pass terminates and the passes end. A take of c places of a
+generalization with s nodes and h holes removes c × s nodes and adds s nodes
+in the row and c calls, so the node count falls by (c - 1)(s - 1) - 1, at
+least 2. The size the debug check reads counts the arguments of calls too, as
+3 × nodes + arguments. A positive gain means h ≤ s - 2, so a take lowers it by
+at least 3(cs - s - c) - c(s - 2) = s(2c - 3) - c, which is above 0 for
+c ≥ 2 and s ≥ 3. A hole argument counts less than a node because it is a
+reference, not work: counted alike, two calls of `ripple` (`examples/reifying/glsl/`),
+4 nodes over 2 holes, would not lower the size.
 
 | Gain | Cost |
 |---|---|
 | functions in the output, identical under every refactor in R | the functions are not the author's, so emitted GLSL is harder to read; the dump maps them back |
 | bounded output size: inlining a call tree duplicates bodies, exponentially in the worst case, and outlining shares them again | stability is global: adding one use of a shape anywhere can change which rows are chosen everywhere, on a real edit, never on a refactor in R |
-| O(n log n) per pass over the size of `inline` | `inline` has to be materialized first, which is the expensive step |
+| a helper called over different arguments (`step(input.a)` and `step(input.b)`) is one row | per pass, O(D × m log m) for the keys of m nodes, plus the walks of the groups (below) |
 
-K, the selection order and the hole numbering are part of the language
-version, like R.
+K, D, the gain, the selection order and the hole numbering are part of the
+language version, like R.
+
+`src/reify/views.zig` (`outlineSelect`) builds the rule (M9 and V3b of the
+plan). K is 4 (`views.outline_min_size`) and D is 3 (`views.outline_key_depth`).
+The rule above leaves these points open, and the build reads them as the
+table says:
+
+| Point | Reading |
+|---|---|
+| literals | a literal is not a stopping point, and it does not count in the size. Literals with one value at every place are copied into the row. Literals that differ are a hole, whose argument is the literal: a literal cannot crash, so the hole is always allowed, and the row keeps the node that reads it. Stopping above the literal would cost the same argument and lose that node. So `x * 3` and `x * 4` generalize to `x * h0` |
+| which cones a row can be | a cone with one output, no `Return` to the row, no `Continue` or `Break` of a loop outside it, no `Jump` to a join outside it, and no `Call` or `Closure` of its own recursive component. Other nodes are not places |
+| keys | a key is a hash, so two keys can collide. A collision only puts places in one group; the walk compares values, so it never treats two computations as one |
+| overlap | a place overlaps a taken occurrence when their images share a node. A place whose root is a value of a hole of another, or the other way round, does not overlap it: the outer call reads the inner one |
+| the end of a pass | the made rows and their callers are finalized again (3.8), and the next pass reads the result. The pass stops when it takes nothing. A debug check asserts that each pass lowers 3 × nodes + call arguments (`views.SiteSize`) |
+| cost | the keys are O(m × a^D) for nodes of at most a arguments, the sort O(D × m log m). A walk of a group of c places is O(c × w) for w tuples, run once per rule 4 round and once per change of the group's places; a round adds at least one hole. Selection evaluates a candidate again after each take that predates its evaluation |
 
 ### 5.4 Rebuilding expression trees
 
@@ -1466,7 +1959,7 @@ step = |x| x * 3
 
 The translated code reached it through these calls:
 
-    step(x) (line 28, column 14)
+    step(x) (test/cli/StagedRefusal.roc:28:14)
 
 The translator gave this reason:
 
@@ -1525,6 +2018,7 @@ Every row is an edit that preserves meaning in Roc under C2. "A" means the norma
 | literal spelling: `1_000`, `1000`, `0x3E8` | A | A | N1 |
 | rename a helper; move it to another module in the package; reorder top-level definitions | A | A | N8 |
 | any refactor inside a function in the site's cut | A | A | 3.8: the function is a primitive by name |
+| any refactor in R inside a dependency's function outside the cut; move a helper to another package, or back | A | A | N8l: the body is walked in any package |
 | turn a local closure into a top-level helper, or back | A | A | N8 |
 | reorder a private helper's parameters; drop an unused one | A | A | N8 |
 | `List.map(xs, \|x\| f(x))` and `List.map(xs, f)` | A | A | N8, eta |
@@ -1539,6 +2033,7 @@ Every row is an edit that preserves meaning in Roc under C2. "A" means the norma
 | a tail-recursive helper or a loop | A | A | N12, N11 |
 | `return x` as the last statement, or `x` | A | A | T6 |
 | a helper that returns a tag or a `Try`, matched or unwrapped with `?` by its caller, or the helper's tests written in place | A for a helper with one call site, B otherwise | A | 5.1, case-of-case (3.13) |
+| reject a literal in its conversion with an `if`, a `match`, a chain of tests or a helper's `Try`, at any depth | A | A | N13w (3.13), C2 |
 | call a function chosen by an `if` or read from a record literal, or call each function directly | A | A | `Apply` (3.8) |
 | drop a loop variable nothing reads, or one that never changes | A | A | N11 |
 | build a record, tuple or tag and read it back, or use the parts directly | A | A | N13 |
@@ -1590,13 +2085,14 @@ absorbing them costs more than the refactor they would absorb:
 | equal operands of a chain merged or cancelled, `x & x` and `x`, `x ^ x` and `0` | with operand order kept, it is not confluent with N15a's flattening (3.15); a canonical operand order would make it so, which the first row leaves out |
 | a canonical form for boolean formulas, such as a reduced BDD | canonical only for a fixed variable order, which would have to come from the walk, so it adds no invariance N7 and N13 lack |
 | merging identical work in some sibling branches but not all | it places work where some branch did not evaluate it, which is speculation. Work in every arm is merged (3.5), because binding it once before the switch is a refactor in R |
-| a branch that always crashes, treated as unreachable | C2 would allow it, but the author wrote the `crash`, and an interpreter target reports it |
+| a branch that always crashes, treated as unreachable | C2 would allow it, but the author wrote the `crash`, and an interpreter target reports it. The crash of a rejected literal is the compiler's, and N13w decides it (3.13) |
 | inlining a builtin's body | a builtin is a primitive; its body is not API, and a translator recognizes it by identity |
 | loop unrolling, loop fusion outside layer L | optimizations, not refactors anyone makes to reified code. The exception is a loop over a list of known length, which N17g unrolls, because a loop over `[r, g, b]` and three statements is a refactor authors make |
 | outlining in the `graph` view | it would replace the author's shared helpers, which is what `outline` is for |
 | mutual tail recursion as one `Loop` with a dispatch slot | the slot's tags are the compiler's, so an author's state loop over its own tags would not meet it (3.12) |
 | a callee's set of result tags, read by its callers | it removes only arms the callee never returns; a helper matched by its caller meets its tests in place only by case-of-case in `inline` (5.1), so no refactor moves into R |
 | a call of a row whose result is always parameter `k`, replaced by argument `k` | a row that can crash would lose a `crash` its author wrote; a speculatable one is already reduced to the parameter, so only calls of an identity row would change |
+| `OptField` of a `Record` node, which names the fields it sets | the answer is `Ok` of the field or `Err(MissingField)`, but the result has to be built as a `Try` of a type the table's `Tmpl` has no template for; the description keeps the read, and a translator that wants the answer reads the `Record`'s field names |
 
 ---
 
@@ -1676,6 +2172,7 @@ Code(_fn) :: { ... }.{
 		rows : Graph -> List(Row)               # canonical order, root first
 		row : Graph, RowId -> Row
 		inputs : Graph -> List({ name : Str, ty : Ty })   # root parameter fields, by name
+		slots : Graph -> List(Ty)                         # the root's input slots, in slot order (3.18)
 		iteration : Graph, NodeRef -> Iteration   # the NodeRef names a loop node; read off the node
 		to_tree : Graph, RowId -> Tree
 	}
@@ -1700,16 +2197,17 @@ Code(_fn) :: { ... }.{
 		Node(U32),
 		Out({ node : U32, k : U32 }),        # output k of a Switch node
 		Arg({ owner : U32, k : U32 }),       # param k of the loop body or join the node owner holds; in ForRange, param 0 is the index; in ForList, param 0 is the element and param 1 the index
+		Input(U32),                          # input slot k of the root (3.18)
 	]
 
 	Node := { op : Op, args : List(Val), ty : Ty, speculatable : Bool }
 
 	Op := [
 		Lit(Lit),
-		Prim({ owner : Str, method : Str }),   # Num.F32 and sin; Glsl.Vec3 and scale
+		Prim({ owner : Str, method : Str, id : PrimId, evidence : List(Evidence) }),   # Num.F32 and sin; Glsl.Vec3 and scale; id is Code.prim of the definition; evidence below
 		Call(RowId),
 		Closure(RowId),             # args are the captured values
-		Record(List(Str)),          # field names in the type's order
+		Record(List(Str)),          # the names of the fields the node sets, in the type's order
 		Tuple,
 		List,
 		Tag(Str),
@@ -1731,6 +2229,9 @@ Code(_fn) :: { ... }.{
 		Derived(Str, Ty),
 	]
 
+	Evidence := { method : Str, ty : Ty, target : Target }   # one where requirement of the Prim's scheme
+	Target := [Prim({ owner : Str, method : Str, id : PrimId, evidence : List(Evidence) }), Row(RowId), Derived(Str), Unreachable]
+
 	Key := [Tag(Str), Lit(Lit), Len(U64), AtLeast(U64), Default]
 
 	Iteration := [
@@ -1750,7 +2251,34 @@ parameter's owner, so a nested loop or join never shadows an outer one. `Prim` c
 arguments for a chain N15 flattened. `Prim` names its owner and method apart,
 so a translator's table is keyed by method and reads the type from the node;
 the rest of this document writes `Prim("Num.F32.sin")` for
-`Prim({ owner: "Num.F32", method: "sin" })`. A translator for a target
+`Prim({ owner: "Num.F32", method: "sin", id })`. The names are for messages:
+`id` is the definition's `Code.PrimId` (`src/reify/identity.zig`), the value
+`Code.prim(f)` gives, so two packages' `Time.is_before` are two ids. In the
+same way an opaque type is `Opaque(name, type_id, args)`, whose `TypeId` is
+the value `Code.type_id` gives, and a builtin opaque type is named as the
+owner of its primitives (`Dict`, not `Builtin.Dict`). Neither id is part of
+the rules: an id is a function of the definition the node already names.
+
+`Prim.evidence` (D7 of `roc-reify-opaque-proposal.md`) has one `Evidence` per
+`where` requirement of the primitive's scheme, in the checked order with a
+constraint alias (`item.Sort`) expanded: the required method, the type it
+dispatches on at the call, and the method the checker chose. The walk reads it
+from the checker's recorded evidence, or, where a derivation reached the call
+and nothing is recorded, from the method registry by the checker's rule. It
+plans nothing:
+
+| Recorded resolution | `Target` |
+|---|---|
+| a target (`direct`) | classified as a callee is: `Prim` with its own evidence, or `Row` of the method's body, built at the evidence's instance |
+| forwarded (`constraint`) | the answer the enclosing walked call supplied, then as above; where the use relates the slot's target to its own callable, the slot names the target and the dispatcher fixes a `Row`'s instance; a variable only the rest of the callable fixes is refused |
+| derived (`structural`) | `Derived(method)` |
+| `unreachable_value` | `Unreachable` |
+| none, because the compiler's own derivation reached the primitive | the receiver's type fixes the dispatcher, and the method registry answers it by the checker's rule: a nominal's target as above, a derived one or a structural shape (for equality and hash) `Derived(method)`; a type variable, a composite dispatcher and an undeclared method are refused by name |
+| left to a later stage (`from_callable`, `from_scheme`) | the site is refused by name |
+
+Evidence is part of the node: two calls that chose two methods are two nodes
+and have two digests. A row that evidence names is a row of the site in every
+view. A translator for a target
 without short-circuit evaluation, such as SQL's `AND`, reads `speculatable` on
 the operands to decide whether it may evaluate them eagerly.
 
@@ -1882,12 +2410,37 @@ for all three.
 | Should layer L ship with the first version? | it is separable: N1 to N15 stand without it. Shipping it later is a versioned change of R, like any law added after |
 | Which laws belong in L? | the five of 3.16 are the ones a loop-to-builtin refactor needs, and N16f adds `len() > 0` and `len() == 0` against `is_empty()`. Further candidates are theorems about builtins that the library would have to state and test |
 | Commutative operators? | only leaf pairs, by N15c: a literal last, the root's parameters in order. The rest is left out (7.2). Revisit only if real translators show that authors reorder other operands |
-| What is K in `outline`? | a constant of the language version. Too small and `outline` makes a row of every repeated pair of operations; too large and it recovers little size. It needs measuring on real shaders |
+| What is K in `outline`? | decided for now: K = 4, measured on the examples (table below). K must be 3 or more, so that a pass lowers the site's measure. The examples do not tell 3 and 4 apart, and K = 5 loses the one row of the GLSL example. The measurement of M9 found that a cone takes in every argument only it reads, so `step(input.a)` and `step(input.b)` had two shapes. V3b answers it by anti-unification (5.3, rules 3 and 4): the differing arguments are holes, so both are one row, and the GLSL shader's two calls of `ripple` are one row. Measure again when a translator reads `outline` |
 | Should `graph` inline single-use rows? | yes in this design, because it moves the most common helper extraction into tier A. The price is that a GLSL translator reading `graph` never emits a function the author called once |
 | Do translators need names for emitted identifiers? | no in this design: the dump and provenance cover debugging. A name exposed for emission becomes observable again |
 | Should the rules be derived rather than accumulated? | yes: the gate of `roc-reify-rule-derivation.md` section 6 passed on 2026-09-27. That document defines an offline tool, `zig build reify-rules`, that finds unjoined critical pairs and equal small terms that normalize apart, proves them in a most-defined semantics in which every rule is an equation, and writes the first-order rules as table rows. After the gate, a tier F rule enters the table through the tool, and a hand-written tier F row, such as N15a's rows over operand runs, states its reason |
-| How does a translator declare its cut? | decided: a well-known associated item `code_primitives` on the nominal type that owns the function with the `Code(f)` parameter, found through that type as `iter` and `to_inspect` are. It is public, like every well-known name, and it tells a translator's users which functions it reads by name. It is a direct reference to one top-level function, or a tuple of such references; anything else, and a function listed twice, is a compile error at the item. A type without it has an empty cut. The checker resolves it and records the cut in the checked artifact, as it records `IteratorProcedureId`; the reifier reads the checked expression, not an evaluated value. The cut is per type: two translators with different cuts are two types. Rejected: a private module constant read by name, which no Roc mechanism is like; a second `Code` type parameter with a `Code.prim` intrinsic (new surface), a package header entry (one cut per package, which `Glsl` and `Interp` in one package cannot share), and a cut passed to a `Code` function at run time (the normalizer would have to run in every backend, as plan 1.5 rejects for views) |
+| How does a translator declare its cut? | decided: a well-known associated item `code_primitives` on the nominal type that owns the function with the `Code(f)` parameter, found through that type as `iter` and `to_inspect` are. It is public, like every well-known name, and it tells a translator's users which functions it reads by name. It is a direct reference to one top-level function, or a tuple of such references; anything else, and a function listed twice, is a compile error at the item. A type without it has an empty cut. The function with the `Code(f)` parameter is the one the call that takes the site names: the callee of a direct call, the method a method call dispatches to, or a wrapper (3.8). The checker resolves it and records the cut in the checked artifact, as it records `IteratorProcedureId`; the reifier reads the checked expression, not an evaluated value. The cut is per type: two translators with different cuts are two types. Rejected: a private module constant read by name, which no Roc mechanism is like; a second `Code` type parameter with a `Code.prim` intrinsic (new surface), a package header entry (one cut per package, which `Glsl` and `Interp` in one package cannot share), and a cut passed to a `Code` function at run time (the normalizer would have to run in every backend, as plan 1.5 rejects for views) |
 | Where does the `graph` view stop being worth it? | if no translator ends up reading it, drop it and keep only `inline`; the normal form's definition does not change |
+
+K was measured with `ROC_REIFY_OUTLINE_STATS=3,4,5,6,8,12` (a Debug compiler
+only), which reifies each site in `outline` at each K and prints its size,
+over `roc check` of each `main.roc` and of each fixture. "Nodes" counts the
+nodes of all rows of all sites, literals not counted. "Rows" counts the rows
+that `outline` made. The measurement is of normal form 15 (V3b).
+
+| Source | Sites | Nodes in `inline` | K = 3 | K = 4 | K = 5 | K = 6, 8, 12 |
+|---|---|---|---|---|---|---|
+| `examples/reifying/glsl/` | 8 | 165 | 163, 1 row | 163, 1 row | 165, 0 rows | 165, 0 rows |
+| `examples/reifying/sql/` | 42 | 141 | 141, 0 rows | 141, 0 rows | 141, 0 rows | 141, 0 rows |
+| `examples/reifying/dbsp/` | 22 | 107 | 107, 0 rows | 107, 0 rows | 107, 0 rows | 107, 0 rows |
+| `examples/reifying/hello/` | 3 | 6 | 6, 0 rows | 6, 0 rows | 6, 0 rows | 6, 0 rows |
+| `test/cli/Staged*.roc` | 153 | 584 | 569, 5 rows | 569, 5 rows | 569, 5 rows | 584, 0 rows |
+
+The GLSL row is `ripple`: the shader `rippled` calls it twice over two field
+reads, `frag.fragTexCoord.y` and `frag.fragTexCoord.x`, and `settings.time * 2.0`
+is one value at both places. The row has 4 nodes and 2 holes, the field read
+and the shared product, and the site falls from 16 nodes to 14. No other site
+of the examples repeats a computation of 3 nodes or more. The five rows of the
+fixtures are all in `test/cli/StagedOutlinedView.roc`, as in M9. The
+`step(input.a)` and `step(input.b)` pair of the M9 measurement is not in an
+example (the DBSP example calls `step` at run time, not at a `Code` site);
+`L3 V3b` in `src/compile/test/code_reifier_test.zig` holds it, and it is one
+row.
 
 ---
 

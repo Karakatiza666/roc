@@ -131,6 +131,11 @@ What the walk does (`callExpr`, `src/check/code_reifier.zig:3558`; `callOf`, `:3
   union its consumer reads, and the row of the helper keeps its own, narrower,
   result. `Builder.callRowAt` builds the node (`src/reify/builder.zig:1039`).
   `Builder.callRow` (`:1032`) is `callRowAt` at the result of the row.
+  Where the `row_coerce` type is a nominal that the result only lifts into,
+  the `Call` is built at the nominal's backing, or at its own result where a
+  payload below needs a lift, and 2.4 lifts it from there (`liftReach`,
+  `src/check/code_reifier.zig:2792`). A `Call` is never typed at a nominal
+  that its row's result only lifts into.
 - `verify.zig` accepts a `Call` whose type the result of the row `widens` to.
   Any other call type is reported (`src/reify/verify.zig:215-222`).
 
@@ -188,9 +193,59 @@ Tests:
 | `src/reify/rebuild.zig:654` | inlining a call over a narrower argument drops the arms of the tags the argument cannot hold | switch pruning (2.2) |
 | `src/reify/verify.zig:522`, `:559`, `:578` | conformance of a narrower tag, a wider value where a narrower one is expected, and the call type | 2.1 and the call type |
 | `src/reify/rows.zig:1140` | the walked digest reads a tag by its name, not by the order a store interned it in | digest by text |
-| `src/compile/test/code_reifier_test.zig:1384` | a helper that closes a row, read at a wider union, describes as the same code written inline | the refactor promise |
-| `src/compile/test/code_reifier_test.zig:1334`, `:1421`, `:1463` | a `?` body reaches a wider match with no node between; a match keeps the arm of a tag only it lists; a match lists a tag the helper cannot build | conformance and arms through the walk |
+| `src/compile/test/code_reifier_test.zig:1440` | a helper that closes a row, read at a wider union, describes as the same code written inline | the refactor promise |
+| `src/compile/test/code_reifier_test.zig:1390`, `:1477`, `:1519` | a `?` body reaches a wider match with no node between; a match keeps the arm of a tag only it lists; a match lists a tag the helper cannot build | conformance and arms through the walk |
 | `src/eval/test/eval_staging_tests.zig:1573` | a call result of the union its callee's body closed reaches a wider match by name | staged output without `Widen` |
+
+### 2.4 Lift into a nominal
+
+Conformance (2.1) is the step that keeps a tag's name and its node. A lift
+into a nominal changes the node's type to the nominal, and the type is
+interface (`roc-reify-normal-form.md`, `Wrap`, rule L), so it is a node.
+`exprAt` (`src/check/code_reifier.zig:1955`) builds a value at `at` by 2.3
+where its producer can choose its type (a tag, a nominal constructor, a
+`match`, an `if`, a block, a crash, a closure, a constant that folds). Every
+other producer (a parameter, a local, a `Prim` or `Apply` result, a
+projection, a loop result, a `Call`) builds at its own type, and `liftTo`
+(`:2701`) applies one step per pair, from the root down, over the reach of
+design.md "Row Coercion Primitive":
+
+| Own type of the value at this position | Type at `at` | Node |
+|---|---|---|
+| the same, or it `widens` to `at` | | none: the value (conformance, 2.1) |
+| a tag union that widens to the backing `B` of the nominal `N` | `N` | `Wrap_N(v)` |
+| a tag union `S` that does not widen to the backing `B` of `N` | `N` | `Switch v`, one arm per member `t` of `S`: `Wrap_N(Tag_B(t, lifted payloads))` |
+| a nominal `N` whose backing does not widen | `N` | `Switch Unwrap(v)`, one arm per member `t`: `Wrap_N(Tag(t, lifted payloads))` |
+| a tag union `[False, True]` or narrower | `Bool` | `Switch v`: the `False` arm is `Lit(False)`, the `True` arm is `Lit(True)`, the spelling of a tag at `Bool` (`tagExpr`, `:2656`) |
+| a tag union `S` | a tag union `D`, and some payload pair is not a widening | `Switch v`, one arm per member `t` of `S`: `Tag_D(t, lifted payloads)` |
+| a recursive type at a lift | | refused with a diagnostic ("a recursive tag union lifted into a nominal") |
+| any other pair | | compiler invariant |
+
+A lifted payload is `liftTo(Payload(v, t, k), D.t.k)`. A root lift needs no
+`Switch`: `Wrap(v)` is the whole lift. The `Switch` rows give the same nodes
+as the `match` written by hand whose arms rebuild each tag and pass each
+payload through a function whose body is the lift (`roc-reify-normal-form.md`
+rule L). The steps read only the `row_coerce` node's type and its child's
+type. A pair that is neither a widening nor a lift is outside the reach of
+design.md "Row Coercion Primitive" and is a compiler invariant.
+
+Tests (`src/compile/test/code_reifier_test.zig`, the "F9" and "L3 F9" tests
+after "a block-generalized helper read at its own union and at the Try it
+lifts into describes at each"):
+
+| Test | Pins |
+|---|---|
+| L3 F9: a fold's structural result read at Try is a Wrap of the fold | the root lift of a `Prim` result: `n4 = wrap(n3) : Builtin.Try` over `List.fold(..) : [Err([Empty]), Ok(I64)]` |
+| L3 F9: a fold's result bound to a local and returned at Try is the same Wrap | a local |
+| F9: a generic max_by, whose fold state is a structural union, describes | the program of defect F9 (`roc-reify-opaque-proposal.md`) |
+| L3 F9: a parameter of the backing union read at Try; of a narrower union; at a user nominal | `wrap(p0)` for a parameter, with a widening, and for a nominal that is not `Try` |
+| L3 F9: a parameter of [False, True] read at Bool | equal to `match input { False => False, True => True }` |
+| L3 F9: a parameter in one branch of an if read at Try | a branch |
+| L3 F9 and F9: calls of a helper that forwards a closed union; a recursive helper | `Call` and the inline view |
+| L3 F9: a lift below a tag payload; in a nominal's argument | the nested lift, equal to the hand-written `match` with `lift` |
+| F9: a widening below a tag payload adds no node | `value p0`: rule L adds nodes only for a lift |
+| `src/reify/types.zig` "F9: a tag union never widens to a nominal, only to its backing" | the lift is not conformance |
+| `src/reify/verify.zig` "F9: a row whose result is a nominal and whose value is the structural backing does not verify" | the verifier keeps rejecting a missing `Wrap` |
 
 ## 3 Tag ids across module and site boundaries
 
@@ -235,7 +290,7 @@ Each gap is resolved. The last column says where.
 | Gap | Effect if left | Needed | Resolved at |
 |---|---|---|---|
 | digest hashed tag payload words raw | interning order depends on walk order, so two equal sites digest differently | hash tag and payload names by text (section 2) | `src/reify/digest.zig:348-349`. Test: `src/reify/rows.zig:1140`. |
-| the demanded-type rule (2.3) is new | without it, an extracted helper changes node types, a smaller version of the `Widen` problem | the inline view rebuilds the ends at the demanded type, with a test that compares inline code and an inlined helper | `src/reify/rebuild.zig:116-265` and `:522`. Test: `src/compile/test/code_reifier_test.zig:1384`. Limits: 2.3. |
+| the demanded-type rule (2.3) is new | without it, an extracted helper changes node types, a smaller version of the `Widen` problem | the inline view rebuilds the ends at the demanded type, with a test that compares inline code and an inlined helper | `src/reify/rebuild.zig:116-265` and `:522`. Test: `src/compile/test/code_reifier_test.zig:1440`. Limits: 2.3. |
 | switch pruning (2.2) is new | a switch with arms for tags its scrutinee cannot hold fails `verify` after inlining | the switch constructor maps arms by name | `src/reify/builder.zig:1061-1095`. Test: `src/reify/rebuild.zig:654`. |
 | typed translators | a C or GLSL translator with one struct per union sees a child whose type is narrower than its slot, and must convert there | document conformance in `Code` | the paragraph in `src/build/roc/Builtin.roc:23930-23936`. `Code.Ty.widens` was not added: the paragraph is enough for the translators that exist, and the helper can follow when one needs it. |
 | the derivation tool | `src/reify/derive/cp.zig` and `sig.zig` read tag positions through `armCount` | update them | `src/reify/derive/sig.zig:22-37` (the tool interns `A` and `B` first, so a tag name is its index), `:330-331`, `src/reify/derive/term.zig:667-702` (`readBack` turns a name into a term position), `src/reify/derive/cp.zig:278`, `:309`, `:586`, `:617-620`. The rule table and the builtin table did not change, so the fingerprint did not change either. The version stays 3. |

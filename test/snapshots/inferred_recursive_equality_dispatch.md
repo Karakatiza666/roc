@@ -204,7 +204,7 @@ main = Leaf("a") == make({})
 						(e-string
 							(e-literal (string "a"))))))
 			(rhs
-				(e-call (constraint-fn-var 479)
+				(e-call (constraint-fn-var 560)
 					(e-lookup-local
 						(p-assign (ident "make")))
 					(e-empty_record)))))

@@ -566,20 +566,20 @@ main! = |_| {
 			(e-block
 				(s-let
 					(p-assign (ident "result1"))
-					(e-call (constraint-fn-var 702)
+					(e-call (constraint-fn-var 783)
 						(e-lookup-local
 							(p-assign (ident "identity")))
 						(e-num (value "123"))))
 				(s-let
 					(p-assign (ident "result2"))
-					(e-call (constraint-fn-var 713)
+					(e-call (constraint-fn-var 794)
 						(e-lookup-local
 							(p-assign (ident "anotherIdentity")))
 						(e-string
 							(e-literal (string "test")))))
 				(s-let
 					(p-assign (ident "result3"))
-					(e-call (constraint-fn-var 718)
+					(e-call (constraint-fn-var 799)
 						(e-lookup-local
 							(p-assign (ident "combine")))
 						(e-lookup-local
@@ -588,17 +588,17 @@ main! = |_| {
 							(p-assign (ident "result2")))))
 				(s-let
 					(p-assign (ident "result4"))
-					(e-call (constraint-fn-var 722)
+					(e-call (constraint-fn-var 803)
 						(e-lookup-local
 							(p-assign (ident "yetAnotherIdentity")))
 						(e-tag (name "True"))))
 				(s-let
 					(p-assign (ident "result5"))
-					(e-call (constraint-fn-var 732)
+					(e-call (constraint-fn-var 813)
 						(e-lookup-local
 							(p-assign (ident "finalIdentity")))
 						(e-dec-small (numerator "314") (denominator-power-of-ten "2") (value "3.14"))))
-				(e-dispatch-call (method "plus") (constraint-fn-var 733)
+				(e-dispatch-call (method "plus") (constraint-fn-var 814)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "a"))))

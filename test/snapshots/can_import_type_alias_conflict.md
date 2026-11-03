@@ -13,32 +13,23 @@ JsonValue : U64
 main = 42
 ~~~
 # EXPECTED
-DUPLICATE DEFINITION - can_import_type_alias_conflict.md:1:1:1:38
+BUILTIN TYPE SHADOWED - can_import_type_alias_conflict.md:1:1:1:38
 TYPE REDECLARED - can_import_type_alias_conflict.md:4:1:4:16
 # PROBLEMS
 ~~~clojure
 (reports
 	(report
 		(severity warning)
-		(title "Duplicate Definition")
+		(title "Builtin Type Shadowed")
 		(region (start 1 1) (end 1 38))
 		(headline
-			(reflow "The name ")
+			(text "The type ")
 			(annotated symbol-unqualified "Json")
-			(reflow " is being redeclared here."))
+			(text " shadows a builtin type."))
 		(document
-			(source-region (file "can_import_type_alias_conflict.md") (start 1 1) (end 1 38) (annotation error) (line-text "import json.Json exposing [JsonValue]"))
+			(reflow "This may make the builtin type inaccessible in this scope.")
 			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Json")
-			(reflow " was already defined in ")
-			(source-location
-				(file "can_import_type_alias_conflict.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "can_import_type_alias_conflict.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import json.Json exposing [JsonValue]"))))
+			(source-region (file "can_import_type_alias_conflict.md") (start 1 1) (end 1 38) (annotation warning) (line-text "import json.Json exposing [JsonValue]"))))
 	(report
 		(severity runtime_error)
 		(title "Type Redeclared")

@@ -29,18 +29,21 @@ post_process = |frag, settings| ...
 Glsl.fragment_330(post_process)
 ```
 
-`fragment_330` takes a `Code(f)`, so `post_process` is checked against the
-function type inside it rather than against `Code` itself. The compiler then
-describes `post_process` and hands the description over; `Code.graph` opens it,
-and `to_tree` gives the root row as nested expressions. The shader is compiled
-during the build, not on the way to the first frame.
+`fragment_330` takes a `Code.Inlined(f)`, so `post_process` is checked against
+the function type inside it rather than against `Code.Inlined` itself. The
+compiler then describes `post_process` and hands the description over;
+`inline` opens it, and `to_tree` gives the root row as nested expressions. The
+shader is compiled during the build, not on the way to the first frame.
 
 `main.roc` reaches `Glsl` as a package, `glsl: "package.roc"`, and not as a
-module of its own package. A function of another package reaches the
-translator as a named `Prim` and its body is not read, so `Glsl.Vec3.scale`
-arrives as `scale` under the owner `Glsl.Vec3`, and the translator maps it to
-`*`. A builtin arrives the same way, `sin` under `Num.F32`, so the table of
-GLSL functions is keyed by method.
+module of its own package. `Glsl` declares the functions it reads by name with
+its item `code_primitives` (`Glsl.roc:122`): the vector methods and
+`Sampler.texture`. A function in that cut reaches the translator as a named
+`Prim` and its body is not read, so `Glsl.Vec3.scale` arrives as `scale` under
+the owner `Glsl.Vec3`, and the translator maps it to `*`. Any other function a
+shader calls, in any package, arrives as its body. A builtin arrives as a
+`Prim`, `sin` under `Num.F32`, so the table of GLSL functions is keyed by
+method.
 
 ## The interface is the two parameter records
 
@@ -94,10 +97,14 @@ line. `Code.refuse_at` reports a node at every place in the source it came from,
 but it stops the compile, where an `Err` can be tested, so this translator
 returns an `Err` instead.
 
-A helper function of the shader's own package that two places call stays a
-`Call` row in the `graph` view, and `Glsl.roc` refuses it (`Glsl.roc:372`). A
-helper that one place calls is inlined, and so is every one that a
-`Code.Inlined(f)` parameter would receive, which this translator does not use.
+A helper function of the shader's own package is inlined at every call, however
+many calls it has, because `fragment_330` takes a `Code.Inlined(f)` and reads
+its `inline` view. A shader that calls `ripple` twice needs no GLSL function,
+and the work the two calls share is still one local (`main.roc:152`). Only a
+helper that reaches itself stays a `Call` row, and `Glsl.roc` refuses it with
+that reason, because GLSL 330 has no recursion (`Glsl.roc:373`, `main.roc:178`).
+A translator that emitted GLSL functions would take a `Code(f)` and read the
+`graph` view instead, where a helper called from two places is a `Call` row.
 
 ## Two ways to run a shader on the CPU
 
@@ -114,23 +121,20 @@ what headless CI is.
 
 ## The tradeoff, plainly
 
-At the size of one shader the DSL looks five times cheaper: 420 lines of code
-here against the 77 it spends on its `Expr` library. That ratio is an artifact
-of the small demo. Nearly everything written here is fixed cost, paid
-once for the target, while the shaders-without-reifying DSL pays per construct and pays twice,
-once in its own source and again in the spelling each construct forces on the shader
-author. Filled out to a working shading language the two cost about the same to
-write, and by then the translator is the better tool for the job -
-turning an expression into a target representation: it reads the whole of
-Roc, keeps shared work shared, keeps the types the checker solved, and keeps the
-shader a function. The accounting, in three parts.
+On a demo with one shader, the DSL looks much cheaper. That is an artifact of
+the small demo. Nearly everything written here is fixed cost, paid once for the
+target. The shaders-without-reifying DSL pays per construct, and pays twice:
+once in its own source and again in the spelling each construct forces on the
+shader author. For a full shading language the two cost about the same to write.
+Then the translator is the better tool: it reads the whole of Roc, keeps shared
+work shared, keeps the types the checker solved, and keeps the shader a
+function. `Glsl.roc` is the largest module, and the translator is its largest
+part. The accounting, in three parts.
 
-Most of the gap is coverage the demo never reaches. Strip `render` to the node
-kinds this one shader uses, trim the builtin table from 34 names to the 2 it
-calls, and the translator is 282 lines and still passes all five expects. Drop
-source regions and interface derivation on top of that, which is what the DSL
-has, and it is 244 lines emitting the same shader byte for byte. Two of the five
-expects die there, and neither is a test the DSL could have written.
+Most of the gap is coverage the demo never reaches. The translator can shrink to
+the node kinds and builtins this one shader uses. It then emits the same shader
+byte for byte. Dropping source regions and interface derivation makes it smaller
+again, but the expects that check those two features then fail.
 
 The rest is the seam between two languages. The DSL has one language in it:
 `Expr.Call("sin", [x])` names GLSL directly, so there is nothing to map. The
@@ -139,17 +143,16 @@ translator has Roc on one side and GLSL on the other, and `operator`,
 only because Roc's `*` wants both operands to have the same type, so a vector
 times a scalar has to be spelled `scale`.
 
-The two sides then grow differently, which matters more than today's ratio:
+The two sides then grow differently, which matters more than today's size:
 
 | | Grows by |
 | --- | --- |
 | This translator | a table entry per GLSL function, one line per GLSL type, and a Roc method that computes the function where Roc has none of its own. `render_op` does not grow at all: its arms are exactly the variants of `Code.Op`, so the input language is already covered in full |
 | An `Expr` DSL | a method per function, a method per lane per vector type, a combinator per control-flow form, and a spelling the shader author has to learn for each |
 
-Add the sixty-odd functions a working shading library needs and both sides grow
-by roughly a line each, so the line counts converge. The difference is that the
-translator's line is a table entry the shader author never sees, while the DSL's
-is a new word they write instead of the Roc they already know.
+For a full shading library both sides grow at a similar rate. The difference is
+that the translator's growth is a table entry the shader author never sees. The
+DSL's growth is a new word they write instead of the Roc they already know.
 
 The DSL also has to re-invent what Roc's syntax provides already.
 Bindings need an explicit binder, `let_("wave", e, |w| ...)`; branching needs
@@ -180,13 +183,8 @@ entry in the translator that maps the name.
 
 ## Status
 
-`roc test examples/reifying/glsl/main.roc` passes six expects and
+`roc test examples/reifying/glsl/main.roc` passes eight expects and
 `roc examples/reifying/glsl/main.roc` prints the shader. The whole shader is a
-compile-time constant, so `roc check` reports
-
-```
-● unconditional condition
-This match value is known at compile time
-```
-
-on the driver's `match`, which is the point.
+compile-time constant. `roc check`, `roc test` and `roc build` exit with status
+0 and print no warning for the driver's `match`: the result of a translator is
+known at compile time by design, and a `match` is how a program reads it.

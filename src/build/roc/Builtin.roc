@@ -6976,6 +6976,26 @@ Builtin :: [].{
 			digits_after_pt_count = |self| match self {
 				Literal({ is_negative: _, digits_before_pt: _, digits_after_pt: _, digits_after_pt_count: count }) => count
 			}
+
+			## Two numerals are equal when they spell the same sign and the same
+			## digits. `0.50` and `0.5` are different numerals, because their
+			## counts of digits after the point differ.
+			is_eq : Numeral, Numeral -> Bool
+			is_eq = |a, b|
+				a.is_negative() == b.is_negative()
+					and a.digits_before_pt() == b.digits_before_pt()
+					and a.digits_after_pt() == b.digits_after_pt()
+					and a.digits_after_pt_count() == b.digits_after_pt_count()
+
+			to_hash : Numeral, Hasher -> Hasher
+			to_hash = |self, hasher| {
+				before = self.digits_before_pt()
+				after = self.digits_after_pt()
+				with_sign = Hasher.write_bool(hasher, self.is_negative())
+				with_before = Hasher.write_bytes(Hasher.write_u64(with_sign, List.len(before)), before)
+				with_after = Hasher.write_bytes(Hasher.write_u64(with_before, List.len(after)), after)
+				Hasher.write_u64(with_after, self.digits_after_pt_count())
+			}
 		}
 
 		U8 :: [].{
@@ -23671,9 +23691,9 @@ Builtin :: [].{
 
 		## The type of a reified expression. Every [Code.Node] carries one.
 		##
-		## `Named` carries a nominal type's name alongside its backing, which is
-		## what lets a translator recognise `Math.Vec2` rather than seeing an
-		## anonymous record.
+		## `Named` carries a nominal type's name and type arguments alongside
+		## its backing, which is what lets a translator recognise `Math.Vec2`
+		## rather than seeing an anonymous record.
 		Ty := [
 			I8,
 			U8,
@@ -23696,12 +23716,28 @@ Builtin :: [].{
 			## whether the field is there. An `Optional` field may be absent from
 			## a value of this type, so a translator emitting a struct either has
 			## a form for absence or rejects the type by name. A field with a
-			## default is `Required`: the default fills it in, so every value of
-			## the type carries it.
-			Record(List({ name : Str, ty : Ty, presence : [Required, Optional] })),
+			## default (`??`) is there in every value of the type, because the
+			## default fills it in. `Default(value)` carries the default where
+			## the compiler describes it as a literal, or a list, record, tuple,
+			## tag or nominal of literals, as [Code.Value] holds a captured value.
+			## `DefaultComputed` is any other default, such as a call: the type
+			## does not carry its value.
+			Record(List({ name : Str, ty : Ty, presence : [Required, Optional, Default(Value), DefaultComputed] })),
 			Tuple(List(Ty)),
 			Fn(List(Ty), Ty),
-			Named(Str, Ty),
+
+			## A nominal type a translator may read: its name, its type
+			## arguments in the order the declaration writes its variables, and
+			## its backing at those arguments. A type argument that the backing
+			## does not hold is here too: in a module `Store`, `Id(row) := {
+			## table : Str, key : Str }` at `Id(Customer)` is
+			## `Named("Store.Id", [customer], Record(..))`, where `customer` is
+			## the type of `Customer`. So a translator reads the row type from
+			## the arguments.
+			##
+			## The arguments are inside the `Named`, as its backing is, so a
+			## `Recursive` of its name in an argument refers to it.
+			Named(Str, List(Ty), Ty),
 
 			## A reference back to the enclosing `Named` of this name, so a
 			## recursive type has a finite description. A translator resolves the
@@ -23711,25 +23747,36 @@ Builtin :: [].{
 			## reaches itself at other type arguments gets a `Named` of its own
 			## at those arguments, so the nearest enclosing `Named` of that
 			## name is always the type meant.
+			##
+			## A type has one description. A nominal is `Recursive` exactly
+			## where the nearest enclosing `Named` of its name is the same type,
+			## so two equal types are equal `Ty` values, wherever a cycle
+			## through two nominals is entered.
 			Recursive(Str),
 
 			## A tag union, each variant by name with the types of its payloads.
 			## A variant written without payloads carries an empty list, and an
 			## empty tag union is an empty list of variants.
 			##
-			## Variants arrive in the order the compiler holds them: a union a
-			## nominal declares keeps its written order, and one the solver
-			## built is in name order. A translator that needs a fixed order
-			## sorts them itself.
+			## Variants arrive in name order, for a union a nominal declares and
+			## for one the solver built. The written order of a nominal's
+			## variants is not kept.
 			TagUnion(List({ name : Str, payloads : List(Ty) })),
 
 			## A type this IR has no shape for, named the way the compiler names
-			## it, with its type arguments. A `Hasher`, a `Dict`, an encoding: a
-			## derived implementation threads these without looking inside them,
-			## and an opaque nominal forbids looking inside from outside its own
-			## module. A translator that owns the type recognises the name; every
-			## other translator rejects it by name.
-			Opaque(Str, List(Ty)),
+			## it, with its identity and its type arguments. A `Hasher`, a
+			## `Dict`, an encoding: a derived implementation threads these
+			## without looking inside them, and an opaque nominal forbids looking
+			## inside from outside its own module.
+			##
+			## A builtin is named as its functions' `Prim` owner is (`Dict`,
+			## `Box`, `Num.U8x16`). A name is for messages: two packages can
+			## each declare a `Time`, and a package can declare a type with a
+			## builtin's name. The [Code.TypeId] tells them apart, and
+			## [Code.type_id] gives the same id for the type itself. A
+			## translator that owns the type recognises it; every other
+			## translator rejects it by name.
+			Opaque(Str, TypeId, List(Ty)),
 		].{
 			is_eq : _
 			to_hash : _
@@ -23742,6 +23789,7 @@ Builtin :: [].{
 			## to emit for each.
 			##
 			## A `Fn`'s children are its parameters and then its result. A
+			## `Named`'s are its type arguments and then its backing. A
 			## `Record`'s are its field types, a `TagUnion`'s are every variant's
 			## payloads in variant order, and a `Recursive` has none, so a walk
 			## over a recursive type terminates.
@@ -23751,9 +23799,9 @@ Builtin :: [].{
 				Record(fields) => fields.map(|field| field.ty)
 				Tuple(parts) => parts
 				Fn(params, result) => params.append(result)
-				Named(_, backing) => [backing]
+				Named(_, args, backing) => args.append(backing)
 				TagUnion(variants) => variants.join_map(|variant| variant.payloads)
-				Opaque(_, args) => args
+				Opaque(_, _, args) => args
 				I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | I128 | U128 => []
 				F32 | F64 | Dec | Bool | Str | Recursive(_) => []
 			}
@@ -23785,15 +23833,18 @@ Builtin :: [].{
 				F64 => Ok({ bits: 64, kind: Frac, signed: Bool.True })
 				Dec => Ok({ bits: 128, kind: Fixed, signed: Bool.True })
 				Bool | Str | ListOf(_) | Record(_) | Tuple(_) => Err(NotNumeric)
-				Fn(_, _) | Named(_, _) | Recursive(_) | TagUnion(_) | Opaque(_, _) => Err(NotNumeric)
+				Fn(_, _) | Named(_, _, _) | Recursive(_) | TagUnion(_) | Opaque(_, _, _) => Err(NotNumeric)
 			}
 
 			## This type, spelled the way Roc spells it, so a translator that
 			## refuses a type names the one it refused.
 			##
-			## A `Named` and an `Opaque` are their own names, so a nominal is
-			## never printed as the shape it was declared over, and a `Recursive`
-			## is the name it refers back to.
+			## A `Named` is its nominal's name as the compiler holds it, with
+			## the module in front (`Builtin.Try`, `Math.Vec2`), so a nominal is
+			## never printed as the shape it was declared over. A `Named` and an
+			## `Opaque` carry their type arguments, so they are spelled with
+			## them: a `Try` of an `I64` and a `Str` is `Builtin.Try(I64, Str)`.
+			## A `Recursive` is the name it refers back to.
 			name : Ty -> Str
 			name = |ty| match ty {
 				I8 => "I8"
@@ -23814,14 +23865,20 @@ Builtin :: [].{
 				ListOf(item) => "List(${item.name()})"
 				Record(fields) => {
 					rendered = fields.map(|field| "${field.name} : ${field.ty.name()}")
-					if rendered.is_empty() "{}" else "{ ${Str.join_with(rendered, ", ")} }"
+					if (rendered.is_empty()) "{}" else "{ ${Str.join_with(rendered, ", ")} }"
 				}
 				Tuple(parts) => "(${Str.join_with(parts.map(|part| part.name()), ", ")})"
 				Fn(params, result) => {
 					taken = Str.join_with(params.map(|param| param.name()), ", ")
 					"${taken} -> ${result.name()}"
 				}
-				Named(nominal, _) => nominal
+				Named(nominal, args, _) => {
+					if args.is_empty() {
+						nominal
+					} else {
+						"${nominal}(${Str.join_with(args.map(|arg| arg.name()), ", ")})"
+					}
+				}
 				Recursive(nominal) => nominal
 				TagUnion(variants) => {
 					rendered = variants.map(
@@ -23836,7 +23893,7 @@ Builtin :: [].{
 					)
 					"[${Str.join_with(rendered, ", ")}]"
 				}
-				Opaque(nominal, args) => {
+				Opaque(nominal, _, args) => {
 					if args.is_empty() {
 						nominal
 					} else {
@@ -23858,6 +23915,13 @@ Builtin :: [].{
 		## translator wants to recognise the blob as one value. A file embedded
 		## as a `Str` is a `Str` literal instead.
 		##
+		## `Numeral` is the literal the compiler hands to a `from_numeral`
+		## conversion: the sign and the digits the source spells, exactly as
+		## written. Its node has the type `Num.Numeral`. A translator reads it
+		## through the accessors of [Num.Numeral], or converts it at its own
+		## target type with that type's `from_numeral`, for example
+		## `Dec.from_numeral` or `F64.from_numeral`.
+		##
 		## The `Ty` an `Int` or a `Frac` carries is the type of the `Lit` node
 		## around it. It is here so that printing a literal is a
 		## `Code.Lit -> Str` of its own, which an `F32` needs: read as an `F64`,
@@ -23869,6 +23933,7 @@ Builtin :: [].{
 			Bool(Bool),
 			Str(Str),
 			Bytes(List(U8)),
+			Numeral(Num.Numeral),
 		].{
 			is_eq : _
 			to_hash : _
@@ -23884,11 +23949,13 @@ Builtin :: [].{
 		## `Switch`. In a `ForRange` body, parameter 0 is the index; in a
 		## `ForList` body, parameter 0 is the index and parameter 1 the item;
 		## the slots follow.
+		## `Input` is input slot `k` of the root (see [Code.Bound]).
 		Val := [
 			Param(U32),
 			Node(U32),
 			Out({ node : U32, k : U32 }),
 			Arg({ owner : U32, k : U32 }),
+			Input(U32),
 		].{
 			is_eq : _
 			to_hash : _
@@ -23947,10 +24014,10 @@ Builtin :: [].{
 		## | Op | Args |
 		## |---|---|
 		## | `Lit` | none |
-		## | `Prim` | the builtin's arguments, in its parameter order |
+		## | `Prim` | the builtin's arguments, in its parameter order; a chain of an associative builtin has all its operands (see below) |
 		## | `Call` | the row's parameters |
 		## | `Closure` | the captured values; the row takes them first |
-		## | `Record`, `Tuple`, `List`, `Tag` | the components; a `Record`'s in its field order |
+		## | `Record`, `Tuple`, `List`, `Tag` | the components; a `Record`'s in its field order, one for each name it lists. The names are every field of the type, unless the type marks a field `Optional` and the record leaves it unset |
 		## | `Wrap`, `Unwrap` | the value; `Wrap` into the named nominal |
 		## | `Field`, `Index`, `Payload`, `OptField` | the value read |
 		## | `Item` | the list, then the index |
@@ -23958,13 +24025,51 @@ Builtin :: [].{
 		## | `And`, `Or` | the first operand; each region after it is one more |
 		## | `ForRange` | the start, the end, then the slots' initial values |
 		## | `ForList` | the list, then the slots' initial values |
-		## | `Loop` | the slots' initial values |
+		## | `Loop` | the slots' initial values; the body's `Break` delivers the node's `outputs`, which need not be the slots |
 		## | `Crash` | the message |
 		## | `Derived` | the derived method's arguments |
 		##
-		## `Prim` names a builtin, or a function of another package, by its owner
-		## and method apart: `Num.F32` and `sin`, `Glsl.Vec3` and `scale`. A
-		## translator keys its table by method and reads the type from the node.
+		## `Prim` names a builtin, a function or constant of an opaque type, or
+		## a function in the translator's cut, by its owner and method apart:
+		## `Num.F32` and `sin`, `Glsl.Vec3` and `scale`. `id` identifies it
+		## exactly, and [Code.prim] gives the same id for the function itself.
+		## A translator declares its cut with the item `code_primitives` of its
+		## type, a list of `Code.prim(f)` entries; every other function arrives
+		## as its body. A translator keys its table by `id`, and reads the type
+		## from the node. A method name alone does not tell a package's
+		## function from a builtin of the same name, such as a user `Bool.not`
+		## and the builtin `Bool.not`.
+		##
+		## `evidence` holds one [Code.Evidence] for each `where` requirement of
+		## the primitive's type, in the order its `where` clause lists them,
+		## with a constraint alias such as `item.Sort` expanded. It is empty for
+		## a primitive with no `where`. `List.sort` over `I64` carries
+		## `order_relative_to` at `I64` answered by `Num.I64.order_relative_to`;
+		## over a type that writes its own order it carries that order as a row
+		## of the graph. A translator that maps `List.sort` to its own sort
+		## checks the evidence first. A row that evidence names stays a row in
+		## every view.
+		##
+		## The normal form rewrites some expressions before a translator reads
+		## them, so a node is not always the call that was written. Each form
+		## below is a rule of the normal form, so it holds for every `Code` of
+		## one [Code.version]. A new version can add, change or remove a rule,
+		## so a translator matches the forms it knows and refuses the rest by
+		## name.
+		##
+		## | Written | Arrives |
+		## |---|---|
+		## | `"a${x}b${y}"`, or a chain of `Str.concat` | one `Prim` `concat` with every part in `args`: `a`, `x`, `b`, `y`. The same holds for `List.concat` and for a chain of `plus_wrap`, `times_wrap`, `bitwise_and`, `bitwise_or` or `bitwise_xor`. An `And` or an `Or` flattens too. |
+		## | `a > b`, `a >= b` | `is_lt(b, a)`, `is_lte(b, a)`. No node is `is_gt` or `is_gte`. |
+		## | `if a >= b` over integers | a `Switch` on `is_lt(a, b)` with the two arms swapped |
+		## | `!(a <= b)` over integers | `is_lt(b, a)` |
+		## | `a != b` | `Bool.not` of `is_eq(a, b)` |
+		## | `1 + x`, `1 * x`, `10 == x` over integers, `"a" == s` | `plus(x, 1)`, `times(x, 1)`, `is_eq(x, 10)`, `is_eq(s, "a")`: a literal is last. Two parameters of the root row are in parameter order. |
+		## | `(a + b) + c` over integers, where tests bound `a`, `b` and `c` so that no sum overflows | one `Prim` `plus` with `a`, `b` and `c` in `args`, a literal last. Without such bounds, the grouping stays as written. |
+		## | `x < 10` where an enclosing test already decides it | the `Bool` literal, and a `Switch` on it is the arm it takes. A `match` on an integer drops the keys the bounds exclude. |
+		## | `while $i <= n` with `$i = $i + 1`, where `n` is a literal, or a test bounds it, below the type's highest value | a `ForRange` with `inclusive` set, as `for i in $i..=n` gives. Without such a bound it stays a `Loop`. |
+		## | `Ok(v)`, and any value of a nominal type | a `Tag` inside a `Wrap` of the nominal's name, for example `Builtin.Try`. A nominal is read with `Unwrap`, and `?`, `??` and `match` on a `Try` are a `Switch` on that. |
+		##
 		## A `Switch` with outputs is a value switch, whose arms end in `Value`;
 		## one without is an exiting switch, whose arms end in a terminator or
 		## in a `Jump` to one of its joins. An `And` operand runs only if every
@@ -23978,10 +24083,13 @@ Builtin :: [].{
 		## not change. A translator that matches tags by name needs nothing
 		## more. A translator with one representation for each union, such as a
 		## C or GLSL struct, must convert the value where the type of a child is
-		## narrower than the type of its slot.
+		## narrower than the type of its slot. A value of a tag union never
+		## stands where a nominal is expected. Where Roc lifts a union into a
+		## nominal, the value arrives in a `Wrap` of the nominal, as a tag
+		## written there does.
 		Op := [
 			Lit(Lit),
-			Prim({ owner : Str, method : Str }),
+			Prim({ owner : Str, method : Str, id : PrimId, evidence : List(Evidence) }),
 			Call(U32),
 			Closure(U32),
 			Record(List(Str)),
@@ -24000,7 +24108,7 @@ Builtin :: [].{
 			Or(List(Region)),
 			ForRange({ inclusive : Bool, body : Region }),
 			ForList(Region),
-			Loop(Region),
+			Loop({ body : Region, outputs : List(Ty) }),
 			Lambda(Region),
 			Crash,
 			Derived(Str, Ty),
@@ -24015,7 +24123,8 @@ Builtin :: [].{
 				Switch(sw) => List.concat(sw.arms.map(|arm| arm.region), sw.joins)
 				And(rest) | Or(rest) => rest
 				ForRange(loop) => [loop.body]
-				ForList(body) | Loop(body) | Lambda(body) => [body]
+				Loop(loop) => [loop.body]
+				ForList(body) | Lambda(body) => [body]
 				Lit(_) | Prim(_) | Call(_) | Closure(_) | Record(_) | Tuple | List | Tag(_) | Wrap(_) | Unwrap => []
 				Field(_) | Index(_) | Payload(_, _) | Item | OptField(_) | Crash | Derived(_, _) => []
 			}
@@ -24035,7 +24144,10 @@ Builtin :: [].{
 		##
 		## A node with several outputs has a `Tuple` type of them.
 		## `speculatable` is exact: a builtin not on the normal form's list is
-		## not speculatable, and neither is a node over one. A translator for a
+		## not speculatable, and neither is a node over one. A checked
+		## arithmetic node that tests in force prove cannot overflow, such as
+		## `x + 1` under `if x < 10`, is speculatable where it stands, but not
+		## outside those tests. A translator for a
 		## target without short-circuit evaluation, such as SQL's `AND`, reads
 		## it on the nodes of each operand to decide whether it may evaluate
 		## them eagerly.
@@ -24050,16 +24162,35 @@ Builtin :: [].{
 			children = |node| { vals: node.args, regions: node.op.regions() }
 
 			## How many values this node delivers: one, or a `Switch`'s outputs,
-			## or a loop's slots.
+			## or a bounded loop's slots, or a `Loop`'s `outputs`.
 			outputs : Node -> U64
 			outputs = |node| match node.op {
 				Switch(sw) => sw.outputs.len()
 				ForRange(_) => node.args.len() - 2
 				ForList(_) => node.args.len() - 1
-				Loop(_) => node.args.len()
+				Loop(loop) => loop.outputs.len()
 				Lit(_) | Prim(_) | Call(_) | Closure(_) | Record(_) | Tuple | List | Tag(_) | Wrap(_) | Unwrap => 1
 				Field(_) | Index(_) | Payload(_, _) | Item | OptField(_) | And(_) | Or(_) | Lambda(_) | Crash | Derived(_, _) => 1
 			}
+		}
+
+		## What a loop goes over (see [Code.Row] `iteration`).
+		##
+		## `OverList` is a `ForList`: `list` is the list it reads, `item` and
+		## `index` are the body parameters that hold the item and its
+		## position, each `Read` with the [Code.Val] to read it by only when the
+		## body reads it. `OverRange` is a `ForRange` from `start` up to, and
+		## not including, `end`, or including it when `inclusive` is `True`;
+		## `index` is the counter. `exits_early` is `True` when the body can
+		## leave the loop before the last turn, by a `Break` or a `Return`.
+		## `General` is a `Loop`, whose body decides for itself when to stop.
+		Iteration := [
+			OverList({ list : Val, item : [Read(Val), Unread], index : [Read(Val), Unread], exits_early : Bool }),
+			OverRange({ start : Val, end : Val, inclusive : Bool, index : [Read(Val), Unread], exits_early : Bool }),
+			General,
+		].{
+			is_eq : _
+			to_hash : _
 		}
 
 		## One row: a function of its parameters. `nodes` holds every node of the
@@ -24086,6 +24217,33 @@ Builtin :: [].{
 				Err(_) => crash "Code.Row.node: no node at this index"
 			}
 
+			## What the loop at node index `n` goes over: the list of a
+			## `ForList`, the bounds of a `ForRange`, or `General` for a
+			## `Loop`. The normal form meets a `for` over a list, a `for` over
+			## `xs.iter()` and an index `while` in one `ForList`, and a `for`
+			## over a range, a counter `while` and a tail-recursive helper in
+			## one `ForRange`, so a translator that reads this sees one shape.
+			## A node that is not a loop is a compiler bug in the translator and
+			## crashes.
+			iteration : Row, U32 -> Iteration
+			iteration = |row, n| {
+				loop_node = row.node(n)
+				escapes = |body| code_escapes(row, body, 0)
+				read_of = |k| if (code_reads_arg(row, n, k)) Read(Arg({ owner: n, k })) else Unread
+				match loop_node.op {
+					ForList(body) => match loop_node.args {
+						[list, ..] => OverList({ list, item: read_of(1), index: read_of(0), exits_early: escapes(body) })
+						[] => crash "Code.Row.iteration: a ForList without a list"
+					}
+					ForRange(loop) => match loop_node.args {
+						[start, end, ..] => OverRange({ start, end, inclusive: loop.inclusive, index: read_of(0), exits_early: escapes(loop.body) })
+						_ => crash "Code.Row.iteration: a ForRange without bounds"
+					}
+					Loop(_) => General
+					_ => crash "Code.Row.iteration: this node is not a loop"
+				}
+			}
+
 			## Who reads each node, by node index: the nodes whose arguments
 			## read it, each once per read, and how many reads there are in all.
 			## The count includes the reads of the regions' ends, which no node
@@ -24093,12 +24251,13 @@ Builtin :: [].{
 			uses : Row -> List({ users : List(U32), count : U64 })
 			uses = |row| {
 				empty = List.repeat({ users: [], count: 0 }, row.nodes.len())
-				Code.uses_in(row, row.body, empty)
+				code_uses_in(row, row.body, empty)
 			}
 		}
 
-		## The rows a site's description reaches, root first.
-		Graph := { root : U32, rows : List(Row) }.{
+		## The rows a site's description reaches, root first, and the types of
+		## the root's input slots.
+		Graph := { root : U32, rows : List(Row), slots : List(Ty) }.{
 			is_eq : _
 			to_hash : _
 
@@ -24117,12 +24276,18 @@ Builtin :: [].{
 			root_row : Graph -> Row
 			root_row = |graph| graph.row(graph.root)
 
+			## The type of each input slot, in the order the root first reads
+			## them: item `k` is the type of `Input(k)`. Empty unless the
+			## translator returns a [Code.Bound].
+			slots : Graph -> List(Ty)
+			slots = |graph| graph.slots
+
 			## The fields of the root's parameter, by name, for a translator
 			## that binds each field to an input of its host. Empty where the
 			## root does not take one record.
 			inputs : Graph -> List({ name : Str, ty : Ty })
 			inputs = |graph| match graph.root_row().params {
-				[single] => Code.record_fields(single)
+				[single] => code_record_fields(single)
 				_ => []
 			}
 
@@ -24131,8 +24296,8 @@ Builtin :: [].{
 			to_tree = |graph, id| {
 				described = graph.row(id)
 				zeros = List.repeat(0, described.nodes.len())
-				info = Code.depths_in(described, described.body, 0, { uses: zeros, use_depth: zeros, def_depth: zeros })
-				Code.block_tree(described, info, described.body)
+				info = code_depths_in(described, described.body, 0, { uses: zeros, use_depth: zeros, def_depth: zeros })
+				code_block_tree(described, info, described.body)
 			}
 		}
 
@@ -24160,6 +24325,7 @@ Builtin :: [].{
 		Tree := [
 			Op({ op : Op, args : List(Tree), ty : Ty }),
 			Param(U32),
+			Input(U32),
 			Arg({ owner : U32, k : U32 }),
 			Out({ node : U32, k : U32 }),
 			Def(U32),
@@ -24171,13 +24337,111 @@ Builtin :: [].{
 			),
 		]
 
+		## A node's content digest in the `inline` view (see
+		## [Code.Inlined] `inline_digest`). Two digests are equal when the
+		## contents are.
+		Digest :: { bits : U128 }.{
+
+			## The digest as a number, for a translator that persists it.
+			to_u128 : Digest -> U128
+			to_u128 = |Digest.(inner)| inner.bits
+
+			is_eq : Digest, Digest -> Bool
+			is_eq = |Digest.(a), Digest.(b)| a.bits == b.bits
+
+			to_hash : Digest, Hasher -> Hasher
+			to_hash = |Digest.(inner), hasher| Hasher.write_u128(hasher, inner.bits)
+		}
+
+		## The identity of a primitive: a builtin, an operation of an opaque
+		## type, or a function in a translator's cut. Two primitives are equal
+		## exactly when they are the same definition in the same build.
+		## [Code.prim] gives the id of a function, and `Prim` carries the id of
+		## the primitive it calls.
+		PrimId :: { bits : U128 }.{
+			is_eq : PrimId, PrimId -> Bool
+			is_eq = |PrimId.(a), PrimId.(b)| a.bits == b.bits
+
+			to_hash : PrimId, Hasher -> Hasher
+			to_hash = |PrimId.(inner), hasher| Hasher.write_u128(hasher, inner.bits)
+		}
+
+		## The method the checker chose for one `where` requirement of a
+		## primitive's scheme, at one call. `method` is the required method's
+		## name, `ty` the type it dispatches on at this call.
+		Evidence := { method : Str, ty : Ty, target : Target }.{
+			is_eq : _
+			to_hash : _
+		}
+
+		## What answers one requirement of a primitive's call (see
+		## [Code.Evidence]).
+		Target := [
+			## A primitive: a builtin, an opaque type's operation, or a cut member.
+			## Its own evidence is nested, for a target that is itself constrained.
+			Prim({ owner : Str, method : Str, id : PrimId, evidence : List(Evidence) }),
+
+			## A method the walk read: row `id` of the graph is its body.
+			Row(U32),
+
+			## A method the compiler derives, over `ty`, as the `Derived` op names it.
+			Derived(Str),
+
+			## No value of `ty` can reach the dispatch.
+			Unreachable,
+		].{
+			is_eq : _
+			to_hash : _
+		}
+
+		## The identity of a nominal type, without its type arguments.
+		## [Code.type_id] gives the id of a type, and an `Opaque` [Code.Ty]
+		## carries the id of its type.
+		TypeId :: { bits : U128 }.{
+			is_eq : TypeId, TypeId -> Bool
+			is_eq = |TypeId.(a), TypeId.(b)| a.bits == b.bits
+
+			to_hash : TypeId, Hasher -> Hasher
+			to_hash = |TypeId.(inner), hasher| Hasher.write_u128(hasher, inner.bits)
+		}
+
+		## A value that stands for type `t`. Roc has no type arguments, so a
+		## constant with an annotation carries the type:
+		## `time_proxy : Code.Proxy(Time)`, `time_proxy = Code.proxy()`.
+		Proxy(_t) :: {}
+
+		## A value of [Code.Proxy] at the type its use fixes.
+		proxy : () -> Proxy(_t)
+		proxy = || Proxy.({})
+
+		## The identity of the primitive `f` names. `f` must be a reference to
+		## a top-level function or constant: `Code.prim(Time.is_before)`,
+		## `Code.prim(Str.concat)`. The reference is not a use of `f`, so a
+		## `where` clause of `f` asks nothing here. The id is a constant the
+		## compiler computes, and a `Prim` node for `f` carries the same id.
+		prim : _f -> PrimId
+
+		## The identity of `t`, which must be a nominal type that the call
+		## fixes. The id is a constant the compiler computes, and an `Opaque`
+		## [Code.Ty] of `t` carries the same id. In a generic function the
+		## call is computed at each use of the function that fixes `t`.
+		type_id : Proxy(_t) -> TypeId
+
+		## The description of `t`, the type the call fixes. It equals the
+		## `result` of `|x| x` at `t`: `Code.ty_of(owner_proxy)` is
+		## `Named("Owner", Record(..))`. The description is a constant the
+		## compiler computes. A type variable that the call leaves open is an
+		## error, and in a generic function the call is described at each use
+		## of the function that fixes the variable.
+		ty_of : Proxy(_t) -> Ty
+
 		## A description whose site is declared `Code.Inlined(f)`: the `inline`
 		## view of the normal form. Every call of a function that does not reach
 		## itself is inlined, however many calls it has, and a function value of
 		## one is a `Lambda` region where it is built. Only recursive functions
 		## stay rows. A translator with no function form, such as one that emits
 		## one expression, reads this view.
-		Inlined(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+		Inlined(_fn) :: { digests : List(List(U128)), graph : Graph, site : U64, version : U32 }.{
 
 			## The rows the description reaches: the root, and the recursive
 			## rows it calls.
@@ -24200,7 +24464,177 @@ Builtin :: [].{
 			## Refuse node `at.node` of row `at.row` of the `inline` view, as
 			## [Code.refuse_at] refuses one of the `graph` view.
 			refuse_at : Inlined(_fn), { row : U32, node : U32 }, Str -> _a
-			refuse_at = |Inlined.(inner), at, message| Code.refuse(inner.site, at.row, at.node, message)
+			refuse_at = |Inlined.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
+
+			## The content digest of node `at.node` of row `at.row` of the
+			## `inline` view, which names the node under the refactors the
+			## normal form absorbs. Two nodes that compute one thing, in this
+			## value or in another, have one digest: it reads the node's
+			## operation, its types and the digests of what it reads, and not
+			## the node's index, its row's index, or where the node sits. So a
+			## translator can key a persisted operator or a checkpoint by it,
+			## and extracting or inlining a helper, or any other refactor of
+			## the normal form's rules, keeps it. A change to what the node
+			## computes, or to anything it reads, changes it. A `Call` that
+			## `inline` leaves, to a recursive function, is named by that
+			## function's place in `rows` and the content of its body.
+			##
+			## It is defined only in this view: in `graph` a node of a shared
+			## row has one inlined content per caller, so it has no one digest.
+			## A node that does not exist crashes, as [Code.Row] `node` does.
+			inline_digest : Inlined(_fn), { row : U32, node : U32 } -> Digest
+			inline_digest = |Inlined.(inner), at| match inner.digests.get(at.row.to_u64()) {
+				Ok(row_digests) => match row_digests.get(at.node.to_u64()) {
+					Ok(bits) => Digest.({ bits: bits })
+					Err(_) => crash "Code.Inlined.inline_digest: no node at this index"
+				}
+				Err(_) => crash "Code.Inlined.inline_digest: no row with this id"
+			}
+
+			## A translator's result, as [Code.bound] makes one for the `graph`
+			## view.
+			bound : Inlined(_fn), a -> Bound(a)
+			bound = |_, value| Bound.({ value, inputs: [] })
+		}
+
+		## A description whose site is declared `Code.Outlined(f)`: the
+		## `outline` view of the normal form. It starts from the `inline` view
+		## and makes a row of each computation that repeats: a tree of at least
+		## four operations, literals not counted, that occurs at two or more
+		## places becomes one row over the values it reads, and each place
+		## calls it. The rows come from the computation alone, so a refactor
+		## that keeps the computation keeps them, and extracting or inlining a
+		## helper changes nothing. A translator that emits functions, and whose
+		## output must not change when the author moves code into or out of a
+		## helper, reads this view. Recursive functions stay rows, as in
+		## `inline`.
+		Outlined(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+
+			## The rows the description reaches: the root, the recursive rows,
+			## and the rows the view made.
+			outline : Outlined(_fn) -> Graph
+			outline = |Outlined.(inner)| inner.graph
+
+			## The normal-form version the value was built under.
+			version : Outlined(_fn) -> U32
+			version = |Outlined.(inner)| inner.version
+
+			## Two values are equal when their normal forms are, wherever each
+			## was described.
+			is_eq : Outlined(fn), Outlined(fn) -> Bool
+			is_eq = |Outlined.(a), Outlined.(b)| a.version == b.version and a.graph == b.graph
+
+			## Hashes the normal form, and not the site key, to agree with `is_eq`.
+			to_hash : Outlined(_fn), Hasher -> Hasher
+			to_hash = |Outlined.(inner), hasher| inner.graph.to_hash(Hasher.write_u32(hasher, inner.version))
+
+			## Refuse node `at.node` of row `at.row` of the `outline` view, as
+			## [Code.refuse_at] refuses one of the `graph` view. A node of a row
+			## the view made reports every place the row stands for.
+			refuse_at : Outlined(_fn), { row : U32, node : U32 }, Str -> _a
+			refuse_at = |Outlined.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
+
+			## A translator's result, as [Code.bound] makes one for the `graph`
+			## view.
+			bound : Outlined(_fn), a -> Bound(a)
+			bound = |_, value| Bound.({ value, inputs: [] })
+		}
+
+		## A description whose site is declared `Code.Lawful(f)`: the `graph`
+		## view, normalized with the laws of the builtins as well (layer L).
+		## A loop that appends one value per item to an empty list is a
+		## `List.map`, and one that appends the item under a test is a
+		## `List.keep_if`; a `List.fold` of a known function is the loop that
+		## calls it; a `map` of a `map` is one `map`; `xs.iter().map(f).collect()`
+		## into a `List` is `List.map`; and `xs.len() == 0` and `xs.len() > 0`
+		## are `xs.is_empty()` and `!xs.is_empty()`. So a translator that
+		## reads this view sees one form where the author writes either, and
+		## matches the form after the laws. A translator that wants the forms
+		## as written reads `Code(f)`.
+		Lawful(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+
+			## The rows the description reaches, as [Code.graph] gives them.
+			graph : Lawful(_fn) -> Graph
+			graph = |Lawful.(inner)| inner.graph
+
+			## The normal-form version the value was built under.
+			version : Lawful(_fn) -> U32
+			version = |Lawful.(inner)| inner.version
+
+			## Two values are equal when their normal forms are, wherever each
+			## was described.
+			is_eq : Lawful(fn), Lawful(fn) -> Bool
+			is_eq = |Lawful.(a), Lawful.(b)| a.version == b.version and a.graph == b.graph
+
+			## Hashes the normal form, and not the site key, to agree with `is_eq`.
+			to_hash : Lawful(_fn), Hasher -> Hasher
+			to_hash = |Lawful.(inner), hasher| inner.graph.to_hash(Hasher.write_u32(hasher, inner.version))
+
+			## Refuse node `at.node` of row `at.row`, as [Code.refuse_at] refuses
+			## one of the `graph` view. A node a law made reports where the code
+			## it stands for was written.
+			refuse_at : Lawful(_fn), { row : U32, node : U32 }, Str -> _a
+			refuse_at = |Lawful.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
+
+			## A translator's result, as [Code.bound] makes one for the `graph`
+			## view.
+			bound : Lawful(_fn), a -> Bound(a)
+			bound = |_, value| Bound.({ value, inputs: [] })
+		}
+
+		## The run-time value of one input slot, which follows the slot's
+		## [Code.Ty]: an integer that is not a `U128` is an `Int`, a record has
+		## one value per field in the order of its `Ty`, and a nominal value is a
+		## `Wrap` of its backing's value. The value of an optional field that the
+		## record does not hold is `Absent`, and the field's value when it holds
+		## it. A slot whose type holds an opaque type is `Encoded`: the bytes the
+		## `encoder_for` of the slot's type wrote in the format the translator's
+		## `Code.Binds` names.
+		Value := [
+			Int(I128),
+			U128(U128),
+			Frac(F64),
+			Dec(Dec),
+			Bool(Bool),
+			Str(Str),
+			Record(List(Value)),
+			Absent,
+			Tuple(List(Value)),
+			List(List(Value)),
+			Tag(Str, List(Value)),
+			Wrap(Value),
+			Encoded(List(U8)),
+		].{
+			is_eq : _
+			to_hash : _
+		}
+
+		## A `Code` parameter whose run-time captures the program binds in the
+		## format `fmt`: `Code.Binds(Code(Row -> Bool), Sql.Param)`. It is the
+		## `Code` it wraps, so any view goes inside it. For each captured value
+		## the function reads, written as a name or a field path of one (`x`,
+		## `x.a`, `x.0`), the value's type must have
+		## `encoder_for : fmt -> (t, List(U8) -> Try(List(U8), []))`, and `fmt`
+		## must have `default : () -> fmt`. A captured value whose type holds an
+		## opaque type reaches the translator as [Code.Value] `Encoded`, the
+		## bytes that encoder wrote.
+		Binds(code, fmt) : code
+
+		## A translator's result with the run-time values of the site's input
+		## slots. A translator that returns a `Bound` accepts a lambda that
+		## reads a value from around itself which exists only when the program
+		## runs, such as `order.price`. The translator runs while the compiler
+		## runs and emits a placeholder per slot, such as a `?` in SQL; the
+		## program receives one [Code.Value] per slot in `inputs`.
+		Bound(result) :: { value : result, inputs : List(Value) }.{
+
+			## What the translator returned.
+			value : Bound(result) -> result
+			value = |Bound.(inner)| inner.value
+
+			## The run-time value of each input slot, in slot order.
+			inputs : Bound(_result) -> List(Value)
+			inputs = |Bound.(inner)| inner.inputs
 		}
 
 		## The rows the site's description reaches.
@@ -24223,6 +24657,11 @@ Builtin :: [].{
 		to_hash : Code(_fn), Hasher -> Hasher
 		to_hash = |Code.(inner), hasher| inner.graph.to_hash(Hasher.write_u32(hasher, inner.version))
 
+		## A translator's result, which the site completes with the values of
+		## its input slots (see [Code.Bound]).
+		bound : Code(_fn), a -> Bound(a)
+		bound = |_, value| Bound.({ value, inputs: [] })
+
 		## Refuse node `at.node` of row `at.row` of the description: `at.row` is
 		## a row's `id`, and `at.node` the node's index in that row's `nodes`.
 		##
@@ -24231,156 +24670,199 @@ Builtin :: [].{
 		## source the node came from, with the calls that reached it. A
 		## translator that runs when the program runs crashes with `message`.
 		refuse_at : Code(_fn), { row : U32, node : U32 }, Str -> _a
-		refuse_at = |Code.(inner), at, message| Code.refuse(inner.site, at.row, at.node, message)
-
-		# The refusal of node `node` of row `row` of the site keyed `site`.
-		refuse : U64, U32, U32, Str -> _a
-
-		# The fields of a record type, looking through a nominal.
-		record_fields : Ty -> List({ name : Str, ty : Ty })
-		record_fields = |ty| match ty {
-			Record(fields) => fields.map(|field| { name: field.name, ty: field.ty })
-			Named(_, backing) => Code.record_fields(backing)
-			I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | I128 | U128 => []
-			F32 | F64 | Dec | Bool | Str | ListOf(_) | Tuple(_) | Fn(_, _) | Recursive(_) | TagUnion(_) | Opaque(_, _) => []
-		}
-
-		# One read of `val` by `user`, or by a region's end when `user` is null.
-		read_in : List({ users : List(U32), count : U64 }), Val, [User(U32), End] -> List({ users : List(U32), count : U64 })
-		read_in = |table, val, user| match val {
-			Node(n) | Out({ node: n, k: _ }) => {
-				at = n.to_u64()
-				entry = match table.get(at) {
-					Ok(found) => found
-					Err(_) => crash "Code.Row.uses: a read of a node past the row"
-				}
-				users = match user {
-					User(u) => entry.users.append(u)
-					End => entry.users
-				}
-				match table.set(at, { users, count: entry.count + 1 }) {
-					Ok(updated) => updated
-					Err(_) => crash "Code.Row.uses: a read of a node past the row"
-				}
-			}
-			Param(_) | Arg(_) => table
-		}
-
-		uses_in : Row, Region, List({ users : List(U32), count : U64 }) -> List({ users : List(U32), count : U64 })
-		uses_in = |row, region, start| {
-			after_nodes = region.nodes.fold(
-				start,
-				|table, n| {
-					node = row.node(n)
-					read = node.args.fold(table, |acc, arg| Code.read_in(acc, arg, User(n)))
-					node.op.regions().fold(read, |acc, sub| Code.uses_in(row, sub, acc))
-				},
-			)
-			Code.end_vals(region.end).fold(after_nodes, |acc, val| Code.read_in(acc, val, End))
-		}
-
-		# The values a region's end reads.
-		end_vals : End -> List(Val)
-		end_vals = |end| match end {
-			Value(vals) | Continue(vals) | Break(vals) => vals
-			Jump(jump) => jump.args
-			Return(val) => [val]
-			Branch(_) => []
-		}
-
-		# What `to_tree` reads about each node: how often it is read, and at
-		# what loop depth it stands and is last read.
-		TreeInfo : { uses : List(U64), use_depth : List(U64), def_depth : List(U64) }
-
-		at_index : List(U64), U64 -> U64
-		at_index = |list, at| match list.get(at) {
-			Ok(value) => value
-			Err(_) => crash "Code.Graph.to_tree: a node index past the row"
-		}
-
-		put_index : List(U64), U64, U64 -> List(U64)
-		put_index = |list, at, value| match list.set(at, value) {
-			Ok(updated) => updated
-			Err(_) => crash "Code.Graph.to_tree: a node index past the row"
-		}
-
-		read_depth : TreeInfo, Val, U64 -> TreeInfo
-		read_depth = |info, val, depth| match val {
-			Node(n) | Out({ node: n, k: _ }) => {
-				at = n.to_u64()
-				{ ..info, uses: Code.put_index(info.uses, at, Code.at_index(info.uses, at) + 1), use_depth: Code.put_index(info.use_depth, at, depth) }
-			}
-			Param(_) | Arg(_) => info
-		}
-
-		depths_in : Row, Region, U64, TreeInfo -> TreeInfo
-		depths_in = |row, region, depth, start| {
-			after_nodes = region.nodes.fold(
-				start,
-				|info, n| {
-					node = row.node(n)
-					placed = { ..info, def_depth: Code.put_index(info.def_depth, n.to_u64(), depth) }
-					read = node.args.fold(placed, |acc, arg| Code.read_depth(acc, arg, depth))
-					inner = if node.op.repeats() depth + 1 else depth
-					node.op.regions().fold(read, |acc, sub| Code.depths_in(row, sub, inner, acc))
-				},
-			)
-			Code.end_vals(region.end).fold(after_nodes, |acc, val| Code.read_depth(acc, val, depth))
-		}
-
-		# Whether `to_tree` keeps node `n` as a def rather than substituting it.
-		kept : Row, TreeInfo, U32 -> Bool
-		kept = |row, info, n| {
-			node = row.node(n)
-			at = n.to_u64()
-			substituted = match node.op {
-				Lit(_) => Bool.True
-				# An exiting switch is the `Branch` end of its block.
-				Switch(sw) => sw.outputs.is_empty()
-				Prim(_) | Call(_) | Closure(_) | Record(_) | Tuple | List | Tag(_) | Wrap(_) | Unwrap => Bool.False
-				Field(_) | Index(_) | Payload(_, _) | Item | OptField(_) | And(_) | Or(_) => Bool.False
-				ForRange(_) | ForList(_) | Loop(_) | Lambda(_) | Crash | Derived(_, _) => Bool.False
-			}
-			if substituted {
-				Bool.False
-			} else {
-				Code.at_index(info.uses, at) != 1 or Code.at_index(info.use_depth, at) != Code.at_index(info.def_depth, at) or node.outputs() != 1
-			}
-		}
-
-		val_tree : Row, TreeInfo, Val -> Tree
-		val_tree = |row, info, val| match val {
-			Param(k) => Param(k)
-			Arg(arg) => Arg(arg)
-			Out(out) => Out(out)
-			Node(n) => if Code.kept(row, info, n) Def(n) else Code.node_tree(row, info, n)
-		}
-
-		node_tree : Row, TreeInfo, U32 -> Tree
-		node_tree = |row, info, n| {
-			node = row.node(n)
-			values = node.args.map(|arg| Code.val_tree(row, info, arg))
-			blocks = node.op.regions().map(|sub| Code.block_tree(row, info, sub))
-			Op({ op: node.op, args: List.concat(values, blocks), ty: node.ty })
-		}
-
-		block_tree : Row, TreeInfo, Region -> Tree
-		block_tree = |row, info, region| {
-			defs = region.nodes.keep_if(|n| Code.kept(row, info, n)).map(|n| { id: n, value: Code.node_tree(row, info, n) })
-			trees : List(Val) -> List(Tree)
-			trees = |vals| vals.map(|val| Code.val_tree(row, info, val))
-			end = match region.end {
-				Value(vals) => Value(trees(vals))
-				Jump(jump) => Jump({ join: jump.join, args: trees(jump.args) })
-				Return(val) => Return(Code.val_tree(row, info, val))
-				Continue(vals) => Continue(trees(vals))
-				Break(vals) => Break(trees(vals))
-				Branch(n) => Branch(Code.node_tree(row, info, n))
-			}
-			Block({ defs, end })
-		}
+		refuse_at = |Code.(inner), at, message| code_refuse(inner.site, at.row, at.node, message)
 	}
 
+}
+
+# Private declarations of the Code API. They stay out of the public surface of `Code`, which a translator reads, because a top-level declaration of this file is visible to this file only.
+
+# The refusal of node `node` of row `row` of the site keyed `site`.
+code_refuse : U64, U32, U32, Str -> _a
+
+# The fields of a record type, looking through a nominal.
+code_record_fields : Code.Ty -> List({ name : Str, ty : Code.Ty })
+code_record_fields = |ty| match ty {
+	Record(fields) => fields.map(|field| { name: field.name, ty: field.ty })
+	Named(_, _, backing) => code_record_fields(backing)
+	I8 | U8 | I16 | U16 | I32 | U32 | I64 | U64 | I128 | U128 => []
+	F32 | F64 | Dec | Bool | Str | ListOf(_) | Tuple(_) | Fn(_, _) | Recursive(_) | TagUnion(_) | Opaque(_, _, _) => []
+}
+
+# One read of `val` by `user`, or by a region's end when `user` is null.
+code_read_in : List({ users : List(U32), count : U64 }), Code.Val, [User(U32), End] -> List({ users : List(U32), count : U64 })
+code_read_in = |table, val, user| match val {
+	Node(n) | Out({ node: n, k: _ }) => {
+		at = n.to_u64()
+		entry = match table.get(at) {
+			Ok(found) => found
+			Err(_) => crash "Code.Row.uses: a read of a node past the row"
+		}
+		users = match user {
+			User(u) => entry.users.append(u)
+			End => entry.users
+		}
+		match table.set(at, { users, count: entry.count + 1 }) {
+			Ok(updated) => updated
+			Err(_) => crash "Code.Row.uses: a read of a node past the row"
+		}
+	}
+	Param(_) | Arg(_) | Input(_) => table
+}
+
+code_uses_in : Code.Row, Code.Region, List({ users : List(U32), count : U64 }) -> List({ users : List(U32), count : U64 })
+code_uses_in = |row, region, start| {
+	after_nodes = region.nodes.fold(
+		start,
+		|table, n| {
+			node = row.node(n)
+			read = node.args.fold(table, |acc, arg| code_read_in(acc, arg, User(n)))
+			node.op.regions().fold(read, |acc, sub| code_uses_in(row, sub, acc))
+		},
+	)
+	code_end_vals(region.end).fold(after_nodes, |acc, val| code_read_in(acc, val, End))
+}
+
+# Whether parameter `k` of the body of loop node `owner` is read anywhere in the row.
+code_reads_arg : Code.Row, U32, U32 -> Bool
+code_reads_arg = |row, owner, k| {
+	is_it = |val| match val {
+		Arg(arg) => arg.owner == owner and arg.k == k
+		Param(_) | Node(_) | Out(_) | Input(_) => Bool.False
+	}
+	row.nodes.any(|node| node.args.any(is_it)) or code_region_ends_any(row, row.body, is_it)
+}
+
+# Whether the end of any region under `region` reads a value `is_it` accepts.
+code_region_ends_any : Code.Row, Code.Region, (Code.Val -> Bool) -> Bool
+code_region_ends_any = |row, region, is_it| {
+	region.nodes.any(|n| row.node(n).op.regions().any(|sub| code_region_ends_any(row, sub, is_it))) or code_end_vals(region.end).any(is_it)
+}
+
+# Whether a region can leave the loop it is the body of before its last turn:
+# a `Break` of that loop, or a `Return`. `depth` counts the loops inside it.
+code_escapes : Code.Row, Code.Region, U64 -> Bool
+code_escapes = |row, region, depth| {
+	here = match region.end {
+		Break(_) => depth == 0
+		Return(_) => Bool.True
+		Value(_) | Continue(_) | Jump(_) | Branch(_) => Bool.False
+	}
+	here or region.nodes.any(
+		|n| {
+			node = row.node(n)
+			inner = match node.op {
+				ForRange(_) | ForList(_) | Loop(_) => depth + 1
+				_ => depth
+			}
+			match node.op {
+				Lambda(_) => Bool.False
+				_ => node.op.regions().any(|sub| code_escapes(row, sub, inner))
+			}
+		},
+	)
+}
+
+# The values a region's end reads.
+code_end_vals : Code.End -> List(Code.Val)
+code_end_vals = |end| match end {
+	Value(vals) | Continue(vals) | Break(vals) => vals
+	Jump(jump) => jump.args
+	Return(val) => [val]
+	Branch(_) => []
+}
+
+# What `to_tree` reads about each node: how often it is read, and at
+# what loop depth it stands and is last read.
+CodeTreeInfo : { uses : List(U64), use_depth : List(U64), def_depth : List(U64) }
+
+code_at_index : List(U64), U64 -> U64
+code_at_index = |list, at| match list.get(at) {
+	Ok(value) => value
+	Err(_) => crash "Code.Graph.to_tree: a node index past the row"
+}
+
+code_put_index : List(U64), U64, U64 -> List(U64)
+code_put_index = |list, at, value| match list.set(at, value) {
+	Ok(updated) => updated
+	Err(_) => crash "Code.Graph.to_tree: a node index past the row"
+}
+
+code_read_depth : CodeTreeInfo, Code.Val, U64 -> CodeTreeInfo
+code_read_depth = |info, val, depth| match val {
+	Node(n) | Out({ node: n, k: _ }) => {
+		at = n.to_u64()
+		{ ..info, uses: code_put_index(info.uses, at, code_at_index(info.uses, at) + 1), use_depth: code_put_index(info.use_depth, at, depth) }
+	}
+	Param(_) | Arg(_) | Input(_) => info
+}
+
+code_depths_in : Code.Row, Code.Region, U64, CodeTreeInfo -> CodeTreeInfo
+code_depths_in = |row, region, depth, start| {
+	after_nodes = region.nodes.fold(
+		start,
+		|info, n| {
+			node = row.node(n)
+			placed = { ..info, def_depth: code_put_index(info.def_depth, n.to_u64(), depth) }
+			read = node.args.fold(placed, |acc, arg| code_read_depth(acc, arg, depth))
+			inner = if (node.op.repeats()) depth + 1 else depth
+			node.op.regions().fold(read, |acc, sub| code_depths_in(row, sub, inner, acc))
+		},
+	)
+	code_end_vals(region.end).fold(after_nodes, |acc, val| code_read_depth(acc, val, depth))
+}
+
+# Whether `to_tree` keeps node `n` as a def rather than substituting it.
+code_kept : Code.Row, CodeTreeInfo, U32 -> Bool
+code_kept = |row, info, n| {
+	node = row.node(n)
+	at = n.to_u64()
+	substituted = match node.op {
+		Lit(_) => Bool.True
+		# An exiting switch is the `Branch` end of its block.
+		Switch(sw) => sw.outputs.is_empty()
+		Prim(_) | Call(_) | Closure(_) | Record(_) | Tuple | List | Tag(_) | Wrap(_) | Unwrap => Bool.False
+		Field(_) | Index(_) | Payload(_, _) | Item | OptField(_) | And(_) | Or(_) => Bool.False
+		ForRange(_) | ForList(_) | Loop(_) | Lambda(_) | Crash | Derived(_, _) => Bool.False
+	}
+	if substituted {
+		Bool.False
+	} else {
+		code_at_index(info.uses, at) != 1 or code_at_index(info.use_depth, at) != code_at_index(info.def_depth, at) or node.outputs() != 1
+	}
+}
+
+code_val_tree : Code.Row, CodeTreeInfo, Code.Val -> Code.Tree
+code_val_tree = |row, info, val| match val {
+	Param(k) => Param(k)
+	Input(k) => Input(k)
+	Arg(arg) => Arg(arg)
+	Out(out) => Out(out)
+	Node(n) => if (code_kept(row, info, n)) Def(n) else code_node_tree(row, info, n)
+}
+
+code_node_tree : Code.Row, CodeTreeInfo, U32 -> Code.Tree
+code_node_tree = |row, info, n| {
+	node = row.node(n)
+	values = node.args.map(|arg| code_val_tree(row, info, arg))
+	blocks = node.op.regions().map(|sub| code_block_tree(row, info, sub))
+	Op({ op: node.op, args: List.concat(values, blocks), ty: node.ty })
+}
+
+code_block_tree : Code.Row, CodeTreeInfo, Code.Region -> Code.Tree
+code_block_tree = |row, info, region| {
+	defs = region.nodes.keep_if(|n| code_kept(row, info, n)).map(|n| { id: n, value: code_node_tree(row, info, n) })
+	trees : List(Code.Val) -> List(Code.Tree)
+	trees = |vals| vals.map(|val| code_val_tree(row, info, val))
+	end = match region.end {
+		Value(vals) => Value(trees(vals))
+		Jump(jump) => Jump({ join: jump.join, args: trees(jump.args) })
+		Return(val) => Return(code_val_tree(row, info, val))
+		Continue(vals) => Continue(trees(vals))
+		Break(vals) => Break(trees(vals))
+		Branch(n) => Branch(code_node_tree(row, info, n))
+	}
+	Block({ defs, end })
 }
 
 hasher_start : U64 -> Hasher

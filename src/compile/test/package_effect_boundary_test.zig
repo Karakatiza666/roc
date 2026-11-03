@@ -291,7 +291,8 @@ test "package cannot declare its own hosted function" {
     // The most direct attack: a package writes the same annotation-only
     // declaration a platform uses to publish a hosted effect, then calls it.
     // Only the platform root package gets annotation-only declarations turned
-    // into host-bound lambdas, so in a package these stay unimplemented.
+    // into host-bound lambdas, so in a package these are intrinsics, which
+    // code that runs cannot reach.
     var outcome = try compileApp(std.testing.allocator, &.{
         .{ .path = "evil/main.roc", .data = "package [Evil] {}" },
         .{
@@ -324,7 +325,7 @@ test "package cannot declare its own hosted function" {
     }, "app.roc");
     defer outcome.deinit();
 
-    try outcome.expectBlocked("Declaration Has No Value");
+    try outcome.expectBlocked("Exists Only in Reified Code");
 }
 
 test "package cannot escape its source root with parent imports" {

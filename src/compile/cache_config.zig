@@ -349,12 +349,190 @@ pub const Constants = struct {
     /// 164: sorted array builders serialize zeroed entry padding and an
     ///      integer offset that the cache validator checks.
     /// 165: compile-time reads persist placement and semantic root identity.
-    /// 168: A module remembers how many lines of its source the compiler
-    ///      prepended, so a region it reports names the line the author wrote.
     /// 169: A stored `Code` value holds the normal-form IR, not `Code.Ir`:
     ///      placement and numbering are canonical, rows are digests, and the
     ///      `graph` view inlines rows called once.
-    pub const CACHE_VERSION = 169;
+    /// 170: Normal form 4: a `Code` value's graph holds the types of its
+    ///      input slots, and a checked body store records the calls that
+    ///      bind them.
+    /// 171: Normal form 5: a `Record` node may leave an optional member
+    ///      unset and lists the members it sets, and the walk describes the
+    ///      constructs it refused before.
+    /// 172: A checked callable-eval template records the expression its
+    ///      binding was written as, and a top-level value that computes a
+    ///      function describes as that expression.
+    /// 173: Normal form 6: a `match` on string literals is a literal switch
+    ///      keyed by the strings, its arms in byte order (N13n over `Str`,
+    ///      N7a).
+    /// 174: Normal form 7: literals, chains, `and`/`or`, nested `if`, bounded
+    ///      `List.get` and case-of-case.
+    /// 175: Normal form 8: three canonical loop forms. A tail-recursive row is
+    ///      a `Loop`, a general `Loop` has outputs of its own (`Op.Loop` is a
+    ///      record of its body and outputs), and `Code.Row.iteration` says what
+    ///      a loop iterates over.
+    /// 176: Normal form 9: a record or tuple that a non-root row or a loop
+    ///      only reads by field or index is one parameter or slot per
+    ///      component (N14).
+    /// 177: Normal form 10: the speculatable conditions of the rules read the
+    ///      operand cone, so `x - x` keeps a loop that can crash.
+    /// 178: `Code.Inlined` values hold `inline_digest`'s digests (V5a), and
+    ///      `Code.Digest` is a builtin type.
+    /// 179: An interpolated literal of a type of the author's own describes as
+    ///      the call of the row its conversion's first stage hands back, and a
+    ///      lambda read at a function of the nominal over its result delivers
+    ///      the nominal.
+    /// 180: Normal form 11: a crash records who wrote it, and N13w drops the
+    ///      tests of a literal's conversion that reach its rejection.
+    /// 181: An interpolation of a type of the author's own has a conversion
+    ///      root, and a `Code` site records the conversion roots its walk met.
+    /// 182: Normal form 12: `Code.Outlined` is a builtin type, a site's view
+    ///      can be `outline` (V3), and its value holds that view.
+    /// 183: Normal form 13: `Code.Lawful` is a builtin type, and a site of
+    ///      it holds the `graph` view under the laws of layer L.
+    /// 184: Normal form 14: a region's digest and its structural comparison
+    ///      read its loops that can return, and two merged rows pair their
+    ///      nodes for provenance by the comparison.
+    /// 185: Normal form 15: `outline` matches places by anti-unification
+    ///      (V3b), so the rows of a `Code.Outlined` site change.
+    /// 186: Normal form 16: N13u intervals, N8k result ranges and the
+    ///      parameter half of N15c (M11), so plus chains, decided tests,
+    ///      inclusive counter loops and speculatable flags change.
+    /// 188: Normal form 18: the translator's cut (I14). A site records its
+    ///      translator call, the artifact records each type's cut, and a
+    ///      function of another package outside the cut is walked (N8l).
+    /// 189: Normal form 19: a site passed to a translator called as a
+    ///      method records that call, and takes its method's cut (I14).
+    /// 190: Normal form 20: known lists (N17, M17). List builtins over a
+    ///      `List` node are their results and a loop over one of at most B
+    ///      elements is unrolled, so described bodies change.
+    /// 191: Normal form 21: one spelling per recursive type (2.1), so the
+    ///      types of described bodies over a cycle of two nominals change.
+    /// 192: Normal form 22: a checked `plus` chain with an operand that
+    ///      always crashes flattens (N15a), so described bodies change.
+    /// 193: Normal form 23: a nominal closes only under its own instance
+    ///      (2.1, T1), so described bodies over a nominal inside another
+    ///      instance of its name change, and some are refused.
+    /// 194: A record update joins its base's type class as an occurrence, so
+    ///      a mismatch at the update no longer makes the base's binding
+    ///      erroneous, and checked types of such modules change.
+    /// 195: A staged argument relates the call's own `Code(f)` parameter and
+    ///      takes no copy of it, so a `where` receiver in `f` is not copied,
+    ///      and checked results of modules with such calls change.
+    /// 196: Normal form 24: N17f takes `List.fold_with_index` and N13c decides
+    ///      `Try.ok_or` of a known tag, so an interpolated literal of a type
+    ///      that wraps `Str`'s assembler describes as its `Str.concat` chain,
+    ///      and the builtin table's `PrimId`s change.
+    /// 197: Normal form 25: a package function's `Prim` and a declared
+    ///      nominal's `Named` or `Opaque` type are keyed by their
+    ///      definitions, so the inline digests of sites that read them change.
+    /// 198: Normal form 26 (rule L): a structural tag union that a
+    ///      `row_coerce` lifts into a nominal is a `Wrap`, and every `Code`
+    ///      value carries the new version.
+    /// 199: Normal form 27 (opaque proposal D1, D3): a function or constant
+    ///      of an opaque type is a `Prim` in every call form, a constant can be
+    ///      in a cut, and a cut that lists a primitive is a new problem kind.
+    /// 200: Normal form 28 (opaque proposal D4, Q10): a `Prim` carries its
+    ///      `PrimId`, an `Opaque` carries its `TypeId`, `code_primitives` is a
+    ///      list of `Code.prim` calls, and `ModuleEnv` records each identity
+    ///      call.
+    /// 202: Normal form 31: a `where` requirement of a primitive a
+    ///      derivation reached is answered by the method registry, so sites
+    ///      that 30 refused describe.
+    /// 203: Normal form 32: a forwarded requirement whose shared slot names
+    ///      a walked target describes, so sites that 31 refused describe.
+    /// 204: Opaque proposal D5 (`Code.Binds`): `ModuleEnv` records each
+    ///      capture read of a lambda at a `Code.Binds` position, a
+    ///      `CheckedCodeSlot` carries the encoder of an encoded slot, and
+    ///      `Code.Value` has `Encoded`.
+    /// 205: A requirement of the rule "Bound Capture Encoding" has the
+    ///      constraint origin `bound_capture`, and a captured function has
+    ///      no record and no encoder.
+    /// 206: Structural proposal Stage 0: `DescriptorFlags.record_row`
+    ///      (Record Extension Well-Formedness), the problem
+    ///      `record_extension_not_record`, named `Code` sites publish their
+    ///      evidence, and description digests key a row binding by its
+    ///      canonical record or tag union.
+    /// 207: Normal form 33: N11j reads a `Break` value as outside the loop
+    ///      where N5b hoists it, so a speculatable switch is the loop's output.
+    /// 208: A qualified name through an import alias names the imported
+    ///      module even where a builtin type has the module's name
+    ///      (`import Bool as Flag`), and a `Code.prim` argument that names a
+    ///      derived method publishes as `anno_only`.
+    /// 209: One rule for a module qualifier (roc-lang/roc#12720): an import
+    ///      wins over the builtin type of the same name in hosted entries,
+    ///      tags, patterns and qualified type names, and `import Bool` binds
+    ///      the module instead of a duplicate-definition warning.
+    /// 210: Structural proposal Stage 2 (D1): the checked module data has a
+    ///      `CodeInstanceTable`, an instance site has no node, and its
+    ///      lambda keeps its checked form under a new expression id.
+    /// 211: Q16 of the structural proposal: a stored function value
+    ///      (`ConstFn`) keeps the Code instance table it was built with, and
+    ///      publication reads compile-time constant bodies and `for` loops
+    ///      for closing uses.
+    /// 212: Q16 and Q17 of the structural proposal: a constant's entry
+    ///      template holds an inventory and a use of the constant is a
+    ///      closing use, and a site in a method the compiler calls is the
+    ///      `instance_in_implicit_method` refusal.
+    /// 213: Structural proposal Stage 3: `Code.ty_of` (a `code_identity_uses`
+    ///      kind and a recipe kind), a `Code.type_id` or `Code.ty_of` call in
+    ///      a generic function is an inventory entry, and a field default is
+    ///      in `Code.Ty` (D5, normal-form version 34).
+    /// 214: Q18 of the structural proposal: a record literal that leaves out
+    ///      a field with a carried default is described with the default
+    ///      (normal-form version 35).
+    /// 215: an expression whose type mentions a rigid type variable is never
+    ///      a hoisted root, so a value that reads the type an instance fixes
+    ///      is computed at each instance. A use of a method of a `::` type
+    ///      with an inventory gets its instance table, and so does a use in
+    ///      a top-level `expect`.
+    /// 216: Structural proposal Y8: `Code.Ty.Named` carries the nominal's
+    ///      type arguments (normal-form version 36).
+    /// 217: a checked type variable records `record_row`, so a variable in
+    ///      a record extension slot of an alias or nominal application
+    ///      demands all of its substitution.
+    /// 218: a lambda at a `Code(f)` position checks against `f` as its
+    ///      contextual type, so a call that fixes `f` gives its parameters
+    ///      their types before its body is checked, and a site whose root
+    ///      holds a checking error is refused with no report of its own.
+    /// 219: Structural proposal D8: a captured slot's shape has
+    ///      `opt_field` for an optional field, and `Code.Value` has `Absent`
+    ///      for an optional field that a captured record does not hold.
+    /// 220: a derived `==` over a record compares its fields in label
+    ///      order, and an optional field through its `OptField`; a derived
+    ///      hash of a record with an optional field is `Derived`
+    ///      (normal-form version 37).
+    /// 221: a captured value that a description reads whole is one input
+    ///      slot, and the description reads its fields as `Field` nodes
+    ///      over that slot (N18e, normal-form version 38).
+    /// 222: `Code.Lit` has `Numeral` for the operand of a `from_numeral`
+    ///      conversion, at a row and a `Prim` alike, and `Num.Numeral` has
+    ///      `is_eq` and `to_hash` (normal-form version 39).
+    /// 223: the builtin table holds an integer type's `from_numeral` and the
+    ///      accessors of `Num.Numeral`, so a `Code` value names them by the
+    ///      table (normal-form version 40).
+    /// 224: a static-dispatch constraint has a `runs` bit, which a checked
+    ///      module's type store holds.
+    /// 225: a checked module holds its reify-only definitions with their
+    ///      witnesses (`ModuleEnv.reify_only_defs`).
+    /// 226: a dispatch in a lambda at a `Code` position that a template body
+    ///      holds is resolved in the chain of that template, so a dispatch
+    ///      on a type variable of a query fragment forwards to its evidence.
+    /// 227: a reference to an intrinsic in a description-only body, and a
+    ///      dispatch to an intrinsic method whose constraint does not run,
+    ///      is a value, which a `Code` value describes as a `Prim`, and the
+    ///      argument of `Code.prim` makes no definition reify-only.
+    /// 228: an intrinsic is a value everywhere. A reference to one, or to a
+    ///      reify-only definition, that runs in a root is reported and
+    ///      poisoned; a declaration with no value is no longer reported for
+    ///      an intrinsic; a compile-time root that reaches one is pruned; an
+    ///      unimplemented declaration records whether it is an intrinsic.
+    /// 229: a reify-only definition exports its full chain (each frame's
+    ///      text, path, line and column) and its intrinsic's name, and the
+    ///      checking interface hashes them and the place of each intrinsic;
+    ///      the cached checking outcome keeps the frames of its chains.
+    /// 230: the code provenance of a module names, per node, the intrinsics
+    ///      its `Prim` names, and a translation refusal keeps their names.
+    pub const CACHE_VERSION = 230;
 };
 
 /// Configuration for the Roc cache system.

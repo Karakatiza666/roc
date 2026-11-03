@@ -185,6 +185,7 @@ pub fn fingerprint(store: *const ir.Store, returns: *live_mod.Returns, numbering
         fn ref(hh: *std.crypto.hash.sha2.Sha256, st: *const ir.Store, num: *const Numbering, x: Ref) void {
             switch (x.kind) {
                 .row_param => words(hh, &.{ 0, x.output }),
+                .input => words(hh, &.{ 3, x.target }),
                 .node => words(hh, &.{ 1, num.of(x.nodeId()), x.output }),
                 .region_param => {
                     words(hh, &.{ 2, x.output });
@@ -223,7 +224,7 @@ pub fn fingerprint(store: *const ir.Store, returns: *live_mod.Returns, numbering
 }
 
 /// The rows a site whose root is `root` reaches through `Call` and `Closure`
-/// nodes, root first, each where the walk of a row reached earlier first
+/// nodes and the evidence of `Prim` nodes, root first, each where the walk of a row reached earlier first
 /// meets it, depth first, as `code_emit` writes them.
 pub fn siteRows(gpa: Allocator, store: *const ir.Store, returns: *live_mod.Returns, root: RowId, out: *ir.RowTable(Numbering)) Allocator.Error!void {
     const gop = try out.getOrPut(gpa, root);
@@ -237,9 +238,38 @@ pub fn siteRows(gpa: Allocator, store: *const ir.Store, returns: *live_mod.Retur
         const nd = store.node(n);
         switch (nd.op) {
             .call, .closure => try siteRows(gpa, store, returns, RowId.of(nd.payload), out),
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .prim, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => {},
+            // The rows a `Prim`'s evidence names (D7), in evidence order.
+            .prim => {
+                var it = ir.EvidenceWords.of(store.wordSlice(nd.aux));
+                while (it.next()) |e| if (e.kind == .row) try siteRows(gpa, store, returns, RowId.of(e.target), out);
+            },
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .field, .index, .payload, .elem, .opt_field, .unwrap, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => {},
         }
     }
+}
+
+/// The input slots the root reads, in slot order (N18d, 3.9): the root's
+/// nodes in `numbering` order, each node's arguments and then the ends of the
+/// regions it holds, and the body's end last, each slot where it is first
+/// read. The caller frees the result.
+pub fn slotOrder(gpa: Allocator, store: *const ir.Store, root: RowId, numbering: *const Numbering) Allocator.Error![]ir.SlotId {
+    var out = std.ArrayList(ir.SlotId).empty;
+    errdefer out.deinit(gpa);
+    for (numbering.order.items) |n| {
+        const nd = store.node(n);
+        for (store.refSlice(nd.args)) |r| try noteSlot(gpa, &out, r);
+        for (store.regionSlice(nd.regions)) |owned| {
+            for (store.refSlice(store.region(owned).end.refs)) |r| try noteSlot(gpa, &out, r);
+        }
+    }
+    for (store.refSlice(store.region(store.row(root).body).end.refs)) |r| try noteSlot(gpa, &out, r);
+    return out.toOwnedSlice(gpa);
+}
+
+fn noteSlot(gpa: Allocator, out: *std.ArrayList(ir.SlotId), r: Ref) Allocator.Error!void {
+    if (r.kind != .input) return;
+    if (std.mem.findScalar(ir.SlotId, out.items, r.slotId()) != null) return;
+    try out.append(gpa, r.slotId());
 }
 
 const testing = std.testing;
@@ -279,4 +309,28 @@ test "a row numbers arguments before their users and a region's nodes before its
     }
     try testing.expectEqual([3]u32{ 0, 1, 2 }, orders[0]);
     try testing.expectEqual(orders[0], orders[1]);
+}
+
+test "slot order is the order in which the root first reads each slot" {
+    var store = ir.Store.init(testing.allocator);
+    defer store.deinit();
+    var types = types_mod.Types.init(testing.allocator);
+    defer types.deinit();
+    var b = builder_mod.Builder.init(testing.allocator, &store, &types);
+    defer b.deinit();
+    const i64_ty = try types.intTy(.i64);
+    // Slot 1 is made first and read second.
+    const late = try b.input(i64_ty, 1);
+    const row = try b.beginRow(&.{i64_ty}, i64_ty);
+    const early = try b.input(i64_ty, 0);
+    const first = try b.call(.i64, .plus_wrap, &.{ Ref.rowParam(0), early });
+    const second = try b.call(.i64, .times_wrap, &.{ first, late });
+    try b.endRow(.{ .value = &.{second} });
+    var returns = try live_mod.Returns.init(testing.allocator, &store);
+    defer returns.deinit(testing.allocator);
+    var numbering = try ofRow(testing.allocator, &store, &returns, row);
+    defer numbering.deinit(testing.allocator);
+    const order = try slotOrder(testing.allocator, &store, row, &numbering);
+    defer testing.allocator.free(order);
+    try testing.expectEqualSlices(ir.SlotId, &.{ early.slotId(), late.slotId() }, order);
 }

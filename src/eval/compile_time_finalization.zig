@@ -6500,12 +6500,18 @@ fn reportRefusal(
         _ = try store.appendProblem(.{ .translation_refused = .{
             .message = message_idx,
             .region = root_region,
-            .path = try store.putExtraString(""),
+            .path = try store.putRefusalCalls(&.{}),
             .unplaced = true,
         } });
         return;
     };
     if (chains.len == 0) finalizationInvariant("a reified node has no source");
+    const named = found.table.intrinsicsOf(found.site, refusal.row, refusal.node) orelse
+        finalizationInvariant("a reified node with sources has no intrinsics entry");
+    const names = try store.gpa.alloc(check.problem.ExtraStringIdx, named.len);
+    defer store.gpa.free(names);
+    for (names, named) |*name, span| name.* = try store.putExtraString(found.table.intrinsicText(span));
+    const intrinsics = try store.putExtraStrings(names);
     for (chains) |chain| {
         const links = found.table.links[chain.start..][0..chain.len];
         const place = refusalPlace(module, imports, found, links[0]);
@@ -6513,7 +6519,7 @@ fn reportRefusal(
         // that reached it.
         var region = if (place.foreign) root_region else place.region;
         var placed = !place.foreign;
-        var path: std.ArrayList(u8) = .empty;
+        var path: std.ArrayList(check.problem.RefusalCall) = .empty;
         defer path.deinit(store.gpa);
         for (links[1..]) |link| {
             const call = refusalPlace(module, imports, found, link);
@@ -6521,21 +6527,25 @@ fn reportRefusal(
                 region = call.region;
                 placed = true;
             }
-            if (path.items.len != 0) try path.append(store.gpa, '\n');
-            if (call.foreign)
-                try path.print(store.gpa, "{s} (in {s}, line {d}, column {d})", .{ call.text, call.module_name, call.line, call.column })
-            else
-                try path.print(store.gpa, "{s} (line {d}, column {d})", .{ call.text, call.line, call.column });
+            try path.append(store.gpa, .{
+                .text = try store.putExtraString(call.text),
+                .place = if (call.foreign) .{ .foreign = .{
+                    .path = try store.putExtraString(call.path),
+                    .line = call.line,
+                    .column = call.column,
+                } } else .{ .local = call.region },
+            });
         }
         _ = try store.appendProblem(.{ .translation_refused = .{
             .message = message_idx,
             .region = region,
             .origin = if (place.foreign) .{
-                .module_name = try store.putExtraString(place.module_name),
+                .path = try store.putExtraString(place.path),
                 .line = place.line,
                 .column = place.column,
             } else null,
-            .path = try store.putExtraString(path.items),
+            .path = try store.putRefusalCalls(path.items),
+            .intrinsics = intrinsics,
         } });
     }
 }
@@ -6560,7 +6570,9 @@ fn refusalSite(
 const RefusalPlace = struct {
     region: base.Region,
     foreign: bool,
-    module_name: []const u8,
+    /// The path of the file that holds the source
+    /// (`ModuleEnv.diagnosticSourceName`).
+    path: []const u8,
     text: []const u8,
     line: u32,
     column: u32,
@@ -6580,18 +6592,11 @@ fn refusalPlace(
     const env = if (local) module.moduleEnvConst() else for (imports) |view| {
         if (std.meta.eql(view.key, key)) break view.module_env;
     } else finalizationInvariant("a reification source names a module that finalization does not see");
-    const info = env.calcAuthoredRegionInfo(region);
-    const root_env = module.moduleEnvConst();
-    // The bare name, unless it is the root module's own bare name. The name is
-    // resolved in the root's interner before the identities are compared.
-    const bare_name_collides = if (root_env.common.idents.lookup(base.Ident.for_text(env.module_name))) |display_ident|
-        display_ident.eql(root_env.display_module_name_idx)
-    else
-        false;
+    const info = env.calcRegionInfo(region);
     return .{
         .region = region,
         .foreign = !local,
-        .module_name = if (!local and bare_name_collides) env.qualifiedModuleName() else env.module_name,
+        .path = env.diagnosticSourceName(),
         .text = env.getSource(region),
         .line = info.start_line_idx + 1,
         .column = info.start_col_idx + 1,
@@ -7039,7 +7044,7 @@ fn failedRootPayload(
     if (root.guarded) return .runtime;
     return switch (root.kind) {
         .expect => .expect,
-        .hoisted_validation => .discarded,
+        .hoisted_validation, .interpolation_conversion => .discarded,
         .constant,
         .hoisted_constant,
         .callable_binding,
@@ -7240,7 +7245,7 @@ fn compileTimeRootForRequest(
     }
     const root = module.compile_time_roots.roots[raw];
     const kind_matches = switch (request.kind) {
-        .compile_time_constant => root.kind == .constant or root.kind == .hoisted_constant or root.kind == .hoisted_validation or root.kind == .numeral_conversion or root.kind == .quote_conversion or root.kind == .literal_argument,
+        .compile_time_constant => root.kind == .constant or root.kind == .hoisted_constant or root.kind == .hoisted_validation or root.kind == .numeral_conversion or root.kind == .quote_conversion or root.kind == .literal_argument or root.kind == .interpolation_conversion,
         .compile_time_callable => root.kind == .callable_binding,
         .repl_expr => root.kind == .repl_expr,
         .runtime_entrypoint,
@@ -7267,7 +7272,7 @@ fn storeRootValue(
     compile_time_root: checked.CompileTimeRoot,
     value: @import("value.zig").Value,
 ) ConstStoreWriter.Error!checked.CompileTimeRootPayload {
-    if (compile_time_root.kind == .hoisted_validation) return .discarded;
+    if (compile_time_root.kind == .hoisted_validation or compile_time_root.kind == .interpolation_conversion) return .discarded;
     if (compile_time_root.literal_argument) |argument| if (argument.validate_only) return .discarded;
     return writer.storeRoot(root, value);
 }
@@ -7296,6 +7301,7 @@ fn completeRoot(
         .expect,
         .numeral_conversion,
         .quote_conversion,
+        .interpolation_conversion,
         .repl_expr,
         .literal_argument,
         => null,
@@ -7353,6 +7359,7 @@ pub fn finishConstRoot(
         .expect,
         .numeral_conversion,
         .quote_conversion,
+        .interpolation_conversion,
         .repl_expr,
         .literal_argument,
         => unreachable, // finishConstRoot returned above for every kind other than constant and hoisted_constant

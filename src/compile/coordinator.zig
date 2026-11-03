@@ -2144,12 +2144,6 @@ const BoxyObjects = struct {
     }
 };
 
-/// A module whose file the compiler wrote the first lines of, and how many.
-pub const PrependedSource = struct {
-    path: []const u8,
-    line_count: u32,
-};
-
 /// Coordinator manages all compilation state and coordinates workers
 pub const Coordinator = struct {
     gpa: Allocator,
@@ -2306,11 +2300,6 @@ pub const Coordinator = struct {
     /// checking, so platform existence comes from explicit registration data
     /// rather than probing names or canonicalization progress.
     platform_root_package_name: ?[]const u8 = null,
-    /// The module compiled from a source the compiler prepended lines to, and
-    /// how many. `roc file.roc` writes a headerless file out with app wiring on
-    /// top, and anything that hands one of that module's lines to its author
-    /// counts from the file the author wrote instead. Borrowed from the caller.
-    prepended_source: ?PrependedSource = null,
 
     /// Timing accumulators
     total_parse_ns: u64,
@@ -2569,19 +2558,6 @@ pub const Coordinator = struct {
 
     pub fn setReleaseCheckedSolverTypes(self: *Coordinator, enabled: bool) void {
         self.release_checked_solver_types = enabled;
-    }
-
-    /// Declare that one module's file carries compiler-written lines on top.
-    /// `path` is borrowed and must outlive the coordinator.
-    pub fn setPrependedSource(self: *Coordinator, path: []const u8, line_count: u32) void {
-        self.prepended_source = .{ .path = path, .line_count = line_count };
-    }
-
-    fn applyPrependedSource(self: *const Coordinator, env: *ModuleEnv, path: []const u8) void {
-        env.common.prepended_line_count = if (self.prepended_source) |prepended|
-            if (std.mem.eql(u8, prepended.path, path)) prepended.line_count else 0
-        else
-            0;
     }
 
     /// Record which registered package is the app's platform. App-root type
@@ -5478,6 +5454,7 @@ pub const Coordinator = struct {
         // package-qualified name comes from the module being installed.
         cached_env.qualified_module_name = mod.qualified_name;
         cached_env.package_name = mod.package_name;
+        cached_env.source_path = mod.path;
 
         const artifact_serialized: *const check.CheckedArtifact.CheckedModuleArtifact.Serialized = @ptrCast(@alignCast(artifact_buffer.ptr));
         // L-10: bounds-check every relocatable marker against the body before any
@@ -6183,20 +6160,26 @@ pub const Coordinator = struct {
             // any directory segments the logical module name carries.
             env.qualified_module_name = mod.qualified_name;
             env.package_name = mod.package_name;
+            env.source_path = mod.path;
 
             if (can.BuiltinLowLevel.isBuiltinModule(env)) {
                 try can.BuiltinLowLevel.apply(env);
-            } else if (self.enable_hosted_transform) {
+            } else {
                 // Only the platform package provides hosted functions, so only
                 // its modules' annotation-only declarations become hosted
                 // lambdas. Regular package/module dependencies may legitimately
                 // contain annotation-only (unimplemented) declarations; turning
                 // those into hosted lambdas would incorrectly make the
-                // effectful-function-name check flag them as effects.
+                // effectful-function-name check flag them as effects. Those
+                // declarations are intrinsics, whatever the hosted transform says.
                 const is_platform_pkg = self.platform_root_package_name != null and
                     std.mem.eql(u8, package_name, self.platform_root_package_name.?);
                 if (is_platform_pkg) {
-                    try can.HostedCompiler.replaceAnnoOnlyWithHosted(env);
+                    if (self.enable_hosted_transform) {
+                        try can.HostedCompiler.replaceAnnoOnlyWithHosted(env);
+                    }
+                } else {
+                    can.HostedCompiler.markAnnoOnlyAsIntrinsic(env);
                 }
             }
         }
@@ -7405,8 +7388,6 @@ pub const Coordinator = struct {
             module_alloc.destroy(env);
         };
         std.debug.assert(env.module_role == task.module_role);
-        // The cache key names the source, not how much of it the compiler wrote.
-        self.applyPrependedSource(env, task.path);
 
         const worker_alloc = task_allocs.result;
 
@@ -7589,7 +7570,6 @@ pub const Coordinator = struct {
         const parse_ast = parsed.ast;
         errdefer destroyModuleEnvAndSource(env);
         errdefer parse_ast.deinit();
-        self.applyPrependedSource(env, task.path);
 
         if (self.cache_manager) |manager| {
             try @import("source_inventory.zig").publishAst(task_allocs.scratch, manager, parse_ast);
@@ -11109,6 +11089,7 @@ fn hashPatternExtractionRegionsForView(
             .numeral_conversion,
             .quote_conversion,
             .literal_argument,
+            .interpolation_conversion,
             .repl_expr,
             => false,
         };
@@ -11169,6 +11150,7 @@ fn hashPatternExtractionRegionsForView(
             .numeral_conversion,
             .quote_conversion,
             .literal_argument,
+            .interpolation_conversion,
             .repl_expr,
             => unreachable, // is_selected_root skipped every root of these kinds
         }

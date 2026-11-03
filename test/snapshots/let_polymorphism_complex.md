@@ -852,21 +852,21 @@ main = |_| {
 									(p-assign (ident "val"))))))))))
 	(d-let
 		(p-assign (ident "container1"))
-		(e-call (constraint-fn-var 944)
+		(e-call (constraint-fn-var 1025)
 			(e-lookup-local
 				(p-assign (ident "make_container")))
 			(e-lookup-local
 				(p-assign (ident "num")))))
 	(d-let
 		(p-assign (ident "container2"))
-		(e-call (constraint-fn-var 951)
+		(e-call (constraint-fn-var 1032)
 			(e-lookup-local
 				(p-assign (ident "make_container")))
 			(e-lookup-local
 				(p-assign (ident "str")))))
 	(d-let
 		(p-assign (ident "container3"))
-		(e-call (constraint-fn-var 958)
+		(e-call (constraint-fn-var 1039)
 			(e-lookup-local
 				(p-assign (ident "make_container")))
 			(e-lookup-local
@@ -895,13 +895,13 @@ main = |_| {
 												(elems
 													(e-lookup-local
 														(p-assign (ident "num")))
-													(e-dispatch-call (method "times") (constraint-fn-var 970)
+													(e-dispatch-call (method "times") (constraint-fn-var 1051)
 														(receiver
 															(e-lookup-local
 																(p-assign (ident "num"))))
 														(args
 															(e-num (value "2"))))
-													(e-dispatch-call (method "times") (constraint-fn-var 979)
+													(e-dispatch-call (method "times") (constraint-fn-var 1060)
 														(receiver
 															(e-lookup-local
 																(p-assign (ident "num"))))
@@ -945,7 +945,7 @@ main = |_| {
 											(e-literal (string "more"))))))))))))
 	(d-let
 		(p-assign (ident "compute1"))
-		(e-dispatch-call (method "plus") (constraint-fn-var 1071)
+		(e-dispatch-call (method "plus") (constraint-fn-var 1152)
 			(receiver
 				(e-lookup-local
 					(p-assign (ident "num"))))
@@ -953,7 +953,7 @@ main = |_| {
 				(e-num (value "10")))))
 	(d-let
 		(p-assign (ident "compute2"))
-		(e-dispatch-call (method "times") (constraint-fn-var 1080)
+		(e-dispatch-call (method "times") (constraint-fn-var 1161)
 			(receiver
 				(e-lookup-local
 					(p-assign (ident "num"))))
@@ -979,13 +979,13 @@ main = |_| {
 						(elems
 							(e-lookup-local
 								(p-assign (ident "num")))
-							(e-dispatch-call (method "plus") (constraint-fn-var 1090)
+							(e-dispatch-call (method "plus") (constraint-fn-var 1171)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "num"))))
 								(args
 									(e-num (value "1"))))
-							(e-dispatch-call (method "plus") (constraint-fn-var 1099)
+							(e-dispatch-call (method "plus") (constraint-fn-var 1180)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "num"))))
@@ -1045,14 +1045,14 @@ main = |_| {
 					(e-record
 						(fields
 							(field (name "from_num")
-								(e-dispatch-call (method "times") (constraint-fn-var 1126)
+								(e-dispatch-call (method "times") (constraint-fn-var 1207)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "num"))))
 									(args
 										(e-num (value "100")))))
 							(field (name "from_frac")
-								(e-dispatch-call (method "times") (constraint-fn-var 1136)
+								(e-dispatch-call (method "times") (constraint-fn-var 1217)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "frac"))))
@@ -1073,7 +1073,7 @@ main = |_| {
 			(args
 				(p-underscore))
 			(e-block
-				(e-dispatch-call (method "plus") (constraint-fn-var 1154)
+				(e-dispatch-call (method "plus") (constraint-fn-var 1235)
 					(receiver
 						(e-field-access
 							(receiver

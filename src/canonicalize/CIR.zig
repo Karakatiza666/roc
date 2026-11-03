@@ -103,7 +103,19 @@ pub const BuiltinIndices = struct {
     code_row_type: Statement.Idx,
     code_graph_type: Statement.Idx,
     code_tree_type: Statement.Idx,
+    code_iteration_type: Statement.Idx,
     code_inlined_type: Statement.Idx,
+    code_outlined_type: Statement.Idx,
+    code_lawful_type: Statement.Idx,
+    code_binds_type: Statement.Idx,
+    code_value_type: Statement.Idx,
+    code_bound_type: Statement.Idx,
+    code_digest_type: Statement.Idx,
+    code_prim_id_type: Statement.Idx,
+    code_type_id_type: Statement.Idx,
+    code_evidence_type: Statement.Idx,
+    code_target_type: Statement.Idx,
+    code_proxy_type: Statement.Idx,
 
     // Ident indices - simple unqualified names (e.g., "Bool", "U8")
     bool_ident: Ident.Idx,
@@ -174,7 +186,19 @@ pub const BuiltinIndices = struct {
     code_row_ident: Ident.Idx,
     code_graph_ident: Ident.Idx,
     code_tree_ident: Ident.Idx,
+    code_iteration_ident: Ident.Idx,
     code_inlined_ident: Ident.Idx,
+    code_outlined_ident: Ident.Idx,
+    code_lawful_ident: Ident.Idx,
+    code_binds_ident: Ident.Idx,
+    code_value_ident: Ident.Idx,
+    code_bound_ident: Ident.Idx,
+    code_digest_ident: Ident.Idx,
+    code_prim_id_ident: Ident.Idx,
+    code_type_id_ident: Ident.Idx,
+    code_evidence_ident: Ident.Idx,
+    code_target_ident: Ident.Idx,
+    code_proxy_ident: Ident.Idx,
     // Tag idents for Try type
     ok_ident: Ident.Idx,
     err_ident: Ident.Idx,
@@ -338,7 +362,19 @@ pub const builtin_type_specs = [_]BuiltinTypeSpec{
     .{ .display_name = "Row", .qualified_name = "Builtin.Code.Row", .type_field = "code_row_type", .ident_field = "code_row_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Row" } }, .auto_import = false },
     .{ .display_name = "Graph", .qualified_name = "Builtin.Code.Graph", .type_field = "code_graph_type", .ident_field = "code_graph_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Graph" } }, .auto_import = false },
     .{ .display_name = "Tree", .qualified_name = "Builtin.Code.Tree", .type_field = "code_tree_type", .ident_field = "code_tree_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Tree" } }, .auto_import = false },
+    .{ .display_name = "Iteration", .qualified_name = "Builtin.Code.Iteration", .type_field = "code_iteration_type", .ident_field = "code_iteration_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Iteration" } }, .auto_import = false },
     .{ .display_name = "Inlined", .qualified_name = "Builtin.Code.Inlined", .type_field = "code_inlined_type", .ident_field = "code_inlined_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Inlined" } }, .auto_import = false },
+    .{ .display_name = "Outlined", .qualified_name = "Builtin.Code.Outlined", .type_field = "code_outlined_type", .ident_field = "code_outlined_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Outlined" } }, .auto_import = false },
+    .{ .display_name = "Lawful", .qualified_name = "Builtin.Code.Lawful", .type_field = "code_lawful_type", .ident_field = "code_lawful_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Lawful" } }, .auto_import = false },
+    .{ .display_name = "Binds", .qualified_name = "Builtin.Code.Binds", .type_field = "code_binds_type", .ident_field = "code_binds_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Binds" } }, .auto_import = false },
+    .{ .display_name = "Value", .qualified_name = "Builtin.Code.Value", .type_field = "code_value_type", .ident_field = "code_value_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Value" } }, .auto_import = false },
+    .{ .display_name = "Bound", .qualified_name = "Builtin.Code.Bound", .type_field = "code_bound_type", .ident_field = "code_bound_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Bound" } }, .auto_import = false },
+    .{ .display_name = "Digest", .qualified_name = "Builtin.Code.Digest", .type_field = "code_digest_type", .ident_field = "code_digest_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Digest" } }, .auto_import = false },
+    .{ .display_name = "PrimId", .qualified_name = "Builtin.Code.PrimId", .type_field = "code_prim_id_type", .ident_field = "code_prim_id_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "PrimId" } }, .auto_import = false },
+    .{ .display_name = "TypeId", .qualified_name = "Builtin.Code.TypeId", .type_field = "code_type_id_type", .ident_field = "code_type_id_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "TypeId" } }, .auto_import = false },
+    .{ .display_name = "Evidence", .qualified_name = "Builtin.Code.Evidence", .type_field = "code_evidence_type", .ident_field = "code_evidence_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Evidence" } }, .auto_import = false },
+    .{ .display_name = "Target", .qualified_name = "Builtin.Code.Target", .type_field = "code_target_type", .ident_field = "code_target_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Target" } }, .auto_import = false },
+    .{ .display_name = "Proxy", .qualified_name = "Builtin.Code.Proxy", .type_field = "code_proxy_type", .ident_field = "code_proxy_ident", .lookup = .{ .nested = .{ .parent = "Code", .name = "Proxy" } }, .auto_import = false },
 };
 
 /// The registry entry for the builtin type whose `BuiltinIndices` statement
@@ -406,7 +442,7 @@ pub const BUILTIN_TYPE_REGISTRY_HASH: u64 = blk: {
 
 /// Hash of the BuiltinIndices field layout used to reject stale generated index values.
 pub const BUILTIN_INDICES_LAYOUT_HASH: u64 = blk: {
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(20_000);
     var hash = hashBytes(hash_offset, "roc-builtin-indices-layout-v1");
     hash = hashInt(hash, @sizeOf(BuiltinIndices));
     hash = hashInt(hash, @alignOf(BuiltinIndices));

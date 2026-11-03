@@ -3091,11 +3091,14 @@ variable names, and comments. They may appear only in this ban. Say the
 specific operation instead, such as conversion, field read, tag payload read,
 capture slot, or wrapper function.
 
-The terms `readback`, `reification`, `value graph`,
-`compile-time value store`, and `representation repair` are also banned in new
-post-check docs and code. Compile-time evaluation stores results in
-`ConstStore`; later compilations restore cached consts from `ConstStore`.
-There is no separate phase or store under the const-related names. If two
+The terms `readback`, `value graph`, `compile-time value store`, and
+`representation repair` are also banned in new post-check docs and code, and so
+is `reification` for compile-time values (rebuilding a value from the result of
+evaluation). Code reification is a different feature, which describes a
+function for a translator and keeps its name; see "Code Reification".
+Compile-time evaluation stores results in `ConstStore`; later compilations
+restore cached consts from `ConstStore`. There is no separate phase or store
+under the const-related names. If two
 representations unexpectedly differ for the same value at the same boundary,
 that is an invariant violation; fix the producer instead of adding a later
 conversion.
@@ -3307,6 +3310,16 @@ an auto-imported type, redeclares an existing type, or repeats the same external
 type must live in one place. Callers may choose which source operation they are
 performing, but they must not duplicate the type-binding collision matrix.
 
+A module qualifier (`M` in `M.x`, `M.T`, `M.T.Tag`, or a hosted entry `M.f!`)
+has one rule, stated once in `resolveModuleQualifier`
+(src/canonicalize/Can.zig): a module the source imports under the name wins
+over the builtin type of the same name, and the builtin type is the qualifier
+only where no import binds the name. An import whose name is a builtin type's
+replaces the builtin binding and reports `builtin_type_shadowed_warning`, not a
+redeclaration. A type binding denotes a builtin type only when the compiler
+installed it (`builtinTypeOfBinding`), never because a module has a builtin
+type's name.
+
 Local type bindings record their exact declaration kind when introduced,
 including forward placeholders. Completing a placeholder fills its body without
 changing that kind. Scope aliases retain the same statement identity and need
@@ -3393,19 +3406,40 @@ that could reach one. The check reads only the declaration's own annotation
 type: a hosted declaration has no dependencies, so it is checked before any
 definition that refers to it, and nothing about it needs recording elsewhere.
 
-An annotation-only declaration that no implementation supersedes names no value
-at all, whatever its annotation says, and `e_anno_only` is the body-free state
-that records this. Two rewrites give such an annotation a body, and only these
-two: a platform package's hosted rewrite, which produces `e_hosted_lambda`
-during canonicalization, and Builtin.roc's compiler-owned intrinsic annotations,
-whose bodies post-check lowering emits at each checked call site. Every other
-`e_anno_only` declaration keeps its declared type, so surrounding code still
-checks, but reading it is an error: checking reports the missing value at the
-reference and marks that expression erroneous. This holds for a plain lookup,
-an imported lookup, a qualified associated read, and a method dispatch alike, so
-no reference to a valueless declaration survives checking. Post-check stages
-therefore never see one, and their rule that a procedure use carries a
-function-shaped request node needs no exception for it.
+An annotation-only declaration that no implementation supersedes is
+`e_anno_only`, the body-free state. It has one of three kinds
+(`AnnotationOnlyKind`):
+
+- Two rewrites give such an annotation a body, and only these two: a platform
+  package's hosted rewrite, which produces `e_hosted_lambda` during
+  canonicalization, and Builtin.roc's compiler-owned intrinsic annotations,
+  whose bodies post-check lowering emits at each checked call site.
+- In a module that is neither the builtin module nor a module of the platform
+  package, the declaration is an intrinsic (`.intrinsic`). An intrinsic is a
+  value of its declared type, so checking reports nothing at its declaration
+  or at a reference to it. Only reified code can use it: a description names
+  it as a `Prim` (see "Code Reification"). A reference to one in code that
+  runs is judged after checking, by the roots rule (see "Reify-Only
+  Definitions"), which reports and poisons it in a root. The coordinator
+  marks the intrinsics of each module it canonicalizes outside the platform
+  package. A tool that canonicalizes one module without its package (the
+  snapshot tool, the playground, the checker's tests) marks them from the
+  module's header (`HostedCompiler.markIntrinsicsByModuleHeader`): a
+  `platform` or `hosted` module keeps its declarations ordinary.
+- Every other `e_anno_only` declaration (`.ordinary`, for example in a
+  platform module that the hosted rewrite did not process, and
+  `.unsupported_generated_method`) names no value at all, whatever its
+  annotation says. It keeps its declared type, so surrounding code still
+  checks, but reading it is an error: checking reports the missing value at
+  the reference and marks that expression erroneous. This holds for a plain
+  lookup, an imported lookup, a qualified associated read, and a method
+  dispatch alike, so no reference to a valueless declaration survives
+  checking.
+
+Post-check stages therefore never see a reference to a valueless declaration,
+and they never reach an intrinsic (invariant 1, see "Reify-Only
+Definitions"). Their rule that a procedure use carries a function-shaped
+request node needs no exception for either.
 
 The `Scope.type_bindings` table has one ordinary mutation API for type names.
 It accepts the full scope slice, the target scope index, the introduced name,
@@ -3574,6 +3608,14 @@ return variables, deferred dispatch constraints, generalization pools, checked
 type keys, and every other consumer of solved variable identity observe that
 checked representative exactly as they did before structural balancing. They
 must never observe or infer meaning from the storage root.
+
+An expression whose type is the type of one of its operands (a lookup of a
+binding, a block's final value, a record update's base) relates its own
+variable as the first operand, so the operand's class keeps its checked
+representative and the expression joins it as an occurrence. A later mismatch
+at the expression, such as against an annotation, then poisons only that
+occurrence (`Store.poisonOnMismatch`) and never the binding the operand reads,
+which other definitions may already have used.
 
 The storage root is selected by a separate union-find rank. This structural
 rank is not `Descriptor.rank`: descriptor rank is the Hindley-Milner scope level
@@ -3808,6 +3850,80 @@ checked data. Nominal identities, including their type arguments and backing
 authority, remain distinct. Root requests and ordinary calls therefore agree
 on runtime type identity without alias-aware codec lookup or extra graph
 construction for already closed roots.
+
+### Record Extension Well-Formedness
+
+This is a typing rule of the language. It was added on purpose, and it
+changes which programs check. Earlier compilers did not state it: they let
+any type reach a record extension slot, and later stages crashed on a
+record extended by a non-record (`Ref(Str)` with `Ref(r) := { ..r }`).
+
+A record extension slot `..r` accepts these types, and no others:
+
+| Type in the slot | Result |
+|---|---|
+| A record, or the empty record | accepted |
+| A row variable (flex, or a rigid that stands in a row slot) | accepted |
+| A transparent alias whose backing is a record | accepted, through the alias |
+| A `:=` nominal whose backing is a record (after its own extension) | accepted, transparent: its fields join the record |
+| A `::` opaque nominal | refused in every module, its own module too |
+| A builtin opaque type (`Str`, `Dict`, `List`) | refused |
+| Any other type (number, tag union, tuple, function) | refused |
+| A flex variable that carries a literal constraint (`from_quote`, `from_numeral`) | refused |
+
+How the checker applies it:
+
+| Where | What |
+|---|---|
+| Annotation generation (`stepRecordAnnoGen`, applications of a local, external or self-recursive type) | the argument of a formal that stands in an extension slot is judged by `requireRecordRow` |
+| Type declarations | a declaration's own formals are judged after all declarations of the module are generated (`judgePendingRecordRows`, called by `finalizeTypeDeclarationValidity`); a declaration that forwards a formal to another declaration's row slot marks it too, to a fixed point. A refused declaration is invalid |
+| Unification | a variable in a row slot carries `DescriptorFlags.record_row`, and `unifyVars` refuses to merge it with a type that `recordRowFit` (`src/check/unify.zig`) classifies as not a record. The flag rides the union-find class (`Store.union_` ORs it) and import copies (`copy_import.zig`) |
+| Checked module data | the checked module builder copies the flag to `CheckedTypeVariable.record_row`, so later stages read it from the checked type |
+| Report | an annotation is reported as "Not A Record Extension". A unification refusal is a type mismatch with a hint that names the row slot |
+
+The flag is set when annotation generation creates the slot. It is a
+property of the variable from its start, like its rank, so the rule is not
+a probe-then-mutate rewrite and it adds no `RedirectRule` member (see
+"Solver-Mutating Rewrites"). The refusal changes no solved type: it only
+reports a mismatch.
+
+A record update of an opaque value in its own module (`{ ..p, x: 1 }` with
+`P :: { x : I64 }`) is not a type in an extension slot and is unchanged.
+
+Monotype reads a record extended by a record-backed nominal through the
+nominal's backing (`rowExtensionChainResolved` in
+`src/postcheck/monotype/solve.zig` follows an inspectable, non-recursive
+backing), so the nominal's fields are fields of the record. The Boxy
+pipeline (`--specialize=no`) reads it the same way. Every Boxy walk over a
+record row's extension chain goes on in the nominal's planned backing
+(`recordExtensionBacking` in `src/postcheck/boxy/plan.zig:1618`, the same
+backing `planNominalRep` plans for the nominal):
+
+| Walk | What it does at a nominal in the chain |
+|---|---|
+| `planRecordRep` (`src/postcheck/boxy/plan.zig:10753`) | collects the backing's fields, so `{ ..Owner }` is a closed record |
+| `hostRecordExtensionBacking` (`src/postcheck/boxy/plan.zig:9499`) | for a host ABI row, binds the nominal's formals in a fresh context, as `beginHostNominal` does |
+| `planNominalDeclaredFields` (`src/postcheck/boxy/plan.zig:11105`) | gives each field an extension brings a declared field too, at its alphabetical rank, so the declared fields cover every payload field. A row that ends in a quantified row variable (`Labeled(r)` in the body of a function generic over `r`) is open: the nominal has no declared field order, and its record field order is structural |
+| `storedRecordTypeMatchesChecked`, `openRecordRowVariable` | read the backing's fields and row variable |
+
+A field can come from the nominal's own module, so a record whose field
+labels belong to more than one module sorts its fields by label text
+(`src/postcheck/boxy/plan.zig:11283`). A transparent nominal without a
+declared field order, and every alias, has the runtime layout of its
+backing (`immediateRuntimeStep` in `src/postcheck/boxy/layouts.zig`). So a
+wrapper of an open row is a dynamic box, as the row is. Any other nominal
+in a record extension slot is a compiler invariant. The shapes are pinned
+by `test/cli/RecordExtension/shapes.roc` in both lowerings.
+
+A variable that stands in a row slot through an application (`r` in
+`name_of : Ref(r) -> Str`) is a row extension of the template that
+quantifies it. Its demand is `full` (see "Specialization By Demand"), so a
+shaped request keeps its record type. A layout representative of a record
+is a tuple, and a tuple in a row slot is a compiler invariant. Calls of such
+a function are pinned by `test/cli/RecordExtension/generic.roc` in both
+lowerings. Boxy does not yet lower a record that is only a row variable
+(`{ ..r }`, also without a nominal), so
+`test/cli/RecordExtension/generic_bare.roc` runs in Monotype only.
 
 ### Where Method Annotations
 
@@ -5629,9 +5745,29 @@ function arguments, runtime pattern binders, mutable locals, runtime control
 decisions, effectful calls, host calls, platform requirements whose values are
 not available during checking finalization, and any static dispatch whose
 checked plan does not identify a pure compile-time-evaluable operation.
+A selected root is evaluated once for every instance of the functions around
+it, so after solving no expression in it may have a type that mentions a rigid
+type variable (`hoistedRootTypeMentionsRigid` in `src/check/Check.zig`). A
+rigid variable stands for the type each instance fixes, and code reification
+lets a value read that type (`Code.ty_of`, `Code.type_id`, a `Code` site, or a
+function that reaches one; see "Code Reification"). Only an annotation names a
+rigid variable. A variable of an unannotated function reaches a root only
+through the root's own type, which must already be concrete.
 Low-level operations may participate only through explicit checked purity and
 totality metadata; they must never be allowed by whitelist, name, or backend
 knowledge.
+
+Code that only reified code can use is not a compile-time-evaluable
+dependency: an intrinsic has no Roc body. So a selected root is pruned when
+the code it evaluates references an intrinsic or a reify-only definition, or
+holds a dispatch that selected one. The code a root evaluates is its
+expression without the description-only bodies below it: a lambda at a
+`Code` place below the root is described, not evaluated, so a call that binds
+a site's inputs stays a root whatever its description names. A root inside a
+description-only body evaluates its whole expression. The reify-only pass
+records these expressions, in code that runs and in description-only bodies
+(`reify_only_reaching_exprs`), and `hoistedRootReachesReifyOnlyCode` reads
+them.
 
 Checking errors are dependency-local for hoistability. A malformed expression,
 unresolved static-dispatch call, type error, or other checker-owned diagnostic
@@ -6005,6 +6141,19 @@ so finalization evaluates each node once in append order without recursion or
 another CIR traversal. Eligibility for compile-time condition warnings remains
 independent of whether a condition is selected as an independent root or covered
 by an enclosing root.
+
+A condition that reads a code reification site draws no compile-time condition
+warning. A described function exists only while the compiler runs, so the
+result of a translator is known at compile time by design, and a `match` over
+it is how a program reads it. The author cannot act on the warning. The
+checker records this as explicit data: a hoist frame carries
+`reads_code_site`, set where a site is recorded and passed to every parent
+frame, and a binder whose right-hand side reads a site is kept in
+`code_site_bindings`, so a later lookup of that binder carries the flag. Only
+a binder named by a plain pattern is kept. Accepted: `match Stage.describe(f)`,
+a match over a top-level or local value bound to that call. Rejected: an `if`
+on a plain constant still warns. Both sides are pinned by
+test/cli/StagedTranslatorMatch.roc.
 
 Unguarded hoisted roots use the same compile-time constant rules as ordinary
 top-level constants. A failure produced while evaluating one is a checking-time
@@ -9680,6 +9829,13 @@ compares only the flags a copy carries (`DescriptorFlags.copied`), so a type
 whose classes record a defaulting decision or a rejection is identical to its
 own copy and shares it like any other.
 
+A contextual type (a call's parameter, which an argument is checked in) is
+never copied: the call relates the argument to it. A staged argument relates
+its function to the `f` of the parameter's `Code(f)`, and its node to the
+parameter, and takes no copy of the parameter either. A copy would hold a
+second instance of each flex `where` receiver in `f`, which nothing relates to
+the call and so nothing fixes.
+
 A row the reference itself WRITES as a type argument is decided the same way,
 by composition rather than by inheritance. A declaration's formal stands
 wherever the declaration's body puts it, so the argument substituted for it is
@@ -11973,6 +12129,203 @@ polymorphism without checker-local requirement state.
 Rejected—"weak top-level literal rejects second use at different type"—proves
 the representation does not make the weak receiver itself polymorphic.
 
+### The Runs Bit
+
+Each static-dispatch constraint has a `runs` bit. It is set when some code
+that runs at run time uses the relation. Compile-time evaluation counts as run
+time. The bit is metadata, like `provenance`: type keys,
+`GeneralizedAttachedConstraintKey`, constraint equivalence and unification do
+not read it, so it never changes typing. It is the input for finding the
+definitions that only reified code can use (intrinsics).
+
+A body is description-only when it is one of these:
+
+- the body of a lambda written at a `Code` place;
+- a function name written as a `Code` argument, or as the callee of a
+  template call;
+- the whole body of a template. The reifier walks a template body as code to
+  describe at each call (`reifyTemplateSite`), and refuses each expression
+  that it cannot describe, so nothing in the body is evaluated.
+
+The checker counts the description-only bodies that enclose the expression it
+checks (`description_only_depth`). It raises the count in `beginExprCheckFrame`
+and lowers it when the frame ends. A definition that is checked on demand
+starts at zero, and `SavedDefState` restores the count after it. The checker
+also records the expression at the start of each description-only subtree
+(`description_only_roots`).
+
+The bit follows these rules:
+
+- Creation. A constraint created while the count is zero runs. A derived
+  method's component requirement takes the bit of the comparison or hash it
+  serves. A `Code.Binds` capture encoder runs when its site is not inside
+  another description-only body, because the encoder runs when the site's
+  description is built.
+- Where clauses. A where-clause relation created for the annotation of a body
+  that this checker checks starts clear. Each body dispatch that matches the
+  clause ORs its bit into it, where `body_required` is set. Every other
+  annotation sets the bit: a predeclared scheme, and a declaration with no
+  Roc body (annotation-only, hosted or low-level).
+- Instantiation. A use ANDs each copied constraint's bit with its own bit
+  (`Instantiator.runs_mask`). A value use runs when the count is zero. A
+  dispatch target's instantiation uses the bit of the constraint it resolves.
+  An instantiation with no use (`.none`) keeps each bit. A boundary replay of a
+  predeclared use, and the later link of a use's deferred callables, use the
+  bit that the use recorded.
+- Merges. When one relation is dropped for an equal one, the kept relation ORs
+  the two bits. This applies to unification of fixed literal relations, the
+  generalized dedup of attached constraints and of scheme requirements, a
+  requirement that a scheme already holds, and the rigid where-clause match.
+- Copies across modules keep the bit. The checked module's type store holds
+  it, so the module cache keeps it too.
+
+These are declared over-approximations. Each one can only set a bit that
+could be clear, so a reader of the bit can only reject more code, never
+accept code that it must reject.
+
+- A use through a predeclared scheme copies the where-clauses before the body
+  sets their bits. The copy therefore takes the use's bit only.
+- A generated codec body is generated once for its nominal and shared by each
+  use of the codec, so the methods it calls run.
+- An inspect override runs, because run-time code can inspect a value of its
+  type.
+- A call of an imported template is claimed after its callee is checked, so
+  its callee is not a description-only body.
+
+`ROC_REIFY_ONLY` prints each top-level definition's generalized requirements
+with their bits after the module is checked (see "Developer Diagnostics").
+
+### Reify-Only Definitions
+
+An intrinsic is an annotated declaration with no body outside the builtin and
+platform modules (`AnnotationOnlyKind.intrinsic`). Only reified code can use
+it. A top-level definition is reify-only when code of it that runs at run
+time references an intrinsic or another reify-only definition. Compile-time
+evaluation counts as run time.
+
+The pass `src/check/reify_only.zig` finds these definitions once, after the
+module is checked and before the selected hoisted roots are pruned. It reads
+only data that checking produced:
+
+- The checked body of each top-level definition and of each top-level
+  `expect`. The walk of the code that runs skips each subtree in
+  `description_only_roots`. A second walk of those subtrees finds only the
+  references that the hoisting rule reads (see "Compile-Time Constants and
+  Hoisted Roots").
+- The roots (see "The Roots Rule" below).
+- The lookups in a body: of a local top-level definition, of an imported
+  definition, and of a resolved associated item, and a static call of a local
+  method. The argument of a `Code.prim` call is no use of the definition it
+  names (`NodeStore.isCodePrimArgument`), so it is no lookup here.
+- The dispatch edges. Each `DispatchTargetInstantiation` records its use site
+  (`site_expr`) and the `runs` bit of the constraint it resolves. The site is
+  the use that the constraint was copied for (`failure_expr`), else the
+  expression that created the constraint. An edge derived from another edge
+  has the site of that edge. Only an edge with a set bit counts, and the walk
+  gives it to the definition or `expect` whose body holds its site.
+
+A reference whose target is an intrinsic, or a reify-only definition of an
+imported module (read from that module's `reify_only_defs`), seeds the
+fixpoint. The fixpoint is breadth-first. Round 0 marks each definition with
+a reference to a seed. Round `n` marks each unmarked definition with a
+reference to a definition that a round before `n` marked. Each marked
+definition records its witness: its first such reference, with its kind
+(lookup, call or dispatch), its region, the target's module and definition,
+and the method name of a dispatch. Every witness points to an intrinsic or
+to an earlier round, so the chain of witnesses ends at an intrinsic and has
+no cycle. A mutually recursive group that reaches no intrinsic stays
+unmarked, because the fixpoint is the least one.
+
+A dispatch edge carries the final `runs` bit of the relation that dispatches
+at its site. The bit of a relation can change after its dispatch selected a
+target only through a fold: the unifier folds one literal relation into an
+equal one (`static_dispatch_relation_merges`), and the dropped relation then
+dispatches through the target of the relation it was folded into, with no
+`DispatchTargetInstantiation` of its own. Each fold records the dropped
+relation's bit (`dropped_runs`). So the pass gives each such dropped relation
+an edge of its own, at its literal (the node of its `LiteralDispatchPlan`),
+with its own bit and the target of the relation it reaches through its folds
+(`RelationFolds.selected`). A selected relation keeps the bit of its own site:
+a fold adds the bit of another site, which that site's own edge carries. No
+decision is taken at dispatch resolution, so no edge is judged from a bit that
+a later merge could set.
+
+`intrinsic_value_references` holds each lookup of an intrinsic and whether it
+runs. Debug builds also walk each description-only subtree and assert that no
+dispatch edge below its root has a set bit, and that each recorded lookup of
+an intrinsic runs exactly when the walk reaches it outside these subtrees.
+
+#### The Roots Rule
+
+A root is a definition whose code runs whatever references it:
+
+- a platform requirement that an app supplies (`platform_required_defs`),
+  an entry of the module's provides list (`provides_entries`), and a
+  zero-argument definition that the caller records as an evaluated root.
+  The checker reads these from the module header, the platform, and the
+  caller. It never finds a root by its name;
+- a top-level constant, which compile-time evaluation runs (a top-level
+  definition whose body is not a function);
+- a top-level `expect`.
+
+A root is never reify-only, so a reference to a root makes no definition
+reify-only. Each reference in a root that runs and whose target is an
+intrinsic or a reify-only definition is a violation. Checking reports
+`exists_only_in_reified_code` at it and marks it erroneous
+(`markErroneousValueExpr`), so poisoning replaces it with a runtime error:
+the reference lowers to a crash, and nothing behind it is lowered. The
+reported expression is the call of a callee and the use of a value; for a
+dispatch it is its site, or the call whose callee's requirement it resolves.
+The report prints the chain from the reference to the intrinsic, one line for
+each witness, then the intrinsic and its declaration. A frame in another
+module names that module's file (`SourcePlace`). An `expect` with a violation
+counts as a compiler-error test result, a dev run crashes only if it reaches
+the poisoned reference, and `roc build` writes the binary and exits 1, as for
+every other checking error.
+
+The decision reads only the final data of the pass, so it runs after the
+fixpoint, before `pruneSelectedHoistedRootsAfterSolving`. Two invariants
+follow, each a debug assertion:
+
+- Each run-time edge to an intrinsic belongs to a root, where it is a
+  violation, or to a definition that the fixpoint marked reify-only.
+- Invariant 1: Monotype lowering never reaches an intrinsic. A root's
+  references to one are poisoned, and no root reaches a reify-only
+  definition, so no lowering request names one. `UnimplementedDeclaration`
+  records whether the declaration is an intrinsic, and the `.unimplemented`
+  arms of Monotype (`lowerUnimplementedTemplateAtNode`, the constant use) and
+  of Boxy (`rootProcedureTemplateBody`) assert that it is not.
+
+Boxy needs one more rule. Monotype lowers only the code that a request
+reaches, but Boxy fills each dictionary that a call passes with one slot for
+each relation of the callee's scheme. A fragment such as
+`|q| Db.Q.filter(q, |x| x.t.now())` has the relation `now` in its scheme, and
+only the described lambda uses it, so its runs bit is clear. A call of the
+fragment at `Clock` selects `Clock.now`, an intrinsic, for that slot. Evidence
+output sets `CheckedEvidence.description_only_intrinsic` when the
+resolution is direct to an intrinsic and the callee's relation has a clear
+runs bit. Boxy then gives the slot the resolution
+`description_only_intrinsic`, which lowers to a crashing slot, as
+`unreachable_value` does, in place of a worker. No run-time code reads the
+slot. The resolution stays `direct`, because the reifier reads the target to
+describe the fragment. A slot of an ordinary method keeps its worker, whatever
+its runs bit.
+
+`ModuleEnv.reify_only_defs` stores the reify-only definitions that are not
+roots, in ascending order of definition id. Each entry holds its witness,
+its full chain (`reify_only_frames`: each frame's text, and its place as a
+path, a line and a column), and the qualified name of the intrinsic at the
+end. The checker builds the chain when it writes the module: it follows
+the local witnesses, and at an imported reify-only definition it appends the
+chain that the imported module exported. So an importer reports the full
+chain from explicit exported data, whichever modules it imports: an app that
+imports `Lib` and not `Text` still names `Text.is_email` and its place. The
+module cache keeps these lists, and the checking interface hashes the bit,
+the witness and the chain of each exported definition, and the line and
+column of each intrinsic, so an importer is checked again when a frame that
+it reports changes. The cached checking outcome keeps the frames of each
+report (`refusal_calls`). The reify-only `expect`s are not exported.
+
 ### Field Kinds (All-Dynamic Optional Fields)
 
 This section supersedes the earlier "Existential Presence (Sealed Optional
@@ -13095,6 +13448,24 @@ Other solved-graph mutations:
   structural edge, and dispatch decision. It also normalizes the private
   import-facing type mapping to producer slots before hashing it.
 
+- `introduceBoundCaptureEncoding` (src/check/Check.zig)—not a rewrite:
+  constraint generation for the typing rule "Bound Capture Encoding" (see
+  Code Reification). At a lambda whose written position is `Code.Binds(c,
+  fmt)`, it introduces the ordinary method requirements `fmt.default` and,
+  for each capture read (syntax), `t.encoder_for`, through the ordinary
+  requirement path before they are solved, with the origin `bound_capture`.
+  It reads no solved type, writes no redirect and restamps no plan; the only
+  probe is the existing `Code` position detection (`stagedCode`), which reads
+  the written alias. Its one discharge rule, the function exemption, is in
+  the constraint drain: an `encoder_for` of origin `bound_capture` whose
+  dispatcher resolves to a function type is satisfied
+  (`exemptFunctionBoundCapture`). It writes nothing to the solved graph and
+  stamps no plan; it drops the site's record of that read
+  (`ModuleEnv.removeBoundCaptureEncoding`), so the checked module builder plans no encoder
+  for it. Accepted side: `compared` in `test/cli/StagedBinds/main.roc` (a
+  captured function is described as code beside an encoded `Time`).
+  Rejected side: `holds` in `test/cli/StagedBinds/typing.roc` (a captured
+  record that holds a function still needs an encoder).
 - `checkConcreteBuiltinNumeral`—mechanism: Concrete Builtin Numeral
   Introduction (above). Uses the existing `unifyWith` descriptor-introduction
   mechanism for a proved concrete builtin conversion; does not mutate the
@@ -13139,6 +13510,13 @@ Other solved-graph mutations:
   for immediate rejection while the expression frame owns the result;
   deferred rejection follows the expression replacement described under Module
   Completion Boundary and never poisons either shared solved class.
+- `poisonUndescribableStagedCode` (`markErroneous` and
+  `erroneous_value_exprs`)—mechanism: diagnostic recovery after an
+  already-reported error. It probes only whether a description site's function
+  type holds an error, which an error-free program never does, and then retires
+  the definition holding the site the same way an erroneous value is retired,
+  so that compile-time evaluation does not instantiate an erroneous function.
+  No error-free program's typechecking or checked-module output changes.
 - `retireCallLikeExprWithErroneousOperands` / statement-owned iterator plan
   recovery (`markErroneous`, `markStaticDispatchFnRejected`, and the explicit
   `call_operand_type_error_exprs` table)—mechanism: Erroneous Call Operand Retirement
@@ -16861,7 +17239,9 @@ The demand of a variable is one of three values, the same scale
   mentions the variable (lambda sets are program-specific), an argument of a
   builtin whose representation follows its argument's structure (`FieldNames`,
   `FieldName`, `ParseTagUnionSpec`, `Iter`, `Stream`), a variable used as a row
-  extension, and a variable the scheme's root type does not mention.
+  extension (directly, or as the record-row argument of an alias or nominal
+  application, which `CheckedTypeVariable.record_row` records), and a variable
+  the scheme's root type does not mention.
 
 Checking computes the demand vector of every template once, when the checked
 module data is written (`TemplateDemandPass`), and stores it beside the
@@ -17815,6 +18195,16 @@ checking, and during requirement derivation for compiler-generated edges. The
 registry only ever answers exact lookups after the owner is known from checked
 type content or from a live cell's content; no stage asks "which owners could
 match this constraint?".
+
+A Code instance table (see "Code Reification") travels as evidence does. A
+specialization of a template from a closing use carries the use's table on
+the root frame of its evidence chain (`EdgeEvidence.instances`,
+`EvidenceChain.instanceTable`). The draft and sealed template requests and
+the queued specialization job keep it, and a forward use inside the template
+passes on the nested table its entry names (`instancesForUse`). An instance
+site restores the node of its entry in the table in force
+(`restoreCodeSiteAtNode`). A template with an inventory requested with no
+table is a compiler invariant.
 
 ### Iterator `for`
 
@@ -18967,6 +19357,14 @@ a tag test whose arms cover the occurrence type's committed variant set emits
 its last arm as the switch default (a single-variant union emits no dispatch at
 all); open matches keep the `comptime_exhaustiveness_failed` / `runtime_error`
 terminal.
+
+In debug builds the emitter checks that its statement count stays within a
+linear bound of the pattern node count (`LINT_MULT` and `LINT_BASE` in
+`src/postcheck/match_tree.zig`). The count leaves out statements of bodies and
+guards, and statements the host reports through `hostStmtCount`. `.boxy`
+reports the reads and binds it lowers (`scopedRead` and `bindPatternLocal` in
+`src/postcheck/boxy/lower.zig`), because each converts between representations
+and its size follows the type, not the pattern.
 
 Named record-rest binders are derived values, not durable pattern decisions.
 Monotype pattern lowering removes the rest binder from the record pattern,
@@ -21477,6 +21875,17 @@ so the join value carries one intact unit and a later dismantle in the join
 body starts a claim set of its own. Without a claimable stored unit the spent
 value stays dead past the join.
 
+Two reads of one place can be live on the same path: ARC releases a field
+that dies on one branch through a new read from the dismantle root, while an
+older read of the same place lives on past the join. The release spends some
+slots of the place in its container, so the older read cannot claim the whole
+place when the join quotients it. It claims the slots that the container still
+holds, and the spent slots become its own claims: the join value carries the
+place as a residual shell, which agrees with the shell that ARC writes on its
+reads after the join. This applies when the join value reads the place
+directly from its unit-holding container, or through views of it. In every
+other case the claim fails as before.
+
 #### Per-edge aggregate residuals
 
 Field ownership is not a property of a container local for its whole lifetime.
@@ -21637,12 +22046,12 @@ against the borrow typing rules:
   the name count; balance divergence across mode-identical entries is itself a
   finding—per-iteration accumulation),
   so certification of every procedure runs to completion
-- an intermediate aggregate field read needed to claim a selected field
+- an intermediate aggregate field or payload read needed to claim a selected field
   keeps its carrier local across inner-join frames as well as join summaries.
   Retaining only the anonymous value preserves a liveness proof but loses the
   exact ownership path when the enclosing loop is summarized again. Copying
   reachable frame values therefore also copies the carrier bindings of their
-  payload sources, including field reads defined inside an exited region.
+  payload sources, including field and payload reads defined inside an exited region.
 - no join discards a lifetime proof; a group-count threshold must never
   discard provenance and manufacture a borrowed entry with no owner. Valid
   incoming paths with different lenders join to a value that needs every one
@@ -23076,6 +23485,592 @@ Roots that finish before the slow threshold therefore pay only monitor setup and
 signaling overhead, not the reporting period. Roots that exceed the threshold
 are reported, then the worker waits interruptibly until the next per-root report
 deadline or finalization stop.
+
+## Code Reification
+
+A function that stands where the type says `Code(f)` becomes a description of
+itself, which a translator (ordinary Roc, run while the compiler runs) reads.
+The word "reification" here is this feature. It is not the banned
+compile-time-value term (see "Source Parsing Boundary"). A described function
+is an ordinary constant in `ConstStore` once it exists. The design and the
+rules are in `roc-reify-proposal.md`, `roc-reify-normal-form.md` and
+`roc-reify-normalization-plan.md`. The user page is `docs/langref/reifying.md`.
+
+| Stage | What it does with a description | Where |
+|---|---|---|
+| Checking | Types a function at a `Code` position as usual, records a `CodeReificationSite` and a `code_from_lambda` expression, and rejects a `Code` anywhere except a parameter of the annotation's outermost function or what that function returns (see the position rules below) | `src/check/Check.zig` (`stagedCode`, `checkStagedCodePositions`) |
+| Description | Walks each site's checked bodies, solved types and dispatch plans, builds the normal form with `src/reify`, and writes the `Code` value into the module's `ConstStore`. It walks a site once, or, for an instance site, once per closing use, in the module of the use (see the instance invariant below). A refusal is one `staged_code` problem (when the caller asks for compile-time problems), and its site becomes a `runtime_error` exactly like one checking poisoned | `src/check/code_reifier.zig`, `reifyStagedCode` |
+| Lowering | Restores the stored node as a constant, or, for an instance site, the node the instance table in force names. It walks no function, and a refused site has already become a checked error, so lowering has no refused case | `.code_from_lambda` in `src/postcheck/monotype/lower.zig`, `pushCodeConversion` in `src/postcheck/boxy/plan.zig` |
+| Evaluation | Runs a translator as any other Roc. `Code.refuse_at` lowers to a crash statement that carries a `Refusal`, and compile-time evaluation reports it at the source regions of the node | `src/lir/LIR.zig` (`Refusal`), `CodeProvenanceTable` in the checked module data |
+
+Invariants:
+
+- The walk is the only stage that reads a function body for a `Code`. It
+  consumes solved types and dispatch plans and never infers a missing one. A
+  construct with no normal form stops the walk with a named reason, and no
+  partial description exists.
+- A description is a specialization read without lowering, so the walk reads
+  types by Monotype's rules and checking commits nothing for it. A variable a
+  substitution fixes is read through it. A dispatch edge whose target
+  the checker selected (`derived_from_callable`) relates a monomorphic
+  target's type to the edge's callable, which fixes the callable's other
+  variables (`y` in `|x, y| x + y`). A variable still open after that seals
+  to its recorded `numeric_default_phase` by
+  `literal_defaulting.defaultTargetForPhase` (`x` in `|x| x * 2` is `Dec`). A
+  variable with no default (`same = |x| x`), or a dispatcher whose selected
+  target does not fit its callable (`x` in `|x| x * 2.U8`), is refused. A
+  variable that an enclosing template quantifies is never sealed: the site
+  is an instance site, described at each closing use. See
+  `relateSelectedTargets` and `defaultedVariable` in
+  `src/check/code_reifier.zig`. A record or tag row tail still open seals to
+  its recorded row default by `CheckedTypePayload.variableSealsToRowDefault`,
+  as Monotype seals it (`r` in `|r| r.id > 0` is `{ id : Dec }`), so checking
+  closes no row at a `Code` site. A tag row tail that carries no row default
+  seals to the empty union too, as `lowerCheckedTypeVariable` does, so a tag
+  union the checker left open has the variants the definition names
+  (`collectVariants`). A record or tag row tail that the call being walked
+  fixed is read in the caller's module and frame, and a field or variant that
+  a nearer link already named is dropped (`collectRecordFields`,
+  `collectVariants`). So a helper over `[Cat, ..t]` read at `[Cat, Dog]` keeps
+  `Dog`, and a helper over `{ city : Str, ..r }` read at `Owner` has every
+  field of `Owner`.
+- Each `FramedType` names the frame its variables are read in (`FrameId`,
+  `Walk.frames`). A call pushes one frame that holds what the call fixed, and
+  each binding of that frame names the caller's frame. So a chain of
+  annotated generic helpers over open rows reads each variable at the
+  caller that fixed it, however deep the chain is. `instantiationKey` hashes
+  a binding by its content, and a record binding by its set of fields
+  (labels sorted, each field once, tail last), so a row that recursion
+  rebuilds hashes the same and the key does not grow.
+- A record extended by a record-backed `:=` nominal (see "Record
+  Extension Well-Formedness") has the backing's fields at the use's
+  arguments, as Monotype's `flattenRecordRow` reads it. The walk binds the
+  nominal's declared variables while it reads those field types
+  (`BoundNominal`), and the nominal's name is not kept in the `Ty`.
+- A nominal whose backing the site may read is `Named(name, args,
+  backing)`. `args` are the use's type arguments in declaration order, read
+  before the nominal binds its own variables, and inside the nominal as its
+  backing is: a `Recursive` of its name in an argument refers to it (T1,
+  `Reifier.nominalTy`, `Spelling.partsOf` in `src/reify/types.zig`). An
+  argument the backing does not hold is part of the type, so a phantom
+  parameter (`Id(row) := { table : Str, key : Str }`) tells `Id(Customer)`
+  from `Id(Product)`, and a slot of an `Id` holds only the backing
+  (`slotShape` reads the backing, never the arguments). `widens` reaches the
+  arguments as it reaches the backing.
+- A named `Code` site (a definition passed by name, `owners.filter(f)`) is
+  walked with the evidence the checker recorded on that lookup. The checked module
+  builder writes the use's evidence and substitution for the named site,
+  and the root walk supplies it
+  (`siteEvidence`), as `calledRow` supplies a call's evidence.
+- An instance site is a site whose function type mentions a quantified
+  variable of the template that holds it (D1 of
+  `roc-reify-structural-proposal.md`). The checked module builder gives it no node. The
+  inventory of a template is its instance sites, plus one forward entry per
+  use inside it of a template with an inventory at its own variables. A
+  closing use is a use of a template with an inventory whose substitution
+  mentions no variable an enclosing template quantifies. For a closing use,
+  the checked module builder of its module builds one instance table: per inventory
+  entry, the node of the site described at the use's instance, or the nested
+  table of a forward entry. Tables are keyed by template and
+  `instantiationKey`, so equal instances share one table, and a recursive
+  template is a graph. All of it is `CodeInstanceTable` in the checked
+  module data. A use is a call, a lookup of the template as a value, or a
+  direct static dispatch to it: a method call, `a == b` on a written
+  `is_eq`, `T.method(..)`, and a `for` loop's `iter` call, which is keyed
+  by the loop's body. The checked module builder also reads each compile-time constant
+  body and each top-level binding evaluation computes; a use there at a
+  variable of the binding's own type is closed by the binding's use. It
+  reads each top-level `expect` too, where every use is a closing use. A
+  stored function value keeps the table it was built with
+  (`ConstFn.instances`), and a restore puts it on the root frame of the
+  restored evidence. A binding stored at its own type variables keeps none,
+  and the binding's use gives it. A constant whose type its use fixes is
+  computed by its entry template at each use: the constant's body is read
+  at that template's variables, and a use of the constant is a use of the
+  template, whose table rides on the root frame of the evaluation (Monotype)
+  or selects the entry worker (Boxy). A lambda written at an instance site
+  keeps its checked form under a new id, which a walk from another module
+  reads. The walk refuses by name: a site that binds inputs
+  (`bound_instance`, "Cannot Bind Inputs In A Generic Function"), a use
+  whose `where` evidence selects a method with an inventory
+  (`instance_through_evidence`), a closing use inside a generic local
+  function (`instance_in_local_generic`), and a site, or a use of a template
+  with an inventory, at the variables of a method the compiler calls with no
+  written use: `to_inspect`, `is_eq`, `to_hash`, `encoder_for` and
+  `parser_for`, read from the method registry (`implicit_method_instance`,
+  the report that refuses a code description in such a method). Such a method gets no
+  inventory.
+  A use of a primitive with an inventory (a method of a `::` type, D1 of
+  `roc-reify-opaque-proposal.md`) is a use of its template: a description
+  names the primitive, but the program runs its body, so the table reads the
+  definition (`CalleeUse.instance_table`). A body that reads no parameter
+  but holds an inventory entry is no hoisted root, because an expression in
+  it has a type that mentions a rigid variable of the template (see
+  "Compile-Time Constants and Hoisted Roots").
+  A refused use becomes a `runtime_error` (a refused `for` statement
+  becomes its body, a `runtime_error`), so lowering never specializes a
+  template with an inventory without a table. `ROC_REIFY_INSTANCES` prints
+  each closing use with its table.
+- A `Code` value met inside a walked body (a constant that holds a `Code`, or
+  a `Code` the body passes on) is refused as `code_value`. The report title
+  is the one for the `code_value` rejection, and it names the constant the walk was
+  folding when it met the value (`Walk.constant`).
+- A record field's `presence` in `Code.Ty` is `Required`, `Optional`,
+  `Default(Value)` or `DefaultComputed` (D5). A field with a default (`??`)
+  is `Default` of the `Code.Value` of its default where the walk describes
+  the default as a literal, or as a list, tuple, record, tag or nominal of
+  literals, read in the module that declares the default
+  (`CheckedBodyStore.default_exprs`, `Reifier.fieldDefault`). A name is the
+  value its constant holds, unless it is a primitive (a constant of an
+  opaque type). Any other default is `DefaultComputed`: a call, a literal
+  of the author's own type (its conversion call), a value of an opaque
+  type, or a record that leaves out a field the type does not fill (an
+  optional field, or one whose default is computed). The translator's cut
+  does not change a type. The default is part of the type (`types.Member.default`,
+  `Types.values`), so two nominals that differ only in a default are two
+  types.
+- A `Record` node sets every member of its type, or, where the type marks a
+  member optional, lists the members it sets in `aux` (`ir.RecordForm`). A
+  record literal that unsets or omits an optional field, and a record pattern
+  rest or an update over a record with an optional field, are described this
+  way. A record literal that leaves out a field whose presence is
+  `Default(value)` sets the member to the literal of the value
+  (`Reifier.valueRef`, Q18 of `roc-reify-structural-proposal.md`), as the
+  program fills it when it runs. One that leaves out a field whose default is
+  computed (`DefaultComputed`) is refused, and the report says the default is
+  computed. A member the subject may lack is read by a switch on its `OptField`
+  `Try`, so the description decides what Roc decides at run time.
+- A derived `==` over a record (`Reifier.eqOver`) is `And` over its fields in
+  label order (`sortFieldsByLabel`), the order Monotype gives the fields,
+  whatever links the checker made in the row. A field whose
+  `CheckedFieldKind` is `optional` is never read with `Field`: its value type
+  is not the type of what the record holds. Monotype stores the field as the
+  tagged slot `[#Missing, #Present(value)]`, and its derived `is_eq`
+  (`EqDeriver`) compares that slot as every tag union. The walk compares
+  the `OptField` `Try` of each operand the same way
+  (`Reifier.optionalFieldEq`): a switch on the left `Try`, and in each arm a
+  switch on the right one. Two `Ok` arms compare the values at the field's
+  value type, two `Err` arms are `True`, and the other arms are `False`. So
+  two records that both do not hold the field are equal there. `!=` is
+  `Bool.not` of this, and a nested record, a tag payload, a nominal backing
+  and the item comparison of a `List.is_eq` reach the same arm. A derived
+  `to_hash` over a record that holds an optional field is `Derived`
+  (`Reifier.hashOver`), as it is over every tag union, because only the
+  compiler's widths and order agree with the Roc side.
+- A literal of the author's own type whose conversion is a Roc function is a
+  `Call` of that function's row. A `from_numeral` row takes the `Num.Numeral`
+  the compiler builds from the digits of the literal, as one `Code.Lit`
+  `Numeral` at the type of the row's parameter (`numeralArgument`). The value
+  is the one Monotype builds (`lowerNumeralValue`). A conversion that is a
+  builtin or a function in the cut is a `Prim` over the same literal, at the
+  type of the first parameter of the callable the checker solved, so the
+  argument matches the `Prim`'s signature. An integer type's `from_numeral` and
+  the accessors of `Num.Numeral` are in the builtin table, and no rule folds
+  them. The conversion's `Try` is read as the
+  checker reads it: the `Ok` payload is the value, and an `Err` is a crash
+  of kind `rejected_literal` (`ir.CrashKind`), because the compiler wrote it
+  and not the author. Rule N13w of the normal form drops the tests that only
+  lead to such a crash, and keeps every crash the author wrote.
+  A custom `from_interpolation` is walked by its definition where the literal
+  stands, with the segments as a literal list: the lambda its `Ok` holds is a
+  closure of a row, and the literal is that row called over its captures and the
+  list of the interpolated values. A builtin the stage calls that hands back a
+  function (`Str.from_interpolation`, `Try.map_ok`) is walked by its Roc
+  definition, and a lambda the stage applies is walked where it is applied.
+  The walk reads no shape of the stage to find its rejection: the `Err` of the
+  stage is the conversion's crash, and N13w acts on the graph. One that can
+  leave its body early with `?` is refused.
+- A binder's name in a description is the identifier the canonicalizer
+  recorded on its pattern, written to `CheckedPatternBinder.name`, never
+  text read back through the pattern's region.
+- A lambda written at a `Code` position is described rather than lowered, so
+  no template lowers it. The template ref seal collects its parameters and
+  body on their own (`collectStagedLambda`, `StagedLambdaRefs` in
+  `TemplateIteratorRefs`), with the template whose body holds it as its
+  owner, in the scope that holds it. The evidence pass resolves each
+  dispatch plan inside it and writes the use-site evidence and substitution
+  of every call inside it in the chain of that owner, as it does for a named
+  function's body. A lambda with no owner, such as one in a defaulted field,
+  has no enclosing template params. The walk reads what each call fixed an
+  unannotated callee to from that entry (`siteSubstitution`,
+  `siteEvidence`), never from the lambda's types. So a dispatch on a type
+  variable of a query fragment (`|x| x.t.now()`) is `evidence_dependent` on
+  the fragment's evidence param, and the walk at a closing use reads its
+  target from the evidence that the use supplied (`Site.enclosing`).
+- A lambda written at a `Code(f)` position checks against `f` in the channel
+  a plain function argument checks against its parameter type: its nested
+  expected type is `f` as the contextual type, in the position's context
+  (`beginExprCheckFrame` in `src/check/Check.zig`). At a call argument
+  (`fn_call_arg`) whose `f` is known, `seedLambdaParamsFromExpectedFn` relates
+  the lambda's parameters to `f` before the body is checked, as for a plain
+  lambda argument, so a field read and a method call on one parameter
+  (`o.c.id` and `o.c.id()`) both resolve. This is the existing seeding path,
+  not a new rewrite. The node's own var is still fresh and takes the `Code`,
+  and `finishBeforeBoundary` relates the function to `f`
+  (`staged_code_fn_var`). A method call on a receiver whose type is not known
+  when the lambda is checked gives no `f`, so it seeds nothing (the hint in
+  `test/cli/StagedUnannotatedReceiver.roc`). Accepted side:
+  `test/cli/StagedFieldAndMethod.roc`.
+- A root whose checked expression holds a checking error
+  (`contains_diagnostic_error`, which the checked module builder writes before the walk
+  runs) is refused by `rootSite` with the rejection `checking_error`.
+  The checked module builder makes its site or closing use a runtime error and adds no
+  report of its own (`appendStagedCodeRefusal`), because the checker has
+  reported the error. See `test/cli/StagedCheckingError.roc`.
+- A call to an unannotated generic helper from another unannotated helper
+  reads the callee's evidence through the caller's own: an evidence entry that
+  forwards to the caller's evidence is resolved against the evidence the walk
+  holds, as Monotype does through its evidence chain (`supply` in
+  `src/check/code_reifier.zig`).
+- A `Code` position is read off the annotation the user wrote, not off the
+  solved type. A `Code` is allowed as a parameter of the annotation's outermost
+  function, and as what that function returns. A transparent alias of a
+  `Code` is a `Code` position (`stagedCode`), and an alias used in any other
+  place is rejected. A callback's parameters and a record field of function
+  type are rejected (`rejectMisplacedStagedCode`). A call is a template call
+  only when the callee's own return type is a `Code`
+  (`claimOrRejectCodeCall`), so a generic function that hands a `Code` back is
+  an ordinary call. Each site records the definition or top-level `expect`
+  that owns it, and `poisonUndescribableStagedCode` retires that owner when
+  the site's function type holds an error.
+- A site's cut is explicit data, never a guess about which functions a
+  translator knows (I14 of `roc-reify-normalization-plan.md`). The checker
+  records the call a site is an argument of, a direct call or a method call
+  (`CodeReificationSite.translator`, from the argument's `fn_call_arg`
+  context in `translatorCall`). A method call checks its arguments against
+  the method's parameters only after its dispatch is planned, so the walk
+  reads the method from that plan's target, never from the method's name
+  (`translatorFunction`). A `code_primitives` item of a nominal has the
+  type `List(Code.PrimId)`: `finishDef` in `src/check/Check.zig` unifies the
+  item with that type under the context `code_primitives_item`, and a
+  mismatch (the old tuple form) is a type error whose hint says to wrap each
+  entry in `Code.prim`. This is constraint generation on the item, not a
+  rewrite of the solved graph. The checked module builder reads the item as a list literal,
+  directly or through a top-level constant of the same module, and each
+  entry as a `Code.prim` call that the checker recorded (or a constant that
+  holds one). It resolves the recorded argument of each call, one lookup of a
+  function defined as a lambda or of a top-level constant, each once, and
+  records the lookups in `CodeCutTable`; any other entry is a `staged_code`
+  problem at the entry (`moduleCuts` in `src/check/code_reifier.zig`), and an
+  item that is no list is `primitives_not_a_list`. An entry that names a primitive (a
+  definition of the builtin module, or an operation of an opaque type, see
+  the next item) is the problem `primitive_already_primitive`: a cut lists
+  only what is not a primitive already. The walk resolves the translator to
+  the nominal that has it as an associated item and reads that nominal's cut
+  from the table of the module that declares it (`Walk.useCut`). A callee
+  whose module and body are in the cut is a `Prim` named by the nominal and
+  the item (`inCut`, `qualifiedName`), and a constant in the cut is a `Prim`
+  with no arguments; every other function and computed value, in any
+  package, is walked. The site's rows are keyed by what its walk built, so
+  two sites with different cuts share no normal form they do not both build.
+- One step classifies every definition a description reaches, the same in
+  the direct-call path (`resolvedTarget`), the method-call path
+  (`methodTargetCallee`) and the constant path (`foldedConstant`):
+  `primitiveOf` in `src/check/code_reifier.zig`, asked of the reader of the
+  module that defines the definition. It reads only explicit data: the
+  module's role, the nominal's opaque flag and builtin origin, the module
+  that declares the nominal, and the definition's checked type.
+
+  | Definition | Primitive | Name |
+  |---|---|---|
+  | An intrinsic (`AnnotationOnlyKind.intrinsic`), function or constant | yes, whatever the site's cut says | `qualifiedName` |
+  | A function of the builtin module | yes | its export name (`Str.concat`) |
+  | A constant of the builtin module | no: it folds | |
+  | A function or top-level constant whose checked type mentions, at any depth (parameters, result, fields, payloads, type arguments, `where` method types; never a nominal's backing), a nominal declared with `::` by the module that defines it | yes | `qualifiedName` (`Time.is_before`, `Cal.parse`) |
+  | Anything else (`Time.days_in_week : U8`, `Util.double` of `Util :: [].{..}`) | no: in the cut it is a `Prim`, otherwise walked | |
+
+  An intrinsic has no body, so each path classifies it before it asks for
+  a body (`intrinsicCallee`, `intrinsicOfTemplate`, `intrinsicConstant`).
+  Its `Prim` carries the evidence of its own `where` clause. The walk never
+  asks for an intrinsic's body: the `.unimplemented` arms that would read
+  one assert this in debug builds. An intrinsic has no inventory, an
+  intrinsic used as a value is refused as a cut member used as a value is,
+  an intrinsic named as the function to describe is refused, and a cut
+  that lists one is `primitive_already_primitive`. A translator sees no
+  difference between the `Prim` of an intrinsic and any other `Prim`: it
+  carries the same fields, and the normal form is the same.
+
+  A primitive function is a `Prim` over its arguments, and a primitive
+  constant is a `Prim` with no arguments. One definition has one name
+  whichever path reaches it, because `Builder.declaredPrim` keys it by
+  `ir.Definition` and every path names it by `qualifiedName`. A package
+  primitive is not in the builtin table, so it gets no law, no fold and no
+  speculation. Its body is never read, so a value of an opaque type is built
+  only by a primitive; a walked body that builds one from its fields is
+  refused with a message that names that fix (`nominalExpr`, `recordExpr`).
+  The design is `roc-reify-opaque-proposal.md` D1 and D3.
+- Each `Prim` carries its `Code.PrimId`, and each `Opaque` carries its
+  `Code.TypeId` (D4). Both are 128-bit hashes of the identity the compiler
+  already keys them by, made only in `src/reify/identity.zig`:
+
+  | Identity | Hashed |
+  |---|---|
+  | builtin primitive | owner and method (`Str`, `concat`) |
+  | package primitive | `ir.Definition`: checked module digest of the module and the definition |
+  | builtin nominal | the name a `Ty` spells (`Dict`) |
+  | declared nominal | `types.Declaration`: content identity of the module and the declaration |
+
+  A builtin opaque `Ty` is spelled as the owner of its primitives (`Dict`,
+  `Box`), not `Builtin.Dict` (Q10). This holds for every nominal the
+  builtin module declares, also one the checker does not mark as a builtin
+  (`CheckedBuiltinNominal`), such as `Hasher` or `Code.PrimId`. The walk
+  knows such a nominal by the role of its declaring module
+  (`ForeignLookup.resolve_builtin_module`, keyed by the content identity of
+  the module), not by its name. `Code.prim(f)` and
+  `Code.type_id(proxy)` are intrinsics (`code_prim`, `code_type_id` in
+  `src/canonicalize/BuiltinLowLevel.zig`), and so is `Code.ty_of(proxy)`
+  (`code_ty_of`, D6 of `roc-reify-structural-proposal.md`), the `Code.Ty`
+  of the proxy's type, which equals the `result` of `|x| x` at that type. The checker does not check or
+  instantiate the argument of `Code.prim`, so a generic function with a
+  `where` clause can be named; it records each call in
+  `NodeStore.code_identity_uses`. An argument that is no lookup of a
+  top-level or imported definition is `prim_not_a_definition`, unless
+  canonicalization already reported it as a runtime error, and an
+  identity intrinsic read as a value is `identity_not_called`. A retired
+  identity call evaluates no operand: `appendEvaluationOperands` in
+  `src/check/Check.zig` never lists the identity callee, nor the argument of
+  a one-argument call, so the runtime error that replaces the call never
+  lowers the intrinsic as a value. The checked module builder
+  (`moduleIdentities` in `src/check/code_reifier.zig`) computes each call's
+  id with the same functions the emitter uses, and stores it as the call's
+  `code_from_lambda` constant node, so Monotype and Boxy restore it as any
+  other constant. `Code.ty_of` converts the proxy's type with the walk's
+  `tyOf` and writes the `Code.Ty` with the emitter (`Reifier.tyOfProxy`). A
+  proxy whose type is not a nominal fixed at the call is
+  `type_id_not_nominal`; a `Code.ty_of` proxy whose type holds a variable
+  the call leaves open is `ty_of_not_closed` ("Type Not Fixed"), and a type
+  the walk has no description for is the walk's own refusal. A
+  `Code.type_id` or `Code.ty_of` call whose proxy type mentions a quantified
+  variable of the template that holds it is an entry of the template's
+  inventory, as an instance site is (recipe kinds `type_id` and `ty_of`,
+  Q8): each closing use computes it at the use's instance, and a refusal is
+  reported at the use. `moduleIdentities` runs after the sites' plan and
+  skips these calls (`ModuleSites.identities`).
+- Each `Prim` carries `evidence`: for each `where` requirement of the
+  primitive's scheme, the method the checker chose at the call (D7,
+  `Code.Evidence` and `Code.Target`). The order is the template's evidence
+  params (`CheckedProcedureTemplateTable.evidenceParams`), with a constraint
+  alias expanded. The walk reads the recorded evidence: the call's
+  `siteEvidence` in the direct form, the dispatch edge's `nestedEvidence` in
+  the method form, and `supply` for an entry that forwards to the enclosing
+  call's evidence. It plans nothing:
+
+  | Recorded resolution | `Target` |
+  |---|---|
+  | `direct` | classified by `methodTargetCallee`: `Prim` with its own evidence, or `Row` of the walked method |
+  | `constraint` | through `supply`, then as `direct`; an `independent_callable` slot through `sharedTarget`, whose target has no requirement of its own. A `Row` target there is built at the instance the dispatcher fixes (`methodTargetCallee` with `.receiver` fixing, `receiverInstantiation`), because the use relates the target to its own callable, whose first parameter is the dispatcher; a non-row variable only the rest of the callable fixes is refused ("a generic method this receiver does not fix") |
+  | `structural` | `Derived(method)` |
+  | `unreachable_value` | `Unreachable` |
+  | none, because the compiler's own derivation reached the primitive (a derived `==` reaching `List.is_eq`) | the receiver fixes each requirement's dispatcher (`receiverEvidence`), and `receiverEntry` resolves it by the checker's rule for that type (the checker's dispatcher resolution step, Monotype's `synthesizeComponentEvidenceAtNodeForPurpose`): a nominal's registry target through `receiverMethod` and `methodTargetCallee`, as `dispatchTarget` reads a derivation-reached dispatch; a structural registry target, or a structural shape whose requirement permits a derived equality or hash, is `Derived(method)`. A type variable, a composite dispatcher, a method no registry in reach declares, and a codec or map requirement on a structural shape are refused by name |
+  | `from_callable`, `from_scheme`, an edge whose nested evidence is `from_callable`, or a `constraint` no walked call answers | refused: "a call whose `where` evidence the compiler did not record" |
+
+  In the IR the evidence is the prim node's `aux` words (`ir.EvidenceWords`,
+  `src/reify/ir.zig`), so it is part of hash-consing, equality
+  (`src/reify/equal.zig`) and the digest (`src/reify/digest.zig`). A row it
+  names is referred to as a `Closure` of the row is: it is an edge of the
+  `references` graph, `mergeInto` renames it, N8f gives it a convention row,
+  and `number.siteRows` emits it, so it stays a row in every view.
+- A row that holds a `Return` in a loop or in a switch arm is not inlined, in
+  the `graph` view and in the `inline` view, because inlining it would make
+  the caller return the value of the callee. A `Return` in a lambda body ends
+  the lambda and does not count (`Returns.holds` in `src/reify/live.zig`,
+  used by `src/reify/views.zig`).
+- A refusal by `Code.refuse_at` carries the calls the refused node was inlined
+  through as structured frames (`RefusalCall`, `src/check/problem/types.zig`).
+  A frame in the reporting module keeps its region, so the report places it
+  through the same mapping as every other region of that module, including the
+  mapping of a synthetic root. A frame in another module carries the path of
+  that module's file and the line and the column (`SourcePlace`), and so does
+  the refused source when it is in another module. Every frame and the source
+  print as `path:line:col`. The path is the one the coordinator records on the
+  module's env (`ModuleEnv.source_path`); a module no file holds is named by
+  its qualified name (`ModuleEnv.diagnosticSourceName`). No second line-shift
+  mechanism exists.
+- A refusal by `Code.refuse_at` of a `Prim` node names each intrinsic that
+  the `Prim` names, its own and each one its evidence names, with one line
+  per intrinsic: it has no Roc body, and a translator binds it by id, as it
+  binds a builtin. The translator writes no code for this line, and the
+  `Prim` has no field for it. `Builder.declaredPrim` records on the
+  primitive whether its definition is an intrinsic (`ir.NamedPrim.intrinsic`,
+  from `ForeignName.intrinsic`), and no rule, digest, numbering or view
+  reads that bit. `provenance.emitted` writes, per node, the names of those
+  intrinsics next to the node's origins, `CodeProvenanceTable` keeps them
+  (`intrinsicsOf`), and `reportRefusal` copies them into the
+  `TranslationRefused` problem. The report never reads the translator's
+  message.
+- A refusal by the walk carries the module whose source holds its region
+  (`Rejection.module` in `src/check/code_reifier.zig`). The walk records that
+  module where it enters a body or an expression of a module (`Walk.body`,
+  `Reifier.enter`), never from the offsets. A refusal in another module's
+  source is reported in that module's file, by the path the coordinator
+  records on its env (`ModuleEnv.source_path`), and the report names the site
+  in the reporting module that reached it (`StagedCode.foreign`). A refusal
+  in the site's own module but outside the site's region, in a helper the
+  site calls, also names the site that reached it.
+- The normal-form version, `normal_form_version` in `src/reify/mod.zig`,
+  changes exactly when the rules, the builtin table or the speculatable lists
+  change. A fingerprint test pins it. `Code.version` carries it, so a
+  translator can key a cache with it.
+- A loop has one of three forms, `ForRange`, `ForList` and a general `Loop`
+  (`src/reify/loops.zig`). A row whose every call to itself is a tail call
+  becomes a `Loop` whose `Break` delivers the row's value (N12). The loop rules
+  rewrite one loop per round as a hook on the rebuild: slots and outputs
+  first, then the kind. A general `Loop` has outputs of its own, so `Break`
+  has one value per output and `Continue` one per slot. A bounded loop has one
+  output per slot. A loop over `List.iter(xs)` is recognized by the
+  checker-authored `IteratorRole` of the named primitive, never by a name.
+  `Code.Row.iteration` reads what a loop iterates over off its node.
+- A record or tuple that a non-root row or a loop slot only reads by `Field`
+  or `Index` is split into its components (N14, `src/reify/scalar.zig`). A
+  value splits when no node, and no region end but the loop's own `Continue`
+  and `Break` at the slot, uses it in another way; a component splits again
+  under the same condition. A tag union, a record with a member a value may
+  lack, and an empty record never split. A `Call` of a finalized row with such
+  a parameter is a `Call` of a row built on the spot (`Builder.scalarizedCall`,
+  `Specialize.scalarize`), keyed by the row's digest and the shapes. A loop
+  slot splits in `loops.analyze` when every `Continue` gives it unchanged or
+  as a construction. The measure counts the layers still to split (`split_calls`
+  for calls, `aggregate_slots` for parameters and slots), and the driver's
+  L2 check fails a site that reaches a call it should have split.
+- Equality and hashing of a `Code` read the normal form and the version, and
+  never the site key.
+- The provenance table that maps a node to its source regions is for the
+  compiler. A translator cannot read it.
+- A function that only the walk reads is never lowered, so a literal in it
+  would never be checked. The walk notes the conversion root of each literal of
+  the author's own type that it converts (`Walk.noteRead`,
+  `src/check/code_reifier.zig:8341`). The checked module builder stores the roots on the site
+  (`CheckedCodeSite.reads`), and
+  lowering reads them where the site stands (`restoreCodeSiteAtNode`,
+  `src/postcheck/monotype/lower.zig:47588`), which demands each root. A
+  `from_numeral` or `from_quote` literal already had such a root. A literal
+  with an interpolation gets an `interpolation_conversion` root
+  (the builder's literal conversion root step):
+  it runs the first stage of `from_interpolation`, keeps no value (its payload
+  is `discarded` and its result `{}`), and only a read demands it. A rejected
+  literal is reported at the literal, in `roc check` and in `roc build`,
+  whether or not anything calls the function it is in.
+- Later stages treat a description as a constant. They never read its rows,
+  and they never rewrite it.
+- A condition that reads a code reification site draws no compile-time
+  condition warning (see "Checked Boundary").
+- A lambda at a `Code` position that reads a value only the running program
+  has is no run-time dependency of its own. The call that holds it decides
+  (`finishHoistFrame` in `src/check/Check.zig`). A call whose solved type is
+  the builtin `Code.Bound` and that holds exactly one such site marks the
+  site (`CodeReificationSite.bound_call`), becomes an expression root of its
+  own and is a run-time dependency of what holds it. The marked lambda is no
+  dependency of that root when pruning checks what a kept root reads
+  (`isBoundCodeSite` in `hoistedRootExprStep`). Any other holder keeps the
+  run-time dependency, and the walk refuses the read. This is hoist
+  selection, which writes no solved type and no dispatch plan.
+- The root of a call that binds inputs is part of what the program means,
+  because the program reads that call only through its root. A caller that
+  outputs only some of the selected roots (the eval harness outputs only
+  top-level roots, `src/eval/inspected.zig`) still outputs it
+  (`selectedHoistedRootBindsCodeInputs` in `src/check/Check.zig`).
+- The walk makes an input slot only at a marked site, only in the root row,
+  and never for a `var` (`inputSlot` in `src/check/code_reifier.zig`).
+  The checked module builder records the slots of a call that it hoisted as an expression
+  root, whose type is closed, on the call (`CheckedCodeBinding` and
+  `bindCodeInputs`), and refuses every
+  other marked site that reads a slot. A slot is a binder and the
+  path steps the description reads it through, in slot order, with the
+  shape of the slot type.
+- A captured value that the description reads whole is one slot (N18e in
+  `roc-reify-normal-form.md`). Of the slots the final root reads, a slot
+  whose path extends the path of another one is no slot: the outermost slot
+  whose path it extends is marked `whole` (`ir.Slot.whole`), and the root reads the
+  value as `Field`, `Index` and `Unwrap` nodes over that slot's `Input`
+  (`wholeSlots` in `src/reify/driver.zig`, which copies the root once with
+  `Builder.slotRead` for each such read, then simplifies and finalizes the
+  site's rows again). N18b makes no slot of a path that extends the path of a whole slot.
+  Accepted: `|c| c.address == place` with `zip ?: Str` in the address reads
+  `place` whole through `OptField`, so it binds one input and reads
+  `Field(Input(0), city)`. Rejected: a value that the root reads only
+  through field paths (`|c| c.city == place.city and c.line == place.line`)
+  stays one slot per path, and a whole read of `place.addr` does not take in
+  the path slot `place.name`, whose path does not extend it. The verifier
+  reports a `Field`, `Index` or `Unwrap` node over a slot that is not whole
+  and a read of a slot whose path extends the path of a whole slot, and in
+  debug builds the driver checks that no slot the root reads has a path that
+  extends the path of another one and that the root reads each whole slot
+  only as a whole.
+- Lowering reads the recorded slots and nothing else. Where the program
+  reads a call that binds slots, it reads the call's compile-time value with
+  `inputs` set to one `Code.Value` per slot (`boundCodeValue` in
+  `src/postcheck/monotype/lower.zig`). A value is built by one generated
+  helper per Monotype type, so a recursive type reaches its own helper. In
+  debug builds lowering asserts that each slot's Monotype type has the shape
+  the walk recorded.
+  The walk records `Bool` as the `Bool` shape, and Monotype lowers `Bool` as a
+  nominal tag union, so `codeValueBody` builds `Bool` for a type whose owner is
+  the builtin `Bool`, never `Wrap`.
+- An optional field of a slot type (structural proposal D8) has the shape
+  `opt_field` followed by the shape of its value type. Its `Code.Value` is
+  `Absent` when the record does not hold the field, and the value's own
+  `Code.Value` when it does. Both lowerings read the field's presence from
+  explicit post-check data and never from the shape of the slot: Monotype
+  from the field's `value_ty` (`optionalFieldCodeValue`), which only an
+  optional field has, and `.boxy` from the record child's
+  `record_field_kind` and the presence slot's planned Present discriminant
+  (`lowerOptionalFieldCodeValueInto`). Each matches on the field's
+  `#Missing` and `#Present` slot. A field default never uses `Absent`: a
+  default record that leaves out an optional field stays `DefaultComputed`.
+- `.boxy` reads the same recorded slots. It runs the call where the program
+  reads it, and builds the call's `Code.Bound` again around the result's
+  `value` with one `Code.Value` per slot. A value is built by one generated
+  procedure per representation and formal environment, and in debug builds
+  lowering asserts each slot's representation against the recorded shape (see
+  "`.boxy` Runtime Lowering").
+- Typing rule "Bound Capture Encoding" (`roc-reify-opaque-proposal.md`
+  D5). `Code.Binds(code, fmt) : code` is a builtin transparent alias whose
+  second parameter is phantom, so a parameter of type
+  `Code.Binds(Code(f), fmt)` is the `Code` position it wraps
+  (`stagedCode` reads the first `Binds` the head passes through, and
+  `rejectMisplacedStagedCode` lets `code` stand where the `Binds` stands).
+  Let a lambda `L` stand at such a position. A capture read of `L` is a
+  maximal expression of `L`'s body of the form `x`, `x.a`, `x.a.b`, `x.0`,
+  ... whose `x` is a lookup of one of `L`'s closure captures; a field path
+  with an optional segment ends before it. For each capture read `R` of type
+  `t`, the checker introduces the requirement
+  `t.encoder_for : fmt -> (t, List(U8) -> Try(List(U8), []))`, and it
+  introduces `fmt.default : () -> fmt` once for the site
+  (`introduceBoundCaptureEncoding` in `src/check/Check.zig`, when the
+  lambda's frame finishes). Both have the constraint origin `bound_capture`,
+  which checks as `method_call` and survives instantiation. These are
+  ordinary requirements: they are solved, reported, generalized into an
+  enclosing scheme and discharged by each caller as any other, so this is
+  constraint generation and "Solver-Mutating Rewrites" does not apply.
+
+  Function exemption: a captured function is described as code, not bound,
+  so an `encoder_for` of origin `bound_capture` whose `t` is a function type
+  is satisfied, at the site or in a copy a caller instantiated, and the site
+  drops its record of that read (see the Rewrite Inventory entry). The test
+  is the checked type of the read itself: a record, tuple or tag union that
+  holds a function is data, and needs an encoder for the function, which no
+  format has.
+
+  A missing method on a requirement of the rule, or on a requirement a
+  derived encoder of one needs (`boundCaptureOf` follows the derivation), is
+  reported with the captured value's type and the format
+  (`DispatcherDoesNotImplMethod.bound_capture`), in error reporting only. A
+  copy that instantiation made of a generic function's requirement is noted
+  when the drain enters it (`noteBoundCaptureCopy`), so its failure has the
+  same text.
+
+  | Stage | What it does |
+  |---|---|
+  | Checking | records each capture read with its two callables (`ModuleEnv.BoundCaptureEncoding`) |
+  | Checked module build | synthesizes the expressions `fmt.default()` and `T.encoder_for(fmt.default())` per read (`appendBoundCaptureExprs`), whose plans `StaticDispatchPlanTable.fromModule` builds from the two requirements; the template ref collector visits them where it skips the site's lambda, so the evidence pass resolves them in the template that holds the site |
+  | Walk | a slot whose type holds an opaque type is encoded: its path (binder and path steps) must equal a capture read's path, and the slot records that read's encoder expression (`CheckedCodeSlot.encoder`, shape `encoded`). Any other such slot is refused, with a message for a site that names no format and one for a value read other than as a capture read (`{ at } = order` then `at`) |
+  | Lowering | Monotype (`encodedSlotValue`) and Boxy (`lowerEncodedSlotInto`) lower the recorded encoder expression where the program binds the inputs, apply it to the slot's value and `[]`, and wrap the `Ok` bytes as `Code.Value.Encoded`. Neither plans a dispatch. Debug builds assert that a slot with an encoder has the shape `encoded` |
+
+  A slot whose type holds no opaque type is bound structurally as before,
+  though the checker requires its encoder too. A captured function is no
+  slot: the walk describes it as code. A site in a function that
+  stays generic is still refused by the walk, so a generic capture gets the
+  requirement in its scheme and no description.
 
 ## Test Root Ownership
 
@@ -25166,7 +26161,8 @@ each phase's report.
 The compiler's developer-only environment variables (`ROC_LIR_DUMP`,
 `ROC_SPEC_CENSUS`, `ROC_FRESH_TYPE_ANALYSIS`, `ROC_CTFE_DEMAND_TRACE`,
 `ROC_CTFE_REUSE_TRACE`, the object-compile round-trip
-variable and `ROC_TEST_LLVM_OBJECT_COMPILE_COUNT_FILE`) are honored only by a
+variable, `ROC_TEST_LLVM_OBJECT_COMPILE_COUNT_FILE`, `ROC_REIFY_OUTLINE_STATS`,
+`ROC_REIFY_INSTANCES` and `ROC_REIFY_ONLY`) are honored only by a
 compiler for which `build_options.dev_diagnostics` is true: every Debug compiler, and any
 other build made with `-Ddev-diagnostics`. Every read goes through
 `base.dev_diagnostics`, whose `Var` enum names exactly these variables and
@@ -25190,6 +26186,19 @@ measurement only and does not alter specialization or cache admission. Native
 lookup separates function-type classification from provider queries; the
 provider reports exclusive bucket, offer, metadata, graph, eligibility, payload,
 and installation phases under the same diagnostic.
+
+`ROC_REIFY_ONLY` prints, after a module is checked, one line for each
+generalized requirement of each top-level definition:
+`reify-only: <module>.<def>: <method> runs=<true|false>` (see "The Runs Bit").
+The lines of one definition are sorted, and an equal line is printed once.
+It also prints one line for each reify-only definition, in order of
+definition id:
+`reify-only: <module>.<def>: witness <kind> <target> at <line>:<col>`, where
+`<target>` is `<module>.<def>` and, for a dispatch, `<method> -> <module>.<def>`
+(see "Reify-Only Definitions"). Then it prints one line for each reify-only
+top-level `expect`, with `expect at <line>:<col>` in place of `<def>`. The line and column are in the checked
+source, so in a headerless file they count the lines of the header that the
+compiler adds.
 
 `ROC_TEST_COMMAND_WORK` prints deterministic test-command counters at exit.
 The specialization, evaluation, runtime LIR, ARC, static-data and native test

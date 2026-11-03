@@ -57,12 +57,12 @@ is_urgent = |found| found.over_by > 5.0 and !found.room.starts_with("test-")
 ## The ceiling test is written the other way round. The order of the tests is
 ## kept: they pick different results when the floor is above the ceiling.
 clamp : F64, F64, F64 -> F64
-clamp = |value, floor, ceiling| if value < floor floor else if ceiling < value ceiling else value
+clamp = |value, floor, ceiling| if (value < floor) floor else if (ceiling < value) ceiling else value
 
 ## The counter is named for what it counts down, and its test is written the
 ## other way round.
 power : I64, I64 -> I64
-power = |number, remaining| if 0 >= remaining 1 else number * power(number, remaining - 1)
+power = |number, remaining| if (0 >= remaining) 1 else number * power(number, remaining - 1)
 
 alerts : Dbsp.Rel(Alert)
 alerts =

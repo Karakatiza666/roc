@@ -13,7 +13,6 @@ r : [
 ~~~
 # EXPECTED
 MALFORMED TYPE - open_tag_union_stability.md:2:2:2:3
-DECLARATION HAS NO VALUE - open_tag_union_stability.md:1:1:5:2
 # PROBLEMS
 ~~~clojure
 (reports
@@ -24,18 +23,7 @@ DECLARATION HAS NO VALUE - open_tag_union_stability.md:1:1:5:2
 		(headline
 			(reflow "This type annotation is malformed or contains invalid syntax."))
 		(document
-			(source-region (file "open_tag_union_stability.md") (start 2 2) (end 2 3) (annotation error) (line-text "\ta,"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 1) (end 5 2))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "open_tag_union_stability.md") (start 1 1) (end 5 2) (annotation error) (line-text "r : [\n\ta,\n\n\t..,\n]"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "open_tag_union_stability.md") (start 2 2) (end 2 3) (annotation error) (line-text "\ta,")))))
 ~~~
 # TOKENS
 ~~~zig

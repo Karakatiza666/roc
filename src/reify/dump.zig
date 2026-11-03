@@ -159,6 +159,11 @@ const View = struct {
                 try w.print("{s}.{s}(", .{ p.owner, p.method });
                 try v.refs(w, args, "");
                 try w.writeAll(")");
+                if (nd.aux.len != 0) {
+                    var it = ir.EvidenceWords.of(store.wordSlice(nd.aux));
+                    try w.writeAll(" where ");
+                    try v.evidence(w, &it, it.left);
+                }
             },
             .call, .closure => {
                 try w.print("{s} r{d}(", .{ @tagName(nd.op), v.rowName(nd.payload) });
@@ -184,8 +189,21 @@ const View = struct {
                 try w.writeAll("switch ");
                 try v.refs(w, args, "");
             },
-            .crash, .derived, .record, .tuple, .list, .wrap, .unwrap, .elem, .opt_field, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => {
-                try w.print("{s}(", .{opName(nd.op)});
+            .record => {
+                // A node that leaves a member unset names the members it sets.
+                const members = types.memberSlice(types.get(store.tySlice(nd.tys)[0]).record);
+                try w.writeAll("record");
+                if (args.len != members.len) {
+                    try w.writeAll(" set");
+                    for (store.wordSlice(nd.aux)) |k| try w.print(" {s}", .{types.nameText(members[k].name)});
+                }
+                try w.writeAll("(");
+                try v.refs(w, args, "");
+                try w.writeAll(")");
+            },
+            .crash, .derived, .tuple, .list, .wrap, .unwrap, .elem, .opt_field, .and_, .or_, .for_range, .for_list, .loop, .lambda, .apply => {
+                // A range that includes its end says so.
+                try w.print("{s}{s}(", .{ opName(nd.op), if (nd.op == .for_range and nd.payload == 1) " inclusive" else "" });
                 try v.refs(w, args, "");
                 try w.writeAll(")");
             },
@@ -216,7 +234,7 @@ const View = struct {
                 .operand => try w.writeAll("operand"),
                 .loop_body => try w.writeAll("body"),
                 .lambda_body => try w.writeAll("lambda"),
-                .row_body => unreachable,
+                .row_body => unreachable, // row_body regions are dumped by the row, not as a node's region
             }
             const params = store.tySlice(reg.params);
             if (params.len > 0) {
@@ -234,11 +252,40 @@ const View = struct {
         }
     }
 
+    // `count` entries of a `Prim`'s evidence (D7), each `method @ Ty ->
+    // target`, a primitive's own nested in brackets: `[order_relative_to @
+    // I64 -> Num.I64.order_relative_to]`, `[.. -> r1]`.
+    fn evidence(v: View, w: *Writer, it: *ir.EvidenceWords, count: u32) Writer.Error!void {
+        try w.writeAll("[");
+        for (0..count) |i| {
+            const e = it.next().?;
+            if (i != 0) try w.writeAll(", ");
+            try w.print("{s} @ ", .{v.types.nameText(types_mod.NameId.of(e.method))});
+            try writeTy(w, v.types, e.ty);
+            try w.writeAll(" -> ");
+            switch (e.kind) {
+                .prim => {
+                    const p = v.store.primName(ir.PrimId.of(e.target));
+                    try w.print("{s}.{s}", .{ p.owner, p.method });
+                    if (e.nested != 0) {
+                        try w.writeAll(" where ");
+                        try v.evidence(w, it, e.nested);
+                    }
+                },
+                .row => try w.print("r{d}", .{v.rowName(e.target)}),
+                .derived => try w.print("derived {s}", .{v.types.nameText(types_mod.NameId.of(e.target))}),
+                .unreachable_ => try w.writeAll("unreachable"),
+            }
+        }
+        try w.writeAll("]");
+    }
+
     fn refs(v: View, w: *Writer, list: []const Ref, lead: []const u8) Writer.Error!void {
         for (list, 0..) |r, i| {
             try w.writeAll(if (i == 0) lead else ", ");
             switch (r.kind) {
                 .row_param => try w.print("p{d}", .{r.output}),
+                .input => try w.print("in{d}", .{r.target}),
                 .region_param => {
                     try v.regionName(w, r.regionId());
                     try w.print(".{d}", .{r.output});
@@ -273,6 +320,13 @@ fn writeLit(w: *Writer, store: *const ir.Store, types: *const types_mod.Types, l
         .str => |span| try w.print("\"{s}\"", .{store.byteSlice(span)}),
         .dec => |bits| try w.print("dec {d}", .{@as(i128, @bitCast(bits))}),
         .bytes => |span| try w.print("bytes {d}", .{span.len}),
+        .numeral => |n| {
+            try w.print("numeral {s}[", .{if (n.negative) "-" else ""});
+            for (n.before(store), 0..) |d, i| try w.print("{s}{d}", .{ if (i == 0) "" else " ", d });
+            try w.writeAll("].[");
+            for (n.after(store), 0..) |d, i| try w.print("{s}{d}", .{ if (i == 0) "" else " ", d });
+            try w.print("] {d}", .{n.after_count});
+        },
     }
 }
 
@@ -315,7 +369,7 @@ pub fn writeTy(w: *Writer, types: *const types_mod.Types, ty: TyId) Writer.Error
             try w.writeAll("{ ");
             for (types.memberSlice(span), 0..) |m, i| {
                 if (i > 0) try w.writeAll(", ");
-                try w.print("{s} {s} ", .{ types.nameText(m.name), if (m.optional) "?" else ":" });
+                try w.print("{s} {s} ", .{ types.nameText(m.name), if (m.optional) "?" else if (m.default != .none) "??" else ":" });
                 try writeTy(w, types, types.tySlice(m.tys)[0]);
             }
             try w.writeAll(" }");

@@ -212,7 +212,8 @@ pub fn sortOf(vars: Vars, t: Term) Sort {
                 .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => .i64,
                 .concat => .str,
                 .len => .i64,
-                .get => unreachable,
+                .get => unreachable, // `get` is not an enumerated signature symbol
+                .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or, .from_numeral, .is_negative, .digits_before_pt, .digits_after_pt, .digits_after_pt_count => unreachable, // the builtins of layer L are not enumerated signature symbols
             },
             .and_, .or_ => .bool,
             .switch_ => sortOf(vars, x.args[1 + (term.litKeys(x) orelse 0)]),
@@ -223,7 +224,7 @@ pub fn sortOf(vars: Vars, t: Term) Sort {
             .tuple => .tuple_ib,
             .wrap => .nominal_i64,
             .unwrap => .i64,
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         },
     };
 }
@@ -238,8 +239,8 @@ pub fn tyOf(types: *reify.types.Types, sort: Sort, width: IntTy) Allocator.Error
         .union_ab => types.tagUnionTy(&.{ .{ .name = "A", .payload = &.{int} }, .{ .name = "B", .payload = &.{} } }),
         .record_xy => types.recordTy(&.{ .{ .name = "x", .ty = int }, .{ .name = "y", .ty = bool_ty } }),
         .tuple_ib => types.tupleTy(&.{ int, bool_ty }),
-        .nominal_i64 => types.nominalTy("N", int),
-        .f64, .str, .union_abc, .list_i64 => unreachable,
+        .nominal_i64 => types.nominalTy("N", .builtin, &.{}, int),
+        .f64, .str, .union_abc, .list_i64 => unreachable, // signatures use only the sorts above
     };
 }
 
@@ -335,8 +336,8 @@ pub const Instance = struct {
             .index => b.index(a[0], x.sym.index.?),
             .wrap => b.wrap(try tyOf(&self.types, .nominal_i64, width), a[0]),
             .unwrap => b.unwrap(a[0]),
-            .switch_, .and_, .or_ => unreachable,
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .switch_, .and_, .or_ => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         };
     }
 };
@@ -378,7 +379,7 @@ pub fn checkSort(vars: Vars, t: Term) ?Sort {
             const result: Sort = switch (x.sym.method.?) {
                 .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not => .bool,
                 .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => operand,
-                .concat, .len, .get => return null,
+                .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or, .from_numeral, .is_negative, .digits_before_pt, .digits_after_pt, .digits_after_pt_count => return null,
             };
             for (args) |a| if (a != operand) return null;
             return result;

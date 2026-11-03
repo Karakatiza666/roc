@@ -2357,7 +2357,7 @@ const Certifier = struct {
         }
         if (state.balanceOf(value) < 1) {
             const seen = try self.valueWalkScratch();
-            if (try self.tryClaimSeen(state, value, seen, mutations)) return;
+            if (try self.tryClaimSeen(state, value, seen, mutations, null)) return;
             return self.fail("consumed local {d} without an ownership unit", .{@backingInt(local)});
         }
         const before = state.balanceOf(value);
@@ -2377,7 +2377,22 @@ const Certifier = struct {
     /// unit spent (`claimsSpendUnit`) rather than releasable.
     fn tryClaim(self: *Certifier, state: *State, value: ValueId) Allocator.Error!bool {
         const seen = try self.valueWalkScratch();
-        return try self.tryClaimSeen(state, value, seen, null);
+        return try self.tryClaimSeen(state, value, seen, null, null);
+    }
+
+    /// Like `tryClaim`, for a join value that becomes the carrier of its
+    /// stored unit (see `summarizeForJoin`). The container can already have
+    /// spent some slots of the read's range on this path, through another
+    /// read of the same place that released them. The read then claims only
+    /// the slots that remain, and the result names the spent slots in the
+    /// read's own slot numbering. These become the claims of the carrier, so
+    /// the carrier holds the unit as a residual shell. Null when the claim
+    /// is not available.
+    fn tryClaimCarrier(self: *Certifier, state: *State, value: ValueId) Allocator.Error!?ClaimSet {
+        const seen = try self.valueWalkScratch();
+        var spent: ClaimSet = .{};
+        if (!try self.tryClaimSeen(state, value, seen, null, &spent)) return null;
+        return spent;
     }
 
     /// A container that must claim its own unit from its parent before the
@@ -2436,6 +2451,7 @@ const Certifier = struct {
         root: ValueId,
         seen: *std.bit_set.DynamicBitSetUnmanaged,
         mutations: ?*std.ArrayList(OwnershipMutation),
+        carrier_spent: ?*ClaimSet,
     ) Allocator.Error!bool {
         var marked = std.ArrayList(ValueId).empty;
         defer {
@@ -2512,7 +2528,31 @@ const Certifier = struct {
                     // spent claims settle against the unit they spent.
                     // Repeating a field of an incomplete claim set would
                     // lose its other fields.
-                    if (!existing.eql(required)) break :walk false;
+                    if (!existing.eql(required)) {
+                        // A carrier read directly from the container, or
+                        // through views of it, claims the slots of its range
+                        // that the container still holds. The slots that
+                        // another read of the same place spent stay spent:
+                        // they become the carrier's own claims.
+                        const spent_out = carrier_spent orelse break :walk false;
+                        if (pending.items.len != 0) break :walk false;
+                        if (state.balanceOf(container) < 1 or state.conditionalConditionOf(container) != null) break :walk false;
+                        var remaining: ClaimSet = .{};
+                        var spent: ClaimSet = .{};
+                        var slot = range.first;
+                        while (slot < range.first + range.count) : (slot += 1) {
+                            if (!required.contains(slot)) continue;
+                            if (existing.contains(slot)) {
+                                spent = try spent.withField(self.state_arena.allocator(), slot - range.first);
+                            } else {
+                                remaining = try remaining.withField(self.claim_arena.allocator(), slot);
+                            }
+                        }
+                        if (remaining.isEmpty()) break :walk false;
+                        try self.claimContainerField(state, container, remaining, existing, mutations);
+                        spent_out.* = spent;
+                        break :walk true;
+                    }
                     if (state.conditionalConditionOf(container) != null) break :walk false;
                     if (state.balanceOf(container) >= 2) {
                         try self.settleSpentClaims(state, container, existing, mutations);
@@ -2725,7 +2765,7 @@ const Certifier = struct {
         if (state.balanceOf(value) != 1 or state.conditionalConditionOf(value) != null) return false;
         const seen = try self.valueWalkScratch();
         // The parent's stored unit goes straight to the consumer.
-        return try self.tryClaimSeen(state, value, seen, mutations);
+        return try self.tryClaimSeen(state, value, seen, mutations, null);
     }
 
     /// Aggregate consumption: one unit moves into the holder. The emitted
@@ -4484,7 +4524,10 @@ const Certifier = struct {
         // `tryClaim` declines a read whose exact claim is unavailable or
         // conditionally present. A value whose explicit unit its claims have
         // fully spent holds no unit either; the stored unit it claims
-        // replaces the spent one, whose claims settle here.
+        // replaces the spent one, whose claims settle here. When this path
+        // already spent some slots of the value's place through another read
+        // of it, the value claims the remaining slots and keeps the spent
+        // ones as its own claims (`tryClaimCarrier`).
         for (self.relevant_bound_scratch.items) |dense| {
             const value = state.valueAtDense(dense);
             const spent = try self.claimsSpendUnit(state, value);
@@ -4497,12 +4540,9 @@ const Certifier = struct {
                 if (state.balanceOf(root) > 0) break;
             }
             if (self.carrier_scratch.contains(root)) continue;
-            if (try self.tryClaim(state, value)) {
-                if (spent) {
-                    try state.setClaims(value, .{});
-                } else {
-                    try state.addBalance(value, 1);
-                }
+            if (try self.tryClaimCarrier(state, value)) |carried_spent| {
+                if (!spent) try state.addBalance(value, 1);
+                if (spent or !carried_spent.isEmpty()) try state.setClaims(value, carried_spent);
             }
         }
 
@@ -9857,6 +9897,95 @@ test "certify flags a nested field a view dismantle leaves unspent" {
     var f = try CertifyTest.init(testing.allocator);
     defer f.deinit();
     try buildNestedViewTakes(&f, &.{1}, false);
+    try testing.expectError(error.Certification, f.certify());
+    try testing.expect(std.mem.find(u8, f.diag.message(), "unspent") != null);
+}
+
+/// `outer = { 0: { 0: Str, 1: Str }, 1: Str }` as a parameter, with a view of
+/// field 0 that the join's body reads. Slot 2 is taken and released before
+/// the join. On one path to the join, slot 0 is released through a second
+/// read of field 0, and on the other through the view. The body reads the
+/// view as a shell without slot 0, and reads slot 1 through it: a take that
+/// releases it when `release_last`, otherwise a borrowed read. This is the
+/// shape of a record update in a loop over the items of an iterator:
+/// one branch drops the old field, and the rest of the item lives on.
+fn buildViewCarriedAcrossJoin(f: *CertifyTest, release_last: bool) Allocator.Error!void {
+    const outer_layout = try f.layouts.putStructFields(&.{
+        .{ .index = 0, .layout = f.pair_str },
+        .{ .index = 1, .layout = .str },
+    });
+    const outer = try f.local(outer_layout);
+    const cond = try f.local(.bool);
+    const view = try f.local(f.pair_str);
+    const c = try f.local(.str);
+    const second_view = try f.local(f.pair_str);
+    const second_a = try f.local(.str);
+    const a = try f.local(.str);
+    const shell = try f.local(f.pair_str);
+    const b = try f.local(.str);
+    const result = try f.local(.i64);
+    const join_id = f.freshJoinPointId();
+
+    const ret = try f.ret(result);
+    const result_assign = try f.assignI64(result, ret);
+    const after_b = if (release_last) try f.decrefStmt(b, .str, result_assign) else result_assign;
+    const read_b = if (release_last)
+        try takeFieldStmt(f, b, shell, 1, after_b)
+    else
+        try fieldReadStmt(f, b, shell, 1, after_b);
+    const read_shell = try f.store.addCFStmt(.{ .assign_ref = .{
+        .target = shell,
+        .op = .local(view),
+        .extra = try f.store.addOptionalStmtRow(LIR.RefExtra, .{
+            .residual_shell_absent_fields = try f.store.addU32Span(&.{0}),
+        }),
+        .next = read_b,
+    } }, .test_fixture);
+
+    const second_jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } }, .test_fixture);
+    const release_second_a = try f.decrefStmt(second_a, .str, second_jump);
+    const take_second_a = try takeFieldStmt(f, second_a, second_view, 0, release_second_a);
+    const read_second_view = try f.store.addCFStmt(.{ .assign_ref = .{
+        .target = second_view,
+        .op = .field(outer, 0),
+        .extra = try f.store.addOptionalStmtRow(LIR.RefExtra, .{
+            .residual_shell_absent_fields = try f.store.addU32Span(&.{1}),
+        }),
+        .next = take_second_a,
+    } }, .test_fixture);
+
+    const first_jump = try f.store.addCFStmt(.{ .jump = .{ .target = join_id } }, .test_fixture);
+    const release_a = try f.decrefStmt(a, .str, first_jump);
+    const take_a = try takeFieldStmt(f, a, view, 0, release_a);
+
+    const choose = try f.store.addCFStmt(.{ .switch_stmt = .{
+        .cond = cond,
+        .branches = try f.store.addCFSwitchBranches(&.{.{ .value = 1, .body = read_second_view }}),
+        .default_branch = take_a,
+    } }, .test_fixture);
+    const join_stmt = try f.store.addCFStmt(.{ .join = .{
+        .id = join_id,
+        .params = LIR.LocalSpan.empty(),
+        .body = read_shell,
+        .remainder = choose,
+    } }, .test_fixture);
+    const release_c = try f.decrefStmt(c, .str, join_stmt);
+    const take_c = try takeFieldStmt(f, c, outer, 1, release_c);
+    const body = try fieldReadStmt(f, view, outer, 0, take_c);
+    _ = try f.addProc(&.{ outer, cond }, body, .i64);
+}
+
+test "certify carries a view across a join after another read of its place spent a slot" {
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    try buildViewCarriedAcrossJoin(&f, true);
+    try f.certify();
+}
+
+test "certify flags a slot that a view carried across a join leaves unspent" {
+    var f = try CertifyTest.init(testing.allocator);
+    defer f.deinit();
+    try buildViewCarriedAcrossJoin(&f, false);
     try testing.expectError(error.Certification, f.certify());
     try testing.expect(std.mem.find(u8, f.diag.message(), "unspent") != null);
 }

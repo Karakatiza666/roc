@@ -312,7 +312,7 @@ NO CHANGE
 				(ty-lookup (name "U8") (builtin)))))
 	(d-let
 		(p-assign (ident "supplied"))
-		(e-call (constraint-fn-var 581)
+		(e-call (constraint-fn-var 662)
 			(e-lookup-local
 				(p-assign (ident "id")))
 			(e-record
@@ -323,7 +323,7 @@ NO CHANGE
 			(ty-lookup (name "Config") (local))))
 	(d-let
 		(p-assign (ident "omitted"))
-		(e-call (constraint-fn-var 593)
+		(e-call (constraint-fn-var 674)
 			(e-lookup-local
 				(p-assign (ident "id")))
 			(e-empty_record))
@@ -331,7 +331,7 @@ NO CHANGE
 			(ty-lookup (name "Config") (local))))
 	(d-let
 		(p-assign (ident "supplied_list"))
-		(e-call (constraint-fn-var 620)
+		(e-call (constraint-fn-var 701)
 			(e-lookup-external
 				(builtin))
 			(e-record
@@ -344,7 +344,7 @@ NO CHANGE
 				(ty-lookup (name "Config") (local)))))
 	(d-let
 		(p-assign (ident "omitted_list"))
-		(e-call (constraint-fn-var 628)
+		(e-call (constraint-fn-var 709)
 			(e-lookup-external
 				(builtin))
 			(e-empty_record)
@@ -354,7 +354,7 @@ NO CHANGE
 				(ty-lookup (name "Config") (local)))))
 	(d-let
 		(p-assign (ident "supplied_mapped"))
-		(e-call (constraint-fn-var 672)
+		(e-call (constraint-fn-var 753)
 			(e-lookup-external
 				(builtin))
 			(e-list
@@ -373,7 +373,7 @@ NO CHANGE
 				(ty-lookup (name "Config") (local)))))
 	(d-let
 		(p-assign (ident "omitted_mapped"))
-		(e-call (constraint-fn-var 702)
+		(e-call (constraint-fn-var 783)
 			(e-lookup-external
 				(builtin))
 			(e-list
@@ -389,7 +389,7 @@ NO CHANGE
 				(ty-lookup (name "Config") (local)))))
 	(d-let
 		(p-assign (ident "omitted_mixed"))
-		(e-call (constraint-fn-var 708)
+		(e-call (constraint-fn-var 789)
 			(e-lookup-local
 				(p-assign (ident "id")))
 			(e-empty_record))
@@ -412,7 +412,7 @@ NO CHANGE
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-call (constraint-fn-var 730)
+				(e-call (constraint-fn-var 811)
 					(e-lookup-local
 						(p-assign (ident "total")))
 					(e-record
@@ -424,7 +424,7 @@ NO CHANGE
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-call (constraint-fn-var 759)
+				(e-call (constraint-fn-var 840)
 					(e-lookup-local
 						(p-assign (ident "total")))
 					(e-nominal (nominal "Config")
@@ -434,7 +434,7 @@ NO CHANGE
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-call (constraint-fn-var 778)
+				(e-call (constraint-fn-var 859)
 					(e-lookup-local
 						(p-assign (ident "total")))
 					(e-empty_record)))

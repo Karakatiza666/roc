@@ -63,7 +63,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "rec")))
-			(e-call (constraint-fn-var 393)
+			(e-call (constraint-fn-var 474)
 				(e-field-access
 					(receiver
 						(e-lookup-local

@@ -35,13 +35,13 @@ NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-call (constraint-fn-var 375)
+(e-call (constraint-fn-var 456)
 	(e-lambda
 		(args
 			(p-assign (ident "x")))
-		(e-dispatch-call (method "negate") (constraint-fn-var 366)
+		(e-dispatch-call (method "negate") (constraint-fn-var 447)
 			(receiver
-				(e-dispatch-call (method "negate") (constraint-fn-var 364)
+				(e-dispatch-call (method "negate") (constraint-fn-var 445)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "x"))))

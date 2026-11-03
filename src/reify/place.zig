@@ -67,7 +67,7 @@ pub const Ties = union(enum) {
 };
 
 /// Where a use of a node is: in a node that reads it, or in a region's end.
-const Site = union(enum) { node: NodeId, region: RegionId };
+pub const Site = union(enum) { node: NodeId, region: RegionId };
 
 /// The placement of one row.
 pub const Plan = struct {
@@ -147,6 +147,13 @@ pub fn noSpeculation(p: *const Plan) bool {
     var it = p.info.constIterator();
     while (it.next()) |e| {
         const n = e.key_ptr.*;
+        if (e.value_ptr.merged) continue;
+        // A checked op N13u proved fits is speculatable inside the region
+        // of its facts and no further out (normal-form 1.1).
+        if (p.store.fitFloor(n)) |floor| {
+            if (!within(p, e.value_ptr.place, floor)) return false;
+            continue;
+        }
         if (p.store.nodes.items(.flags)[n.index()].speculatable or e.value_ptr.merged) continue;
         const home = p.store.nodes.items(.region)[n.index()];
         var at = e.value_ptr.place;
@@ -172,8 +179,14 @@ pub fn planWith(gpa: Allocator, store: *const ir.Store, returns: *live_mod.Retur
     try late(&p, returns);
     try fillMembers(&p);
     switch (stage) {
-        .simplify => try everyArm(&p, returns),
-        .number => try hoist(&p, returns),
+        .simplify => _ = try everyArm(&p, returns),
+        // A node hoisted into the arms of a switch merges with the nodes
+        // every arm computes, as in the simplify phase (normal-form 3.5),
+        // and a merged node is hoisted again from the switch's region.
+        .number => {
+            try hoist(&p, returns);
+            while (try everyArm(&p, returns)) try hoist(&p, returns);
+        },
     }
     try regionOrder(&p, returns);
     return p;
@@ -486,8 +499,9 @@ fn sameRegions(p: *const Plan, a: Allocator, x: NodeId, y: NodeId) Allocator.Err
 // one when its regions read nothing from the arms and end alike. Inner
 // switches first, so a node merged out of an inner switch can merge again
 // out of an outer one; each switch again until nothing merges, so a node
-// over merged nodes merges too.
-fn everyArm(p: *Plan, returns: *live_mod.Returns) Allocator.Error!void {
+// over merged nodes merges too. Says whether a node merged.
+fn everyArm(p: *Plan, returns: *live_mod.Returns) Allocator.Error!bool {
+    var any = false;
     const a = p.arena();
     const store = p.store;
     var inner_first: std.ArrayList(NodeId) = .empty;
@@ -517,14 +531,26 @@ fn everyArm(p: *Plan, returns: *live_mod.Returns) Allocator.Error!void {
                 if (store.node(kept).op.ownsRegions()) for (tables[1..]) |t| {
                     if (!try sameRegions(p, a, kept, t.get(e.key_ptr.*).?)) continue :next_key;
                 };
-                for (tables[1..]) |t| p.info.getPtr(t.get(e.key_ptr.*).?).?.alias = kept;
+                for (tables[1..]) |t| retarget(p, t.get(e.key_ptr.*).?, kept);
                 p.info.getPtr(kept).?.place = home;
                 p.info.getPtr(kept).?.merged = true;
                 merged = true;
             }
             if (!merged) break;
+            any = true;
             try fillMembers(p);
         }
+    }
+    return any;
+}
+
+// Merge node `from` into `kept`, and every node already merged into `from`,
+// so a node's alias is always the node the rebuild builds for it, never a node
+// that merged away after it.
+fn retarget(p: *Plan, from: NodeId, kept: NodeId) void {
+    var it = p.info.valueIterator();
+    while (it.next()) |info| {
+        if (info.alias == from) info.alias = kept;
     }
 }
 
@@ -543,6 +569,9 @@ fn hoist(p: *Plan, returns: *live_mod.Returns) Allocator.Error!void {
     for (order.items) |n| {
         const nd = p.store.node(n);
         if (!nd.flags.speculatable or pinned(p, returns, n)) continue;
+        // A proved op placed outside the region of its facts, by N5c, is
+        // not speculatable where it stands.
+        if (p.store.fitFloor(n)) |floor| if (!within(p, p.info.get(n).?.place, floor)) continue;
         reads.clearRetainingCapacity();
         try readRegions(p, a, n, &reads);
         const body = p.store.row(p.row).body;
@@ -580,9 +609,9 @@ fn hoistNode(p: *const Plan, a: Allocator, n: NodeId, order: *std.ArrayList(Node
     try order.append(a, n);
 }
 
-// The values region `r`'s end reads that the row reaches: an arm of a value
-// switch gives only the outputs something reads.
-fn endReads(p: *const Plan, a: Allocator, r: RegionId) Allocator.Error![]const Ref {
+/// The values region `r`'s end reads that the row reaches: an arm of a value
+/// switch gives only the outputs something reads.
+pub fn endReads(p: *const Plan, a: Allocator, r: RegionId) Allocator.Error![]const Ref {
     const reg = p.store.region(r);
     const refs = p.store.refSlice(reg.end.refs);
     if (reg.owner == NodeId.none or reg.kind != .arm) return refs;
@@ -596,10 +625,15 @@ fn endReads(p: *const Plan, a: Allocator, r: RegionId) Allocator.Error![]const R
 // The regions node `n` reads from: where each node it reads is placed, the
 // region of each region parameter, and for a node that owns regions, the
 // same for everything its regions read from outside them.
+//
+// A checked op N13u proved fits reads the region of its facts too, so it is
+// hoisted no further out than that region, and neither is a node whose
+// regions hold it (normal-form 1.1).
 fn readRegions(p: *const Plan, a: Allocator, n: NodeId, out: *collections.DenseMapUnmanaged(RegionId, void)) Allocator.Error!void {
     const store = p.store;
     const nd = store.node(n);
     for (store.refSlice(nd.args)) |arg| try readRegion(p, a, arg, n, out);
+    if (store.fitFloor(n)) |floor| try out.put(a, floor, {});
     if (!nd.op.ownsRegions()) return;
     var stack: std.ArrayList(RegionId) = .empty;
     try stack.appendSlice(a, store.regionSlice(nd.regions));
@@ -607,24 +641,45 @@ fn readRegions(p: *const Plan, a: Allocator, n: NodeId, out: *collections.DenseM
         for (try endReads(p, a, r)) |ref| try readRegion(p, a, ref, n, out);
         for (p.membersOf(r)) |m| {
             for (store.refSlice(store.node(m).args)) |arg| try readRegion(p, a, arg, n, out);
+            if (store.fitFloor(m)) |floor| if (!inside(p, floor, n)) try out.put(a, floor, {});
             try stack.appendSlice(a, store.regionSlice(store.node(m).regions));
         }
     }
 }
 
 fn readRegion(p: *const Plan, a: Allocator, ref: Ref, owner: NodeId, out: *collections.DenseMapUnmanaged(RegionId, void)) Allocator.Error!void {
-    const r = switch (ref.kind) {
-        .row_param => return,
+    // A value read from inside `owner`'s own regions is not read from outside.
+    if (placedIn(p, ref, owner)) return;
+    try out.put(a, regionOfRef(p, ref) orelse return, {});
+}
+
+// The region the value `ref` is placed in, or null for a row parameter and an input.
+fn regionOfRef(p: *const Plan, ref: Ref) ?RegionId {
+    return switch (ref.kind) {
+        .row_param, .input => null,
         .region_param => ref.regionId(),
         .node => p.info.get(p.aliasOf(ref.nodeId())).?.place,
     };
-    // A value read from inside `owner`'s own regions is not read from outside.
-    if (inside(p, r, owner)) return;
-    try out.put(a, r, {});
 }
 
-// Whether region `r` is one of `owner`'s regions or nested in one.
-fn inside(p: *const Plan, r: RegionId, owner: NodeId) bool {
+/// Whether the value `ref` is placed in one of `owner`'s regions or in a
+/// region nested in one, in the plan's tree.
+pub fn placedIn(p: *const Plan, ref: Ref, owner: NodeId) bool {
+    const r = regionOfRef(p, ref) orelse return false;
+    return inside(p, r, owner);
+}
+
+// Whether region `r` is `outer` or nested in it, in the plan's tree.
+fn within(p: *const Plan, r: RegionId, outer: RegionId) bool {
+    var at = r;
+    while (at != RegionId.none) : (at = p.parentOf(at)) {
+        if (at == outer) return true;
+    }
+    return false;
+}
+
+/// Whether region `r` is one of `owner`'s regions or nested in one, in the plan's tree.
+pub fn inside(p: *const Plan, r: RegionId, owner: NodeId) bool {
     var at = r;
     while (at != RegionId.none) : (at = p.parentOf(at)) {
         if (p.store.region(at).owner == owner) return true;
@@ -740,6 +795,9 @@ fn invariant(comptime message: []const u8) noreturn {
 }
 
 const testing = std.testing;
+
+// The errors of the test helpers: allocation, and a failed check.
+const TestError = std.mem.Allocator.Error || error{ TestUnexpectedResult, TestExpectedEqual };
 const builder_mod = @import("builder.zig");
 const types_mod = @import("types.zig");
 const driver = @import("driver.zig");
@@ -774,6 +832,67 @@ const Fixture = struct {
         try testing.expectEqualStrings(want, out.written());
     }
 };
+
+// `|n| for i in 0..10 (acc = 0) { for _ in 0..n (acc) { acc + (i + k) } }`.
+fn nestedSum(f: *Fixture, k: i128) TestError!RowId {
+    const b = &f.b;
+    const u8_ty = try f.types.intTy(.u8);
+    const row = try b.beginRow(&.{u8_ty}, u8_ty);
+    const zero = try b.litInt(u8_ty, 0);
+    const outer = try b.openRegion(.loop_body, &.{ u8_ty, u8_ty });
+    const i = Ref.regionParam(outer, 0);
+    const inner = try b.openRegion(.loop_body, &.{ u8_ty, u8_ty });
+    const step = try b.call(.u8, .plus, &.{ i, try b.litInt(u8_ty, k) });
+    try b.close(.{ .continue_ = &.{try b.call(.u8, .plus, &.{ Ref.regionParam(inner, 1), step })} });
+    const inner_loop = try b.loopOf(.for_range, &.{ zero, Ref.rowParam(0), Ref.regionParam(outer, 1) }, inner, &.{u8_ty});
+    try b.close(.{ .continue_ = &.{inner_loop} });
+    const outer_loop = try b.loopOf(.for_range, &.{ zero, try b.litInt(u8_ty, 10), zero }, outer, &.{u8_ty});
+    try b.endRow(.{ .value = &.{outer_loop} });
+    return row;
+}
+
+test "N5b with N13u: a checked plus proved to fit leaves the inner loop for the body whose index bounds it, and one not proved stays" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    // `i` is at most 9, so `i + 1` fits and is computed once per outer turn.
+    try f.expectSite(try nestedSum(&f, 1),
+        \\row r0 (U8) -> U8
+        \\  n0 = 0 : U8
+        \\  n1 = 10 : U8
+        \\  n2 = 1 : U8
+        \\  n6 = for_range(n0, n1, n0) : U8 !spec
+        \\    body (s6.0: U8, s6.1: U8)
+        \\      n3 = Num.U8.plus(s6.0, n2) : U8
+        \\      n5 = for_range(n0, p0, s6.1) : U8 !spec
+        \\        body (s5.0: U8, s5.1: U8)
+        \\          n4 = Num.U8.plus(s5.1, n3) : U8 !spec
+        \\          continue n4
+        \\      continue n5
+        \\  value n6
+        \\
+    );
+    var g: Fixture = undefined;
+    g.init();
+    defer g.deinit();
+    // `i + 250` can overflow, so it stays where the inner body computes it.
+    try g.expectSite(try nestedSum(&g, 250),
+        \\row r0 (U8) -> U8
+        \\  n0 = 0 : U8
+        \\  n1 = 10 : U8
+        \\  n2 = 250 : U8
+        \\  n6 = for_range(n0, n1, n0) : U8 !spec
+        \\    body (s6.0: U8, s6.1: U8)
+        \\      n5 = for_range(n0, p0, s6.1) : U8 !spec
+        \\        body (s5.0: U8, s5.1: U8)
+        \\          n3 = Num.U8.plus(s6.0, n2) : U8 !spec
+        \\          n4 = Num.U8.plus(s5.1, n3) : U8 !spec
+        \\          continue n4
+        \\      continue n5
+        \\  value n6
+        \\
+    );
+}
 
 test "N5d with N5b: a speculatable node in a branch in a loop lands just outside the loop, after the branch's fact simplified it" {
     var f: Fixture = undefined;
@@ -1020,6 +1139,58 @@ test "N5c: a value switch every arm computes from values outside the arms is one
         \\      n7 = 3 : I64
         \\      n8 = Num.I64.times(n4, n7) : I64 !spec
         \\      value n8
+        \\  value n9
+        \\
+    );
+}
+
+test "N5c: a node merged out of an inner switch and then out of an outer one is built once, in the outer switch's region" {
+    // `if b < 5 then a else if flag then 1 - a else a - b`: the `a` read of
+    // the inner arms merges into the inner switch's region, which then
+    // merges with the `a` read of the outer arm. The inner arms' nodes read
+    // the node the rebuild builds, never the one that merged away.
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    const b = &f.b;
+    const i64_ty = try f.types.intTy(.i64);
+    const bool_ty = try f.types.boolTy();
+    const rec_ty = try f.types.recordTy(&.{ .{ .name = "a", .ty = i64_ty }, .{ .name = "b", .ty = i64_ty }, .{ .name = "flag", .ty = bool_ty } });
+    const row = try b.beginRow(&.{rec_ty}, i64_ty);
+    const input = Ref.rowParam(0);
+    const small = try b.call(.i64, .is_lt, &.{ try b.field(input, 1), try b.litInt(i64_ty, 5) });
+    const big_arm = try b.openArm(small, 0);
+    const flag = try b.field(input, 2);
+    const flag_off = try b.openArm(flag, 0);
+    try b.close(.{ .value = &.{try b.call(.i64, .minus, &.{ try b.field(input, 0), try b.field(input, 1) })} });
+    const flag_on = try b.openArm(flag, 1);
+    try b.close(.{ .value = &.{try b.call(.i64, .minus, &.{ try b.litInt(i64_ty, 1), try b.field(input, 0) })} });
+    const inner = try b.switchOn(flag, &.{ flag_off, flag_on }, &.{}, &.{i64_ty}, &.{});
+    try b.close(.{ .value = &.{inner} });
+    const small_arm = try b.openArm(small, 1);
+    try b.close(.{ .value = &.{try b.field(input, 0)} });
+    const out = try b.switchOn(small, &.{ big_arm, small_arm }, &.{}, &.{i64_ty}, &.{});
+    try b.endRow(.{ .value = &.{out} });
+    try f.expectSite(row,
+        \\row r0 ({ a : I64, b : I64, flag : Bool }) -> I64
+        \\  n0 = field 1(p0) : I64
+        \\  n1 = 5 : I64
+        \\  n2 = Num.I64.is_lt(n0, n1) : Bool
+        \\  n4 = field 0(p0) : I64
+        \\  n9 = switch n2 : I64 !spec
+        \\    arm 0
+        \\      n3 = field 2(p0) : Bool
+        \\      n8 = switch n3 : I64 !spec
+        \\        arm 0
+        \\          n5 = Num.I64.minus(n4, n0) : I64 !spec
+        \\          value n5
+        \\        arm 1
+        \\          n6 = 1 : I64
+        \\          n7 = Num.I64.minus(n6, n4) : I64 !spec
+        \\          value n7
+        \\      value n8
+        \\    arm 1
+        \\      value n4
         \\  value n9
         \\
     );

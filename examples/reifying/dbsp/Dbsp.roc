@@ -82,7 +82,7 @@ Dbsp :: {}.{
 			|acc, View.(v)| {
 				one = Dbsp.lower(v.plan, "view `${v.name}`", acc.helpers)?
 				match one.source {
-					Unread(_) => Err(BadCircuit("view `${v.name}` has no stage; it is the input itself"))
+					Unread(_) => Err(Error.BadCircuit("view `${v.name}` has no stage; it is the input itself"))
 					Read => Ok({ done: acc.done.append({ name: v.name, one }), helpers: one.helpers })
 				}
 			},
@@ -244,7 +244,7 @@ Dbsp :: {}.{
 		defined = Dbsp.define(graph, called, parent.helpers).map_err(|error| Dbsp.blame(error, place))?
 		scope = { row, params, locals: [], fns: defined.names }
 		body = Dbsp.render_block(tree, scope).map_err(|error| Dbsp.blame(error, place))?
-		named = names.map_with_index(|name, at| if Dbsp.reads(tree, at.to_u32_wrap()) name else "_${name}")
+		named = names.map_with_index(|name, at| if (Dbsp.reads(tree, at.to_u32_wrap())) name else "_${name}")
 		settled = match (parent.source, row.params.first()) {
 			(Unread(name), Ok(ty)) => { ..parent, source: Read, ty, inputs: parent.inputs.append({ name, ty }) }
 			_ => parent
@@ -277,7 +277,7 @@ Dbsp :: {}.{
 			}
 			block.defs.join_map(|def| Dbsp.calls_in(def.value)).concat(ends.join_map(Dbsp.calls_in))
 		}
-		Param(_) | Arg(_) | Out(_) | Def(_) => []
+		Param(_) | Input(_) | Arg(_) | Out(_) | Def(_) => []
 	}
 
 	## Every row that `pending` calls, directly or through other rows, once each,
@@ -336,9 +336,9 @@ Dbsp :: {}.{
 		names = row.params.map_with_index(|_, at| "p${at.to_str()}")
 		scope = { row, params: names.map(Dbsp.atom), locals: [], fns }
 		body = Dbsp.render_block(tree, scope)?
-		typed = List.map2(row.params, names, |ty, param| Dbsp.rust_type(ty).map_ok(|rust| if Dbsp.is_copy(ty) rust else "&${rust}").map_ok(|rust| (param, rust)))
+		typed = List.map2(row.params, names, |ty, param| Dbsp.rust_type(ty).map_ok(|rust| if (Dbsp.is_copy(ty)) rust else "&${rust}").map_ok(|rust| (param, rust)))
 		declared = typed.map_try(|one| one)?
-		listed = declared.map_with_index(|(param, rust), at| "${if Dbsp.reads(tree, at.to_u32_wrap()) param else "_${param}"}: ${rust}")
+		listed = declared.map_with_index(|(param, rust), at| "${if (Dbsp.reads(tree, at.to_u32_wrap())) param else "_${param}"}: ${rust}")
 		result = Dbsp.rust_type(row.result)?
 		Ok("fn ${name}(${Str.join_with(listed, ", ")}) -> ${result} {\n${Dbsp.indent(Str.join_with(body.lets.append(body.value), "\n"))}\n}")
 	}
@@ -385,7 +385,7 @@ Dbsp :: {}.{
 			}
 			block.defs.any(|def| Dbsp.reads(def.value, k)) or ends.any(|end| Dbsp.reads(end, k))
 		}
-		Arg(_) | Out(_) | Def(_) => Bool.False
+		Input(_) | Arg(_) | Out(_) | Def(_) => Bool.False
 	}
 
 	## One more stage: the call it writes, and the row type it leaves.
@@ -417,12 +417,12 @@ Dbsp :: {}.{
 	# ------------------------------------------------------------ Rust types
 
 	## One Rust struct of a row type.
-	Struct : { name : Str, fields : List({ name : Str, ty : Code.Ty, presence : [Required, Optional] }) }
+	Struct : { name : Str, fields : List({ name : Str, ty : Code.Ty, presence : [Required, Optional, Default(Code.Value), DefaultComputed] }) }
 
 	## The structs a type needs, a struct after the structs of its fields.
 	structs_of : Code.Ty -> List(Struct)
 	structs_of = |ty| match ty {
-		Named(name, Record(fields)) => fields.join_map(|field| Dbsp.structs_of(field.ty)).append({ name, fields })
+		Named(name, _, Record(fields)) => fields.join_map(|field| Dbsp.structs_of(field.ty)).append({ name, fields })
 		_ => ty.children().join_map(Dbsp.structs_of)
 	}
 
@@ -452,7 +452,8 @@ Dbsp :: {}.{
 		fields = one.fields.map_try(
 			|field| match field.presence {
 				Optional => Err(BadType("`${field.name}` of `${Dbsp.short(one.name)}` may be absent, and a Rust column is always there"))
-				Required => Dbsp.rust_type(field.ty).map_ok(|ty| "    pub ${field.name}: ${ty},")
+				# A default fills the field in, so every value of the type has it.
+				Required | Default(_) | DefaultComputed => Dbsp.rust_type(field.ty).map_ok(|ty| "    pub ${field.name}: ${ty},")
 			},
 		)?
 		Ok(
@@ -487,7 +488,7 @@ Dbsp :: {}.{
 		F64 => Ok("F64")
 		Bool => Ok("bool")
 		Str => Ok("String")
-		Named(name, Record(_)) => Ok(Dbsp.short(name))
+		Named(name, _, Record(_)) => Ok(Dbsp.short(name))
 		Tuple(parts) =>
 			if parts.len() >= 2 {
 				Ok("Tup${parts.len().to_str()}<${Str.join_with(parts.map_try(Dbsp.rust_type)?, ", ")}>")
@@ -496,9 +497,9 @@ Dbsp :: {}.{
 			}
 		Dec => Err(BadType("Dec has no `dbsp` column type; use I64 or F64"))
 		Record(_) => Err(BadType("an anonymous record has no Rust struct; declare the row as a nominal, `Row := { .. }`"))
-		Named(name, _) => Err(BadType("`${name}` is a nominal over something other than a record, and only a record becomes a Rust struct"))
+		Named(name, _, _) => Err(BadType("`${name}` is a nominal over something other than a record, and only a record becomes a Rust struct"))
 		ListOf(_) => Err(BadType("a List column has no `dbsp` row type in this translator"))
-		TagUnion(_) | Fn(_, _) | Recursive(_) | Opaque(_, _) => Err(BadType("`${ty.name()}` has no `dbsp` column type"))
+		TagUnion(_) | Fn(_, _) | Recursive(_) | Opaque(_, _, _) => Err(BadType("`${ty.name()}` has no `dbsp` column type"))
 	}
 
 	is_copy : Code.Ty -> Bool
@@ -591,6 +592,9 @@ Dbsp :: {}.{
 		_ => Ok({ lets: [], value: Dbsp.owned(tree, scope)?.text })
 	}
 
+	no_input : Error
+	no_input = Unsupported("a value the step reads from around itself has no closure form here; read it from a column")
+
 	no_loop : Error
 	no_loop = Unsupported("a loop has no closure form; `dbsp`'s operators are the loops, so write the step as a `filter`, a `map` or a `count`")
 
@@ -602,7 +606,7 @@ Dbsp :: {}.{
 			(Field(_), [inner]) | (Index(_), [inner]) | (Unwrap, [inner]) => Dbsp.is_read(inner)
 			_ => Bool.False
 		}
-		Arg(_) | Out(_) | Block(_) => Bool.False
+		Input(_) | Arg(_) | Out(_) | Block(_) => Bool.False
 	}
 
 	## Whether a tree reads a name, whose value a Rust expression would borrow
@@ -614,7 +618,7 @@ Dbsp :: {}.{
 			Field(_) | Index(_) | Unwrap => Bool.True
 			_ => Bool.False
 		}
-		Arg(_) | Out(_) | Block(_) => Bool.False
+		Input(_) | Arg(_) | Out(_) | Block(_) => Bool.False
 	}
 
 	tree_ty : Code.Tree, Scope -> Try(Code.Ty, Error)
@@ -626,6 +630,7 @@ Dbsp :: {}.{
 		}
 		Def(n) => Ok(scope.row.node(n).ty)
 		Arg(_) | Out(_) | Block(_) => Err(Dbsp.no_loop)
+		Input(_) => Err(Dbsp.no_input)
 	}
 
 	## An expression that owns its value.
@@ -655,6 +660,7 @@ Dbsp :: {}.{
 			Err(_) => Err(BadCircuit("a value read before its block computes it"))
 		}
 		Arg(_) | Out(_) => Err(Dbsp.no_loop)
+		Input(_) => Err(Dbsp.no_input)
 		Block(_) => {
 			inner = Dbsp.render_block(tree, scope)?
 			if inner.lets.is_empty() {
@@ -756,7 +762,7 @@ Dbsp :: {}.{
 	literal = |value| match value {
 		Int(number, ty) => {
 			text = "${number.to_str()}${Dbsp.rust_type(ty)?}"
-			level = if number < 0 8 else 9
+			level = if (number < 0) 8 else 9
 			Ok({ text, level })
 		}
 		Frac(number, ty) => {
@@ -764,13 +770,19 @@ Dbsp :: {}.{
 				F32 => number.to_f32_wrap().to_str()
 				_ => number.to_str()
 			}
-			digits = if rendered.contains(".") or rendered.contains("e") rendered else "${rendered}.0"
+			digits = if (rendered.contains(".") or rendered.contains("e")) rendered else "${rendered}.0"
 			Ok(Dbsp.atom("${Dbsp.rust_type(ty)?}::new(${digits})"))
 		}
-		Bool(flag) => Ok(Dbsp.atom(if flag "true" else "false"))
+		Bool(flag) => Ok(Dbsp.atom(if (flag) "true" else "false"))
 		Str(text) => Ok(Dbsp.atom(Dbsp.rust_str(text)))
 		Fixed(_) => Err(BadType("Dec has no `dbsp` column type; write this literal as an F64 or an I64"))
 		Bytes(_) => Err(Unsupported("a byte literal has no `dbsp` column type"))
+		# `F64` is the one `dbsp` column type that holds every numeral's
+		# fraction, so a numeral is the `F64` it is.
+		Numeral(n) => match F64.from_numeral(n) {
+			Ok(number) => Dbsp.literal(Frac(number, F64))
+			Err(_) => Err(BadType("this numeral has no F64 value"))
+		}
 	}
 
 	rust_str : Str -> Str
@@ -830,7 +842,7 @@ Dbsp :: {}.{
 	## `not` of an equality is Rust's `!=`.
 	negation : Code.Tree, Scope -> Try(Ex, Error)
 	negation = |operand, scope| match operand {
-		Op({ op: Prim({ owner: _, method: "is_eq" }), args: [a, b], .. }) => Dbsp.compare("!=", a, b, scope)
+		Op({ op: Prim({ owner: _, method: "is_eq", .. }), args: [a, b], .. }) => Dbsp.compare("!=", a, b, scope)
 		_ => Dbsp.render(operand, scope).map_ok(|ex| { text: "!${Dbsp.at(ex, 8)}", level: 8 })
 	}
 
@@ -856,11 +868,11 @@ Dbsp :: {}.{
 	compare : Str, Code.Tree, Code.Tree, Scope -> Try(Ex, Error)
 	compare = |symbol, lhs, rhs, scope| {
 		flip = Dbsp.is_literal(lhs) and !Dbsp.is_literal(rhs)
-		first = if flip rhs else lhs
-		second = if flip lhs else rhs
+		first = if (flip) rhs else lhs
+		second = if (flip) lhs else rhs
 		left = Dbsp.render(first, scope)?
 		right = Dbsp.render(second, scope)?
-		written = if flip Dbsp.mirror(symbol) else symbol
+		written = if (flip) Dbsp.mirror(symbol) else symbol
 		Ok({ text: "${Dbsp.at(left, 5)} ${written} ${Dbsp.at(right, 5)}", level: 4 })
 	}
 

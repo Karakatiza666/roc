@@ -66,6 +66,7 @@ Interp :: {}.{
 			Err(_) => Err(Unbound("node ${n.to_str()}"))
 		}
 		Arg(_) | Out(_) => Err(UnknownCall("a loop's or a branch's state, which this interpreter evaluates no loop for"))
+		Input(k) => Err(Unbound("input slot ${k.to_str()}"))
 		Block(block) => {
 			inner = block.defs.fold_try(
 				scope,
@@ -92,6 +93,10 @@ Interp :: {}.{
 			Bool(flag) => Ok(Value.Boolean(flag))
 			Str(text) => Ok(Value.Text(text))
 			Bytes(_) => Err(UnknownCall("a byte blob has no CPU value in this interpreter"))
+			Numeral(n) => match F64.from_numeral(n) {
+				Ok(number) => Ok(Value.Float(number))
+				Err(_) => Err(NotAFloat("this numeral has no F64 value"))
+			}
 		}
 		Prim(prim) => Interp.call(prim.owner, prim.method, args.map_try(|arg| Interp.eval(arg, scope))?)
 		And(_) => Interp.connective(args, scope, Bool.False)
@@ -163,8 +168,8 @@ Interp :: {}.{
 			|state, operand| match state {
 				Decided => Ok(Decided)
 				Undecided => match Interp.eval(operand, scope)? {
-					Boolean(flag) => Ok(if flag == decides Decided else Undecided)
-					_ => Err(NotAFloat("`and` and `or` need Bools"))
+					Boolean(flag) => Ok(if (flag == decides) Decided else Undecided)
+					_ => Err(Error.NotAFloat("`and` and `or` need Bools"))
 				}
 			},
 		)?
@@ -248,8 +253,8 @@ Interp :: {}.{
 		("tan", [only]) => Interp.unary(only, F64.tan)
 		("sqrt", [only]) => Interp.unary(only, F64.sqrt)
 		("abs", [only]) => Interp.unary(only, F64.abs)
-		("min", [a, b]) => Interp.arith(method, a, b, |x, y| if x < y x else y)
-		("max", [a, b]) => Interp.arith(method, a, b, |x, y| if x > y x else y)
+		("min", [a, b]) => Interp.arith(method, a, b, |x, y| if (x < y) x else y)
+		("max", [a, b]) => Interp.arith(method, a, b, |x, y| if (x > y) x else y)
 		("pow", [a, b]) => Interp.arith(method, a, b, |x, y| x.pow(y))
 		_ => Err(UnknownCall("${owner}.${method}"))
 	}

@@ -1559,6 +1559,13 @@ pub const CheckedEvidence = struct {
     /// runtime representation still needs an explicit descriptor).
     dispatcher_ty: CheckedTypeId,
     resolution: Resolution,
+    /// Whether the resolution is `direct` to an intrinsic, and the callee's
+    /// relation for this obligation has a clear runs bit, so only
+    /// description-only bodies of the callee use it (design.md "The Runs
+    /// Bit"). No run-time code reads a dictionary slot for it, and an
+    /// intrinsic has no Roc body, so Boxy stores a crashing slot in place of
+    /// a worker. Descriptions still read the direct target.
+    description_only_intrinsic: bool,
     /// Independent callable contracts in `evidence_refs`, sharing one target slot.
     callable_contracts: artifact_serialize.Span = .{},
 
@@ -2535,6 +2542,48 @@ pub const StaticDispatchPlanTable = struct {
             });
         }
 
+        // The two requirements of each capture read at a `Code.Binds`
+        // position (rule "Bound Capture Encoding"), planned on the
+        // expressions publication synthesized for them.
+        {
+            const default_method = try names.internMethodName("default");
+            const encoder_method = try names.internMethodIdent(module.identStoreConst(), module.commonIdents().encoder_for);
+            for (checked_bodies.bound_capture_exprs.items) |bound| {
+                const encoding = module_env.bound_capture_encodings.items.items[bound.encoding];
+                const format_var: Var = @fromBackingInt(@intCast(encoding.format_var));
+                const default_fn_var: Var = @fromBackingInt(@intCast(encoding.default_fn_var));
+                const encoder_fn_var: Var = @fromBackingInt(@intCast(encoding.encoder_fn_var));
+                const read_var: Var = @fromBackingInt(@intCast(encoding.read_expr));
+                try plans.append(allocator, .{
+                    .expr = bound.default_expr,
+                    .method = default_method,
+                    .dispatcher = .type_only,
+                    .dispatcher_ty = try checkedTypeIdForVar(allocator, module, checked_types, format_var),
+                    .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, default_fn_var),
+                    .args = .{ .start = 0, .len = 0 },
+                    .result_mode = .value,
+                });
+                try plan_sources.append(allocator, .{
+                    .dispatcher_var = format_var,
+                    .constraint_fn_var = default_fn_var,
+                });
+                const args = [_]StaticDispatchOperand{.{ .checked_expr = bound.default_expr }};
+                try plans.append(allocator, .{
+                    .expr = bound.encoder_expr,
+                    .method = encoder_method,
+                    .dispatcher = .type_only,
+                    .dispatcher_ty = try checkedTypeIdForVar(allocator, module, checked_types, read_var),
+                    .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, encoder_fn_var),
+                    .args = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, &args),
+                    .result_mode = try staticDispatchResultModeForCheckedValueCall(allocator, module, checked_types, &constraint_index, module.commonIdents().encoder_for, encoder_fn_var),
+                });
+                try plan_sources.append(allocator, .{
+                    .dispatcher_var = read_var,
+                    .constraint_fn_var = encoder_fn_var,
+                });
+            }
+        }
+
         for (module_env.for_loop_dispatch_plans.items.items) |for_plan| {
             const for_node_idx: CIR.Node.Idx = @fromBackingInt(@intCast(for_plan.node_idx));
             const pattern_idx: CIR.Pattern.Idx = @fromBackingInt(@intCast(for_plan.pattern_idx));
@@ -3350,12 +3399,12 @@ test "StaticDispatchPlanTable: relocates with a constant number of fixups, opera
             .nested = .{ .resolved = .{ .start = 0, .len = 1 } },
         }};
         var evidence_refs = [_]CheckedEvidence{
-            .{ .dispatcher_ty = @fromBackingInt(@intCast(14)), .resolution = .{ .structural = .{
+            .{ .dispatcher_ty = @fromBackingInt(@intCast(14)), .description_only_intrinsic = false, .resolution = .{ .structural = .{
                 .derivation = .encoder,
                 .dispatcher_ty = @fromBackingInt(@intCast(14)),
                 .callable_ty = @fromBackingInt(@intCast(15)),
             } } },
-            .{ .dispatcher_ty = @fromBackingInt(@intCast(12)), .resolution = .{ .direct = @fromBackingInt(@intCast(fixtureTableIndex(0))) } },
+            .{ .dispatcher_ty = @fromBackingInt(@intCast(12)), .description_only_intrinsic = false, .resolution = .{ .direct = @fromBackingInt(@intCast(fixtureTableIndex(0))) } },
         };
         var site_evidence = [_]SiteEvidenceEntry{.{
             .key = 16,

@@ -26,20 +26,21 @@ pub const specs = [_]integration_spec.Spec{
     .{ .name = "issue 12292: goto definition follows resolved imports and type annotations", .run = gotoDefinitionFollowsResolvedImportsAndTypes },
 };
 
-const Sibling = struct {
+/// A file written next to the document before it is checked.
+pub const Sibling = struct {
     name: []const u8,
     source: []const u8,
 };
 
 /// One checked document that built without problems.
-const Fixture = struct {
+pub const Fixture = struct {
     tmp: test_env.TmpDir,
     source: []u8,
     file_path: [:0]u8,
     file_uri: []u8,
     checker: SyntaxChecker,
 
-    fn init(fixture: *Fixture, comptime template: []const u8, file_name: []const u8, siblings: []const Sibling) integration_spec.SpecError!void {
+    pub fn init(fixture: *Fixture, comptime template: []const u8, file_name: []const u8, siblings: []const Sibling) integration_spec.SpecError!void {
         const allocator = test_env.allocator;
         fixture.tmp = test_env.tmpDir(.{});
         errdefer fixture.tmp.cleanup();
@@ -74,7 +75,7 @@ const Fixture = struct {
         try std.testing.expectEqual(@as(usize, 0), problem_count);
     }
 
-    fn deinit(fixture: *Fixture) void {
+    pub fn deinit(fixture: *Fixture) void {
         const allocator = test_env.allocator;
         fixture.checker.deinit();
         allocator.free(fixture.file_uri);
@@ -83,7 +84,7 @@ const Fixture = struct {
         fixture.tmp.cleanup();
     }
 
-    fn expectHover(fixture: *Fixture, line: u32, character: u32, expected: []const u8, unexpected: []const u8) integration_spec.SpecError!void {
+    pub fn expectHover(fixture: *Fixture, line: u32, character: u32, expected: []const u8, unexpected: []const u8) integration_spec.SpecError!void {
         const result = try fixture.checker.getTypeAtPosition(fixture.file_uri, fixture.source, line, character) orelse {
             std.debug.print("\nhover returned null at {d}:{d}\n", .{ line, character });
             return error.TestUnexpectedResult;

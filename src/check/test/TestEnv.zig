@@ -137,6 +137,7 @@ pub fn initWithImport(module_name: []const u8, source: []const u8, other_module_
     errdefer can.deinit();
 
     try can.canonicalizeFile();
+    can_mod.HostedCompiler.markIntrinsicsByModuleHeader(module_env);
     // Note: We skip validateForChecking() in unit tests since tests may not be valid
     // type modules. The validation is for real modules that will be imported.
 
@@ -280,6 +281,7 @@ pub fn initWithExecutableRootNames(module_name: []const u8, source: []const u8, 
     errdefer can.deinit();
 
     try can.canonicalizeFile();
+    can_mod.HostedCompiler.markIntrinsicsByModuleHeader(module_env);
     // Note: We skip validateForChecking() in unit tests since tests may not be valid
     // type modules. The validation is for real modules that will be imported.
 
@@ -387,6 +389,7 @@ pub fn countModuleNotFoundDiagnosticsAfterCanonicalization(module_name: []const 
     defer czer.deinit();
 
     try czer.canonicalizeFile();
+    can_mod.HostedCompiler.markIntrinsicsByModuleHeader(&module_env);
 
     // Whether a name denotes a module is settled by import resolution, so this
     // count comes from the drain with no imports available.
@@ -767,6 +770,30 @@ pub fn assertNominalDeclValidity(self: *TestEnv, name: []const u8, expected: boo
             @backingInt(stmt_idx),
         ) orelse return error.TestUnexpectedResult;
         try testing.expectEqual(expected, self.module_env.types.getNominalDecl(decl_idx).isValid());
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// Assert which formals of the nominal declaration `name` are record-row
+/// parameters (design.md "Record Extension Well-Formedness").
+pub fn assertNominalRecordRowFormals(self: *TestEnv, name: []const u8, expected: []const bool) TestEnvError!void {
+    for (self.module_env.store.sliceStatements(self.module_env.all_statements)) |stmt_idx| {
+        const stmt = self.module_env.store.getStatement(stmt_idx);
+        if (stmt != .s_nominal_decl) continue;
+        const header = self.module_env.store.getTypeHeader(stmt.s_nominal_decl.header);
+        if (!std.mem.eql(u8, self.module_env.getIdent(header.relative_name), name)) continue;
+
+        const decl_idx = self.module_env.types.lookupNominalDeclByKey(
+            self.module_env.selfModuleIdentity(),
+            @backingInt(stmt_idx),
+        ) orelse return error.TestUnexpectedResult;
+        const decl = self.module_env.types.getNominalDecl(decl_idx);
+        const formals = self.module_env.types.sliceVars(decl.formals);
+        try testing.expectEqual(expected.len, formals.len);
+        for (formals, expected) |formal, row| {
+            try testing.expectEqual(row, self.module_env.types.resolveVar(formal).desc.flags.record_row);
+        }
         return;
     }
     return error.TestUnexpectedResult;

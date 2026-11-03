@@ -162,6 +162,23 @@ pub fn forEachForLoopDispatchTypeRoot(plan: ModuleEnv.ForLoopDispatchPlan, visit
     try visitor.visit(@fromBackingInt(@intCast(plan.step_topology.skip_payload_var)));
 }
 
+/// The roots of the two dispatches of every capture read at a `Code.Binds`
+/// position: the format and its `default` callable, and the read's
+/// `encoder_for` callable and the encoder it returns.
+pub fn forEachBoundCaptureTypeRoot(module_env: *const ModuleEnv, visitor: anytype) Allocator.Error!void {
+    for (module_env.bound_capture_encodings.items.items) |encoding| {
+        try forEachBoundCaptureEncodingTypeRoot(encoding, visitor);
+    }
+}
+
+/// The roots of one capture read's two dispatches (`forEachBoundCaptureTypeRoot`).
+pub fn forEachBoundCaptureEncodingTypeRoot(encoding: ModuleEnv.BoundCaptureEncoding, visitor: anytype) Allocator.Error!void {
+    try visitor.visit(@fromBackingInt(@intCast(encoding.format_var)));
+    try visitor.visit(@fromBackingInt(@intCast(encoding.default_fn_var)));
+    try visitor.visit(@fromBackingInt(@intCast(encoding.encoder_fn_var)));
+    try visitor.visit(@fromBackingInt(@intCast(encoding.encoder_var)));
+}
+
 /// The roots of every literal conversion that dispatches to a custom or
 /// specialization-time callable: its target and callable, and a literal
 /// pattern's equality callable. A direct builtin conversion needs neither.

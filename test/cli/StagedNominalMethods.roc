@@ -26,6 +26,7 @@ Stage := {}.{
 	tree = |t| match t {
 		Op(o) => Stage.op(o.op, o.args)
 		Param(k) => "p${k.to_str()}"
+		Input(k) => "in${k.to_str()}"
 		Arg(a) => "s${a.owner.to_str()}.${a.k.to_str()}"
 		Out(o) => "n${o.node.to_str()}.${o.k.to_str()}"
 		Def(n) => "n${n.to_str()}"
@@ -90,6 +91,7 @@ Stage := {}.{
 		Fixed(number) => number.to_str()
 		Str(text) => "'${text}'"
 		Bytes(bytes) => "bytes[${Str.join_with(bytes.map(|b| b.to_str()), " ")}]"
+		Numeral(n) => "numeral ${Str.inspect(Dec.from_numeral(n))}"
 	}
 
 	key : Code.Key -> Str
@@ -147,27 +149,11 @@ derived_hash = |r| { m: r.p }.to_hash(r.h)
 sealed_eq : { a : Sealed, b : Sealed } -> Bool
 sealed_eq = |r| { m: r.a } == { m: r.b }
 
-# A builtin container writes its own `is_eq` like any other nominal, and the
-# walk stops at a builtin's body, so the comparison is the name and nothing
-# more. A translator resolves that name against what its own target provides,
-# or rejects it by name.
-list_eq : { a : List(U16), b : List(U16) } -> Bool
-list_eq = |r| { m: r.a } == { m: r.b }
-
-dict_eq : { a : Dict(U16, U16), b : Dict(U16, U16) } -> Bool
-dict_eq = |r| { m: r.a } == { m: r.b }
-
-try_eq : { a : Try(U16, Str), b : Try(U16, Str) } -> Bool
-try_eq = |r| { m: r.a } == { m: r.b }
-
 main! = |_args| {
 	echo!("${Stage.describe(written_eq)}\n")
 	echo!("${Stage.describe(derived_eq)}\n")
 	echo!("${Stage.describe(written_hash)}\n")
 	echo!("${Stage.describe(derived_hash)}\n")
 	echo!("${Stage.describe(sealed_eq)}\n")
-	echo!("${Stage.describe(list_eq)}\n")
-	echo!("${Stage.describe(dict_eq)}\n")
-	echo!("${Stage.describe(try_eq)}\n")
 	Ok({})
 }

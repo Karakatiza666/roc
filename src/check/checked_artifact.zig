@@ -967,7 +967,7 @@ pub const RootRequestTable = struct {
             try appendRoot(&requests, allocator, .{
                 .module_idx = root.module_idx,
                 .kind = switch (root.kind) {
-                    .constant, .hoisted_constant, .hoisted_validation, .numeral_conversion, .quote_conversion, .literal_argument => .compile_time_constant,
+                    .constant, .hoisted_constant, .hoisted_validation, .numeral_conversion, .quote_conversion, .literal_argument, .interpolation_conversion => .compile_time_constant,
                     .callable_binding => .compile_time_callable,
                     .expect => .test_expect,
                     .repl_expr => .repl_expr,
@@ -977,7 +977,7 @@ pub const RootRequestTable = struct {
                 .checked_type = entryWrapperForRoot(entry_wrappers, root.id).checked_fn_root,
                 .abi = switch (root.kind) {
                     .expect => .test_expect,
-                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument => .compile_time,
+                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument, .interpolation_conversion => .compile_time,
                 },
                 .exposure = .private,
                 .procedure_template = templateForEntryWrapperRoot(entry_wrappers, root.id),
@@ -1982,7 +1982,7 @@ fn compileTimeRootKindMatchesRequest(
         .callable_binding => request_kind == .compile_time_callable,
         .expect => request_kind == .test_expect,
         .repl_expr => request_kind == .repl_expr,
-        .numeral_conversion, .quote_conversion, .literal_argument => request_kind == .compile_time_constant,
+        .numeral_conversion, .quote_conversion, .literal_argument, .interpolation_conversion => request_kind == .compile_time_constant,
     };
 }
 
@@ -2537,6 +2537,12 @@ pub const CheckedTypeVariable = struct {
     /// can. `.boxy` seals such a scheme variable to the empty row (design.md
     /// "Sealed Result Rows").
     bounded_row_ext: bool = false,
+    /// The variable stands in a record extension slot (`..r`), directly or
+    /// as the record-row argument of an alias or nominal application. The
+    /// checker sets it (`DescriptorFlags.record_row`, design.md "Record
+    /// Extension Well-Formedness"), so a substitution for the variable is a
+    /// record row, not a type of its own.
+    record_row: bool = false,
 };
 
 /// Artifact-stable identity of a `??` default in its declaring module; see
@@ -2567,6 +2573,77 @@ pub const CheckedFieldDefault = extern struct {
 /// construction site. This remains separate from the record's final checked
 /// type because ordinary value unification may normalize that shared field to
 /// `required` after the construction decision has already been made.
+/// The words of a captured slot's shape (`code_reifier.slotShape`), which
+/// the site lowering compares with the type it builds each `Code.Value` at in
+/// debug builds. The words are in pre-order. `int` is followed by the
+/// `reify.types.IntTy` of the integer, `frac` by 1 for `F64` and 0 for
+/// `F32`, `tuple` by its item count, `record` by its field count and then a
+/// field label and the field's shape per field, and `tag_union` by its tag
+/// count and then a tag label, a payload count and the payloads' shapes per
+/// tag. `recursive` is a reference back to an enclosing `wrap`. `opt_field`
+/// is the shape of an optional record field and is followed by the shape of
+/// the field's value: the field's `Code.Value` is `Absent` when the record
+/// does not hold the field, and the value's own `Code.Value` when it does.
+/// `encoded` is the whole shape of a slot whose type holds an opaque type:
+/// its value is `Code.Value.Encoded`, the bytes of the slot's encoder
+/// (`CheckedCodeSlot.encoder`).
+pub const CodeValueShape = enum(u32) { int, frac, dec, bool_, str, list, record, tuple, tag_union, wrap, recursive, encoded, opt_field };
+
+/// A call whose result is a `Code.Bound`, with the input slots the program
+/// supplies at run time (roc-reify-proposal.md section 10.1). The slots are
+/// `code_slot_pool[slots_start..][0..slots_len]`, in slot order.
+pub const CheckedCodeBinding = extern struct {
+    call: CheckedExprId,
+    slots_start: u32,
+    slots_len: u32,
+};
+
+/// A compile-time root that the walk of a `Code` site met: the conversion root
+/// of a literal in a function the description reaches. Lowering reads it where
+/// the site stands, so a rejected literal is reported though nothing calls
+/// the function it is in.
+pub const CheckedCodeRead = extern struct {
+    /// The key of the module that holds the root.
+    module: [32]u8,
+    /// The root's id in that module's compile-time root table.
+    root: u32,
+};
+
+/// What publication leaves on a `Code` site (`code_from_lambda`).
+pub const CheckedCodeSite = struct {
+    /// The description. Null only between copying and publication.
+    node: ?ConstNodeId,
+    /// The literal conversion roots the walk met, in the order it met them.
+    reads: []const CheckedCodeRead = &.{},
+};
+
+/// One input slot: the run-time name the program reads, the projections it
+/// reads it through (`code_slot_step_pool`), and the slot type's shape
+/// (`code_shape_pool`, words of `CodeValueShape`).
+pub const CheckedCodeSlot = extern struct {
+    leaf: PatternBinderId,
+    steps_start: u32,
+    steps_len: u32,
+    shape_start: u32,
+    shape_len: u32,
+    /// For an `encoded` slot, the expression `T.encoder_for(fmt.default())`
+    /// whose function lowering applies to the slot's value and `[]`; the
+    /// checker planned it from the rule "Bound Capture Encoding". `none` for
+    /// every other slot.
+    encoder: OptionalId(CheckedExprId) = .none,
+};
+
+/// One projection of an input slot: a record field by its label, a tuple
+/// item by its index, or the backing of a nominal value.
+pub const CheckedCodeSlotStep = extern struct {
+    kind: Kind,
+    value: u32,
+
+    pub const Kind = enum(u32) { field, index, unwrap };
+};
+
+/// A record field that a record expression omits, with the default the field
+/// takes.
 pub const CheckedRecordOmittedDefault = extern struct {
     expr: CheckedExprId,
     field_name: canonical.RecordFieldLabelId,
@@ -3149,6 +3226,7 @@ pub const StoredTypeVariable = struct {
     row_default: ?RowDefault = null,
     row_default_discharges_constraints: bool = false,
     bounded_row_ext: bool = false,
+    record_row: bool = false,
 };
 
 /// POD form of `CheckedAliasType`: `args` is a range into `type_id_pool`.
@@ -5677,6 +5755,7 @@ fn cloneCheckedTypeBuildVariable(
         .row_default = variable.row_default,
         .row_default_discharges_constraints = variable.row_default_discharges_constraints,
         .bounded_row_ext = variable.bounded_row_ext,
+        .record_row = variable.record_row,
     };
 }
 
@@ -7975,6 +8054,10 @@ fn appendStaticDispatchTypeRoots(
     }
 
     try output_type_roots.forEachLiteralDispatchTypeRoot(module.moduleEnvConst(), &publisher);
+    for (module.moduleEnvConst().bound_capture_encodings.items.items) |encoding| {
+        if (!source_nodes.hasExpr(@fromBackingInt(encoding.site_node))) continue;
+        try output_type_roots.forEachBoundCaptureEncodingTypeRoot(encoding, &publisher);
+    }
 }
 
 fn rootKeyFacts(root: CheckedTypeRoot) canonical_type_keys.TypeKeyInfo {
@@ -8541,7 +8624,7 @@ const CheckedTypePublisher = struct {
             // children first, then hash-cons the immediate payload from interned
             // child ids. Repeated fresh solver graphs therefore stop here without
             // another recursive canonical digest.
-            return .{ .call = .{ .payload = .{ .content = resolved.desc.content, .bounded_row_ext = resolved.desc.flags.bounded_row_ext } } };
+            return .{ .call = .{ .payload = .{ .content = resolved.desc.content, .bounded_row_ext = resolved.desc.flags.bounded_row_ext, .record_row = resolved.desc.flags.record_row } } };
         }
 
         const key_info = try active.scratch.?.key_writer.fromVar(resolved_var);
@@ -8571,7 +8654,7 @@ const CheckedTypePublisher = struct {
         try active.put(resolved_var, id);
         task.id = id;
         task.reserved = true;
-        return .{ .call = .{ .payload = .{ .content = resolved.desc.content, .bounded_row_ext = resolved.desc.flags.bounded_row_ext } } };
+        return .{ .call = .{ .payload = .{ .content = resolved.desc.content, .bounded_row_ext = resolved.desc.flags.bounded_row_ext, .record_row = resolved.desc.flags.record_row } } };
     }
 
     /// Publish a closed acyclic graph's root from its complete payload,
@@ -8636,6 +8719,8 @@ const CheckedTypePublisher = struct {
         /// (`DescriptorFlags.bounded_row_ext`), a fact of the class rather
         /// than of its content.
         bounded_row_ext: bool,
+        /// The class's `DescriptorFlags.record_row`, published on a variable.
+        record_row: bool,
         /// The index in `publisher_builds` of the payload built so far, owned
         /// by this frame once its first step ran.
         build: u32 = undefined,
@@ -8670,6 +8755,7 @@ const CheckedTypePublisher = struct {
                         .constraints = &.{},
                         .numeric_default_phase = null,
                         .row_default = null,
+                        .record_row = task.record_row,
                     } };
                     return .{ .call = .{ .constraints = .{ .range = flex.constraints } } };
                 },
@@ -8688,6 +8774,7 @@ const CheckedTypePublisher = struct {
                         .constraints = &.{},
                         .numeric_default_phase = null,
                         .row_default = null,
+                        .record_row = task.record_row,
                     } };
                     return .{ .call = .{ .constraints = .{ .range = rigid.constraints } } };
                 },
@@ -9328,7 +9415,8 @@ fn checkedBuiltinNominalForMatchingView(view: *const ImportedModuleView, source_
     return checkedBuiltinNominalForSourceDecl(view.module_env, source_decl);
 }
 
-fn checkedBuiltinNominalForSourceDecl(module_env: *const ModuleEnv, source_decl: u32) ?CheckedBuiltinNominal {
+/// The builtin the builtin module's declaration `source_decl` is, or null.
+pub fn checkedBuiltinNominalForSourceDecl(module_env: *const ModuleEnv, source_decl: u32) ?CheckedBuiltinNominal {
     if (module_env.module_role != .builtin) return null;
     const type_ident = sourceDeclTypeIdent(module_env, source_decl) orelse return null;
     return checkedBuiltinNominalForIdent(module_env, type_ident);
@@ -10546,10 +10634,13 @@ const TestImportViewTables = struct {
     callable_eval_templates: CallableEvalTemplateTable = .{},
     hoisted_constants: HoistedConstTable = .{},
     const_templates: ConstTemplateTable = .{},
+    top_level_values: TopLevelValueTable = .{},
     method_registry: static_dispatch.MethodRegistry = .{},
     interface_capabilities: ModuleInterfaceCapabilities = .{},
     const_store: ConstStore,
     code_provenance: CodeProvenanceTable = .{},
+    code_cuts: CodeCutTable = .{},
+    code_instances: CodeInstanceTable = .{},
 
     fn init(allocator: Allocator) TestImportViewTables {
         if (!builtin.is_test) unreachable; // test scaffolding: only test blocks call this
@@ -10597,10 +10688,13 @@ const TestImportViewTables = struct {
             .callable_eval_templates = self.callable_eval_templates.view(),
             .hoisted_constants = &self.hoisted_constants,
             .const_templates = &self.const_templates,
+            .top_level_values = &self.top_level_values,
             .method_registry = &self.method_registry,
             .interface_capabilities = &self.interface_capabilities,
             .const_store = &self.const_store,
             .code_provenance = &self.code_provenance,
+            .code_cuts = &self.code_cuts,
+            .code_instances = &self.code_instances,
         };
     }
 };
@@ -10835,6 +10929,13 @@ pub const CheckedBody = struct {
 pub const CheckedPatternBinder = struct {
     id: PatternBinderId,
     pattern: CheckedPatternId,
+    /// The name the binding's source wrote, interned in the owning module's
+    /// ident store: the identifier the canonicalizer recorded on the binding
+    /// pattern (`assign`, `var_assign`, `as`), or, for an associated item,
+    /// the method identifier its owner registered it under. Null for a binder
+    /// publication introduces with no source name: a literal pattern's
+    /// matched-value binder.
+    name: ?Ident.Idx,
     reassignable: bool,
     /// A generalized callable lookup binding. Its uses instantiate the
     /// referenced callable; the binding does not own a runtime value cell.
@@ -11227,9 +11328,10 @@ pub const CheckedExprData = union(enum) {
     str_from_quote: CheckedQuoteData,
     /// A function named where a `Code(f)` was expected. Publication walks the
     /// function's body into this module's const store and records the root of
-    /// that description here; null means the walk refused the body and said so
-    /// as a `staged_code` problem.
-    code_from_lambda: ?ConstNodeId,
+    /// that description here. Null is only the state copying leaves the site
+    /// in until publication fills it: a refused walk, and the name a template
+    /// call calls, become `runtime_error`, so no published body holds a null.
+    code_from_lambda: CheckedCodeSite,
     str_segment: CheckedStringLiteralId,
     str: []const CheckedExprId,
     bytes_literal: CheckedStringLiteralId,
@@ -11385,6 +11487,11 @@ pub const CheckedInterpolation = struct {
     segments: []const CheckedExprId,
     values: []const CheckedExprId,
     assembler_ty: CheckedTypeId,
+    /// The `interpolation_conversion` compile-time root that evaluates this
+    /// literal's first stage, when the target is a non-builtin type and the
+    /// finalized dispatch is independent of specialization. Only a read of the
+    /// root demands it: the literal itself still lowers its own first stage.
+    conversion_root: ?ComptimeRootId = null,
 };
 
 /// Public `CheckedReturnContext` declaration.
@@ -11711,6 +11818,41 @@ pub const CheckedBodyStoreView = struct {
     string_ranges: []const CheckedStringRange = &.{},
     default_exprs: []const CheckedBodyStore.CheckedDefaultExpr = &.{},
     record_omitted_defaults: []const CheckedRecordOmittedDefault = &.{},
+    code_bindings: []const CheckedCodeBinding = &.{},
+    code_slot_pool: []const CheckedCodeSlot = &.{},
+    code_slot_step_pool: []const CheckedCodeSlotStep = &.{},
+    code_shape_pool: []const u32 = &.{},
+    code_read_pool: []const CheckedCodeRead = &.{},
+
+    /// The input slots `call` binds, in slot order, or null when `call`
+    /// binds none.
+    pub fn codeBinding(self: CheckedBodyStoreView, call: CheckedExprId) ?[]const CheckedCodeSlot {
+        var lo: usize = 0;
+        var hi: usize = self.code_bindings.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const at = @backingInt(self.code_bindings[mid].call);
+            if (at < @backingInt(call)) {
+                lo = mid + 1;
+            } else if (at > @backingInt(call)) {
+                hi = mid;
+            } else {
+                const binding = self.code_bindings[mid];
+                return self.code_slot_pool[binding.slots_start..][0..binding.slots_len];
+            }
+        }
+        return null;
+    }
+
+    /// The projections a slot reads its leaf through, outermost last.
+    pub fn codeSlotSteps(self: CheckedBodyStoreView, slot: CheckedCodeSlot) []const CheckedCodeSlotStep {
+        return self.code_slot_step_pool[slot.steps_start..][0..slot.steps_len];
+    }
+
+    /// The words of a slot type's shape (`CodeValueShape`).
+    pub fn codeSlotShape(self: CheckedBodyStoreView, slot: CheckedCodeSlot) []const u32 {
+        return self.code_shape_pool[slot.shape_start..][0..slot.shape_len];
+    }
 
     /// Resolve a locally-declared field default's `DefaultId.expr_node` to
     /// its published checked expression (design.md "Defaulted Fields").
@@ -12837,12 +12979,25 @@ pub const CheckedBodyStore = struct {
     default_exprs: std.ArrayList(CheckedDefaultExpr) = .empty,
     /// Checker-selected defaults attached to their exact omission sites.
     record_omitted_defaults: std.ArrayList(CheckedRecordOmittedDefault) = .empty,
+    /// Calls that bind the input slots of a site (`CheckedCodeBinding`),
+    /// sorted by call.
+    code_bindings: std.ArrayList(CheckedCodeBinding) = .empty,
+    code_slot_pool: std.ArrayList(CheckedCodeSlot) = .empty,
+    code_slot_step_pool: std.ArrayList(CheckedCodeSlotStep) = .empty,
+    code_shape_pool: std.ArrayList(u32) = .empty,
+    code_read_pool: std.ArrayList(CheckedCodeRead) = .empty,
     source_node_map: CheckedSourceNodeMap = .{},
     /// Synthesized conversion, matched-value lookup, and equality expressions
     /// for custom literal patterns, ordered by source node. Pattern nodes
     /// already occupy their slot in `source_node_map`, so publication uses
     /// this build-only table to attach their ordinary checked expression data.
     literal_pattern_exprs: std.ArrayList(LiteralPatternExprs) = .empty,
+    /// The two synthesized dispatch expressions of each capture read at a
+    /// `Code.Binds` position (`appendBoundCaptureExprs`), in the order
+    /// checking recorded the reads, so a site's reads are contiguous.
+    /// Build-only: the walk copies the encoder of each encoded slot onto
+    /// `CheckedCodeSlot`, which later stages read.
+    bound_capture_exprs: std.ArrayList(BoundCaptureExprs) = .empty,
     /// True for a store reconstructed from a serialized buffer (pools point into
     /// buffer-owned memory and must not be freed).
     serialized: bool = false,
@@ -12851,7 +13006,30 @@ pub const CheckedBodyStore = struct {
     /// store, so the mixin's `deserialize` resets them to their default. Declared
     /// here so a *data* field accidentally left out of `Serialized` is a compile
     /// error rather than a silently-dropped field.
-    pub const serde_transient_fields = [_][]const u8{ "source_node_map", "literal_pattern_exprs" };
+    pub const serde_transient_fields = [_][]const u8{ "source_node_map", "literal_pattern_exprs", "bound_capture_exprs" };
+
+    /// One capture read at a `Code.Binds` position: the lambda, the read, and
+    /// the expressions `fmt.default()` and `T.encoder_for(fmt.default())`
+    /// whose plans publication builds from the checker's requirements.
+    pub const BoundCaptureExprs = struct {
+        site: CheckedExprId,
+        read: CheckedExprId,
+        default_expr: CheckedExprId,
+        encoder_expr: CheckedExprId,
+        /// The index of the checker's record in `bound_capture_encodings`.
+        encoding: u32,
+    };
+
+    /// The capture reads of the lambda `site`, in source order.
+    pub fn boundCaptureExprsForSite(self: *const CheckedBodyStore, site: CheckedExprId) []const BoundCaptureExprs {
+        std.debug.assert(!self.serialized);
+        const all = self.bound_capture_exprs.items;
+        var start: usize = 0;
+        while (start < all.len and all[start].site != site) start += 1;
+        var end = start;
+        while (end < all.len and all[end].site == site) end += 1;
+        return all[start..end];
+    }
 
     /// The checked expression of source node `raw_node`, while the store is
     /// being published from its typed module (`source_node_map` is not
@@ -12902,6 +13080,15 @@ pub const CheckedBodyStore = struct {
             const decl = module.getStatement(method_statement).s_decl;
             if (std.meta.activeTag(module.expr(decl.expr).data) != .e_runtime_error) continue;
             try rejected_method_decls.put(allocator, method_statement, {});
+        }
+        // An associated item's pattern binds its qualified name (`Lib.scale`);
+        // the name its declaration wrote is the method identifier its owner
+        // registered it under.
+        var associated_binder_names = collections.DenseMapUnmanaged(CIR.Pattern.Idx, Ident.Idx).empty;
+        defer associated_binder_names.deinit(allocator);
+        for (module.methodDefEntries()) |entry| {
+            const binding_pattern = module.moduleEnvConst().store.getDef(entry.value.def_idx).pattern;
+            try associated_binder_names.put(allocator, binding_pattern, entry.key.methodIdent());
         }
         var exprs = std.ArrayList(CheckedExpr).empty;
         errdefer exprs.deinit(allocator);
@@ -13024,6 +13211,7 @@ pub const CheckedBodyStore = struct {
             .promoted_patterns = &promoted_patterns,
             .recursively_referenced_patterns = &recursively_referenced_patterns,
             .rejected_method_decls = &rejected_method_decls,
+            .associated_binder_names = &associated_binder_names,
         };
 
         node_idx = 0;
@@ -13179,6 +13367,11 @@ pub const CheckedBodyStore = struct {
             .string_ranges = self.string_ranges.items,
             .default_exprs = self.default_exprs.items,
             .record_omitted_defaults = self.record_omitted_defaults.items,
+            .code_bindings = self.code_bindings.items,
+            .code_slot_pool = self.code_slot_pool.items,
+            .code_slot_step_pool = self.code_slot_step_pool.items,
+            .code_shape_pool = self.code_shape_pool.items,
+            .code_read_pool = self.code_read_pool.items,
         };
     }
 
@@ -13630,7 +13823,103 @@ pub const CheckedBodyStore = struct {
     /// A site that named a function holds the empty description body copying
     /// left on it. A lambda written in place holds itself, because the walk
     /// had to read it to build the description now taking its place.
-    pub fn attachCodeReification(self: *CheckedBodyStore, expr_id: CheckedExprId, node: ?ConstNodeId) void {
+    pub fn attachCodeReification(
+        self: *CheckedBodyStore,
+        allocator: Allocator,
+        expr_id: CheckedExprId,
+        node: ConstNodeId,
+        reads: []const CheckedCodeRead,
+    ) Allocator.Error!void {
+        const range = try artifact_serialize.appendSpan(CheckedBodyRange, CheckedCodeRead, &self.code_read_pool, allocator, reads);
+        self.stagedSiteData(expr_id).* = .{ .code_from_lambda = .{ .node = node, .reads = range } };
+    }
+
+    /// Record that the walk refused a staged site. The refusal is reported
+    /// separately; the site is a checked error exactly like one checking
+    /// poisoned, so no later stage has a refused description to special-case.
+    pub fn refuseCodeReification(self: *CheckedBodyStore, expr_id: CheckedExprId) void {
+        self.stagedSiteData(expr_id).* = .{ .runtime_error = .{} };
+    }
+
+    /// Record that a staged site is an instance site (D1): it has no node of
+    /// its own, and lowering restores the node of the table in force.
+    /// Record that the site at `expr_id` is an instance site (D1). A lambda
+    /// written at the site keeps its checked form under a new id, which the
+    /// walk of a closing use in another module reads: the site's own id
+    /// now holds the `Code` value. Returns that id.
+    pub fn markInstanceSite(self: *CheckedBodyStore, allocator: Allocator, expr_id: CheckedExprId) Allocator.Error!CheckedExprId {
+        const lambda: CheckedExprId = @fromBackingInt(@intCast(self.stored_exprs.items.len));
+        try self.stored_exprs.append(allocator, self.stored_exprs.items[@backingInt(expr_id)]);
+        self.stagedSiteData(expr_id).* = .{ .code_from_lambda = .{ .node = null } };
+        return lambda;
+    }
+
+    /// Record that the walk refused a closing use (D1). The refusal is
+    /// reported separately; the use is a checked error, so lowering never
+    /// specializes its template without a table.
+    pub fn refuseInstanceUse(self: *CheckedBodyStore, expr_id: CheckedExprId) void {
+        self.stored_exprs.items[@backingInt(expr_id)].data = .{ .runtime_error = .{} };
+    }
+
+    /// Record that the walk refused the `iter` use of the `for` statement
+    /// `statement_id`, whose body is `loop_body` (D1): the statement becomes
+    /// the body, and the body a runtime error, so the loop is never lowered.
+    pub fn refuseInstanceLoop(self: *CheckedBodyStore, allocator: Allocator, statement_id: CheckedStatementId, loop_body: CheckedExprId) Allocator.Error!void {
+        self.stored_exprs.items[@backingInt(loop_body)].data = .{ .runtime_error = .{} };
+        // An expression statement names the binders it reassigns; a
+        // runtime error reassigns none.
+        const merge = try self.appendStateMerge(allocator, .{ .binders = .{} });
+        const loop = &self.stored_statements.items[@backingInt(statement_id)];
+        loop.data = .{ .expr = loop_body };
+        loop.state_merge = merge;
+    }
+
+    /// Record that `call` binds `slots`, the input slots of the one site it
+    /// holds, in slot order. Calls arrive in any order; `sortCodeBindings`
+    /// orders them once every call is recorded.
+    pub fn attachCodeBinding(
+        self: *CheckedBodyStore,
+        allocator: Allocator,
+        call: CheckedExprId,
+        slots: []const code_reifier.SlotSource,
+    ) Allocator.Error!void {
+        try self.code_bindings.ensureUnusedCapacity(allocator, 1);
+        const slots_start: u32 = @intCast(self.code_slot_pool.items.len);
+        for (slots) |slot| {
+            const steps_start: u32 = @intCast(self.code_slot_step_pool.items.len);
+            for (slot.steps) |step| try self.code_slot_step_pool.append(allocator, switch (step) {
+                .field => |label| .{ .kind = .field, .value = @backingInt(label) },
+                .index => |index| .{ .kind = .index, .value = index },
+                .unwrap => .{ .kind = .unwrap, .value = 0 },
+            });
+            const shape_start: u32 = @intCast(self.code_shape_pool.items.len);
+            try self.code_shape_pool.appendSlice(allocator, slot.shape);
+            try self.code_slot_pool.append(allocator, .{
+                .leaf = slot.leaf,
+                .steps_start = steps_start,
+                .steps_len = @intCast(slot.steps.len),
+                .shape_start = shape_start,
+                .shape_len = @intCast(slot.shape.len),
+                .encoder = if (slot.encoder) |encoder| .some(encoder) else .none,
+            });
+        }
+        self.code_bindings.appendAssumeCapacity(.{
+            .call = call,
+            .slots_start = slots_start,
+            .slots_len = @intCast(slots.len),
+        });
+    }
+
+    /// Order the bindings by call, which `codeBinding` searches.
+    pub fn sortCodeBindings(self: *CheckedBodyStore) void {
+        std.mem.sort(CheckedCodeBinding, self.code_bindings.items, {}, struct {
+            fn lessThan(_: void, a: CheckedCodeBinding, b: CheckedCodeBinding) bool {
+                return @backingInt(a.call) < @backingInt(b.call);
+            }
+        }.lessThan);
+    }
+
+    fn stagedSiteData(self: *CheckedBodyStore, expr_id: CheckedExprId) *StoredCheckedExprData {
         const data = &self.stored_exprs.items[@backingInt(expr_id)].data;
         switch (data.*) {
             .code_from_lambda, .lambda, .closure => {},
@@ -13684,7 +13973,7 @@ pub const CheckedBodyStore = struct {
                 .{@backingInt(expr_id)},
             ),
         }
-        data.* = .{ .code_from_lambda = node };
+        return data;
     }
 
     /// Whether checking replaced a staged site with a runtime error. Its own
@@ -13899,11 +14188,16 @@ pub const CheckedBodyStore = struct {
         string_ranges: SerializedSlice(CheckedStringRange) = .{},
         default_exprs: SerializedSlice(CheckedDefaultExpr) = .{},
         record_omitted_defaults: SerializedSlice(CheckedRecordOmittedDefault) = .{},
+        code_bindings: SerializedSlice(CheckedCodeBinding) = .{},
+        code_slot_pool: SerializedSlice(CheckedCodeSlot) = .{},
+        code_slot_step_pool: SerializedSlice(CheckedCodeSlotStep) = .{},
+        code_shape_pool: SerializedSlice(u32) = .{},
+        code_read_pool: SerializedSlice(CheckedCodeRead) = .{},
 
         comptime {
-            // 26 SerializedSlice fields → 26 base-pointer fixups, independent of
+            // 31 SerializedSlice fields → 31 base-pointer fixups, independent of
             // stored data size.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 26);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 31);
         }
 
         const Serde = artifact_serialize.SliceStoreSerde(CheckedBodyStore, @This());
@@ -15444,6 +15738,9 @@ const CheckedBodyPayloadCopier = struct {
     /// it to a checked error and checking retired every lookup of its name,
     /// so its declaration evaluates nothing and its block omits it.
     rejected_method_decls: *const collections.DenseMapUnmanaged(CIR.Statement.Idx, void),
+    /// The declared name of each associated item's binding pattern, from the
+    /// method table the canonicalizer registered it in.
+    associated_binder_names: *const collections.DenseMapUnmanaged(CIR.Pattern.Idx, Ident.Idx),
 
     /// Whether the declaration is a recursive value, marking each of its
     /// binders `recursive_value` when it is.
@@ -15473,11 +15770,17 @@ const CheckedBodyPayloadCopier = struct {
         // walk reads to build the description that replaces it.
         if (self.module.moduleEnvConst().codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr_idx))) |site| {
             switch (site.kind) {
-                .named_function, .template_call, .template_callee => return .{ .code_from_lambda = null },
+                .named_function, .template_call, .template_callee => return .{ .code_from_lambda = .{ .node = null } },
                 .inline_lambda, .template => {},
             }
         }
         const expr = self.module.expr(expr_idx).data;
+        // A call of `Code.prim` or `Code.type_id` is the identity it computes,
+        // which publication writes into the const store as it writes a
+        // description (`attachCodeReification`). Its argument is not read.
+        if (expr == .e_call and self.module.moduleEnvConst().store.isCodeIdentityCall(ModuleEnv.nodeIdxFrom(expr_idx))) {
+            return .{ .code_from_lambda = .{ .node = null } };
+        }
         return switch (expr) {
             .e_num => self.copyNumeralLiteral(expr_idx),
             .e_frac_f32, .e_frac_f64 => checkedArtifactInvariant("float-valued CIR literal (no exact digits) reached artifact publication", .{}),
@@ -15820,7 +16123,7 @@ const CheckedBodyPayloadCopier = struct {
         const pattern_id = self.checkedPattern(pattern_idx);
         const binder: PatternBinderId = @fromBackingInt(@intCast(@as(u32, @intCast(self.pattern_binders.items.len))));
         std.debug.assert(self.pattern_binder_by_pattern[@backingInt(pattern_id)] == .none);
-        try self.pattern_binders.append(self.allocator, .{ .id = binder, .pattern = pattern_id, .reassignable = false });
+        try self.pattern_binders.append(self.allocator, .{ .id = binder, .pattern = pattern_id, .name = null, .reassignable = false });
         self.pattern_binder_by_pattern[@backingInt(pattern_id)] = .some(binder);
         const context = plan.patternContext(&self.module.moduleEnvConst().store) orelse unreachable; // recordLiteralDispatchPlan allocates a pattern context for every pattern node's plan
         std.debug.assert(context.equality_fn_var_plus_one != 0);
@@ -16435,10 +16738,40 @@ const CheckedBodyPayloadCopier = struct {
         try self.pattern_binders.append(self.allocator, .{
             .id = id,
             .pattern = checked_pattern,
+            .name = self.sourcePatternBinderName(pattern),
             .reassignable = self.sourcePatternBinderIsReassignable(pattern),
         });
         self.pattern_binder_by_pattern[raw] = .some(id);
         return id;
+    }
+
+    /// The name a binding pattern's source wrote: an associated item's
+    /// declared method name, and otherwise the identifier on the pattern.
+    fn sourcePatternBinderName(self: *const @This(), pattern: CIR.Pattern.Idx) Ident.Idx {
+        if (self.associated_binder_names.get(pattern)) |declared| return declared;
+        return switch (self.module.pattern(pattern).data) {
+            .assign => |assign| assign.ident,
+            .var_assign => |assign| assign.ident,
+            .as => |as_pattern| as_pattern.ident,
+            .applied_tag,
+            .nominal,
+            .nominal_external,
+            .record_destructure,
+            .list,
+            .tuple,
+            .num_literal,
+            .small_dec_literal,
+            .dec_literal,
+            .frac_f32_literal,
+            .frac_f64_literal,
+            .num_from_numeral_literal,
+            .str_literal,
+            .str_interpolation,
+            .underscore,
+            .runtime_error,
+            => checkedArtifactInvariant("checked artifact invariant violated: non-binder pattern requested a pattern binder", .{}),
+            .deferred_import_ref => checkedArtifactInvariant("deferred import reference pattern reached checked artifact publication", .{}),
+        };
     }
 
     fn sourcePatternBinderIsReassignable(self: *const @This(), pattern: CIR.Pattern.Idx) bool {
@@ -16612,6 +16945,10 @@ fn isStatementNodeTag(tag: CIR.Node.Tag) bool {
 pub const UnimplementedDeclaration = struct {
     /// Source region of the declaration, used as the crash's location.
     region: base.Region,
+    /// Whether the declaration is an intrinsic (`AnnotationOnlyKind.intrinsic`).
+    /// Checking poisons every reference to one that runs, so lowering never
+    /// reaches it (design.md "Reify-Only Definitions", invariant 1).
+    intrinsic: bool,
 };
 
 /// Public `CheckedProcedureBody` declaration.
@@ -16907,6 +17244,11 @@ pub const CallableEvalTemplate = struct {
     /// direct call that forwards to that lookup inside the alias's own
     /// evidence scope, its entry wrapper; no compile-time evaluator runs.
     forwarded_lookup: ?CheckedExprId = null,
+    /// The checked expression the binding was written as. A description that
+    /// reaches a use of a binding that computes a function reads it where the
+    /// name stands, so no evaluated closure is needed to name the lambda and
+    /// its captures.
+    body: CheckedExprId,
 };
 
 /// Public `CallableEvalTemplateTableView` declaration.
@@ -16933,6 +17275,7 @@ pub const CallableEvalTemplateTable = struct {
         root: ComptimeRootId,
         source_scheme: canonical.CanonicalTypeSchemeKey,
         checked_fn_root: CheckedTypeId,
+        body: CheckedExprId,
     ) Allocator.Error!CallableEvalTemplateId {
         const id: CallableEvalTemplateId = @fromBackingInt(@intCast(@as(u32, @intCast(self.templates.items.len))));
         try self.templates.append(allocator, .{
@@ -16942,6 +17285,7 @@ pub const CallableEvalTemplateTable = struct {
             .root = root,
             .source_scheme = source_scheme,
             .checked_fn_root = checked_fn_root,
+            .body = body,
         });
         return id;
     }
@@ -17061,6 +17405,7 @@ const SelectedHoistedCallableTable = struct {
                 root.id,
                 source_scheme,
                 root.checked_type,
+                root.expr,
             );
             const binding = try procedure_bindings.appendCallableEval(
                 allocator,
@@ -17295,6 +17640,13 @@ pub const ResolvedValueRefTable = struct {
             // widens it into a function's result is a separate wrapper node
             // its parent refers to (design.md "Row Coercion Primitive").
             const checked_expr = checked_bodies.exprIdForSource(expr_idx) orelse continue;
+            // A `Code.prim` argument that names a compiler-derived method
+            // reads no value either: `markDerivedMethodNames` made it no
+            // lookup.
+            if (checked_bodies.expr(checked_expr).data == .anno_only) {
+                std.debug.assert(module.moduleEnvConst().store.isCodePrimArgument(@fromBackingInt(@intCast(node_idx))));
+                continue;
+            }
             if (checked_bodies.expr(checked_expr).data == .row_coerce) {
                 checkedArtifactInvariant("a value lookup's own checked node was a row coercion", .{});
             }
@@ -17860,6 +18212,122 @@ fn selectedHoistedConstUse(
     } };
 }
 
+/// The definition a module-level lookup names: the module that declares it
+/// and the definition, read from the lookup as checking resolved it. Null for
+/// a lookup of a local name or of no definition.
+pub const LookupTarget = struct {
+    env: *const ModuleEnv,
+    def: CIR.Def.Idx,
+};
+
+/// The definition the external or resolved associated lookup `expr_idx` of
+/// `module` names, as checking resolved the lookup (`checkCodePrimReference`).
+fn lookupTargetOf(
+    module: TypedCIR.Module,
+    expr_idx: CIR.Expr.Idx,
+    imports: []const PublishImportArtifact,
+    available_artifacts: []const ImportedModuleView,
+) ?LookupTarget {
+    const module_env = module.moduleEnvConst();
+    return switch (module.expr(expr_idx).data) {
+        .e_lookup_external => |external| blk: {
+            const resolved_module_idx = module.resolvedImportModule(external.module_idx) orelse break :blk null;
+            const import_artifact = publishImportForModule(imports, resolved_module_idx) orelse break :blk null;
+            const env = import_artifact.view.module_env;
+            const node: CIR.Node.Idx = @fromBackingInt(@intCast(external.target_node_idx));
+            if (env.store.nodes.fieldItem(.tag, node) != .def) break :blk null;
+            break :blk .{ .env = env, .def = @fromBackingInt(@intCast(external.target_node_idx)) };
+        },
+        .e_lookup_associated_resolved => |resolved| blk: {
+            if (resolved.module_identity == module_env.selfModuleIdentity()) {
+                break :blk .{ .env = module_env, .def = resolved.target_def_idx };
+            }
+            const origin_hash = module_env.moduleIdentityHash(resolved.module_identity);
+            const view = importedViewForOriginHash(imports, available_artifacts, origin_hash) orelse break :blk null;
+            break :blk .{ .env = view.module_env, .def = resolved.target_def_idx };
+        },
+        .e_num,
+        .e_frac_f32,
+        .e_frac_f64,
+        .e_dec,
+        .e_dec_small,
+        .e_num_from_numeral,
+        .e_typed_int,
+        .e_typed_frac,
+        .e_typed_num_from_numeral,
+        .e_str_segment,
+        .e_str,
+        .e_bytes_literal,
+        .e_lookup_local,
+        .e_deferred_import_ref,
+        .e_lookup_associated_local,
+        .e_lookup_associated,
+        .e_lookup_required,
+        .e_list,
+        .e_empty_list,
+        .e_tuple,
+        .e_match,
+        .e_if,
+        .e_call,
+        .e_record,
+        .e_empty_record,
+        .e_block,
+        .e_tag,
+        .e_nominal,
+        .e_nominal_external,
+        .e_zero_argument_tag,
+        .e_closure,
+        .e_lambda,
+        .e_binop,
+        .e_unary_minus,
+        .e_field_access,
+        .e_method_call,
+        .e_dispatch_call,
+        .e_interpolation,
+        .e_structural_eq,
+        .e_structural_hash,
+        .e_method_eq,
+        .e_type_method_call,
+        .e_type_dispatch_call,
+        .e_tuple_access,
+        .e_runtime_error,
+        .e_crash,
+        .e_dbg,
+        .e_expect_err,
+        .e_expect,
+        .e_ellipsis,
+        .e_anno_only,
+        .e_derived_method,
+        .e_return,
+        .e_break,
+        .e_for,
+        .e_hosted_lambda,
+        .e_run_low_level,
+        => null,
+    };
+}
+
+/// Make each `Code.prim` argument that names a compiler-derived method
+/// (`is_eq : _`) the checked `anno_only` the method's own body is. Such an
+/// argument is not read, and publication exports no procedure for the
+/// marker, so it resolves to no value: the walk reads the marker itself
+/// (`code_reifier.Reifier.derivedMethodPrim`).
+fn markDerivedMethodNames(
+    module: TypedCIR.Module,
+    checked_bodies: *CheckedBodyStore,
+    imports: []const PublishImportArtifact,
+    available_artifacts: []const ImportedModuleView,
+) void {
+    for (module.moduleEnvConst().store.codeIdentityUses()) |use| {
+        if (use.kind != .prim) continue;
+        const arg: CIR.Expr.Idx = @fromBackingInt(@intCast(use.arg));
+        const target = lookupTargetOf(module, arg, imports, available_artifacts) orelse continue;
+        if (target.env.store.getExpr(target.env.store.getDef(target.def).expr) != .e_derived_method) continue;
+        const checked_arg = checked_bodies.exprIdForSource(arg) orelse continue;
+        checked_bodies.stored_exprs.items[@backingInt(checked_arg)].data = .anno_only;
+    }
+}
+
 fn categorizeImportedValueRef(
     module: TypedCIR.Module,
     import_idx: CIR.Import.Idx,
@@ -18405,6 +18873,32 @@ const CollectedScopeConstructionSite = struct {
     checked_expr: CheckedExprId,
 };
 
+/// The refs of the body of one lambda written at a `Code` position. No
+/// template lowers such a lambda, because publication replaces it with its
+/// description, so its refs are not part of a template's spans. Each span
+/// indexes the same pool as its per-template counterpart in
+/// `TemplateIteratorRefs`.
+///
+/// The description of the lambda reads, at each call and each dispatch it
+/// makes, what the evidence pass resolved there. A lambda in a template body
+/// is read in the instance of that template (an instance site, D1 of
+/// `roc-reify-structural-proposal.md`), so the evidence pass resolves its
+/// refs in the chain of that template and of the scope that holds the
+/// lambda. Thus a dispatch on a type variable of the template forwards to the
+/// template's evidence, which each closing use supplies.
+const StagedLambdaRefs = struct {
+    /// The index of a template whose body holds the lambda, or null for a
+    /// lambda that no template body holds, such as one in a defaulted field.
+    /// The refs of a lambda with no owner are resolved with no enclosing
+    /// template params.
+    owner: ?u32,
+    plan_refs: artifact_serialize.Span,
+    iterator_refs: artifact_serialize.Span,
+    value_refs: artifact_serialize.Span,
+    scheme_uses: artifact_serialize.Span,
+    scope_sites: artifact_serialize.Span,
+};
+
 /// Build-time-only per-template data collected by
 /// `sealCheckedProcedureTemplateRefs` for the total-resolution pass; never
 /// serialized (mono looks iterator plans up by node and receives evidence
@@ -18442,8 +18936,12 @@ const TemplateIteratorRefs = struct {
     default_iterator_refs: artifact_serialize.Span = .{},
     default_scheme_uses: artifact_serialize.Span = .{},
     default_scope_sites: artifact_serialize.Span = .{},
+    /// Refs collected from the body of each lambda written at a `Code`
+    /// position (see `StagedLambdaRefs`).
+    staged: []StagedLambdaRefs = &.{},
 
     fn deinit(self: *TemplateIteratorRefs, allocator: Allocator) void {
+        allocator.free(self.staged);
         allocator.free(self.spans);
         allocator.free(self.pool);
         allocator.free(self.scopes);
@@ -18538,6 +19036,54 @@ fn noteUnquantifiedReceiver(
         .flex => try out.put(resolved.var_, {}),
         .rigid, .alias, .structure, .field_presence, .err => {},
     }
+}
+
+/// The pools that `StagedLambdaRefs` spans index, each with the pools that
+/// stay parallel to it.
+const StagedRefPools = struct {
+    plans: *std.ArrayList(static_dispatch.StaticDispatchPlanId),
+    plan_scopes: *std.ArrayList(DispatchScope),
+    plan_kinds: *std.ArrayList(DispatchRelationKind),
+    iterators: *std.ArrayList(static_dispatch.IteratorForPlanId),
+    iterator_scopes: *std.ArrayList(DispatchScope),
+    values: *std.ArrayList(ResolvedValueRefId),
+    value_scopes: *std.ArrayList(DispatchScope),
+    scheme_uses: *std.ArrayList(CollectedSchemeUseSite),
+    scheme_use_scopes: *std.ArrayList(DispatchScope),
+    scope_sites: *std.ArrayList(CollectedScopeConstructionSite),
+};
+
+/// Append the refs that `collector` holds to `pools`, as the refs of the
+/// lambdas at a `Code` position that `owner` holds.
+fn appendStagedLambdaRefs(
+    allocator: Allocator,
+    collector: *const CheckedTemplateRefCollector,
+    static_dispatch_plans: *const static_dispatch.StaticDispatchPlanTable,
+    owner: ?u32,
+    pools: StagedRefPools,
+) Allocator.Error!StagedLambdaRefs {
+    const refs: StagedLambdaRefs = .{
+        .owner = owner,
+        .plan_refs = try artifact_serialize.appendSpan(artifact_serialize.Span, static_dispatch.StaticDispatchPlanId, pools.plans, allocator, collector.dispatch_refs.items),
+        .iterator_refs = try artifact_serialize.appendSpan(artifact_serialize.Span, static_dispatch.IteratorForPlanId, pools.iterators, allocator, collector.iterator_refs.items),
+        .value_refs = try artifact_serialize.appendSpan(artifact_serialize.Span, ResolvedValueRefId, pools.values, allocator, collector.value_refs.items),
+        .scheme_uses = try artifact_serialize.appendSpan(artifact_serialize.Span, CollectedSchemeUseSite, pools.scheme_uses, allocator, collector.scheme_use_sites.items),
+        .scope_sites = try artifact_serialize.appendSpan(artifact_serialize.Span, CollectedScopeConstructionSite, pools.scope_sites, allocator, collector.scope_sites.items),
+    };
+    for (collector.dispatch_refs.items) |plan_id| {
+        const plan = static_dispatch_plans.plans[@backingInt(plan_id)];
+        var kind: DispatchRelationKind = .callable_result;
+        for (plan.argsSlice(static_dispatch_plans)) |operand| switch (operand) {
+            .generated_numeral, .generated_quote => kind = .conversion,
+            .checked_expr, .generated_interpolation_segments => {},
+        };
+        try pools.plan_kinds.append(allocator, kind);
+    }
+    try pools.plan_scopes.appendSlice(allocator, collector.dispatch_ref_scopes.items);
+    try pools.iterator_scopes.appendSlice(allocator, collector.iterator_ref_scopes.items);
+    try pools.value_scopes.appendSlice(allocator, collector.value_ref_scopes.items);
+    try pools.scheme_use_scopes.appendSlice(allocator, collector.scheme_use_scopes.items);
+    return refs;
 }
 
 fn sealCheckedProcedureTemplateRefs(
@@ -18687,6 +19233,35 @@ fn sealCheckedProcedureTemplateRefs(
     const scope_site_spans = try allocator.alloc(artifact_serialize.Span, templates.templates.items.len);
     errdefer allocator.free(scope_site_spans);
 
+    var staged_pool = std.ArrayList(StagedLambdaRefs).empty;
+    errdefer staged_pool.deinit(allocator);
+    const staged_ref_pools: StagedRefPools = .{
+        .plans = &dispatch_ref_pool,
+        .plan_scopes = &dispatch_ref_scope_pool,
+        .plan_kinds = &dispatch_relation_kind_pool,
+        .iterators = &iterator_ref_pool,
+        .iterator_scopes = &iterator_scope_pool,
+        .values = &value_ref_pool,
+        .value_scopes = &value_ref_scope_pool,
+        .scheme_uses = &scheme_use_pool,
+        .scheme_use_scopes = &scheme_use_scope_pool,
+        .scope_sites = &scope_site_pool,
+    };
+    // The lambdas at a `Code` position that a site writes in place. A
+    // template's result lambda is described at each call of the template,
+    // so it is no part of this collection.
+    var inline_staged_lambdas = collections.DenseMap(u32, void).init(allocator);
+    defer inline_staged_lambdas.deinit();
+    for (module.moduleEnvConst().store.codeReificationSites()) |site| {
+        if (site.kind != .inline_lambda) continue;
+        const checked_expr = checked_bodies.exprIdForSource(@fromBackingInt(@intCast(site.node_idx))) orelse continue;
+        try inline_staged_lambdas.put(@backingInt(checked_expr), {});
+    }
+    var owned_staged_lambdas = collections.DenseMap(u32, void).init(allocator);
+    defer owned_staged_lambdas.deinit();
+    var staged_hits = std.ArrayList(CheckedTemplateRefCollector.StagedHit).empty;
+    defer staged_hits.deinit(allocator);
+
     for (templates.templates.items, 0..) |*template, template_index| {
         collector.clear();
 
@@ -18805,6 +19380,27 @@ fn sealCheckedProcedureTemplateRefs(
         try dispatch_ref_scope_pool.appendSlice(allocator, collector.dispatch_ref_scopes.items);
         try iterator_scope_pool.appendSlice(allocator, collector.iterator_ref_scopes.items);
         try scheme_use_scope_pool.appendSlice(allocator, collector.scheme_use_scopes.items);
+
+        // Each lambda at a `Code` position that this body holds, and each
+        // one that such a lambda holds, is collected in the scope that holds
+        // it, with this template as its owner (`StagedLambdaRefs`). Two
+        // template bodies can hold one expression. Then the lambda has a
+        // group per owner, and the evidence pass resolves each ref once, in
+        // the first group that resolves it, as it does for the plans of the
+        // two templates.
+        staged_hits.clearRetainingCapacity();
+        try staged_hits.appendSlice(allocator, collector.staged_hits.items);
+        var next_hit: usize = 0;
+        while (next_hit < staged_hits.items.len) : (next_hit += 1) {
+            const hit = staged_hits.items[next_hit];
+            if (!inline_staged_lambdas.contains(@backingInt(hit.expr))) continue;
+            try owned_staged_lambdas.put(@backingInt(hit.expr), {});
+            collector.clear();
+            if (hit.scope) |scope| try collector.scope_stack.append(allocator, scope);
+            try collector.collectStagedLambda(hit.expr);
+            try staged_hits.appendSlice(allocator, collector.staged_hits.items);
+            try staged_pool.append(allocator, try appendStagedLambdaRefs(allocator, &collector, static_dispatch_plans, @intCast(template_index), staged_ref_pools));
+        }
     }
 
     // Defaulted-field expressions (design.md "Defaulted Fields") are value
@@ -18845,6 +19441,25 @@ fn sealCheckedProcedureTemplateRefs(
         try scheme_use_scope_pool.appendSlice(allocator, collector.scheme_use_scopes.items);
     }
 
+    // A lambda written at a `Code` position is described rather than
+    // lowered, so no template collection enters it, and the calls it makes
+    // would reach the description with no record of what each use
+    // instantiated its callee to. Collect its body the way a template's is
+    // collected; the lambda node itself holds the `Code`, so only its
+    // parameters and body are read. A lambda that a template body holds was
+    // collected with that template above; this collects every other one,
+    // with no owner.
+    {
+        collector.clear();
+        for (module.moduleEnvConst().store.codeReificationSites()) |site| {
+            if (site.kind != .inline_lambda) continue;
+            const checked_expr = checked_bodies.exprIdForSource(@fromBackingInt(@intCast(site.node_idx))) orelse continue;
+            if (owned_staged_lambdas.contains(@backingInt(checked_expr))) continue;
+            try collector.collectStagedLambda(checked_expr);
+        }
+        try staged_pool.append(allocator, try appendStagedLambdaRefs(allocator, &collector, static_dispatch_plans, null, staged_ref_pools));
+    }
+
     resolved_value_refs.template_refs = try value_ref_pool.toOwnedSlice(allocator);
     static_dispatch_plans.template_refs = try dispatch_ref_pool.toOwnedSlice(allocator);
     templates.dispatch_ref_scopes = try allocator.dupe(DispatchScope, dispatch_ref_scope_pool.items);
@@ -18871,6 +19486,7 @@ fn sealCheckedProcedureTemplateRefs(
         .default_iterator_refs = default_iterator_refs,
         .default_scheme_uses = default_scheme_uses,
         .default_scope_sites = default_scope_sites,
+        .staged = try staged_pool.toOwnedSlice(allocator),
     };
 }
 
@@ -19368,6 +19984,50 @@ const EvidencePass = struct {
             }
         }
 
+        // The bodies of lambdas written at a `Code` position, which the seal
+        // pass collected apart from every template (`StagedLambdaRefs`). A
+        // description of one reads, at each call it makes, what that use
+        // instantiated the callee to and the evidence it supplied, and at
+        // each dispatch the target or the evidence param it forwards to, as
+        // the template walk above publishes them for a named function's
+        // body. A lambda in a template body is read in that template's
+        // instance, so its refs resolve in that template's chain.
+        for (self.template_iterator_refs.staged) |staged| {
+            const level: ChainLevel = if (staged.owner) |owner|
+                try self.templateChainLevel(self.templates.templates.items[owner], &template_defs)
+            else
+                .empty;
+
+            const plan_span = staged.plan_refs;
+            for (self.plan_table.template_refs[plan_span.start .. plan_span.start + plan_span.len], 0..) |plan_id, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.plan_scopes[plan_span.start + i], level);
+                try self.resolvePlan(plan_id, chain, false);
+            }
+
+            const iter_span = staged.iterator_refs;
+            for (self.template_iterator_refs.pool[iter_span.start .. iter_span.start + iter_span.len], 0..) |iter_plan_id, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.iterator_scopes[iter_span.start + i], level);
+                try self.resolveIteratorPlan(iter_plan_id, chain, false);
+            }
+
+            const value_span = staged.value_refs;
+            for (self.resolved_value_refs.template_refs[value_span.start .. value_span.start + value_span.len], 0..) |ref_id, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.value_ref_scopes[value_span.start + i], level);
+                try self.emitSiteEvidence(ref_id, chain);
+            }
+
+            const scheme_span = staged.scheme_uses;
+            for (self.template_iterator_refs.scheme_use_sites[scheme_span.start .. scheme_span.start + scheme_span.len], 0..) |site, i| {
+                const chain = try self.chainFor(self.template_iterator_refs.scheme_use_scopes[scheme_span.start + i], level);
+                try self.emitSchemeUseSiteEvidence(site.record_idx, @backingInt(site.checked_expr), chain);
+            }
+
+            const scope_span = staged.scope_sites;
+            for (self.template_iterator_refs.scope_sites[scope_span.start .. scope_span.start + scope_span.len]) |site| {
+                try self.emitScopeConstructionEvidence(site, level);
+            }
+        }
+
         try self.publishInspectOverrideEvidence();
 
         if (self.template_root_evidence.len != self.templates.templates.items.len) {
@@ -19475,6 +20135,8 @@ const EvidencePass = struct {
             if (self.iterator_plan_resolved[raw]) continue;
             try self.resolveIteratorPlan(@fromBackingInt(@intCast(raw)), &.{}, true);
         }
+
+        try self.publishNamedCodeSiteEvidence();
 
         std.mem.sort(static_dispatch.SiteEvidenceEntry, self.site_evidence.items, {}, siteEvidenceLessThan);
 
@@ -21722,6 +22384,20 @@ const EvidencePass = struct {
         return self.evidenceFromResolution(context, resolution);
     }
 
+    /// Whether an evidence node's target is an intrinsic: an annotation-only
+    /// declaration of a module that is not a platform, so it has no Roc body.
+    fn evidenceNodeTargetsIntrinsic(self: *EvidencePass, node: static_dispatch.EvidenceNodeId) bool {
+        const target = self.evidence_nodes.items[@backingInt(node)].target;
+        switch (target.kind) {
+            .procedure => {},
+            .local_proc, .structural => return false,
+        }
+        return switch (self.procedureEvidenceView(target).template.body) {
+            .unimplemented => |declaration| declaration.intrinsic,
+            .checked_body, .intrinsic_wrapper, .entry_wrapper => false,
+        };
+    }
+
     fn evidenceFromResolution(
         self: *EvidencePass,
         context: EvidenceContext,
@@ -21733,6 +22409,10 @@ const EvidencePass = struct {
         const dispatcher_ty = context.dispatcher_ty;
         return .{
             .dispatcher_ty = dispatcher_ty,
+            .description_only_intrinsic = switch (resolution) {
+                .direct_pending => |node| !param.constraint.runs and self.evidenceNodeTargetsIntrinsic(node),
+                .direct_closed, .direct_parametric, .evidence_dependent, .structural, .checked_error, .@"unreachable" => false,
+            },
             .resolution = switch (resolution) {
                 .direct_pending => |node| .{ .direct = node },
                 .direct_closed, .direct_parametric => checkedArtifactInvariant("call resolution was finalized before evidence publication completed", .{}),
@@ -21909,6 +22589,7 @@ const EvidencePass = struct {
             checkedArtifactInvariant("checked stored-function dispatcher type was not published", .{});
         return .{
             .dispatcher_ty = dispatcher_ty,
+            .description_only_intrinsic = false,
             .resolution = .from_callable,
         };
     }
@@ -21935,6 +22616,50 @@ const EvidencePass = struct {
             .subst_start = spans.subst.start,
             .subst_len = spans.subst.len,
         });
+    }
+
+    /// A name at a `Code` position is described, not lowered, so no template
+    /// walk above reaches its node. The description reads what the use
+    /// copied each quantified variable of the definition to, including one
+    /// only a `where` obligation names, which the type at the position does
+    /// not hold, and how the use discharged each `where` obligation of the
+    /// definition, which the root reads as a callee reads its call's (D3).
+    /// The site's own chain is empty: a site stands in a definition that
+    /// supplies no evidence of its own. An obligation that chain cannot
+    /// resolve leaves the entry with the substitution only, and the walk
+    /// refuses the dispatch that needs it.
+    fn publishNamedCodeSiteEvidence(self: *EvidencePass) Allocator.Error!void {
+        const module_env = self.module.moduleEnvConst();
+        for (module_env.store.codeReificationSites()) |site| {
+            if (site.kind != .named_function) continue;
+            const record_idx = self.value_use_by_node.get(site.node_idx) orelse continue;
+            const checked_expr = self.checked_bodies.exprIdForSource(@fromBackingInt(@intCast(site.node_idx))) orelse continue;
+            const site_key = @backingInt(checked_expr);
+            if (self.site_seen.contains(site_key)) continue;
+            self.current_chain = &.{};
+            if (try self.evidenceRefsForRecord(record_idx, .commit)) |spans| {
+                try self.site_seen.put(site_key, {});
+                try self.site_evidence.append(self.allocator, .{
+                    .key = site_key,
+                    .start = spans.refs.start,
+                    .len = spans.refs.len,
+                    .subst_start = spans.subst.start,
+                    .subst_len = spans.subst.len,
+                });
+                continue;
+            }
+            const record = module_env.scheme_uses.items.items[record_idx];
+            const pairs = module_env.scheme_use_pairs.items.items[record.pairs_start .. record.pairs_start + record.pairs_len];
+            const subst = try self.appendSiteSubstitution(@fromBackingInt(@intCast(record.scheme_root)), pairs, &.{});
+            try self.site_seen.put(site_key, {});
+            try self.site_evidence.append(self.allocator, .{
+                .key = site_key,
+                .start = 0,
+                .len = 0,
+                .subst_start = subst.start,
+                .subst_len = subst.len,
+            });
+        }
     }
 
     fn emitSchemeUseSiteEvidence(
@@ -22043,6 +22768,7 @@ const EvidencePass = struct {
                     checkedArtifactInvariant("checked nested-procedure evidence dispatcher type was not published", .{});
                 entries.appendAssumeCapacity(.{
                     .dispatcher_ty = dispatcher_ty,
+                    .description_only_intrinsic = false,
                     .resolution = if (param.source == .scheme_requirement) .from_scheme else .from_callable,
                 });
                 continue;
@@ -22231,6 +22957,7 @@ fn sealConstEvalTemplatesForRoots(
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .interpolation_conversion,
             .repl_expr,
             .literal_argument,
             => checkedArtifactInvariant("non-constant root reached const eval template sealing", .{}),
@@ -22271,6 +22998,9 @@ const CheckedTemplateRefCollector = struct {
     callable_derived_schemes: *const collections.DenseMap(u32, Var),
     /// Checked lambdas written at a `Code` position, which no template lowers.
     staged_lambdas: *const collections.DenseMap(u32, void),
+    /// Each lambda at a `Code` position that this collection reached, with
+    /// the scope that holds it. The collection does not enter such a lambda.
+    staged_hits: std.ArrayList(StagedHit) = .empty,
     value_refs: std.ArrayList(ResolvedValueRefId),
     dispatch_refs: std.ArrayList(static_dispatch.StaticDispatchPlanId),
     iterator_refs: std.ArrayList(static_dispatch.IteratorForPlanId),
@@ -22334,7 +23064,16 @@ const CheckedTemplateRefCollector = struct {
         };
     }
 
+    /// A lambda at a `Code` position that a collection reached.
+    const StagedHit = struct {
+        expr: CheckedExprId,
+        /// The generalized local scope that holds the lambda, or null at
+        /// the root of the body.
+        scope: ?DispatchScopeId,
+    };
+
     fn deinit(self: *CheckedTemplateRefCollector) void {
+        self.staged_hits.deinit(self.allocator);
         self.work.deinit(self.allocator);
         self.visited_statements.deinit();
         self.visited_patterns.deinit();
@@ -22356,6 +23095,7 @@ const CheckedTemplateRefCollector = struct {
     }
 
     fn clear(self: *CheckedTemplateRefCollector) void {
+        self.staged_hits.clearRetainingCapacity();
         self.value_refs.clearRetainingCapacity();
         self.dispatch_refs.clearRetainingCapacity();
         self.iterator_refs.clearRetainingCapacity();
@@ -22459,6 +23199,78 @@ const CheckedTemplateRefCollector = struct {
     fn collectExpr(self: *CheckedTemplateRefCollector, expr_id: CheckedExprId) Allocator.Error!void {
         const base_len = self.work.items.len;
         try self.work.append(self.allocator, .{ .expr = expr_id });
+        try self.drainWork(base_len);
+    }
+
+    /// Collect the parameters and body of a lambda written at a `Code`
+    /// position. `visitExpr` stops at the lambda's own node, which holds the
+    /// `Code` rather than a function; what the lambda computes is below it.
+    fn collectStagedLambda(self: *CheckedTemplateRefCollector, expr_id: CheckedExprId) Allocator.Error!void {
+        if (!self.staged_lambdas.contains(@backingInt(expr_id))) {
+            checkedArtifactInvariant("a Code site's lambda was not recorded as staged", .{});
+        }
+        const lambda = switch (self.checked_bodies.expr(expr_id).data) {
+            .lambda => |lambda| lambda,
+            .closure => |closure| return self.collectExpr(closure.lambda),
+            // Checking replaced a lambda that failed to check with its error,
+            // and the site is left to that error rather than described.
+            .runtime_error => return,
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_local,
+            .lookup_external,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .interpolation,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => checkedArtifactInvariant("a lambda written at a Code position was copied as an expression that is not a lambda", .{}),
+        };
+        const base_len = self.work.items.len;
+        for (lambda.args) |arg| try self.work.append(self.allocator, .{ .pattern = arg });
+        try self.work.append(self.allocator, .{ .expr = lambda.body });
+        std.mem.reverse(Work, self.work.items[base_len..]);
+        try self.drainWork(base_len);
+    }
+
+    /// Run the work stack down to `base_len`.
+    fn drainWork(self: *CheckedTemplateRefCollector, base_len: usize) Allocator.Error!void {
         while (self.work.items.len > base_len) {
             switch (self.work.pop().?) {
                 .expr => |id| try self.visitExpr(id),
@@ -22504,7 +23316,17 @@ const CheckedTemplateRefCollector = struct {
         if (entry.found_existing) return;
 
         const raw_expr = @backingInt(expr_id);
-        if (self.staged_lambdas.contains(raw_expr)) return;
+        if (self.staged_lambdas.contains(raw_expr)) {
+            try self.staged_hits.append(self.allocator, .{ .expr = expr_id, .scope = self.currentScopeId() });
+            // The encoders of a `Code.Binds` site's capture reads run where
+            // the program binds the site's inputs, in this template.
+            const children = self.beginChildren();
+            for (self.checked_bodies.boundCaptureExprsForSite(expr_id)) |bound| {
+                try self.pushChild(.{ .expr = bound.encoder_expr });
+            }
+            self.endChildren(children);
+            return;
+        }
         if (self.nested_function_uses.get(raw_expr)) |record_idx| {
             try self.scheme_use_sites.append(self.allocator, .{
                 .record_idx = record_idx,
@@ -23416,6 +24238,9 @@ pub const CheckedProcedureTemplateTable = struct {
                     .field_names_iter,
                     .field_names_for_size,
                     .field_name,
+                    .code_prim,
+                    .code_type_id,
+                    .code_ty_of,
                     => .callable,
                 } else .callable,
             });
@@ -23428,6 +24253,7 @@ pub const CheckedProcedureTemplateTable = struct {
                 break :blk .{ .intrinsic_wrapper = wrapper_id };
             } else if (def.expr.data == .e_anno_only) .{ .unimplemented = .{
                 .region = module.regionAt(ModuleEnv.nodeIdxFrom(def.expr.idx)),
+                .intrinsic = def.expr.data.e_anno_only.kind == .intrinsic,
             } } else blk: {
                 const root_expr = checked_bodies.exprIdForSource(def.expr.idx) orelse {
                     base.invariant("checked artifact invariant violated: checked procedure body root expression was not published", .{});
@@ -23606,7 +24432,7 @@ pub const CheckedProcedureTemplateTable = struct {
                 .nested_proc_sites = .{},
                 .target = switch (root.kind) {
                     .expect => .entry,
-                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument => .comptime_only,
+                    .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument, .interpolation_conversion => .comptime_only,
                 },
             });
         }
@@ -26106,6 +26932,18 @@ fn specializeResolvedStaticDispatchPlanCallables(
         template_refs.default_plan_refs,
         template_refs.default_iterator_refs,
     );
+    // A lambda at a `Code` position is read in the instance of the template
+    // whose body holds it (`StagedLambdaRefs`).
+    for (template_refs.staged) |staged| {
+        try appendEnclosingDispatchSites(
+            &chains,
+            plans,
+            template_refs,
+            if (staged.owner) |owner| templates.templates.items[owner].checked_fn_root else null,
+            staged.plan_refs,
+            staged.iterator_refs,
+        );
+    }
 
     const evidence_closure = try allocator.alloc(DirectEvidenceClosure, plans.evidence_nodes.len);
     defer allocator.free(evidence_closure);
@@ -26266,6 +27104,17 @@ fn directEvidenceEnter(
     }
 }
 
+/// Whether a checked type is a nominal type the program declares, seen through
+/// aliases: not a builtin, whose conversions never reject a literal.
+fn checkedTypeIsCustomNominal(store: *const CheckedTypeStore, root: CheckedTypeId) bool {
+    var current = root;
+    while (true) switch (store.payload(current)) {
+        .alias => |alias| current = alias.backing,
+        .nominal => |nominal| return nominal.builtin == null,
+        .pending, .err, .flex, .rigid, .record, .tuple, .function, .tag_union, .empty_record, .empty_tag_union => return false,
+    };
+}
+
 /// Literal roots have no lexical evidence parameters. Publish them only after
 /// the ordinary dispatch pass has proved the complete conversion closed. A
 /// concrete receiver alone does not prove this: nested codec requirements can
@@ -26286,6 +27135,7 @@ fn publishLiteralConversionRoots(
     const first_root = roots.roots.len;
     var root_list = std.ArrayList(CompileTimeRoot).empty;
     defer root_list.deinit(allocator);
+    var unit_type: ?CheckedTypeId = null;
 
     for (module.moduleEnvConst().store.literalDispatchPlans()) |literal| {
         switch (literal.dispatchResolution()) {
@@ -26365,6 +27215,84 @@ fn publishLiteralConversionRoots(
             .payload = .pending,
         });
     }
+    // A literal with an interpolation has no dispatch plan record of its own,
+    // so its expressions are found through the source node map. Its root
+    // checks the first stage of a custom conversion and keeps no value.
+    for (0..bodies.source_node_map.entries.len) |raw_node| {
+        const expr_id = bodies.source_node_map.exprAtRawNode(@intCast(raw_node)) orelse continue;
+        const data = &bodies.stored_exprs.items[@backingInt(expr_id)].data;
+        const interpolation = switch (data.*) {
+            .interpolation => |*interpolation| interpolation,
+            .pending,
+            .numeral,
+            .str_from_quote,
+            .code_from_lambda,
+            .str_segment,
+            .str,
+            .bytes_literal,
+            .lookup_local,
+            .lookup_external,
+            .lookup_required,
+            .list,
+            .empty_list,
+            .tuple,
+            .match_,
+            .if_,
+            .call,
+            .record,
+            .empty_record,
+            .block,
+            .tag,
+            .nominal,
+            .zero_argument_tag,
+            .closure,
+            .lambda,
+            .binop,
+            .unary_minus,
+            .unary_not,
+            .field_access,
+            .dispatch_call,
+            .structural_eq,
+            .structural_hash,
+            .method_eq,
+            .type_dispatch_call,
+            .tuple_access,
+            .runtime_error,
+            .crash,
+            .dbg,
+            .expect_err,
+            .expect,
+            .ellipsis,
+            .anno_only,
+            .break_,
+            .return_,
+            .row_coerce,
+            .for_,
+            .hosted_lambda,
+            .run_low_level,
+            => continue,
+        };
+        const plan_id = interpolation.plan orelse continue;
+        switch (plans.plans[@backingInt(plan_id)].resolution) {
+            .direct_closed => {},
+            .direct_parametric, .evidence_dependent, .checked_error, .@"unreachable", .direct_pending, .structural => continue,
+        }
+        if (!checkedTypeIsCustomNominal(&checked_types.store, bodies.expr(expr_id).ty)) continue;
+        if (interpolation.conversion_root != null) checkedArtifactInvariant("interpolation received a second conversion root", .{});
+        interpolation.conversion_root = @fromBackingInt(@intCast(@as(u32, @intCast(first_root + root_list.items.len))));
+        try CompileTimeRootTable.appendCompileTimeRoot(&root_list, allocator, .{
+            .module_idx = module.moduleIndex(),
+            .kind = .interpolation_conversion,
+            .source = .{ .expr = @fromBackingInt(@intCast(raw_node)) },
+            .pattern = null,
+            .expr = expr_id,
+            .checked_type = unit_type orelse blk: {
+                unit_type = try checked_types.store.ensureEmptyRecordRoot(allocator, names);
+                break :blk unit_type.?;
+            },
+            .payload = .pending,
+        });
+    }
     if (root_list.items.len == 0) return;
     roots.roots = try allocator.realloc(roots.roots, first_root + root_list.items.len);
     const added = roots.roots[first_root..];
@@ -26390,6 +27318,7 @@ fn publishLiteralConversionRoots(
         const plan_id = switch (bodies.expr(root.expr).data) {
             .numeral => |numeral| numeral.plan.?,
             .str_from_quote => |quote| quote.plan.?,
+            .interpolation => |interpolation| interpolation.plan.?,
             .pending,
             .code_from_lambda,
             .str_segment,
@@ -26417,7 +27346,6 @@ fn publishLiteralConversionRoots(
             .unary_not,
             .field_access,
             .dispatch_call,
-            .interpolation,
             .structural_eq,
             .structural_hash,
             .method_eq,
@@ -26436,7 +27364,7 @@ fn publishLiteralConversionRoots(
             .for_,
             .hosted_lambda,
             .run_low_level,
-            => unreachable, // the loop above appends roots only for numeral and str_from_quote expressions
+            => unreachable, // the loops above append roots only for numeral, str_from_quote and interpolation expressions
         };
         const ref_index = first_ref + i;
         plans.template_refs[ref_index] = plan_id;
@@ -28367,6 +29295,10 @@ pub const PlatformPairing = struct {
                 // The platform's own reification sites, which publication of
                 // the platform described.
                 "code_provenance",
+                // The translators' cuts the platform declares.
+                "code_cuts",
+                // The platform's own inventories and closing uses (D1).
+                "code_instances",
                 // Value reuse metadata: borrowed from the platform. Reuse
                 // moves values between versions of a module's own entry,
                 // never into a composition.
@@ -29579,6 +30511,13 @@ pub const CompileTimeRootKind = enum {
     /// non-builtin nominal type; works exactly like `numeral_conversion` with
     /// `Err(BadQuotedBytes(..))` reported as the checking problem.
     quote_conversion,
+    /// The first stage of a `from_interpolation` conversion of a string
+    /// literal whose target is a non-builtin nominal type. The root body
+    /// evaluates the dispatch call over the literal's segments and keeps no
+    /// value: `Err(InvalidInterpolation(..))` is reported as the checking
+    /// problem. Only a read demands it (a `Code` site that reaches the
+    /// literal reads it), and its payload is `discarded`.
+    interpolation_conversion,
     /// One explicitly requested REPL expression body whose inspected `Str`
     /// result is evaluated during checking finalization but is not installed
     /// as a source-visible top-level constant.
@@ -29690,6 +30629,7 @@ pub const LiteralArgumentRoot = struct {
 pub const CompileTimeLiteralConversionKind = enum(u8) {
     numeral,
     quote,
+    interpolation,
 };
 
 /// Public `CompileTimeRootPayload` declaration.
@@ -29745,6 +30685,7 @@ pub const CompileTimeRoot = struct {
         return switch (self.kind) {
             .numeral_conversion => .numeral,
             .quote_conversion => .quote,
+            .interpolation_conversion => .interpolation,
             .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .expect, .repl_expr, .literal_argument => null,
         };
     }
@@ -30062,6 +31003,7 @@ fn publishCompileTimeRootRequestEligibility(
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .interpolation_conversion,
             .repl_expr,
             .literal_argument,
             => false,
@@ -30512,8 +31454,12 @@ const TemplateDemandPass = struct {
         }
         for (self.current_vars, self.current_demands) |var_ty, *demand| {
             switch (self.checked_types.payload(var_ty)) {
+                // A variable that stands in a record extension slot, also as
+                // the record-row argument of an alias or nominal application
+                // (`Ref(r)` with `Ref(r) := { ..r }`), is a row extension: its
+                // substitution is a row, so it has no layout representative.
                 .flex, .rigid => |variable| {
-                    if (variable.constraints.len != 0 or variable.numeric_default_phase != null) demand.* = .full;
+                    if (variable.constraints.len != 0 or variable.numeric_default_phase != null or variable.record_row) demand.* = .full;
                 },
                 .pending, .field_kind, .err, .alias, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => demand.* = .full,
             }
@@ -31147,6 +32093,11 @@ fn verifyCompileTimeRootPayloadMatchesKind(root: CompileTimeRoot, payload: Compi
             .const_node, .fn_value, .unevaluated => true,
             .pending, .discarded, .expect, .runtime => false,
         },
+        .interpolation_conversion => switch (payload) {
+            .discarded, .unevaluated => true,
+            .runtime => root.guarded,
+            .pending, .const_node, .fn_value, .expect => false,
+        },
     };
     if (matches) return;
     checkedArtifactInvariant("compile-time root payload does not match root kind", .{});
@@ -31155,7 +32106,7 @@ fn verifyCompileTimeRootPayloadMatchesKind(root: CompileTimeRoot, payload: Compi
 fn compileTimeRootHasConstBody(kind: CompileTimeRootKind) bool {
     return switch (kind) {
         .constant, .hoisted_constant => true,
-        .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument => false,
+        .hoisted_validation, .callable_binding, .expect, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument, .interpolation_conversion => false,
     };
 }
 
@@ -31847,6 +32798,8 @@ fn compileTimeRootReplacesSourceOccurrence(kind: CompileTimeRootKind) bool {
         => true,
         .callable_binding,
         .expect,
+        // Its expression holds runtime values the root never evaluates.
+        .interpolation_conversion,
         => false,
     };
 }
@@ -32206,6 +33159,7 @@ pub const TopLevelValueTable = struct {
                     root_id,
                     source_scheme,
                     checked_fn_root,
+                    root.expr,
                 );
                 const binding = try procedure_bindings.appendCallableEval(
                     allocator,
@@ -32219,7 +33173,10 @@ pub const TopLevelValueTable = struct {
                 module.moduleIndex(),
                 checked_pattern,
                 source_scheme,
-                .{ .region = module.regionAt(ModuleEnv.nodeIdxFrom(def.expr.idx)) },
+                .{
+                    .region = module.regionAt(ModuleEnv.nodeIdxFrom(def.expr.idx)),
+                    .intrinsic = def.expr.data.e_anno_only.kind == .intrinsic,
+                },
             ) } else .{ .const_ref = try const_templates.reserveTopLevel(
                 allocator,
                 artifact_key,
@@ -35580,6 +36537,259 @@ pub const CompileTimeRootPortability = struct {
     pub const deinit = artifact_serialize.SliceStoreDeinit(@This()).deinit;
 };
 
+/// The translators' cuts this module declares (plan I14, normal-form 3.8):
+/// per nominal type whose `code_primitives` item publication accepted, the
+/// checked lookups that item lists. The walk of a site whose translator the
+/// type owns resolves each lookup to the function it names, which is then a
+/// `Prim` by its qualified name rather than a body to walk.
+///
+/// | Slice | One entry per | Holds |
+/// |---|---|---|
+/// | `cuts` | nominal type with a cut | its declaration statement, and its span of `members` |
+/// | `members` | function in a cut, in the order the tuple lists it | the checked lookup that names it |
+pub const CodeCutTable = struct {
+    pub const Cut = extern struct { owner_decl: u32, members: Span };
+    pub const Span = extern struct { start: u32 = 0, len: u32 = 0 };
+
+    cuts: []const Cut = &.{},
+    members: []const u32 = &.{},
+
+    pub const Serialized = extern struct {
+        cuts: SerializedSlice(Cut) = .{},
+        members: SerializedSlice(u32) = .{},
+        const Serde = artifact_serialize.SliceStoreSerde(CodeCutTable, @This());
+        pub const serialize = Serde.serialize;
+        pub const deserialize = Serde.deserialize;
+    };
+
+    /// The checked lookups of the cut that the nominal declared at
+    /// `owner_decl` lists, or null for a type that declares none, whose cut
+    /// is empty.
+    pub fn membersOf(self: *const CodeCutTable, owner_decl: u32) ?[]const u32 {
+        for (self.cuts) |cut| {
+            if (cut.owner_decl == owner_decl) return self.members[cut.members.start..][0..cut.members.len];
+        }
+        return null;
+    }
+
+    pub fn validate(self: CodeCutTable) error{CorruptArtifact}!void {
+        for (self.cuts) |cut| {
+            if (cut.members.start > self.members.len or cut.members.len > self.members.len - cut.members.start) return error.CorruptArtifact;
+        }
+    }
+
+    pub fn deinit(self: *CodeCutTable, allocator: Allocator) void {
+        allocator.free(self.cuts);
+        allocator.free(self.members);
+        self.* = .{};
+    }
+};
+
+/// What instance descriptions (D1 of roc-reify-structural-proposal.md)
+/// publish for one module.
+///
+/// A `Code` site whose function type mentions a quantified variable of the
+/// template that holds it is an instance site. Its own module describes it
+/// nowhere: each closing use of the template (a use whose types fix those
+/// variables) describes it, in the module of the use, and records a table
+/// on the use. A use inside a template with an inventory, of a template with
+/// one, at the holder's own variables, is a forward use: its table is an
+/// entry of the holder's table.
+///
+/// | Slice | One entry per | Holds |
+/// |---|---|---|
+/// | `inventories` | template of this module with instance sites or forward uses, by template id | its span of `entries` |
+/// | `entries` | inventory entry, in inventory order | a site (with its `recipes` index) or a forward use |
+/// | `sites` | instance site of this module, by expression | its index in its template's inventory |
+/// | `forwards` | forward use of this module, by expression | its index in its holder's inventory |
+/// | `recipes` | instance site | what a walk in any module reads to describe it |
+/// | `scheme_vars` | quantified variable of a recipe's root | a type id of the root's module |
+/// | `exprs` | template-call argument of a recipe | an expression of the site's module |
+/// | `modules` | module a recipe's root lives in | its key |
+/// | `tables` | table this module's closing uses built | its span of `table_entries` |
+/// | `table_entries` | inventory entry of a table's template | a description node, or a nested table |
+/// | `reads` | literal root a description's walk met | `CheckedCodeRead` |
+/// | `uses` | closing use of this module, by expression | its table |
+pub const CodeInstanceTable = struct {
+    pub const Span = extern struct { start: u32 = 0, len: u32 = 0 };
+    pub const none: u32 = std.math.maxInt(u32);
+
+    pub const Inventory = extern struct {
+        template: canonical.CheckedProcedureTemplateId,
+        entries: Span,
+    };
+    pub const EntryKind = enum(u32) { site, forward };
+    pub const Entry = extern struct {
+        kind: EntryKind,
+        /// The site's expression, or the forward use's.
+        expr: CheckedExprId,
+        /// A site's index in `recipes`; `none` for a forward use.
+        recipe: u32,
+    };
+    pub const Indexed = extern struct { expr: CheckedExprId, index: u32 };
+    /// How a closing use describes one entry: a site of each kind, or a
+    /// `Code.type_id` or `Code.ty_of` call, whose `root_body` is the call's
+    /// proxy (Q8, D6).
+    pub const RecipeKind = enum(u32) { inline_lambda, named_function, template_call, type_id, ty_of };
+    /// What the walk of one instance site reads, in the module that holds the
+    /// site and the module that defines its root. Publication of the site's
+    /// own module resolves it, because only that publication reads the
+    /// module's source.
+    pub const Recipe = extern struct {
+        kind: RecipeKind,
+        /// The site's view (`CodeReificationSite.View`).
+        view: u32,
+        /// The `f` of the site's `Code(f)`, in the site's module.
+        fn_ty: CheckedTypeId,
+        /// The site's region in its module.
+        region_start: u32,
+        region_end: u32,
+        /// The module of the root (`modules` index), or `none` for the
+        /// site's own module.
+        root_module: u32,
+        /// The lambda a named site or the site itself describes, or the
+        /// template's body.
+        root_body: CheckedExprId,
+        /// What the root quantifies over, in the root's module: a span of
+        /// `scheme_vars` and the type that holds them. `scheme_root` is
+        /// `none` for a root with no scheme.
+        scheme_vars: Span,
+        scheme_root: u32,
+        /// Whether the root reads the block around it (`Site.in_block`).
+        in_block: u32,
+        /// The site's lookup or the template call's callee, in the site's
+        /// module, or `none`.
+        use: u32,
+        /// The call the site is an argument of, whose translator declares
+        /// the site's cut, or `none`.
+        translator: u32,
+        /// A template call's arguments, a span of `exprs`.
+        args: Span,
+    };
+    pub const TableEntryKind = enum(u32) { node, table };
+    pub const TableEntry = extern struct {
+        kind: TableEntryKind,
+        /// A `ConstNodeId` of this module's store, or a `tables` index.
+        value: u32,
+        /// A node's literal roots, a span of `reads`.
+        reads: Span,
+    };
+
+    inventories: []const Inventory = &.{},
+    entries: []const Entry = &.{},
+    sites: []const Indexed = &.{},
+    forwards: []const Indexed = &.{},
+    recipes: []const Recipe = &.{},
+    scheme_vars: []const CheckedTypeId = &.{},
+    exprs: []const CheckedExprId = &.{},
+    modules: []const CheckedModuleArtifactKey = &.{},
+    tables: []const Span = &.{},
+    table_entries: []const TableEntry = &.{},
+    reads: []const CheckedCodeRead = &.{},
+    uses: []const Indexed = &.{},
+
+    pub const Serialized = extern struct {
+        inventories: SerializedSlice(Inventory) = .{},
+        entries: SerializedSlice(Entry) = .{},
+        sites: SerializedSlice(Indexed) = .{},
+        forwards: SerializedSlice(Indexed) = .{},
+        recipes: SerializedSlice(Recipe) = .{},
+        scheme_vars: SerializedSlice(CheckedTypeId) = .{},
+        exprs: SerializedSlice(CheckedExprId) = .{},
+        modules: SerializedSlice(CheckedModuleArtifactKey) = .{},
+        tables: SerializedSlice(Span) = .{},
+        table_entries: SerializedSlice(TableEntry) = .{},
+        reads: SerializedSlice(CheckedCodeRead) = .{},
+        uses: SerializedSlice(Indexed) = .{},
+        const Serde = artifact_serialize.SliceStoreSerde(CodeInstanceTable, @This());
+        pub const serialize = Serde.serialize;
+        pub const deserialize = Serde.deserialize;
+    };
+
+    /// The inventory of the template `template`, or null for one with none.
+    pub fn inventoryOf(self: *const CodeInstanceTable, template: canonical.CheckedProcedureTemplateId) ?[]const Entry {
+        for (self.inventories) |inventory| {
+            if (inventory.template != template) continue;
+            return self.entries[inventory.entries.start..][0..inventory.entries.len];
+        }
+        return null;
+    }
+
+    fn indexOf(items: []const Indexed, expr: CheckedExprId) ?u32 {
+        const found = artifact_serialize.binarySearchByKey(Indexed, u32, items, @backingInt(expr), indexedOrder) orelse return null;
+        return found.index;
+    }
+
+    fn indexedOrder(item: Indexed, key: u32) std.math.Order {
+        return std.math.order(@backingInt(item.expr), key);
+    }
+
+    /// The inventory index of the instance site at `expr`, or null where
+    /// `expr` is no instance site.
+    pub fn siteIndex(self: *const CodeInstanceTable, expr: CheckedExprId) ?u32 {
+        return indexOf(self.sites, expr);
+    }
+
+    /// The inventory index of the forward use at `expr`, or null.
+    pub fn forwardIndex(self: *const CodeInstanceTable, expr: CheckedExprId) ?u32 {
+        return indexOf(self.forwards, expr);
+    }
+
+    /// The table of the closing use at `expr`, or null.
+    pub fn useTable(self: *const CodeInstanceTable, expr: CheckedExprId) ?u32 {
+        return indexOf(self.uses, expr);
+    }
+
+    /// The entries of table `table`.
+    pub fn tableEntries(self: *const CodeInstanceTable, table: u32) []const TableEntry {
+        const span = self.tables[table];
+        return self.table_entries[span.start..][0..span.len];
+    }
+
+    /// The literal roots of one table entry.
+    pub fn entryReads(self: *const CodeInstanceTable, entry: TableEntry) []const CheckedCodeRead {
+        return self.reads[entry.reads.start..][0..entry.reads.len];
+    }
+
+    pub fn validate(self: CodeInstanceTable) error{CorruptArtifact}!void {
+        for (self.inventories) |inventory| try checkSpan(inventory.entries, self.entries.len);
+        for (self.entries) |entry| {
+            if (entry.kind == .site and entry.recipe >= self.recipes.len) return error.CorruptArtifact;
+        }
+        for (self.recipes) |recipe| {
+            try checkSpan(recipe.scheme_vars, self.scheme_vars.len);
+            try checkSpan(recipe.args, self.exprs.len);
+            if (recipe.root_module != none and recipe.root_module >= self.modules.len) return error.CorruptArtifact;
+        }
+        for (self.tables) |span| try checkSpan(span, self.table_entries.len);
+        for (self.table_entries) |entry| {
+            try checkSpan(entry.reads, self.reads.len);
+            if (entry.kind == .table and entry.value >= self.tables.len) return error.CorruptArtifact;
+        }
+        for (self.uses) |use| if (use.index >= self.tables.len) return error.CorruptArtifact;
+    }
+
+    fn checkSpan(span: Span, len: usize) error{CorruptArtifact}!void {
+        if (span.start > len or span.len > len - span.start) return error.CorruptArtifact;
+    }
+
+    pub fn deinit(self: *CodeInstanceTable, allocator: Allocator) void {
+        allocator.free(self.inventories);
+        allocator.free(self.entries);
+        allocator.free(self.sites);
+        allocator.free(self.forwards);
+        allocator.free(self.recipes);
+        allocator.free(self.scheme_vars);
+        allocator.free(self.exprs);
+        allocator.free(self.modules);
+        allocator.free(self.tables);
+        allocator.free(self.table_entries);
+        allocator.free(self.reads);
+        allocator.free(self.uses);
+        self.* = .{};
+    }
+};
+
 /// The provenance of the module's `Code` sites (normal-form 3.10, plan I9):
 /// per site key, where each node of the site's graph came from. Nothing a
 /// translator reads holds it; a refusal reads it to report a node at its
@@ -35593,6 +36803,8 @@ pub const CompileTimeRootPortability = struct {
 /// | `nodes` | node of a row, in the row's node order | its span of `chains` |
 /// | `chains` | origin of a node | its span of `links` |
 /// | `links` | step of an origin | a source, by index into the site's sources: the node's own, then each call that reached it |
+/// | `node_intrinsics` | node of a row, as `nodes` | its span of `intrinsics` |
+/// | `intrinsics` | intrinsic a node's `Prim` names, its own or in its evidence | its name, `owner.method`, as a span of `text` |
 pub const CodeProvenanceTable = struct {
     pub const Site = extern struct { key: u64, sources: Span, rows: Span };
     pub const Source = extern struct { module: u32, region_start: u32, region_end: u32 };
@@ -35605,6 +36817,9 @@ pub const CodeProvenanceTable = struct {
     nodes: []const Span = &.{},
     chains: []const Span = &.{},
     links: []const u32 = &.{},
+    node_intrinsics: []const Span = &.{},
+    intrinsics: []const Span = &.{},
+    text: []const u8 = &.{},
 
     pub const Serialized = extern struct {
         sites: SerializedSlice(Site) = .{},
@@ -35614,6 +36829,9 @@ pub const CodeProvenanceTable = struct {
         nodes: SerializedSlice(Span) = .{},
         chains: SerializedSlice(Span) = .{},
         links: SerializedSlice(u32) = .{},
+        node_intrinsics: SerializedSlice(Span) = .{},
+        intrinsics: SerializedSlice(Span) = .{},
+        text: SerializedSlice(u8) = .{},
         const Serde = artifact_serialize.SliceStoreSerde(CodeProvenanceTable, @This());
         pub const serialize = Serde.serialize;
         pub const deserialize = Serde.deserialize;
@@ -35635,6 +36853,12 @@ pub const CodeProvenanceTable = struct {
         defer chains.deinit(allocator);
         var links: std.ArrayList(u32) = .empty;
         defer links.deinit(allocator);
+        var node_intrinsics: std.ArrayList(Span) = .empty;
+        defer node_intrinsics.deinit(allocator);
+        var intrinsics: std.ArrayList(Span) = .empty;
+        defer intrinsics.deinit(allocator);
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(allocator);
         for (published) |entry| {
             const sources_start: u32 = @intCast(sources.items.len);
             for (entry.sources) |src| {
@@ -35659,6 +36883,15 @@ pub const CodeProvenanceTable = struct {
                     }
                     try nodes.append(allocator, .{ .start = chains_start, .len = node.len });
                 }
+                for (emitted.node_intrinsics.items[row.start..][0..row.len]) |named| {
+                    const intrinsics_start: u32 = @intCast(intrinsics.items.len);
+                    for (emitted.intrinsics.items[named.start..][0..named.len]) |span| {
+                        const text_start: u32 = @intCast(text.items.len);
+                        try text.appendSlice(allocator, emitted.intrinsicText(span));
+                        try intrinsics.append(allocator, .{ .start = text_start, .len = span.len });
+                    }
+                    try node_intrinsics.append(allocator, .{ .start = intrinsics_start, .len = named.len });
+                }
                 try rows.append(allocator, .{ .start = nodes_start, .len = row.len });
             }
             try sites.append(allocator, .{
@@ -35676,6 +36909,9 @@ pub const CodeProvenanceTable = struct {
         table.nodes = try nodes.toOwnedSlice(allocator);
         table.chains = try chains.toOwnedSlice(allocator);
         table.links = try links.toOwnedSlice(allocator);
+        table.node_intrinsics = try node_intrinsics.toOwnedSlice(allocator);
+        table.intrinsics = try intrinsics.toOwnedSlice(allocator);
+        table.text = try text.toOwnedSlice(allocator);
         return table;
     }
 
@@ -35700,6 +36936,21 @@ pub const CodeProvenanceTable = struct {
         return self.sources[s.sources.start + link];
     }
 
+    /// The intrinsics node `node` of row `row` of `s`'s graph names, each
+    /// a span of `text`, or null where the graph has no such node.
+    pub fn intrinsicsOf(self: CodeProvenanceTable, s: Site, row: u32, node: u32) ?[]const Span {
+        if (row >= s.rows.len) return null;
+        const r = self.rows[s.rows.start + row];
+        if (node >= r.len) return null;
+        const named = self.node_intrinsics[r.start + node];
+        return self.intrinsics[named.start..][0..named.len];
+    }
+
+    /// The name of one intrinsic `intrinsicsOf` gives.
+    pub fn intrinsicText(self: CodeProvenanceTable, span: Span) []const u8 {
+        return self.text[span.start..][0..span.len];
+    }
+
     pub fn validate(self: CodeProvenanceTable) error{CorruptArtifact}!void {
         const inside = struct {
             fn check(span: Span, len: usize) error{CorruptArtifact}!void {
@@ -35714,6 +36965,9 @@ pub const CodeProvenanceTable = struct {
         for (self.rows) |r| try inside.check(r, self.nodes.len);
         for (self.nodes) |n| try inside.check(n, self.chains.len);
         for (self.chains) |c| try inside.check(c, self.links.len);
+        if (self.node_intrinsics.len != self.nodes.len) return error.CorruptArtifact;
+        for (self.node_intrinsics) |n| try inside.check(n, self.intrinsics.len);
+        for (self.intrinsics) |i| try inside.check(i, self.text.len);
     }
 
     pub fn deinit(self: *CodeProvenanceTable, allocator: Allocator) void {
@@ -35724,6 +36978,9 @@ pub const CodeProvenanceTable = struct {
         allocator.free(self.nodes);
         allocator.free(self.chains);
         allocator.free(self.links);
+        allocator.free(self.node_intrinsics);
+        allocator.free(self.intrinsics);
+        allocator.free(self.text);
         self.* = .{};
     }
 };
@@ -35780,6 +37037,9 @@ pub const CheckedModuleArtifact = struct {
     compile_time_root_identities: CompileTimeRootIdentityTable = .{},
     compile_time_root_portability: CompileTimeRootPortability = .{},
     code_provenance: CodeProvenanceTable = .{},
+    code_cuts: CodeCutTable = .{},
+    /// The module's instance descriptions (D1).
+    code_instances: CodeInstanceTable = .{},
     /// Process-local publication state; cache entries always contain finalized output.
     evaluation_state: enum { prepared, finalized } = .finalized,
     /// Owns the evaluation columns of a finalized artifact that a compilation
@@ -36021,6 +37281,8 @@ pub const CheckedModuleArtifact = struct {
         compile_time_root_identities: CompileTimeRootIdentityTable.Serialized,
         compile_time_root_portability: CompileTimeRootPortability.Serialized,
         code_provenance: CodeProvenanceTable.Serialized,
+        code_cuts: CodeCutTable.Serialized,
+        code_instances: CodeInstanceTable.Serialized,
 
         pub const root_contract: collections.serde_validation.RootContract = .{
             .Owner = CheckedModuleArtifact,
@@ -36055,8 +37317,11 @@ pub const CheckedModuleArtifact = struct {
             // identities add roots, context, definition summaries, report sites and declaration identities.
             // Literal arguments add the literal requirement pool, the demand pool, and the root lookup table.
             // Nominal relocation adds checked type fingerprints and committed occurrence identities. The
-            // code provenance table adds its seven slices.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 265);
+            // code provenance table adds its ten slices, and the calls that
+            // bind input slots four in the body store, and the roots a Code site
+            // reads one. The code cut table adds its two slices, and the code
+            // instance table (D1) its twelve.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 287);
         }
 
         /// Every field but the inline POD `key`, `source_hash`, and
@@ -36121,6 +37386,8 @@ pub const CheckedModuleArtifact = struct {
             try self.compile_time_root_identities.deserialize(base_addr).validateTypes(self.checked_types.payloads.deserialize(base_addr));
             try self.compile_time_root_portability.deserialize(base_addr).validate(roots.roots.len);
             try self.code_provenance.deserialize(base_addr).validate();
+            try self.code_cuts.deserialize(base_addr).validate();
+            try self.code_instances.deserialize(base_addr).validate();
         }
 
         pub fn deserialize(
@@ -36376,7 +37643,7 @@ pub const CheckedModuleArtifact = struct {
             std.debug.assert(@backingInt(root.expr) < self.checked_bodies.exprCount());
             if (root.pattern) |pattern| std.debug.assert(@backingInt(pattern) < self.checked_bodies.patternCount());
             switch (root.kind) {
-                .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument => switch (root.payload) {
+                .constant, .hoisted_constant, .hoisted_validation, .callable_binding, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument, .interpolation_conversion => switch (root.payload) {
                     .pending => {},
                     .unevaluated,
                     .const_node,
@@ -37388,6 +38655,8 @@ pub const CheckedModuleArtifact = struct {
         if (self.evaluation_state != .finalized) checkedArtifactInvariant("complete checked module still awaits evaluation", .{});
         self.compile_time_debug.validate(self.compile_time_roots.roots.len) catch checkedArtifactInvariant("compile-time debug observation has an invalid root or message range", .{});
         self.code_provenance.validate() catch checkedArtifactInvariant("code provenance has a span outside its table", .{});
+        self.code_cuts.validate() catch checkedArtifactInvariant("a code cut has a span outside its table", .{});
+        self.code_instances.validate() catch checkedArtifactInvariant("a code instance table has a span outside its table", .{});
         if (builtin.mode != .debug) return;
 
         std.debug.assert(self.module_identity.module_idx != std.math.maxInt(u32));
@@ -38041,6 +39310,9 @@ pub const ImportedModuleView = struct {
     callable_eval_templates: CallableEvalTemplateTableView,
     hoisted_constants: *const HoistedConstTable,
     const_templates: *const ConstTemplateTable,
+    /// The definition each top-level value's pattern binds, which the walk of
+    /// a description reads to name a constant of this module.
+    top_level_values: *const TopLevelValueTable,
     method_registry: *const static_dispatch.MethodRegistry,
     interface_capabilities: *const ModuleInterfaceCapabilities,
     const_store: *const ConstStore,
@@ -38049,6 +39321,12 @@ pub const ImportedModuleView = struct {
     /// The provenance of the module's reification sites, which a refusal
     /// report reads (I9c).
     code_provenance: *const CodeProvenanceTable = &no_code_provenance,
+    /// The translators' cuts the module declares (I14), which the walk of a
+    /// site in another module reads when the module owns its translator.
+    code_cuts: *const CodeCutTable = &no_code_cuts,
+    /// The module's inventories and closing uses (D1), which a closing use in
+    /// another module and lowering read.
+    code_instances: *const CodeInstanceTable = &no_code_instances,
 
     /// The keys of the modules this module imports directly.
     pub fn directImportKeys(self: ImportedModuleView) []const CheckedModuleArtifactKey {
@@ -38059,6 +39337,8 @@ pub const ImportedModuleView = struct {
 const no_compile_time_root_reads: CompileTimeRootReadTable = .{};
 const no_compile_time_root_identities: CompileTimeRootIdentityTable = .{};
 const no_code_provenance: CodeProvenanceTable = .{};
+const no_code_cuts: CodeCutTable = .{};
+const no_code_instances: CodeInstanceTable = .{};
 
 /// Public `LoweringModuleView` declaration.
 pub const LoweringModuleView = struct {
@@ -38107,12 +39387,15 @@ pub fn importedView(artifact: *const CheckedModuleArtifact) ImportedModuleView {
         .callable_eval_templates = artifact.callable_eval_templates.view(),
         .hoisted_constants = &artifact.hoisted_constants,
         .const_templates = &artifact.const_templates,
+        .top_level_values = &artifact.top_level_values,
         .method_registry = &artifact.method_registry,
         .interface_capabilities = &artifact.interface_capabilities,
         .const_store = &artifact.const_store,
         .compile_time_root_reads = &artifact.compile_time_root_reads,
         .compile_time_root_identities = &artifact.compile_time_root_identities,
         .code_provenance = &artifact.code_provenance,
+        .code_cuts = &artifact.code_cuts,
+        .code_instances = &artifact.code_instances,
     };
 }
 
@@ -38595,6 +39878,7 @@ const CheckedTypeStoreImportProjector = struct {
             .row_default = variable.row_default,
             .row_default_discharges_constraints = variable.row_default_discharges_constraints,
             .bounded_row_ext = variable.bounded_row_ext,
+            .record_row = variable.record_row,
         };
     }
 
@@ -39353,10 +40637,74 @@ const ForeignStagedLookup = struct {
             .resolve_alias = resolveAlias,
             .resolve_exported = resolveExported,
             .resolve_exported_alias = resolveExportedAlias,
+            .resolve_exported_computed = resolveExportedComputed,
             .resolve_constant = resolveConstant,
             .resolve_method = resolveMethod,
             .resolve_inspect_override = resolveInspectOverride,
+            .resolve_builtin_module = resolveBuiltinModule,
+            .resolve_lookup_target = resolveLookupTarget,
+            .resolve_module = resolveModule,
+            .resolve_any_instances = resolveAnyInstances,
+            .resolve_identity_module = resolveIdentityModule,
         };
+    }
+
+    /// A module in reach by its content identity, for a field default's
+    /// declaring module (D5).
+    fn resolveIdentityModule(context: *const anyopaque, identity: *const [32]u8) ?code_reifier.ForeignModule {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        for (self.imports) |*import_artifact| {
+            if (importedViewIdentityMatches(&import_artifact.view, identity)) return foreignModule(import_artifact.view);
+        }
+        for (self.available) |*view| {
+            if (importedViewIdentityMatches(view, identity)) return foreignModule(view.*);
+        }
+        return null;
+    }
+
+    /// Whether a module in reach has an inventory (D1).
+    fn resolveAnyInstances(context: *const anyopaque) bool {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        for (self.imports) |import_artifact| {
+            if (import_artifact.view.code_instances.inventories.len != 0) return true;
+        }
+        for (self.available) |view| {
+            if (view.code_instances.inventories.len != 0) return true;
+        }
+        return false;
+    }
+
+    /// A module in reach by its key, for a recipe's root (D1).
+    fn resolveModule(context: *const anyopaque, key: *const [32]u8) ?code_reifier.ForeignModule {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        for (self.imports) |import_artifact| {
+            if (std.meta.eql(import_artifact.key.bytes, key.*)) return foreignModule(import_artifact.view);
+        }
+        for (self.available) |view| {
+            if (std.meta.eql(view.key.bytes, key.*)) return foreignModule(view);
+        }
+        return null;
+    }
+
+    /// The definition a lookup of the module being published names.
+    fn resolveLookupTarget(context: *const anyopaque, expr_idx: CIR.Expr.Idx) ?LookupTarget {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        return lookupTargetOf(self.module, expr_idx, self.imports, self.available);
+    }
+
+    /// Whether the module of content identity `module` is the builtin module:
+    /// the module being published or a view it holds, by its role.
+    fn resolveBuiltinModule(context: *const anyopaque, module: *const [32]u8) bool {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        const module_env = self.module.moduleEnvConst();
+        if (module_env.module_role == .builtin and moduleEnvIdentityMatches(module_env, module)) return true;
+        for (self.imports) |*import_artifact| {
+            if (import_artifact.view.module_env.module_role == .builtin and importedViewIdentityMatches(&import_artifact.view, module)) return true;
+        }
+        for (self.available) |*view| {
+            if (view.module_env.module_role == .builtin and importedViewIdentityMatches(view, module)) return true;
+        }
+        return false;
     }
 
     /// The target a nominal's declaration names for one method.
@@ -39498,6 +40846,25 @@ const ForeignStagedLookup = struct {
         }
         return null;
     }
+
+    /// A top-level value of a named artifact that computes a function, which
+    /// a use inside a description reads as the expression it was written as.
+    fn resolveExportedComputed(
+        context: *const anyopaque,
+        artifact: canonical.ArtifactRef,
+        def: CIR.Def.Idx,
+    ) ?code_reifier.ForeignComputed {
+        const self: *const ForeignStagedLookup = @ptrCast(@alignCast(context));
+        for (self.imports) |import_artifact| {
+            if (!std.meta.eql(import_artifact.key.bytes, artifact.bytes)) continue;
+            return exportedComputed(import_artifact.view, def);
+        }
+        for (self.available) |view| {
+            if (!std.meta.eql(view.key.bytes, artifact.bytes)) continue;
+            return exportedComputed(view, def);
+        }
+        return null;
+    }
 };
 
 /// One registry's answer for a nominal named by content identity and
@@ -39568,8 +40935,12 @@ fn foreignModule(view: ImportedModuleView) code_reifier.ForeignModule {
             .procedure_bindings = view.top_level_procedure_bindings,
             .procedure_templates = view.checked_procedure_templates,
             .callable_eval_templates = view.callable_eval_templates,
+            .entry_wrappers = view.entry_wrappers,
             .const_templates = view.const_templates,
             .const_bodies = view.checked_const_bodies,
+            .top_level_values = view.top_level_values,
+            .code_cuts = view.code_cuts,
+            .code_instances = view.code_instances,
         },
         .env = view.module_env,
     };
@@ -39577,7 +40948,7 @@ fn foreignModule(view: ImportedModuleView) code_reifier.ForeignModule {
 
 /// The body an exported constant holds, read from the owning module's own
 /// tables the way a procedure's body is.
-fn exportedConstant(view: ImportedModuleView, const_ref: ConstRef) ?code_reifier.ForeignConstant {
+pub fn exportedConstant(view: ImportedModuleView, const_ref: ConstRef) ?code_reifier.ForeignConstant {
     const body = code_reifier.constantBody(view.const_templates, view.checked_const_bodies, const_ref) orelse
         return null;
     return .{ .module = foreignModule(view), .body = body };
@@ -39611,7 +40982,24 @@ pub fn exportedAlias(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.F
         };
         const lookup = view.callable_eval_templates.templates[@backingInt(template)].forwarded_lookup orelse
             return null;
-        return .{ .module = foreignModule(view), .lookup = lookup };
+        return .{ .module = foreignModule(view), .lookup = lookup, .template = template };
+    }
+    return null;
+}
+
+/// The expression an exported top-level value that computes a function was
+/// written as, or null when the definition is not one. An exact alias is not:
+/// it forwards to the procedure its lookup names (`exportedAlias`).
+pub fn exportedComputed(view: ImportedModuleView, def: CIR.Def.Idx) ?code_reifier.ForeignComputed {
+    for (view.exported_procedure_bindings.bindings) |binding| {
+        if (binding.binding.def != def) continue;
+        const template_id = switch (binding.body) {
+            .callable_eval_template => |template| template,
+            .direct_template, .checked_error => return null,
+        };
+        const template = view.callable_eval_templates.templates[@backingInt(template_id)];
+        if (template.forwarded_lookup != null) return null;
+        return .{ .module = foreignModule(view), .body = template.body };
     }
     return null;
 }
@@ -39634,6 +41022,7 @@ fn reifyStagedCode(
     procedure_bindings: *const TopLevelProcedureBindingTable,
     procedure_templates: *const CheckedProcedureTemplateTable,
     callable_eval_templates: *const CallableEvalTemplateTable,
+    entry_wrappers: *const EntryWrapperTable,
     const_templates: *const ConstTemplateTable,
     const_bodies: *const CheckedConstBodyTable,
     top_level_values: *const TopLevelValueTable,
@@ -39641,7 +41030,10 @@ fn reifyStagedCode(
     imports: []const PublishImportArtifact,
     available: []const ImportedModuleView,
     store: *ConstStore,
+    hoisted_constants: *const HoistedConstTable,
     problem_store: ?*problem.Store,
+    code_cuts: *CodeCutTable,
+    code_instances: *CodeInstanceTable,
 ) Allocator.Error!CodeProvenanceTable {
     var foreign = ForeignStagedLookup{
         .module = module,
@@ -39650,6 +41042,44 @@ fn reifyStagedCode(
         .imports = imports,
         .available = available,
     };
+    // The cuts first: a site of this module whose translator this module's
+    // type owns reads them.
+    const no_cuts: CodeCutTable = .{};
+    var cuts = try code_reifier.moduleCuts(allocator, store, .{
+        .types = &type_publication.store,
+        .bodies = checked_bodies,
+        .plans = plans,
+        .names = names,
+        .artifact = artifact_key,
+        .value_refs = value_refs,
+        .procedure_bindings = procedure_bindings,
+        .procedure_templates = procedure_templates,
+        .callable_eval_templates = callable_eval_templates,
+        .entry_wrappers = entry_wrappers,
+        .const_templates = const_templates,
+        .const_bodies = const_bodies,
+        .top_level_values = top_level_values,
+        .site_types = type_publication,
+        .code_cuts = &no_cuts,
+        .method_registry = method_registry,
+    }, module_env, foreign.lookup());
+    defer allocator.free(cuts.problems);
+    if (problem_store) |problems| {
+        for (cuts.problems) |refused| {
+            _ = try problems.appendProblem(.{ .staged_code = .{
+                .reason = switch (refused.kind) {
+                    .not_a_function => .primitive_not_a_function,
+                    .listed_twice => .primitive_listed_twice,
+                    .already_primitive => .primitive_already_primitive,
+                    .not_a_list => .primitives_not_a_list,
+                },
+                .region = refused.region,
+            } });
+        }
+    }
+    code_cuts.* = cuts.table;
+    cuts.table = .{};
+
     var sites = try code_reifier.reifyModuleSites(allocator, store, .{
         .types = &type_publication.store,
         .bodies = checked_bodies,
@@ -39660,30 +41090,282 @@ fn reifyStagedCode(
         .procedure_bindings = procedure_bindings,
         .procedure_templates = procedure_templates,
         .callable_eval_templates = callable_eval_templates,
+        .entry_wrappers = entry_wrappers,
         .const_templates = const_templates,
         .const_bodies = const_bodies,
         .top_level_values = top_level_values,
         .site_types = type_publication,
+        .code_cuts = code_cuts,
+        .method_registry = method_registry,
     }, module, module_env, foreign.lookup());
     defer sites.deinit(allocator);
+
+    // Each `Code.prim`, `Code.type_id` and `Code.ty_of` call is the constant
+    // it computes. A call in a generic function that the sites' plan
+    // describes at each closing use, or refused, is skipped (Q8, D6).
+    const identities = try code_reifier.moduleIdentities(allocator, store, .{
+        .types = &type_publication.store,
+        .bodies = checked_bodies,
+        .plans = plans,
+        .names = names,
+        .artifact = artifact_key,
+        .value_refs = value_refs,
+        .procedure_bindings = procedure_bindings,
+        .procedure_templates = procedure_templates,
+        .callable_eval_templates = callable_eval_templates,
+        .entry_wrappers = entry_wrappers,
+        .const_templates = const_templates,
+        .const_bodies = const_bodies,
+        .top_level_values = top_level_values,
+        .site_types = type_publication,
+        .code_cuts = code_cuts,
+        .method_registry = method_registry,
+    }, module_env, foreign.lookup(), sites.identities);
+    defer allocator.free(identities);
+    for (identities) |identity| {
+        if (checked_bodies.codeSiteWasPoisoned(identity.call)) continue;
+        switch (identity.outcome) {
+            .node => |node| try checked_bodies.attachCodeReification(allocator, identity.call, node, &.{}),
+            .rejected => |rejection| {
+                checked_bodies.refuseCodeReification(identity.call);
+                const problems = problem_store orelse continue;
+                try appendStagedCodeRefusal(allocator, problems, artifact_key, identity.region, rejection);
+            },
+            .not_a_definition, .not_nominal => {
+                checked_bodies.refuseCodeReification(identity.call);
+                const problems = problem_store orelse continue;
+                _ = try problems.appendProblem(.{
+                    .staged_code = .{
+                        .reason = switch (identity.outcome) {
+                            .not_a_definition => .prim_not_a_definition,
+                            .not_nominal => .type_id_not_nominal,
+                            .node, .rejected => unreachable, // the arms above take them
+                        },
+                        .region = identity.region,
+                    },
+                });
+            },
+        }
+    }
+
+    // The name a template call calls is never read: the call stands for a
+    // description built elsewhere, so nothing is walked for it.
+    for (module_env.store.codeReificationSites()) |site| {
+        if (site.kind != .template_callee) continue;
+        const expr = checked_bodies.exprIdAtRawNode(site.node_idx) orelse continue;
+        if (checked_bodies.codeSiteWasPoisoned(expr)) continue;
+        checked_bodies.refuseCodeReification(expr);
+    }
 
     for (sites.outcomes) |site| {
         if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
         switch (site.outcome) {
-            .reified => |node| checked_bodies.attachCodeReification(site.expr, node),
+            .reified => |node| try checked_bodies.attachCodeReification(allocator, site.expr, node, site.reads),
             .rejected => |rejection| {
-                checked_bodies.attachCodeReification(site.expr, null);
+                checked_bodies.refuseCodeReification(site.expr);
+                // The site is a runtime error either way. Only the report
+                // depends on the caller asking for compile-time problems.
                 const problems = problem_store orelse continue;
-                const detail = try problems.putExtraString(rejection.detail);
-                _ = try problems.appendProblem(.{ .staged_code = .{
-                    .reason = stagedCodeReason(rejection.kind),
-                    .region = rejection.region,
-                    .detail = detail,
-                } });
+                try appendStagedCodeRefusal(allocator, problems, artifact_key, site.region, rejection);
             },
         }
     }
+
+    // D1: an instance site has no description of its own; each closing use
+    // describes it, and lowering reads the table in force. A closing use no
+    // table serves is reported at the use and becomes a runtime error, so
+    // lowering never reaches its template without a table.
+    const recipes = @constCast(sites.instances.recipes);
+    for (sites.instance_sites) |expr| {
+        if (checked_bodies.codeSiteWasPoisoned(expr)) continue;
+        const lambda = try checked_bodies.markInstanceSite(allocator, expr);
+        // The recipe of a lambda written at the site reads the kept lambda.
+        for (recipes) |*recipe| {
+            if (recipe.kind == .inline_lambda and recipe.root_module == CodeInstanceTable.none and recipe.root_body == expr) recipe.root_body = lambda;
+        }
+    }
+    for (sites.refused_uses) |refused| {
+        if (refused.statement) |statement_id| {
+            try checked_bodies.refuseInstanceLoop(allocator, statement_id, refused.expr);
+        } else checked_bodies.refuseInstanceUse(refused.expr);
+        const problems = problem_store orelse continue;
+        try appendStagedCodeRefusal(allocator, problems, artifact_key, refused.region, refused.rejection);
+    }
+    code_instances.* = sites.instances;
+    sites.instances = .{};
+
+    try bindCodeInputs(allocator, type_publication, checked_bodies, hoisted_constants, sites.outcomes, problem_store);
     return CodeProvenanceTable.init(allocator, sites.provenance);
+}
+
+/// Report a refusal of the walk at `site_region`: a site, or a closing use
+/// (D1). A refusal outside that region's own source (another module's, or a
+/// callee or constant this module defines elsewhere) is shown where it is,
+/// and the site or use is where the walk reached it from (F4, D9).
+fn appendStagedCodeRefusal(
+    allocator: Allocator,
+    problems: *problem.Store,
+    artifact_key: CheckedModuleArtifactKey,
+    site_region: base.Region,
+    rejection: code_reifier.Rejection,
+) Allocator.Error!void {
+    // The checker reported the error that stopped the walk.
+    if (rejection.kind == .checking_error) return;
+    const detail = if (rejection.open) |open|
+        try openVariableDetail(allocator, problems, open)
+    else
+        try problems.putExtraString(rejection.detail);
+    const foreign_place = !std.meta.eql(rejection.module.artifact, artifact_key);
+    const reached_place = foreign_place or !regionWithin(rejection.region, site_region);
+    _ = try problems.appendProblem(.{ .staged_code = .{
+        .reason = stagedCodeReason(rejection.kind),
+        .region = if (reached_place) site_region else rejection.region,
+        .foreign = if (reached_place) try foreignRefusalPlace(problems, rejection.module.env, rejection.region) else null,
+        .detail = detail,
+        .open = if (rejection.open) |open| .{
+            .cause = switch (open.cause) {
+                .use_leaves_open => .use_leaves_open,
+                .annotation_leaves_open => .annotation_leaves_open,
+                .inferred => .inferred,
+                .inferred_use_leaves_open => .inferred_use_leaves_open,
+            },
+            .place = switch (open.place) {
+                .parameter => .parameter,
+                .result => .result,
+                .expression => .expression,
+                .use => .use,
+            },
+        } else null,
+    } });
+}
+
+/// Whether `inner` lies inside `outer`, both regions of one module's source.
+fn regionWithin(inner: base.Region, outer: base.Region) bool {
+    return outer.start.offset <= inner.start.offset and inner.end.offset <= outer.end.offset;
+}
+
+/// A refusal's place outside the site's own source: its module's file, and
+/// the lines and the 1-based span of `region` there (F4, D9).
+fn foreignRefusalPlace(problems: *problem.Store, env: *const ModuleEnv, region: base.Region) Allocator.Error!problem.StagedCode.Foreign {
+    const info = env.calcRegionInfo(region);
+    return .{
+        .path = try problems.putExtraString(env.diagnosticSourceName()),
+        .line_text = try problems.putExtraString(info.calculateLineText(env.common.source, env.getLineStarts())),
+        .start_line = info.start_line_idx + 1,
+        .start_column = info.start_col_idx + 1,
+        .end_line = info.end_line_idx + 1,
+        .end_column = info.end_col_idx + 1,
+    };
+}
+
+/// Synthesize, for each capture read the checker recorded at a `Code.Binds`
+/// position (rule "Bound Capture Encoding"), the expressions `fmt.default()`
+/// and `T.encoder_for(fmt.default())`. They are ordinary type dispatch calls
+/// whose plans `StaticDispatchPlanTable.fromModule` builds from the checker's
+/// two requirements, so the evidence pass resolves them in the template that
+/// holds the site, and lowering calls the encoder where the program binds the
+/// site's inputs. A site that publication did not copy has none.
+fn appendBoundCaptureExprs(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    checked_types: *const CheckedTypePublication,
+    checked_bodies: *CheckedBodyStore,
+) Allocator.Error!void {
+    for (module.moduleEnvConst().bound_capture_encodings.items.items, 0..) |encoding, index| {
+        const site = checked_bodies.exprIdAtRawNode(encoding.site_node) orelse continue;
+        const read = checked_bodies.exprIdAtRawNode(encoding.read_expr) orelse continue;
+        const format_ty = checked_types.rootForSourceVar(module, @fromBackingInt(encoding.format_var)) orelse
+            checkedArtifactInvariant("a bound capture's format type was not published", .{});
+        const encoder_ty = checked_types.rootForSourceVar(module, @fromBackingInt(encoding.encoder_var)) orelse
+            checkedArtifactInvariant("a bound capture's encoder type was not published", .{});
+        const region = checked_bodies.expr(read).source_region;
+        const default_expr = try checked_bodies.appendSyntheticExpr(allocator, format_ty, region, .{ .type_dispatch_call = null });
+        const encoder_expr = try checked_bodies.appendSyntheticExpr(allocator, encoder_ty, region, .{ .type_dispatch_call = null });
+        try checked_bodies.bound_capture_exprs.append(allocator, .{
+            .site = site,
+            .read = read,
+            .default_expr = default_expr,
+            .encoder_expr = encoder_expr,
+            .encoding = @intCast(index),
+        });
+    }
+}
+
+/// Record, on each call whose result is a `Code.Bound`, the input slots of
+/// the one site it holds (roc-reify-proposal.md section 10.1), and refuse a
+/// site whose slots the call cannot supply.
+///
+/// The program reads the call's compile-time value with the slot values
+/// added, so the call has to be a compile-time root of its own whose type
+/// the call fixes, and it has to hold one site, because two sites have no
+/// one slot order.
+fn bindCodeInputs(
+    allocator: Allocator,
+    type_publication: *const CheckedTypePublication,
+    checked_bodies: *CheckedBodyStore,
+    hoisted_constants: *const HoistedConstTable,
+    outcomes: []const code_reifier.SiteOutcome,
+    problem_store: ?*problem.Store,
+) Allocator.Error!void {
+    defer checked_bodies.sortCodeBindings();
+    for (outcomes) |site| {
+        const call_node = site.bound_call orelse continue;
+        if (site.slots.len == 0) continue;
+        if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
+        const detail: []const u8 = refused: {
+            var sharing: usize = 0;
+            for (outcomes) |other| {
+                if (other.bound_call == call_node) sharing += 1;
+            }
+            if (sharing != 1) break :refused "a call that binds the inputs of two sites";
+            const call = checked_bodies.exprIdAtRawNode(call_node) orelse
+                checkedArtifactInvariant("a call that binds input slots has no checked expression", .{});
+            const entry = hoisted_constants.lookupByExpr(call) orelse
+                break :refused "a translator that receives captured inputs runs while the compiler runs, so the other arguments of its call must be fixed then";
+            std.debug.assert(entry.pattern == null);
+            if (type_publication.store.rootContainsIdentityVariables(checked_bodies.expr(call).ty))
+                break :refused "a translator result whose type the call does not fix";
+            try checked_bodies.attachCodeBinding(allocator, call, site.slots);
+            continue;
+        };
+        checked_bodies.refuseCodeReification(site.expr);
+        const problems = problem_store orelse continue;
+        _ = try problems.appendProblem(.{ .staged_code = .{
+            .reason = .input_not_bound,
+            .region = checked_bodies.expr(site.expr).source_region,
+            .detail = try problems.putExtraString(detail),
+            .open = null,
+        } });
+    }
+}
+
+/// What a refusal at a type variable names: the variable, as its annotation
+/// wrote it, and the place in the function it stands in.
+fn openVariableDetail(
+    allocator: Allocator,
+    problems: *problem.Store,
+    open: code_reifier.OpenVariable,
+) Allocator.Error!problem.ExtraStringIdx {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+    if (open.name) |name| {
+        try text.print(allocator, "the type variable {s}", .{name});
+    } else {
+        try text.appendSlice(allocator, "an unnamed type variable");
+    }
+    switch (open.place) {
+        .parameter => |parameter| switch (parameter) {
+            .name => |name| try text.print(allocator, ", in the type of the parameter {s}", .{name}),
+            .position => |position| try text.print(allocator, ", in the type of parameter {d}", .{position}),
+        },
+        .result => try text.appendSlice(allocator, ", in the type the function returns"),
+        .expression => try text.appendSlice(allocator, ", in the type of this expression"),
+        .use => |use| try text.appendSlice(allocator, switch (use) {
+            .call => ", which this call does not fix",
+            .site => ", which this Code position does not fix",
+        }),
+    }
+    return problems.putExtraString(text.items);
 }
 
 /// The reported reason for a walk that stopped.
@@ -39697,6 +41379,15 @@ fn stagedCodeReason(kind: code_reifier.Rejection.Kind) problem.StagedCode.Reason
         .unresolved_reference => .definition_not_reachable,
         .argument_not_constant => .argument_not_constant,
         .bound_exceeded => .exceeds_a_bound,
+        .input_not_bound => .input_not_bound,
+        .code_value => .reads_a_code_value,
+        .bound_instance => .bound_instance,
+        .instance_through_evidence => .instance_through_evidence,
+        .instance_in_local_generic => .instance_in_local_generic,
+        .implicit_method_instance => .instance_in_implicit_method,
+        .type_id_not_nominal => .type_id_not_nominal,
+        .ty_of_not_closed => .ty_of_not_closed,
+        .checking_error => unreachable, // appendStagedCodeRefusal reports no checking error
     };
 }
 
@@ -39807,6 +41498,7 @@ pub fn publishFromTypedModule(
 
     var checked_body_builder = try CheckedBodyStoreBuilder.fromModule(allocator, module, &canonical_names, &checked_type_publication, &source_nodes, inputs.promoted_local_procedures);
     errdefer checked_body_builder.deinit(allocator);
+    try appendBoundCaptureExprs(allocator, module, &checked_type_publication, checked_body_builder.storePtr());
     try checked_body_builder.reserveSyntheticExprs(allocator, syntheticExprCapacityForHoistedRoots(inputs.hoisted_roots));
     const checked_bodies = checked_body_builder.storePtr();
 
@@ -39964,6 +41656,7 @@ pub fn publishFromTypedModule(
     );
     defer selected_hoisted_callables.deinit(allocator);
 
+    markDerivedMethodNames(module, checked_bodies, inputs.imports, inputs.available_artifacts);
     var resolved_value_refs = try ResolvedValueRefTable.fromModule(
         allocator,
         modules,
@@ -40276,6 +41969,10 @@ pub fn publishFromTypedModule(
     // reads a dispatch plan's resolution, which total resolution assigns, and
     // the body of any constant it folds, which sealing above fills in, so this
     // is the earliest point in publication it can run.
+    var code_cuts: CodeCutTable = .{};
+    errdefer code_cuts.deinit(allocator);
+    var code_instances: CodeInstanceTable = .{};
+    errdefer code_instances.deinit(allocator);
     var code_provenance = try reifyStagedCode(
         allocator,
         module,
@@ -40289,6 +41986,7 @@ pub fn publishFromTypedModule(
         &top_level_procedure_bindings,
         &checked_procedure_templates,
         &callable_eval_templates,
+        &entry_wrappers,
         &const_templates,
         &checked_const_bodies,
         &top_level_values,
@@ -40296,7 +41994,10 @@ pub fn publishFromTypedModule(
         inputs.imports,
         inputs.available_artifacts,
         &checked_const_store,
+        &hoisted_constants,
         inputs.problem_store,
+        &code_cuts,
+        &code_instances,
     );
     errdefer code_provenance.deinit(allocator);
 
@@ -40505,12 +42206,18 @@ pub fn publishFromTypedModule(
         .const_store = checked_const_store,
         .compile_time_root_identities = compile_time_root_identities,
         .code_provenance = code_provenance,
+        .code_cuts = code_cuts,
+        .code_instances = code_instances,
         .evaluation_state = .prepared,
     };
     checked_const_store = ConstStore.init(allocator);
     errdefer artifact.const_store.deinit();
     code_provenance = .{};
     errdefer artifact.code_provenance.deinit(allocator);
+    code_cuts = .{};
+    errdefer artifact.code_cuts.deinit(allocator);
+    code_instances = .{};
+    errdefer artifact.code_instances.deinit(allocator);
 
     if (inputs.evaluation_phase == .immediate) {
         try inputs.compile_time_finalizer.run(
@@ -41645,10 +43352,13 @@ fn testVisibilityImportedView(
         .callable_eval_templates = undefined,
         .hoisted_constants = undefined,
         .const_templates = undefined,
+        .top_level_values = undefined,
         .method_registry = undefined,
         .interface_capabilities = undefined,
         .const_store = undefined,
         .code_provenance = undefined,
+        .code_cuts = undefined,
+        .code_instances = undefined,
     };
 }
 
@@ -42076,6 +43786,7 @@ test "loop mutation and state merge plans preserve expect mode, dispatch operand
     for ([_]PatternBinderId{ b0, b1, b2 }) |binder| try store.pattern_binders.append(gpa, .{
         .id = binder,
         .pattern = p0,
+        .name = null,
         .reassignable = true,
     });
     try store.commitExprs(gpa, &.{
@@ -42519,7 +44230,7 @@ fn divergenceParityFixture(comptime kind: CheckedExprKind) CheckedExprData {
         .pending => .pending,
         .numeral => .{ .numeral = .{ .literal = .{ .node_idx = 0, .digits_start = 0, .before_len = 0, .after_len = 0, .after_decimal_digit_count = 0, .flags = 0 }, .plan = null } },
         .str_from_quote => .{ .str_from_quote = .{ .plan = null, .literal = string } },
-        .code_from_lambda => .{ .code_from_lambda = null },
+        .code_from_lambda => .{ .code_from_lambda = .{ .node = null } },
         .str_segment => .{ .str_segment = string },
         .str => .{ .str = ops },
         .bytes_literal => .{ .bytes_literal = string },
@@ -42736,6 +44447,25 @@ test "checked diagnostic-error fact propagates through body dependencies and typ
     try std.testing.expectEqualSlices(bool, &.{ true, true, true, true, false, true, true }, &contains_diagnostic_error);
 }
 
+test "a refused staged site publishes as a runtime error, never a null description" {
+    const gpa = std.testing.allocator;
+    var store = CheckedBodyStore{};
+    defer store.deinit(gpa);
+    const e0 = testIndexId(CheckedExprId, 0);
+    const exprs = [_]CheckedExpr{.{
+        .id = e0,
+        .ty = testIndexId(CheckedTypeId, 0),
+        .source_region = base.Region.zero(),
+        .data = .{ .code_from_lambda = .{ .node = null } },
+    }};
+    try store.commitExprs(gpa, &exprs);
+
+    try std.testing.expect(!store.codeSiteWasPoisoned(e0));
+    store.refuseCodeReification(e0);
+    try std.testing.expect(store.codeSiteWasPoisoned(e0));
+    try std.testing.expect(store.expr(e0).data == .runtime_error);
+}
+
 test "checked inspect evaluation elision is producer-recorded for exact callable value forms" {
     const field_name: canonical.RecordFieldLabelId = @fromBackingInt(@intCast(1));
     const record_fields = [_]CheckedRecordExprField{.{ .label = field_name, .value = testIndexId(CheckedExprId, 0) }};
@@ -42814,9 +44544,9 @@ test "closed direct evidence excludes specialization-dependent nested recipes" {
     const context_anchor = testIndexId(CheckedStatementId, 0);
 
     var refs = [_]static_dispatch.CheckedEvidence{
-        .{ .dispatcher_ty = callable_ty, .resolution = .{ .constraint = .{ .index = .{ .depth = 0, .index = 0 } } } },
-        .{ .dispatcher_ty = callable_ty, .resolution = .{ .direct = evidence_0 } },
-        .{ .dispatcher_ty = callable_ty, .resolution = .{ .direct = evidence_1 } },
+        .{ .dispatcher_ty = callable_ty, .description_only_intrinsic = false, .resolution = .{ .constraint = .{ .index = .{ .depth = 0, .index = 0 } } } },
+        .{ .dispatcher_ty = callable_ty, .description_only_intrinsic = false, .resolution = .{ .direct = evidence_0 } },
+        .{ .dispatcher_ty = callable_ty, .description_only_intrinsic = false, .resolution = .{ .direct = evidence_1 } },
     };
     const procedure_target = static_dispatch.MethodTarget{
         .module_idx = 0,
@@ -43518,6 +45248,7 @@ test "issue 11737: identical callable contract vectors share their checked stora
     defer pass.callable_contracts.deinit(allocator);
     const contract = [_]static_dispatch.CheckedEvidence{.{
         .dispatcher_ty = @fromBackingInt(@intCast(1)),
+        .description_only_intrinsic = false,
         .resolution = .unreachable_value,
     }};
     const first = try pass.internCallableContracts(&contract);

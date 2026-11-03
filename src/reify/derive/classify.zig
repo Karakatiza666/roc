@@ -40,7 +40,7 @@ fn isCommutative(sym: term.Sym) bool {
     if (sym.op != .prim) return false;
     return switch (sym.method.?) {
         .is_eq, .plus, .times, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor => true,
-        .is_lt, .is_lte, .is_gt, .is_gte, .not, .minus, .div_trunc, .concat, .len, .get => false,
+        .is_lt, .is_lte, .is_gt, .is_gte, .not, .minus, .div_trunc, .concat, .len, .get, .is_empty, .append, .map, .keep_if, .fold, .collect, .first, .last, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or, .from_numeral, .is_negative, .digits_before_pt, .digits_after_pt, .digits_after_pt_count => false,
     };
 }
 
@@ -131,16 +131,16 @@ pub fn run(arena: Allocator, prover: *prove.Prover, vars: sig_mod.Vars, eq: Equa
 // Whether every operand of `m` has its owner's type.
 fn operandsAreOwner(m: prims.Method) bool {
     return switch (m) {
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat => true,
-        .len, .get => false,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .is_empty, .collect, .first, .last, .sum => true,
+        .len, .get, .append, .map, .keep_if, .fold, .prepend, .single, .with_capacity, .set, .drop_first, .take_first, .repeat, .map2, .map_with_index, .fold_rev, .any, .all, .fold_with_index, .ok_or, .from_numeral, .is_negative, .digits_before_pt, .digits_after_pt, .digits_after_pt_count => false,
     };
 }
 
 // Whether `m`'s result has its owner's type.
 fn resultIsOwner(m: prims.Method) bool {
     return switch (m) {
-        .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat => true,
-        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .len, .get => false,
+        .not, .plus, .minus, .times, .div_trunc, .plus_wrap, .times_wrap, .bitwise_and, .bitwise_or, .bitwise_xor, .concat, .append, .map, .keep_if, .prepend, .single, .with_capacity, .drop_first, .take_first, .repeat, .map2, .map_with_index => true,
+        .is_eq, .is_lt, .is_lte, .is_gt, .is_gte, .len, .get, .is_empty, .fold, .collect, .first, .last, .set, .fold_rev, .sum, .any, .all, .fold_with_index, .ok_or, .from_numeral, .is_negative, .digits_before_pt, .digits_after_pt, .digits_after_pt_count => false,
     };
 }
 
@@ -226,7 +226,7 @@ const RowWriter = struct {
             // `Wrap` and `Unwrap` have no payload, so the table's op pattern states them.
             .wrap, .unwrap => return self.print(".{{ .op = .{{ .op = .{s}, .args = &.{{{s}}} }} }}", .{ @tagName(x.sym.op), try self.pat(x.args[0]) }),
             .tag, .payload, .record, .field, .tuple, .index => return self.fail("a pattern over a record, tuple or tag union"),
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         }
     }
 
@@ -303,7 +303,7 @@ const RowWriter = struct {
                 return self.print(".{{ .{s} = {s} }}", .{ @tagName(x.sym.op), try self.list(elems.items) });
             },
             .tag, .payload, .record, .field, .tuple, .index, .wrap, .unwrap => return self.fail("a result over a record, tuple, tag union or nominal"),
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         }
     }
 
@@ -348,7 +348,7 @@ const RowWriter = struct {
             .field => .record,
             .index => .tuple,
             .payload => .tag,
-            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .lit, .crash, .derived, .record, .tuple, .list, .tag, .wrap, .closure, .elem, .opt_field, .unwrap, .prim, .call, .and_, .or_, .switch_, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // the root was matched as field, index or payload by the caller
         };
         if (c.sym.op != want) return self.fail("a projection of another construction");
         if (root.sym.op == .payload and c.sym.index != root.sym.index) return self.fail("a payload of another member");
@@ -409,7 +409,7 @@ const RowWriter = struct {
             .field, .index, .payload => try w.print("        .root = .{s},\n        .args = &.{{{s}}},\n", .{ @tagName(lhs.sym.op), try self.component(lhs) }),
             .wrap, .unwrap => try w.print("        .root = .{s},\n        .args = &.{{{s}}},\n", .{ @tagName(lhs.sym.op), try self.pat(lhs.args[0]) }),
             .lit, .tag, .record, .tuple => return self.fail("a left side rooted at a literal, record, tuple or tag union"),
-            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable,
+            .crash, .derived, .list, .closure, .elem, .opt_field, .call, .for_range, .for_list, .loop, .lambda, .apply => unreachable, // signature terms are built only from the enumerated symbols (derive/enumerate.zig)
         }
         const result_owner: ?[]const u8 = if (lhs.sym.op == .prim and resultIsOwner(lhs.sym.method.?)) try self.owner(lhs.sym) else null;
         const result = try self.tmpl(self.eq.rhs, result_owner);

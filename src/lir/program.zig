@@ -155,6 +155,8 @@ pub const FnTemplate = struct {
     evidence: const_store.ConstFnEvidenceVector = .{},
     evidence_frames: []const const_store.ConstFnEvidenceFrame = &.{},
     evidence_frame_head: ?u32 = null,
+    /// The Code instance table of the specialization (D1), or null.
+    instances: ?const_store.ConstFnInstances = null,
 };
 
 /// Capture field copied from a checked binding into a callable payload. `id`

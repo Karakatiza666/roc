@@ -194,6 +194,10 @@ pub const Slot = union(SlotKind) {
 pub const StaticDispatchRelationMerge = struct {
     dropped_fn_var: Var,
     retained_fn_var: Var,
+    /// The `runs` bit of the dropped relation. The dropped relation selects
+    /// no target of its own, so the reify-only pass reads its bit here to
+    /// give its site a dispatch edge (design.md "Reify-Only Definitions").
+    dropped_runs: bool,
 };
 
 /// The store of all type variables and their descriptors.
@@ -1376,6 +1380,18 @@ pub const Store = struct {
         try self.setDesc(resolved.desc_idx, desc);
     }
 
+    /// Mark a variable that stands in a record extension slot (design.md
+    /// "Record Extension Well-Formedness"). The mark travels with the class
+    /// and its copies.
+    pub fn markRecordRow(self: *Self, target_var: Var) Allocator.Error!void {
+        const resolved = try self.resolveWriteTarget(target_var);
+        if (resolved.desc.flags.record_row) return;
+        self.ground_epoch +%= 1;
+        var desc = resolved.desc;
+        desc.flags.record_row = true;
+        try self.setDesc(resolved.desc_idx, desc);
+    }
+
     /// Bound an annotated definition's implicitly opened row (design.md
     /// "Polarity"). The bound travels with the row's equivalence class.
     pub fn markBoundedRowExt(self: *Self, target_var: Var) Allocator.Error!void {
@@ -2240,6 +2256,9 @@ pub const Store = struct {
             (a_data.desc.flags.annotation_tag_ext or b_data.desc.flags.annotation_tag_ext);
         merged_desc.flags.bounded_row_ext = a_data.desc.flags.bounded_row_ext or b_data.desc.flags.bounded_row_ext;
         merged_desc.flags.host_fixed_row = a_data.desc.flags.host_fixed_row or b_data.desc.flags.host_fixed_row;
+        // A record extension slot stays one: unification refuses a non-record
+        // content for it (design.md "Record Extension Well-Formedness").
+        merged_desc.flags.record_row = a_data.desc.flags.record_row or b_data.desc.flags.record_row;
         const merged_is_empty_tag_union = merged_desc.content == .structure and
             merged_desc.content.structure == .empty_tag_union;
         if (merged_is_empty_tag_union) {

@@ -222,7 +222,7 @@ where : Table(row), Code(row -> Bool, Pred) -> Query(row)
 ```
 
 Under today's `Ir` this translator receives `If(a, b, Lit(Bool(False)))` for
-`a and b` (`roc-reify-design.md:84`) and must pattern-match it back into `AND`.
+`a and b` (`roc-reify-design-checklist.md:84`) and must pattern-match it back into `AND`.
 That recovery is exactly the reconstruction the rest of this code base
 forbids its own stages.
 
@@ -258,13 +258,13 @@ The compiler makes these lowering choices once today:
 
 | Surface | Today's description | Target that wants the surface form | Cited at |
 |---|---|---|---|
-| `a and b`, `a or b` | `If` | SQL, Datalog, SMT | `roc-reify-design.md:84` |
-| `a != b` | `Unary("not", Binop("is_eq"))` | SQL `<>`, GLSL `!=` | `roc-reify-design.md:79` |
-| `x?`, `x ? Tag` | `Match` | a target with exceptions or `Option` | `roc-reify-design.md:99` |
-| `x ?? d` | `Match` | SQL `COALESCE` | `roc-reify-design.md:96` |
-| `"a${b}c"` | `Str.concat` chain | SQL `format`, JavaScript template | `roc-reify-design.md:34` |
-| `for`, `while` | fold with carried `var`s | GLSL, CUDA, C: structured loops | `roc-reify-design.md:200` |
-| derived `is_eq` | expanded structural comparisons | SQL row equality | `roc-reify-design.md:457` |
+| `a and b`, `a or b` | `If` | SQL, Datalog, SMT | `roc-reify-design-checklist.md:84` |
+| `a != b` | `Unary("not", Binop("is_eq"))` | SQL `<>`, GLSL `!=` | `roc-reify-design-checklist.md:79` |
+| `x?`, `x ? Tag` | `Match` | a target with exceptions or `Option` | `roc-reify-design-checklist.md:99` |
+| `x ?? d` | `Match` | SQL `COALESCE` | `roc-reify-design-checklist.md:96` |
+| `"a${b}c"` | `Str.concat` chain | SQL `format`, JavaScript template | `roc-reify-design-checklist.md:34` |
+| `for`, `while` | fold with carried `var`s | GLSL, CUDA, C: structured loops | `roc-reify-design-checklist.md:200` |
+| derived `is_eq` | expanded structural comparisons | SQL row equality | `roc-reify-design-checklist.md:457` |
 
 In the fold each row is its own method: `on_and`, `on_is_ne`, `on_try`,
 `on_default`, `on_interpolate`, `on_for`. The compiler never chooses a lowering

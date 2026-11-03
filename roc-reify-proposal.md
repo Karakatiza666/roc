@@ -51,42 +51,50 @@ Section 4 defines it; section 11 covers where its output executes.
 | Part | State |
 |---|---|
 | What it describes | Pure Roc as section 10 states it: literals, operators, calls (helpers, generic and recursive functions, other modules), lambdas, templates, `if` and `match`, loops, early `return` and `?`, `var`, `crash`, top-level constants, nominal types, derived methods. A construct it does not describe stops with a report that names the construct |
-| What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 3 (`src/reify/mod.zig:33`) |
+| What a translator reads | A normal form: rows of nodes, each with its type, in one canonical order. Every refactor in the list of `roc-reify-normal-form.md` section 7 gives the same value. `Code.is_eq` and `Code.to_hash` compare it. It is version 27 (`src/reify/mod.zig:39`) |
+| How a translator names a node | `Code.Inlined.inline_digest` gives a node of the `inline` view a content digest that survives the refactors above and helper extraction (`roc-reify-normalization-plan.md`, M8) |
+| Rows the compiler chooses | A `Code.Outlined(f)` site gets the `outline` view: each computation of at least four operations that repeats is one row (`roc-reify-normalization-plan.md`, M9). Places that differ in a value pass it as an argument, so `step(input.a)` and `step(input.b)` call one row (V3b). The rows do not depend on how the author split the code into helpers |
+| Laws of the builtins | A `Code.Lawful(f)` site gets the `graph` view under layer L: a loop that appends meets `List.map` or `List.keep_if`, a `List.fold` meets its loop, two `map`s meet one, and `len() > 0` meets `!is_empty()` (`roc-reify-normalization-plan.md`, M10). A site of any other type keeps each form as written |
+| Literal intervals | Every integer value has an interval from literals, from the tests that dominate it and from the index of a range loop. A test it decides is gone, `while $i <= n` with `n` bounded below the type's highest value meets `for i in 0..=n`, a checked `+` proved to fit can leave a loop, and a bounded `(a + b) + c` meets `a + (b + c)`. `1 + a` meets `a + 1`, and two parameters of the root are in parameter order (`roc-reify-normalization-plan.md`, M11) |
+| Facts across loop turns | A loop controlled by a `$done` flag meets the same loop with `break`, and a second counter stepped with the index meets `i + j0` (`roc-reify-normalization-plan.md`, M12) |
+| Known lists | A list builtin over a list the graph holds is its result: `[a, b].len()` is `2`, `[a, b].concat([c])` is `[a, b, c]`, a `fold` or a `map` with a known function is its calls, and a lookup at an index that is not a literal is a literal switch on the index. A `for` over such a list of at most 16 elements is its body once per element, so `[c.r, c.g, c.b].map2(weights, \|x, w\| x * w).sum()` meets the sum written out in `inline` (`roc-reify-normalization-plan.md`, M17). An interpolated literal of a type whose conversion wraps the assembler of `Str` is the flat `Str.concat` chain the literal at `Str` is |
 | How a translator refuses | It returns an `Err`, or calls `Code.refuse_at`, which the compiler reports at the source of the node (section 13) |
+| What a translator reads by name | Its cut: the functions the item `code_primitives` of its type lists, each a `Prim` named by its qualified name. Every other function, in any package, arrives as its body, and so does a computed value of any package (section 7.10, `roc-reify-normalization-plan.md`, M13) |
 
 Three translators ship as examples. Each one has an `expected_output` file and a
 `refactored.roc` that prints the same text after renames and reordered bindings.
 
 | Example | It emits | `roc test` expects | Run by `parallel_cli_runner.zig` |
 |---|---|---|---|
-| `examples/reifying/glsl/` | a GLSL 330 fragment shader | 6 in `main.roc`, 1 in `refactored.roc` | both |
-| `examples/reifying/sql/` | a SQLite script for a schema, migrations, seed rows and queries | 10 in `main.roc`, 11 in `refactored.roc` | `refactored.roc` |
-| `examples/reifying/dbsp/` | a Rust program for the `dbsp` crate, which is not compiled here | 14 in `main.roc`, 1 in `refactored.roc` | neither |
+| `examples/reifying/glsl/` | a GLSL 330 fragment shader | 8 in `main.roc`, 1 in `refactored.roc` | both |
+| `examples/reifying/sql/` | a SQLite script for a schema, migrations, seed rows and queries | 12 in `main.roc`, 11 in `refactored.roc` | `refactored.roc` |
+| `examples/reifying/dbsp/` | a Rust program for the `dbsp` crate, which is not compiled here | 19 in `main.roc`, 1 in `refactored.roc` | both |
+
+`examples/reifying/hello/` is a fourth, smaller translator of 63 lines. It turns an arithmetic function into an expression, and it shows both ways to refuse (`Err` and `Code.refuse_at`). The CLI suite runs it.
 
 `examples/reifying/shaders-without-reifying/` is the control experiment: the
 shader of the GLSL example written as a library DSL.
 
-What the prototype still refuses (`roc-reify-design.md`, "What the remaining
+What the prototype still refuses (`roc-reify-design-checklist.md`, "What the remaining
 unticked boxes cost"):
 
 | Refused | Why |
 |---|---|
 | A function value nothing fixes: read from a list, or from a parameter of the described function | there is no definition to describe. A function chosen by an `if`, or read from a record literal, between known functions describes |
 | A name that exists only at run time: a function parameter, a branch or loop binder, a `var`, read by a lambda from outside itself | timing: the description is built before the value exists |
-| A top-level value that computes a function | no definition names the function it holds |
-| A computed top-level value of another package | its body belongs to that package, and the description does not read it |
+| A site that names a top-level value computing a function | the site's root needs a lambda whose parameters it can list. A use of such a value inside a described body describes (section 13, "Naming a constant") |
 | A tag union whose row nothing closed | it stands for many unions, and a description is monomorphic |
-| A custom `from_interpolation` literal | it needs an assembler function the compiler computes |
+| A custom `from_interpolation` that returns early with `?` or is generic in its item type | the walk runs the first stage where the literal stands, and a `?` can leave the row it is walked in |
 | `dbg`, and any effect | out of scope by design (sections 7.8 and 13) |
 
 The tests, in layers. The counts were taken at the time of writing.
 
 | Layer | Where | What it catches |
 |---|---|---|
-| Normal-form unit tests | `src/reify/` (118 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
-| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (80 tests) | a walk that describes a body wrongly |
-| Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (82 cases) | the same, for calls into other modules and builtins |
-| CLI fixtures | `test/cli/Staged*.roc` (34 files), run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
+| Normal-form unit tests | `src/reify/` (234 `test` blocks) | a rule that fires wrongly, a pass that breaks a verifier invariant |
+| Reifier tests through the checker | `src/compile/test/code_reifier_test.zig` (257 tests) | a walk that describes a body wrongly, and a row of the safety matrix (`roc-reify-normalization-plan.md` 5.12, M14) that meets where it must stay apart, or the reverse |
+| Staging cases, from checker to translator | `src/eval/test/eval_staging_tests.zig` (134 cases) | the same, for calls into other modules and builtins |
+| CLI fixtures | `test/cli/Staged*.roc` (61 files) and `test/cli/StagedCut/`, run by `src/cli/test/parallel_cli_runner.zig` | a described value or a report that changed |
 | Fuzzers | `src/reify/fuzz_gen.zig`, `src/compile/reify_fuzz.zig`, `test/fuzzing/fuzz-reify.zig` | two spellings of one term that differ, or a normal form that computes what Roc does not |
 | Examples | the three above | translator output that changed under a refactor |
 | Rule derivation, offline | `zig build reify-rules`, `src/reify/derive/` (48 `test` blocks) | a normalization rule that is missing |
@@ -139,18 +147,22 @@ role would imply a new kind of module, and a translator is an ordinary package.
      the lambda's body, so it describes as a `Let`.
    - a named function, which describes by its body: inlined where it is
      called, or a `Call` of a row of its own where it is called from two
-     places or recurses (section 4). A function of another package is the
-     exception. It arrives as a named primitive and its body is not read.
+     places or recurses (section 4), in any package. A function in the
+     translator's cut is the exception. It arrives as a named primitive and
+     its body is not read (section 7.10).
 
    What it cannot read is a value that exists only once the program runs: a
    function parameter, a branch or loop binder, a `var`. That is timing rather
    than purity: the description is built before any such value exists, so a
    captured one could only arrive as an opaque pointer, which is what this
-   feature exists to avoid. A top-level value that computes a function,
-   `doubler = make(2.0)`, is refused too, because no definition names the
-   function it holds, and so is a computed value of another package, whose
-   body the description does not read. Each refusal names the value.
-   Section 13 carries what is left of this.
+   feature exists to avoid. A translator that returns a `Code.Bound` opts in
+   to such values as typed input slots of the description, and receives no
+   value: the program receives the values next to the translator's result
+   (section 10.1). A top-level value that computes a function,
+   `doubler = make(2.0)`, describes as the definition it was written as, so
+   the lambda of `make` is a row and its capture is the literal `2.0`, in
+   any package. Each refusal names the value. Section 13 carries what is left
+   of this.
 
    A template goes further: a function returning `Code` whose arguments are
    fixed at the call and written into the body it returns. An argument can be
@@ -164,8 +176,8 @@ role would imply a new kind of module, and a translator is an ordinary package.
    thunk, and cannot be called. Section 12 covers what that costs.
 6. **Structural.** `Code` has `is_eq` and `to_hash` over a normal form, which
    gives translators common-subexpression detection and a stable cache key for
-   compiled artifacts for free. The prototype has both (`src/build/roc/Builtin.roc:24174`,
-   `:24178`). A normal form has no names: parameters and nodes are numbered, so
+   compiled artifacts for free. The prototype has both (`src/build/roc/Builtin.roc:24196`,
+   `:24200`). A normal form has no names: parameters and nodes are numbered, so
    two sites that differ only in the names of locals, parameters or helpers,
    or in the order of independent bindings, are equal and hash alike
    (`test/cli/StagedSites.roc`). Equality ignores the key of the site that
@@ -173,7 +185,9 @@ role would imply a new kind of module, and a translator is an ordinary package.
    another version of the rules is not equal to one built under this version.
    The hash is the one a translator puts in the key of a cache.
 7. **Compile-time constructible only.** No runtime constructor. With rule 3,
-   every `Code` value in a program is fully determined at build time.
+   the description in every `Code` value is fully determined at build time.
+   A captured run-time value is a typed slot of the description, and its
+   value never reaches the translator (section 10.1).
 8. **Roc reifies; the translator validates.** The compiler never asks whether an
    expression is lowerable. It guarantees only that it is well-typed, pure,
    closed and monomorphic, in a stable representation. Whether a GPU can run
@@ -221,8 +235,10 @@ reified, provided the compiler can read its body. These qualify:
   function body
 
 A function received as a runtime argument does not qualify, and neither does
-one chosen by an `if` or read out of a record. Those are the error cases, with
-a message that says so.
+one read from a list. Those are the error cases, with a message that says so. A
+function chosen by an `if` between known functions, or read out of a record
+literal, does qualify: each branch is described, and the call becomes a
+`Switch`.
 
 A `Code(...)` itself appears in exactly two places: a function parameter, which
 takes a description, and a function's return type, which makes that function a
@@ -359,8 +375,8 @@ design.
 `List`, `Tag`, `Wrap`, `Unwrap`, `Field`, `Index`, `Payload`, `Item`,
 `OptField`, `Switch`, `And`, `Or`, `ForRange`, `ForList`, `Loop`, `Lambda`,
 `Crash` and `Derived`. A builtin is a `Prim` named by its owner and method
-apart, such as `Num.F32` and `sin`, so a translator keys its table by method
-and reads the type from the node. The operator `+` and the method `.plus()`
+apart, such as `Num.F32` and `sin`, for messages. A translator keys its table
+by `id`, which `Code.prim` also gives, and reads the type from the node. The operator `+` and the method `.plus()`
 arrive as the same `Prim`.
 
 The normal form drops what a translator should not depend on:
@@ -405,9 +421,11 @@ inline: r0 = |U16| -> U16 Num.U16.times(Num.U16.plus(Num.U16.times(p0, 3), 1), 3
 So a translator meets a `Call` row for recursion, and in the `graph` view also
 for a helper that two places share. A translator with no function form, such as
 one that writes one expression, declares `Code.Inlined(f)` and meets `Call` for
-recursion, and for the one exception in the table. A function of another package, and a builtin, is a `Prim`
-whose body is not read, so a library that belongs to the translator, such as
-`Glsl.Vec3.scale`, is mapped by name. `src/reify/views.zig:3-6` states the
+recursion, and for the one exception in the table. The GLSL example is such a
+translator. The SQL example reads the `graph` view and expands each `Call`. A
+builtin, and a function in the translator's cut, is a `Prim` whose body is not
+read, so a library that belongs to the translator, such as `Glsl.Vec3.scale`,
+which `Glsl.roc` lists in its `code_primitives`, is mapped by name. `src/reify/views.zig:3-6` states the
 two rules. A third view that picks helper boundaries from the computation alone
 is designed (`roc-reify-normal-form.md` section 5.3) and not built.
 
@@ -612,7 +630,7 @@ macros on purpose.
 | Can change what the program means | yes | no |
 | The original code still runs | not necessarily | always |
 | Needs hygiene | yes | no |
-| Reader must know it happened to read the code | yes | no |
+| Reader must know it happened to read the code | yes | no: a translator reads a normal form, so a refactor in R changes nothing it reads (section 7.10) |
 
 Reification is observation, not transformation. A reified function still
 compiles, still runs, still tests. That is why it is not what Roc excluded when
@@ -876,6 +894,72 @@ This is a sketch, not a plan. [`roc-reify-fold-alternative.md`](roc-reify-fold-a
 has the method vocabulary, the GLSL and SQL versions, the costs in full and the
 open questions.
 
+### 7.10 Refactors a translator cannot see
+
+The language's creator raised the objection that decides whether reification
+is safe to use: a translator that reads a body observes how it was written, so
+a refactor that keeps the meaning can change what the translator emits, or
+break it (`roc-reify-refactor-safety.md`). The answer is that a translator
+never reads the body. It reads a quotient of it.
+
+| Part | What it is | Where |
+|---|---|---|
+| R | the list of refactors that keep the `Code` value, each absorbed by a rule of the normal form | `roc-reify-normal-form.md` section 7 |
+| The normal form | the only thing a translator reads: no names, no regions, one canonical order | `roc-reify-normal-form.md` sections 2 and 3 |
+| The cut | the functions a translator reads by name, which it declares | `roc-reify-normal-form.md` section 3.8 |
+| The test matrix | one source pair per row of R that meets, and one per row below that stays apart | `roc-reify-normalization-plan.md` section 5.12 |
+
+R holds the refactors authors make: rename, reorder, bind once or write
+twice, destructure, `and` and `or` against the `if` they mean, `?` against its
+`match`, extract or inline a helper, move a helper to another module or to
+another package, make it generic, and change loop form. Each one gives the
+same `Code`, and the fuzzers compare two spellings of one term on every run
+(`src/reify/fuzz_gen.zig`).
+
+The cut. A translator declares the functions it reads by name with the
+well-known item `code_primitives` of its type, as `Glsl.roc` does
+(`examples/reifying/glsl/Glsl.roc:122`):
+
+```roc
+code_primitives = [Code.prim(Vec2.plus), Code.prim(Vec2.scale), Code.prim(Vec3.scale), Code.prim(Sampler.texture)]
+```
+
+A function in the cut arrives as a `Prim` named by its qualified name,
+`Glsl.Vec3` and `scale`, and its body is never read, so a refactor inside it
+changes nothing a translator sees. The item is a `List(Code.PrimId)`, each
+entry `Code.prim` of a top-level function or constant, and anything else, or
+a name listed twice, is a compile error at the entry. The `Prim` also carries
+the `id` that `Code.prim` gives, so a translator can compare by identity. The cut belongs to the translator and not to the
+library, because the target decides it: a GLSL translator keeps a math
+library's `lerp` as GLSL's `mix`, and a SQL translator reads its body.
+A site takes the cut of the type that owns the function its call names,
+whether the call is `Tr.show(t, f)`, `t |> Tr.show(f)` or `t.show(f)`. A
+wrapper that takes the `Code` itself is the translator of the sites passed
+to it, with the cut of its own type (`roc-reify-normal-form.md` 3.8).
+
+Every other function is read by its body, in any package, and so is a
+computed value of any package. A dependency's body is therefore part of what a
+translator reads. An upgrade that changes the normal form of a function a site
+reaches can change the translation, or stop it at the site
+(`test/cli/StagedCut/stops.roc`). The upgrade is explicit, because a package
+is pinned by its URL and content hash, and the report names the site and the
+calls that reached the refused node. A refactor in R inside the dependency
+changes nothing (`roc-reify-normalization-plan.md` section 5.12).
+
+What stays unsafe. The quotient cannot be complete, because contextual
+equivalence is undecidable. These refactors keep the meaning and still change
+the `Code`:
+
+| Refactor outside R | Why it stays out | What happens |
+|---|---|---|
+| `x * 2` to `x + x`, reassociating `(a + b) + c` | not an equivalence in Roc: integer `+` crashes on overflow, and float addition is not associative | the output changes, and it should, because the target's arithmetic differs too |
+| `x.len() > 0` to `!x.is_empty()` | two different builtins; proving them equal is a theorem about their bodies, which a `Code.Lawful(f)` site opts into | a translator that lacks one refuses the build, at the site |
+| a recursive function rewritten as a fold | a different recursion structure | the same |
+| a function read at a site starts to use a primitive the translator lacks, in the site's package or in a dependency | the operations really changed | the same |
+
+Every row fails loudly, at build time, on a refactor whose operations really
+changed.
+
 ---
 
 ## 8. Prior art
@@ -1007,11 +1091,10 @@ new surface area is small.
 ### 9.2 The prototype's shape
 
 The feature is two commits on the `reify` branch over roc-lang/roc `main` at
-`2664a27882`: `90a70ce708` reifies a pure Roc function, and `10710041d7`
-normalizes the result. The table is `git diff --stat 2664a27882 -- src/` and so
-includes the uncommitted working tree at the time of writing. It covers `src/`
-only: the translator examples, the CLI fixtures and the regenerated snapshots
-are beside it.
+`2664a27882`: `90a70ce708` reifies a pure Roc function, and `b46d3c1a55`
+normalizes the result. The table is `git diff --stat 2664a27882 HEAD -- src/`
+at `b46d3c1a55`. It covers `src/` only: the translator examples, the CLI
+fixtures and the regenerated snapshots are beside it.
 
 | File | Added | Removed | What it is |
 |---|---|---|---|
@@ -1019,7 +1102,7 @@ are beside it.
 | `src/reify/*.zig` (21 files) | 14017 | 0 | The normal form: IR, builder, verifier, rows, views, digests, evaluator, dump |
 | `src/reify/rules/` (3 files) | 3123 | 0 | The normalization rule table and its ledger |
 | `src/reify/derive/` (22 files) | 18977 | 0 | The offline rule-derivation tool. 12482 of the lines are `.zon` data. No compiler artifact depends on it |
-| `src/compile/test/code_reifier_test.zig` | 2311 | 0 | Tests |
+| `src/compile/test/code_reifier_test.zig` | 2340 | 0 | Tests |
 | `src/eval/test/eval_staging_tests.zig` | 1794 | 0 | Tests |
 | `src/compile/reify_fuzz.zig` | 435 | 0 | The fuzz driver, shared by the fixed seeds and the AFL target |
 | `src/build/roc/Builtin.roc` | 738 | 0 | `Code`, `Code.Inlined`, `Graph`, `Row`, `Node`, `Op`, `Val`, `Region`, `End`, `Key`, `Ty`, `Lit`, `Tree` and their methods |
@@ -1029,10 +1112,10 @@ are beside it.
 | `src/check/report.zig` | 276 | 0 | Refusal diagnostics |
 | `src/postcheck/monotype/lower.zig` | 85 | 63 | Net 22 lines larger |
 | `src/postcheck/boxy/lower.zig` | 61 | 23 | Net 38 lines larger |
-| 47 further files | 749 | 37 | A few lines to 130 each |
+| 47 further files | 751 | 37 | A few lines to 130 each |
 
-Of 51605 added lines, 36117 are in `src/reify/`, and 12482 of those are data.
-The walk and its two test files are 11288. The module is a bolt-on by
+Of 51636 added lines, 36117 are in `src/reify/`, and 12482 of those are data.
+The walk and its two test files are 11317. The module is a bolt-on by
 construction: the walk takes the module being published as `anytype`, reaches
 the rest of the compiler through a `ForeignLookup` vtable, reads only const
 views, mutates nothing but a `ConstStore` handed to it, and is called from
@@ -1099,7 +1182,7 @@ exclusions.
 | Excluded | Why |
 |---|---|
 | A function value nothing fixes: read from a list, or from a parameter of the described function | the compiler cannot say which function it is, so there is no body to describe. Defunctionalizing it would emit a dispatch table, and GLSL and SQL have no dispatch table. A function chosen by an `if` between known functions, or read from a record literal, is fixed: each branch is described, and the call becomes a `Switch` |
-| An undetermined type: a type variable, a `where` variable or an open row that nothing fixes | the body reads differently at each instantiation, so there is no one body to describe |
+| An undetermined type: a type variable or a `where` variable that nothing fixes, and no numeric or row default settles | the body reads differently at each instantiation, so there is no one body to describe |
 | A `Code` not fixed at build time: a template argument computed at run time, or a `Code` passed to a template | rule 7 of section 3. This one is a choice rather than an absence, and lifting it raises the cross-stage persistence question section 12 defers |
 
 A reified function's types are worked out the way any other Roc function's are.
@@ -1115,8 +1198,15 @@ the same story one level down: it is described at the types that call gives it.
 None of that is special to `Code`. The only types left out are the ones the
 program never settles on, which is the second exclusion above.
 
-Everything else in pure Roc describes: calls into other modules of the package
-(a function of another package is a named primitive), recursive
+The defaults are the ordinary ones. In `|x| x * 2` at a `Code` position, `x`
+takes `Dec`, as it would in a compiled function, and an open record or tag row
+takes its row default. A default that does not fit its use, as in
+`|x| x * 2.U8`, is refused with that reason. The checker commits none of this.
+The walk seals each variable the way Monotype does (`defaultedVariable` in
+`src/check/code_reifier.zig`).
+
+Everything else in pure Roc describes: calls into other modules and other
+packages (a function in the translator's cut is a named primitive), recursive
 functions, generic functions at whatever types the program settles them to,
 `where` constrained functions at the type the site fixes, a function passed to
 a function that the call fixes, lambdas written inside the body, a lambda
@@ -1139,10 +1229,21 @@ further down the pipeline.
 
 | Kind | What is left |
 |---|---|
-| Mechanical | a tag union whose row the checker left open; a record update over a record with an optional field; a `.?` path; a record pattern whose rest binds a name |
-| Needs a decision | a top-level value that computes a function, which no definition names; a computed value of another package, whose body the description does not read |
+| Needs a decision | a custom `from_interpolation` that returns early with `?`, or is generic in the item type of its assembler. Derived `is_eq` on a function stays refused, because Roc has no equality on functions |
 
-`roc-reify-design.md` lists every construct, ticked or not, with the reason
+The mechanical kind is empty. A tag union whose row the checker left open
+seals to the variants the definition names. An unset or omitted optional
+field, a record update over a record with an optional field, a `.?` before
+the last segment of a path, and a record pattern whose rest binds a name
+describe with the nodes that already exist: a `Record` that lists the fields it
+sets, `OptField`, and a `Switch` on the `Try` that `OptField` gives. A string
+interpolation pattern describes as `Str.starts_with`, `Str.drop_prefix` and
+`Str.split_first` with their tests. A literal of your own type whose
+`from_numeral` or `from_quote` is a Roc function describes as a `Call` of that
+row. Derived `is_eq` on an empty tag union, and through an opaque nominal that
+derives it, describes as `Derived`.
+
+`roc-reify-design-checklist.md` lists every construct, ticked or not, with the reason
 line the compiler prints for each refusal.
 
 The statements that leave or assign share one shape, which is why they closed
@@ -1164,6 +1265,125 @@ row from any region. The end carries the value the author wrote rather than a
 emits them where they stand and a target that folds lowers them itself. The
 split falls along target capability: a target with no loops at all, SQL or a
 query plan, still takes `return` and `x?` and never meets a loop.
+
+### 10.1 Captured run-time inputs
+
+A lambda at a `Code` position can read a value that exists only when the
+program runs: a parameter of the function around it, a branch or loop binder.
+The description cannot hold that value, because the description is built
+while the compiler runs. A translator can opt in to receive such a value as an
+input slot. The description stays fixed at build time, and the translator
+still runs once, at build time. The program receives the values at run time,
+next to the translator's result, as a SQL driver receives the values of its
+bind parameters.
+
+```roc
+Stage := {}.{
+	## The result is a `Code.Bound`, so the lambda may read run-time values.
+	render : Code(U16 -> U16) -> Code.Bound(Str)
+	render = |code| {
+		graph = code.graph()
+		code.bound("${Stage.text(graph)} with ${graph.slots().len().to_str()} slots")
+	}
+}
+
+scaled : U16 -> Str
+scaled = |n| {
+	k = n * 2
+	bound = Stage.render(|x| x + k)   # the translator ran while the compiler ran
+	match bound.inputs() {            # the values arrive when the program runs
+		[Int(value)] => "${bound.value()}: n is ${value.to_str()}"
+		_ => bound.value()
+	}
+}
+```
+
+The description of the lambda is `plus(p0, times(Input(0), 2))`, with
+`Graph.slots` equal to `[U16]`. Slot 0 is `n`. The walk replays `k = n * 2` as
+it replays every binding of the block around the site, so `k` is not a slot.
+
+#### The rules
+
+| Item | Rule |
+| --- | --- |
+| Opt-in | The translator's declared return type is exactly `Code.Bound(a)`. A translator that can fail returns `Code.Bound(Try(s, e))`. A translator with any other return type keeps the refusal, and the refusal names the opt-in. |
+| What a slot is | A name that the walk cannot replay and that the compiler does not fix (a parameter, a branch binder, a loop binder), followed by the longest chain of `Field`, `Index` and `Unwrap` reads of it. `order.price` is one slot. `order` is a slot only where the body reads it whole. |
+| In the description | `Code.Val.Input(k)` reads slot `k`, as `Param(k)` reads a parameter. `Code.Tree.Input(k)` is the same in a tree. Only the root row reads a slot. A lifted row receives a slot value as a `Closure` argument. |
+| Slot types | `Graph.slots : Graph -> List(Ty)`, in slot order. |
+| Slot order | The order in which the final root first reads each slot: its nodes in index order, each node's arguments and then the ends of the regions it holds, and the body's end last. A slot that normalization removes is not a slot. |
+| Equality and hash | `slots` is part of the description, so `==`, `to_hash` and the cache key read it. The values never enter them. |
+| The translator | Builds its result with `Code.bound : Code(f), a -> Code.Bound(a)` (or `Code.Inlined.bound`). The result holds no inputs while the compiler runs, because the values do not exist then. The translator emits one placeholder for each slot it reads, for example `?` in SQL. |
+| The site | The call of the translator is a compile-time root. The lambda is a description, so the root does not depend on what the lambda reads at run time. The program reads that root's value, and the site sets `inputs` to one `Code.Value` for each slot, in slot order. |
+| The program | Reads `bound.value()` and `bound.inputs()`. A SQL binder maps each `Code.Value` to a driver value with one `match`. |
+
+#### `Code.Bound` and `Code.Value`
+
+```roc
+Code.Bound(a) :: { value : a, inputs : List(Code.Value) }
+
+Code.Value := [
+	Int(I128),                 # an integer of any type but U128
+	U128(U128),
+	Frac(F64),                 # an F32 or an F64
+	Dec(Dec),
+	Bool(Bool),
+	Str(Str),
+	Record(List(Code.Value)),  # one value per field, in the field order of the slot's Ty
+	Tuple(List(Code.Value)),
+	List(List(Code.Value)),
+	Tag(Str, List(Code.Value)),
+	Wrap(Code.Value),          # a nominal value: the value of its backing
+]
+```
+
+A `Code.Value` follows the slot's `Code.Ty`:
+
+| `Code.Ty` of the slot | `Code.Value` |
+| --- | --- |
+| an integer type other than `U128` | `Int(value)` |
+| `U128` | `U128(value)` |
+| `F32`, `F64` | `Frac(value)` |
+| `Dec` | `Dec(value)` |
+| `Bool` | `Bool(value)` |
+| `Str` | `Str(value)` |
+| `ListOf(t)` | `List(values)`, one per item |
+| `Record(fields)` | `Record(values)`, one per field, in the order of `fields` |
+| `Tuple(items)` | `Tuple(values)` |
+| `TagUnion(variants)` | `Tag(name, payloads)` |
+| `Named(name, backing)` | `Wrap(value of the backing)` |
+| `Recursive(name)` | the value of the enclosing `Named` of that name |
+
+A slot type that holds a shape no `Code.Value` expresses is refused at the
+site, by name:
+
+| Shape | Reason line |
+| --- | --- |
+| `Fn` | "a captured function value" |
+| `Opaque` | "a captured value of an opaque type" |
+| a record field marked `Optional` | "a captured record with an optional field" |
+
+In debug builds, the site asserts that each `Code.Value` it builds matches its
+slot type. In release builds a mismatch is unreachable.
+
+#### What stays refused
+
+| Case | Reason line |
+| --- | --- |
+| A translator that does not return `Code.Bound` | the capture refusal, with the line "A translator whose result is a `Code.Bound` receives such a value as an input slot." |
+| A `var` | "a `var`, whose value at the call is not always the value the description reads" |
+| A function value with no definition | as before: "a function value that names no definition" |
+| A call whose other arguments are not fixed at build time | "a translator that receives captured inputs runs while the compiler runs, so the other arguments of its call must be fixed then" |
+| A call that holds two sites with captured inputs | "a call that binds the inputs of two sites" |
+| A call whose result type it does not fix | "a translator result whose type the call does not fix" |
+| A translator result that holds a function, such as a query builder that keeps its clauses as closures | The call cannot be a compile-time root of its own, because a stored value holds no function, so the reason line is the one for a call whose arguments are not fixed. Return data, such as the rendered text, from a translator that receives captured inputs. |
+
+#### Why these choices
+
+| Choice | Reason |
+| --- | --- |
+| The opt-in is the return type | The program must receive the values from the call, and the call keeps the type that its signature declares. So the declared return type must hold a place for the values. A parameter type gives no such place. |
+| A slot is a leaf with its projections, not the value the lambda captures | R (`roc-reify-normal-form.md:1509` and `:1514`) promises that binding a value once and writing the expression in place give one description, and that destructuring and reading fields give one description. A slot that is the captured name would break both. The projection chain keeps a slot a scalar where the body reads only a field of a record. |
+| `List(Code.Value)` and not a typed tuple | The slots are a product of the walk, which runs after the solver. A typed tuple needs the solver to know the slots, which needs a new typing rule. `Code.Value` is an ordinary type. |
 
 ---
 
@@ -1232,9 +1452,11 @@ splice would make Roc a two-level language, with hygiene and cross-stage
 persistence attached. Worth wanting and worth deferring, so long as the cost is
 stated: some translators are out of reach until it exists.
 
-**A runtime constructor for `Code`.** Every `Code` value is determined at build
-time, which is what makes rule 7 of section 3 hold and what keeps a translator
-from needing a runtime.
+**A runtime constructor for `Code`.** The description of every `Code` is
+determined at build time, which is what makes rule 7 of section 3 hold and what
+keeps a translator from needing a runtime. A value that exists only at run time
+reaches the program next to the translator's result, through `Code.Bound`, and
+never reaches the translator (section 10.1).
 
 **Automatic lifting.** Not `f(xs)` where `f : a -> b` and `xs : Rel(a)`.
 Type-directed lifting reads as magic exactly when a reader most needs to know
@@ -1271,7 +1493,7 @@ neither crash nor diverge. It is exact: a builtin the normal form does not list
 is not speculatable, and neither is a node over one. Float arithmetic, `_wrap`
 arithmetic, comparisons, and reads of a record or tuple are. Checked integer
 `+`, `-` and `*`, `//`, `%` and `crash` are not
-(`src/build/roc/Builtin.roc:23997`, `roc-reify-normal-form.md` section 1.1). A
+(`src/build/roc/Builtin.roc:24014`, `roc-reify-normal-form.md` section 1.1). A
 translator for a target without short-circuit evaluation, such as SQL's `AND`,
 reads the flag on each operand to decide whether it may evaluate them eagerly.
 The normal form itself never evaluates a node that is not speculatable where the
@@ -1301,9 +1523,25 @@ literal or an aggregate of literals folds to that data, and a computed value,
 the order of compile-time evaluation does not change, and nothing is needed for
 an opaque value. A template argument named by a value written as data folds the
 same way; a value the block around a lambda binds is repeated at the head of
-its body. What is still refused is a top-level value that computes a function,
-because no definition names what it holds, and a computed value of another
-package, because its body belongs to that package. Folded constants are
+its body. This holds in any package. What is still refused is a site that
+itself names a top-level value computing a function, because the site's root
+needs a lambda.
+
+A top-level value that computes a function, `doubler = make(2.0)`, was listed
+here as needing a decision. The decision is that it folds by definition, the
+same as a computed constant. The compiler evaluates the value after the
+description is built, so an evaluated closure is not available to the walk, and
+none is needed: the definition names the lambda and every capture. The checker
+records the checked expression the binding was written as
+(`CallableEvalTemplate.body`, `src/check/checked_artifact.zig:16986`), and the
+walk builds it where the name stands (`src/check/code_reifier.zig`
+(`computedFunction`)). A call on the name is one `Call` of the lambda's row
+over the capture and then the argument, the name used as a value is a `Closure`
+of the row, and a function the definition captures is a row of its own. No
+node, no rule and no language surface changes, so `normal_form_version` stays
+as it is.
+
+Folded constants are
 load-bearing in the alpha-equivalent normal form of rule 6, so two
 instantiations of one template at different constants must not compare equal
 or hash alike. Two constants written alike describe alike, which is the
@@ -1336,15 +1574,13 @@ translator reads off a row is the row's own type, so the substitution stays
 inside the compiler and section 7.6's question about what a `Code` value
 contains does not move.
 
-A function of another package, and a builtin, is a different case. It is a
-`Prim` named by owner and method, and its body is not read. That fits the
-library a translator owns, `Glsl.Vec3.scale` mapped to `*`, and does not fit a
-dependency whose body the translator should read. The design lets a translator
-declare which functions are its primitives and reads every other body
-(`roc-reify-normal-form.md` section 3.8, the item `code_primitives`). The
-prototype has not built that: `src/check/code_reifier.zig:16` is the rule today,
-and milestone M13 of `roc-reify-normalization-plan.md` is the work. Until then
-every function of another package is a primitive.
+Another package is settled too, by the translator's cut (section 7.10). A
+function the item `code_primitives` of the translator's type lists is a `Prim`
+named by its qualified name, and its body is not read. That fits the library a
+translator owns, `Glsl.Vec3.scale` mapped to `*`. Every other function is read
+by its body in any package, as a function of another module of the package is,
+and so is a computed value of any package. That fits a dependency whose body
+the translator should read (`src/check/code_reifier.zig:4527`, `inCut`).
 
 **A refusal as a compiler diagnostic.** Settled in kind, with gaps in use.
 `Code.refuse_at(code, { row, node }, message)` names a node by its row's `id` and
@@ -1362,7 +1598,7 @@ What stays open:
 
 | Gap | Detail |
 |---|---|
-| No example uses it | Each of the three translators returns an `Err`, because `refuse_at` stops the compile and an `Err` can be tested. Their messages name the construct and, in the DBSP example, the stage, and do not name a line |
+| Only the hello example uses it | `examples/reifying/hello/refused.roc` calls `refuse_at` and `roc check` reports the line. Each of the three larger translators returns an `Err`, because `refuse_at` stops the compile and an `Err` can be tested. Their messages name the construct and, in the DBSP example, the stage, and do not name a line |
 | The value carries no region | The regions are in a table only `refuse_at` reads, so a translator cannot put a line in a message of its own. |
 | Where it is reported | The report comes from the dev backend's evaluation. The interpreter's evaluation runs only where no problem store exists, so it never reports one (`roc-reify-normalization-plan.md`, the gaps M8a leaves) |
 

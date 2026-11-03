@@ -96,7 +96,7 @@ expect {
 							(e-lambda
 								(args
 									(p-assign (ident "x")))
-								(e-dispatch-call (method "plus") (constraint-fn-var 400)
+								(e-dispatch-call (method "plus") (constraint-fn-var 481)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "x"))))
@@ -107,7 +107,7 @@ expect {
 								(args
 									(p-assign (ident "x"))
 									(p-assign (ident "y")))
-								(e-dispatch-call (method "plus") (constraint-fn-var 409)
+								(e-dispatch-call (method "plus") (constraint-fn-var 490)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "x"))))
@@ -116,7 +116,7 @@ expect {
 											(p-assign (ident "y"))))))))))
 			(s-let
 				(p-assign (ident "result1"))
-				(e-call (constraint-fn-var 428)
+				(e-call (constraint-fn-var 509)
 					(e-field-access
 						(receiver
 							(e-lookup-local
@@ -126,7 +126,7 @@ expect {
 					(e-num (value "2"))))
 			(s-let
 				(p-assign (ident "result2"))
-				(e-call (constraint-fn-var 447)
+				(e-call (constraint-fn-var 528)
 					(e-field-access
 						(receiver
 							(e-lookup-local

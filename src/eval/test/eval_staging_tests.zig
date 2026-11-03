@@ -31,6 +31,7 @@ const stage =
     \\    tree = |t| match t {
     \\        Op(o) => Stage.op(o.op, o.args)
     \\        Param(k) => "p${k.to_str()}"
+    \\        Input(k) => "in${k.to_str()}"
     \\        Arg(a) => "s${a.owner.to_str()}.${a.k.to_str()}"
     \\        Out(o) => "n${o.node.to_str()}.${o.k.to_str()}"
     \\        Def(n) => "n${n.to_str()}"
@@ -95,6 +96,7 @@ const stage =
     \\        Fixed(number) => number.to_str()
     \\        Str(text) => "'${text}'"
     \\        Bytes(bytes) => "bytes[${Str.join_with(bytes.map(|b| b.to_str()), " ")}]"
+    \\        Numeral(n) => "numeral ${Str.inspect(Dec.from_numeral(n))}"
     \\    }
     \\
     \\    key : Code.Key -> Str
@@ -218,6 +220,103 @@ const staged_generic_where = stage ++
     \\direct : F32 -> Str
     \\direct = |x| plain(x)
     \\main = "${Stage.describe(label)} | ${Stage.describe(direct)}"
+;
+
+// A lambda written in a generic callee is part of that callee, so it
+// describes under the instantiation the call fixed: one row per type, a
+// nested lambda and one that captures a parameter of the callee included.
+// The nested list has a length the stage does not know, so N17 keeps its map.
+const staged_generic_lambdas = stage ++
+    \\firsts : List((a, b)) -> List(a)
+    \\firsts = |xs| xs.map(|p| p.0)
+    \\
+    \\pairs : List(a), b -> List((a, b))
+    \\pairs = |xs, k| xs.map(|x| (x, k))
+    \\
+    \\nested : List(List(a)) -> List(List((a, a)))
+    \\nested = |xss| xss.map(|xs| xs.map(|x| (x, x)))
+    \\
+    \\mix : List(F32), List(Str) -> U64
+    \\mix = |a, b| firsts(pairs(a, "k")).len() + firsts(pairs(b, 1.0.F32)).len() + nested(List.repeat(a, b.len())).len()
+    \\main = Stage.describe(mix)
+;
+
+// A lambda in a generic callee dispatches through the evidence the call
+// supplied, and a `where` obligation's own open row is a row of the scheme,
+// which no call fixes. A lambda the callee's block generalized is fixed by
+// its lookup on top of what the call fixed.
+const staged_generic_lambda_where = stage ++
+    \\bump : List(a) -> List(a) where [a.plus : a, a -> a, a.from_numeral : Numeral -> Try(a, [InvalidNumeral(Str)])]
+    \\bump = |xs| xs.map(|x| x + 1)
+    \\
+    \\dup : List(a) -> List((a, a))
+    \\dup = |xs| {
+    \\    pair = |x| (x, x)
+    \\    xs.map(|x| pair(x))
+    \\}
+    \\
+    \\go : List(U16) -> U64
+    \\go = |xs| bump(xs).len() + dup(xs).len()
+    \\main = Stage.describe(go)
+;
+
+// An arithmetic parameter no literal pins takes the numeric default, `Dec`,
+// as it would in a compiled function. A site inside a function body takes it
+// at that function's boundary.
+const staged_numeric_default = stage ++
+    \\label : U8 -> Str
+    \\label = |_n| Stage.describe(|x| x - 1)
+    \\main = "${Stage.describe(|x| x * 2)} | ${Stage.describe(|x, y| x + y)} | ${label(3)}"
+;
+
+// The literal of an unannotated helper has a type variable that only its
+// `times` obligation names. The checker's record of each use fixes it: `Dec`
+// at the site, `U8` at the call.
+const staged_unannotated_literal = stage ++
+    \\triple = |x| x * 3
+    \\small : U8 -> U8
+    \\small = |y| triple(y)
+    \\main = "${Stage.describe(triple)} | ${Stage.describe(small)}"
+;
+
+// A lambda written at the site is described rather than lowered, and the
+// calls it makes still read what each use fixed its callee to: the literal of
+// `helper`, the element type of `bump`, and the local `g` its block
+// generalized all take `U64` from the call.
+const staged_inline_unannotated_calls = stage ++
+    \\helper = |x| x + 1
+    \\bump = |xs| xs.map(|x| x + 1)
+    \\local = Stage.describe(|s| {
+    \\    g = |y| y + 1
+    \\    g(g(Str.count_utf8_bytes(s)))
+    \\})
+    \\main = "${Stage.describe(|s| helper(Str.count_utf8_bytes(s)))} | ${Stage.describe(|s| bump([Str.count_utf8_bytes(s)]))} | ${local}"
+;
+
+// An unannotated helper that calls another hands it what its own caller
+// discharged its `where` obligations with: `outer2` forwards `inc`'s `plus`
+// to its own, which the site discharges at `U64`, and `outer` forwards
+// `inner`'s `times` the same way. `top` forwards through two helpers.
+const staged_generic_calls_generic = stage ++
+    \\inc = |x| x + 1
+    \\outer2 = |x| inc(x)
+    \\top = |x| outer2(x)
+    \\inner = |xs| xs.map(|x| x * 2)
+    \\outer = |xs| inner(xs)
+    \\outermost = |xs| outer(xs)
+    \\named = |s| outer([Str.count_utf8_bytes(s)])
+    \\main = "${Stage.describe(|s| outer2(Str.count_utf8_bytes(s)))} | ${Stage.describe(|s| outer([Str.count_utf8_bytes(s)]))} | ${Stage.describe(named)} | ${Stage.describe(|s| top(Str.count_utf8_bytes(s)))} | ${Stage.describe(|s| outermost([Str.count_utf8_bytes(s)]))}"
+;
+
+// A function parameter the call fixed stays that definition inside a lambda
+// that captures it, so the lambda a builtin receives names it.
+const staged_bound_capture = stage ++
+    \\apply_all = |xs, f| xs.map(|x| f(x))
+    \\each = |xs, f| xs.map(f)
+    \\twice = |xs, f| xs.map(|x| f(f(x)))
+    \\go : List(I64) -> (List(I64), List(I64), List(I64))
+    \\go = |xs| (apply_all(xs, |x| x * 3), each(xs, |x| x + 1), twice(xs, |x| x - 1))
+    \\main = Stage.describe(go)
 ;
 
 // A type-level statement declares a name for the checker and leaves no value
@@ -523,7 +622,7 @@ const staged_recursive_type =
     \\
     \\    ty : Code.Ty -> Str
     \\    ty = |t| match t {
-    \\        Named(name, backing) => "${name} = ${Shape.ty(backing)}"
+    \\        Named(name, _, backing) => "${name} = ${Shape.ty(backing)}"
     \\        Recursive(name) => "^${name}"
     \\        TagUnion(vs) => "[${Str.join_with(vs.map(Shape.variant), ", ")}]"
     \\        F32 => "F32"
@@ -554,7 +653,7 @@ const staged_recursive_parametric_type =
     \\
     \\    ty : Code.Ty -> Str
     \\    ty = |t| match t {
-    \\        Named(name, backing) => "${name} = ${Shape.ty(backing)}"
+    \\        Named(name, _, backing) => "${name} = ${Shape.ty(backing)}"
     \\        Recursive(name) => "^${name}"
     \\        TagUnion(vs) => "[${Str.join_with(vs.map(Shape.variant), ", ")}]"
     \\        F32 => "F32"
@@ -586,7 +685,7 @@ const staged_recursive_changing_argument =
     \\
     \\    ty : Code.Ty -> Str
     \\    ty = |t| match t {
-    \\        Named(name, backing) => "${name} = ${Shape.ty(backing)}"
+    \\        Named(name, _, backing) => "${name} = ${Shape.ty(backing)}"
     \\        Recursive(name) => "^${name}"
     \\        TagUnion(vs) => "[${Str.join_with(vs.map(Shape.variant), ", ")}]"
     \\        F32 => "F32"
@@ -611,7 +710,8 @@ const staged_recursive_changing_argument =
 // `Node.children` hands back a node's arguments and the regions it owns,
 // whatever kind it is, so a pass with nothing to say about kinds walks with it
 // instead of writing an arm per kind. A guard's test is in an arm of its
-// `Switch`, and a loop's body is the region of its `ForList`.
+// `Switch`, and a loop's body is the region of its `ForList`. The loop's list
+// has a length the stage does not know, so N17g does not unroll it.
 const staged_ir_children =
     \\Shape :: {}.{
     \\    walk : Code(f) -> Str
@@ -637,7 +737,7 @@ const staged_ir_children =
     \\grade : U16, F32 -> F32
     \\grade = |n, t| {
     \\    var $total = t * 2.0
-    \\    for step in [1.0, 2.0] {
+    \\    for step in List.repeat(1.0, n.to_u64()) {
     \\        $total = $total + step
     \\    }
     \\    match n {
@@ -764,10 +864,11 @@ const staged_template_many = stage ++
 
 // A list a staged body writes is a `List` node, which is also what lets a
 // template take one: a compile-time argument is written into the description,
-// so every part of it has to be something the normal form can hold.
+// so every part of it has to be something the normal form can hold. The
+// predicate reads the input, so `keep_if` stays a builtin over the list (N17).
 const staged_list = stage ++
     \\scaled : List(F32) -> Code(F32 -> F32)
-    \\scaled = |steps| |x| x * steps.len().to_f32()
+    \\scaled = |steps| |x| x * steps.keep_if(|s| s > x).len().to_f32()
     \\main = Stage.describe(scaled([2.0.F32, 4.0.F32]))
 ;
 
@@ -839,7 +940,7 @@ const staged_call_shared = table_stage ++
 // A function that calls itself is a `Call` of its own row.
 const staged_recursive_table = table_stage ++
     \\countdown : F32 -> F32
-    \\countdown = |x| if x > 0.0 countdown(x - 1.0) else 0.0
+    \\countdown = |x| if x > 0.0 1.0 + countdown(x - 1.0) else 0.0
     \\main = Table.describe(countdown)
 ;
 
@@ -847,8 +948,179 @@ const staged_recursive_table = table_stage ++
 // function describe at all: the walk writes one `Call` and stops.
 const staged_recursive_call = stage ++
     \\countdown : F32 -> F32
-    \\countdown = |x| if x > 0.0 countdown(x - 1.0) else 0.0
+    \\countdown = |x| if x > 0.0 1.0 + countdown(x - 1.0) else 0.0
     \\main = Stage.describe(countdown)
+;
+
+// V7: what a loop iterates over. Prints `iteration` of every loop node of the root row.
+const iteration_stage = stage ++
+    \\Iterations :: {}.{
+    \\    describe : Code(f) -> Str
+    \\    describe = |code| {
+    \\        first = Code.graph(code).root_row()
+    \\        loops = first.nodes.map_with_index(|nd, k| Iterations.of(first, nd, k))
+    \\        Str.join_with(loops.keep_if(|text| !text.is_empty()), " ; ")
+    \\    }
+    \\
+    \\    of : Code.Row, Code.Node, U64 -> Str
+    \\    of = |row, nd, k| match nd.op {
+    \\        ForList(_) | ForRange(_) | Loop(_) => match row.iteration(k.to_u32_wrap()) {
+    \\            OverList(l) => "OverList(exits_early=${Iterations.flag(l.exits_early)}, item=${Iterations.read(l.item)}, index=${Iterations.read(l.index)})"
+    \\            OverRange(l) => "OverRange(inclusive=${Iterations.flag(l.inclusive)}, exits_early=${Iterations.flag(l.exits_early)}, index=${Iterations.read(l.index)})"
+    \\            General => "General"
+    \\        }
+    \\        _ => ""
+    \\    }
+    \\
+    \\    flag : Bool -> Str
+    \\    flag = |value| if value "True" else "False"
+    \\
+    \\    read : [Read(Code.Val), Unread] -> Str
+    \\    read = |value| match value {
+    \\        Read(_) => "Read"
+    \\        Unread => "Unread"
+    \\    }
+    \\}
+    \\
+;
+
+const staged_iteration_list = iteration_stage ++
+    \\total : List(U64) -> U64
+    \\total = |xs| {
+    \\    var $sum = 0
+    \\    for x in xs {
+    \\        $sum = $sum + x
+    \\    }
+    \\    $sum
+    \\}
+    \\main = Iterations.describe(total)
+;
+
+const staged_iteration_iter = iteration_stage ++
+    \\total : List(U64) -> U64
+    \\total = |xs| {
+    \\    var $sum = 0
+    \\    for x in xs.iter() {
+    \\        $sum = $sum + x
+    \\    }
+    \\    $sum
+    \\}
+    \\main = Iterations.describe(total)
+;
+
+const staged_iteration_index_while = iteration_stage ++
+    \\total : List(U64) -> U64
+    \\total = |xs| {
+    \\    var $i = 0
+    \\    var $sum = 0
+    \\    while $i < xs.len() {
+    \\        $sum = $sum + (xs.get($i) ?? 0)
+    \\        $i = $i + 1
+    \\    }
+    \\    $sum
+    \\}
+    \\main = Iterations.describe(total)
+;
+
+const staged_iteration_break = iteration_stage ++
+    \\total : List(U64) -> U64
+    \\total = |xs| {
+    \\    var $sum = 0
+    \\    for x in xs {
+    \\        if x > 100 {
+    \\            break
+    \\        }
+    \\        $sum = $sum + x
+    \\    }
+    \\    $sum
+    \\}
+    \\main = Iterations.describe(total)
+;
+
+const staged_iteration_range = iteration_stage ++
+    \\total : U64 -> U64
+    \\total = |n| {
+    \\    var $sum = 0
+    \\    for i in 0..<n {
+    \\        $sum = $sum + i
+    \\    }
+    \\    $sum
+    \\}
+    \\main = Iterations.describe(total)
+;
+
+const staged_iteration_counter_while = iteration_stage ++
+    \\total : U64 -> U64
+    \\total = |n| {
+    \\    var $i = 0
+    \\    var $sum = 0
+    \\    while $i < n {
+    \\        $sum = $sum + $i
+    \\        $i = $i + 1
+    \\    }
+    \\    $sum
+    \\}
+    \\main = Iterations.describe(total)
+;
+
+const staged_iteration_inclusive = iteration_stage ++
+    \\total : U64 -> U64
+    \\total = |n| {
+    \\    var $sum = 0
+    \\    for i in 0..=n {
+    \\        $sum = $sum + i
+    \\    }
+    \\    $sum
+    \\}
+    \\main = Iterations.describe(total)
+;
+
+const staged_iteration_general = iteration_stage ++
+    \\total : U64 -> U64
+    \\total = |n| {
+    \\    var $i = 0
+    \\    var $sum = 0
+    \\    while $i < n {
+    \\        $sum = $sum + $i
+    \\        $i = $i + 2
+    \\    }
+    \\    $sum
+    \\}
+    \\main = Iterations.describe(total)
+;
+
+const staged_iteration_tail_call = iteration_stage ++
+    \\go : U64, U64, U64 -> U64
+    \\go = |acc, i, n| if i < n go(acc + i, i + 1, n) else acc
+    \\total : U64 -> U64
+    \\total = |n| go(0, 0, n)
+    \\main = Iterations.describe(total)
+;
+
+// A function whose every call to itself is the value of a path of its body
+// is a loop (N12): the call becomes `continue` and the other paths `break`.
+const staged_tail_call = stage ++
+    \\countdown : F32 -> F32
+    \\countdown = |x| if x > 0.0 countdown(x - 1.0) else x
+    \\main = Stage.describe(countdown)
+;
+
+// `find` is called from one place, which the graph view inlines, except that
+// its loop can end the row in `Return`: inlined, that `Return` would end
+// `twice` and skip the `* 2`. So `find` stays a row and `twice` calls it.
+const staged_loop_return_call = stage ++
+    \\find : List(U8), U8 -> U8
+    \\find = |xs, a| {
+    \\    for x in xs {
+    \\        if x == a {
+    \\            return x
+    \\        }
+    \\    }
+    \\    a + 1
+    \\}
+    \\twice : List(U8), U8 -> U8
+    \\twice = |xs, a| find(xs, a) * 2
+    \\main = Stage.describe(twice)
 ;
 
 // A derived `==` over a tag union is a `Switch` on the left operand, with a
@@ -976,8 +1248,10 @@ const staged_imported_computed_constant = stage ++
     \\main = Stage.describe(scale)
 ;
 
-// A computed value that is a function names no definition, so a call on it
-// has no row to name, and the walk refuses it.
+// A computed value that is a function is the definition it was written as,
+// built where the name stands. `make(2.0)` is the call of a definition that
+// hands back a function, so the call on `doubler` and the definition are one
+// `Call` of the lambda's row, the capture first and the argument after.
 const staged_function_constant = stage ++
     \\make : F32 -> (F32 -> F32)
     \\make = |k| |x| x * k
@@ -987,6 +1261,68 @@ const staged_function_constant = stage ++
     \\scale : F32 -> F32
     \\scale = |x| doubler(x)
     \\main = Stage.describe(scale)
+;
+
+// A capture that is itself a function follows the same rule: `inc` is a
+// definition, so it is the row `twice` calls, and `quad` reads as `twice(inc)`.
+const staged_function_constant_capture = stage ++
+    \\twice : (F32 -> F32) -> (F32 -> F32)
+    \\twice = |f| |x| f(f(x))
+    \\
+    \\inc : F32 -> F32
+    \\inc = |x| x + 1.0.F32
+    \\
+    \\quad = twice(inc)
+    \\
+    \\bump : F32 -> F32
+    \\bump = |x| quad(x)
+    \\main = Stage.describe(bump)
+;
+
+// A name read twice describes the same row twice, and a name used as a value
+// passes the function the definition computes.
+const staged_function_constant_twice = stage ++
+    \\make : F32 -> (F32 -> F32)
+    \\make = |k| |x| x * k
+    \\
+    \\doubler = make(2.0.F32)
+    \\
+    \\both : F32 -> F32
+    \\both = |x| doubler(x) + doubler(x + 1.0.F32)
+    \\main = Stage.describe(both)
+;
+
+// A top-level value that computes a function, used as a value: the function
+// is handed to a builtin as the definition it was written as.
+const staged_function_constant_value = stage ++
+    \\make : F32 -> (F32 -> F32)
+    \\make = |k| |x| x * k
+    \\
+    \\doubler = make(2.0.F32)
+    \\
+    \\scale_all : List(F32) -> List(F32)
+    \\scale_all = |xs| xs.map(doubler)
+    \\main = Stage.describe(scale_all)
+;
+
+// A top-level value that computes a function and another module exports. The
+// module is in the package of the site, so its definition is read there.
+const staged_imported_function_constant = stage ++
+    \\import Scaler
+    \\
+    \\scale : F32 -> F32
+    \\scale = |x| Scaler.doubler(x) + 1.0.F32
+    \\main = Stage.describe(scale)
+;
+
+// A site that names a top-level value computing a function has no lambda to
+// list parameters from, so it stays refused.
+const staged_function_constant_as_site = stage ++
+    \\make : F32 -> (F32 -> F32)
+    \\make = |k| |x| x * k
+    \\
+    \\doubler = make(2.0.F32)
+    \\main = Stage.describe(doubler)
 ;
 
 // A top-level name bound to another function is an exact alias. The checker
@@ -1044,6 +1380,30 @@ const staged_imported_alias_called = stage ++
     \\twice : I64 -> I64
     \\twice = |x| Steps.same_thing(x) * 2
     \\main = Stage.describe(twice)
+;
+
+// A `where` on the `v` of a `Code(row -> v)` parameter is met by the type the
+// staged argument and the value fix together, as for a plain function
+// parameter (surreal bug 04).
+const put_module =
+    \\Put :: {}.{
+    \\    put : List(row), Code(row -> v), v -> Str where [v.to_str : v -> Str]
+    \\    put = |_rows, path, value| "${Code.graph(path).rows().len().to_str()} / ${value.to_str()}"
+    \\}
+;
+
+const staged_where_on_code_result =
+    \\import Put
+    \\
+    \\R : { a : I64 }
+    \\
+    \\rows : List(R)
+    \\rows = []
+    \\
+    \\five : I64
+    \\five = 5
+    \\
+    \\main = Put.put(rows, |r| r.a, five)
 ;
 
 const steps_module =
@@ -1108,8 +1468,9 @@ const staged_custom_quote = stage ++
     \\main = Stage.describe(measure)
 ;
 
-// A literal pattern of the author's own type is a conversion of a literal the
-// compiler generates, so the walk refuses it as it refuses the literal.
+// A literal pattern of the author's own type tests the checker's equality of
+// the pattern's binder with the converted literal, and each alternative
+// converts its own literal.
 const staged_custom_literal_pattern = stage ++
     \\Count := { n : U32 }.{
     \\    from_numeral : Numeral -> Try(Count, [InvalidNumeral(Str)])
@@ -1161,9 +1522,14 @@ const staged_interpolation = stage ++
     \\main = "${Stage.describe(parts)} | ${Stage.describe(only)}"
 ;
 
-// An interpolated literal of the author's own type applies the assembler its
-// `from_interpolation` hands back while the compiler runs. The segments it
-// takes are an operand the compiler generates, which the walk refuses.
+// An interpolated literal of the author's own type is converted in two
+// stages. The first runs while the compiler runs, over the literal's
+// segments, so the walk runs it by its definition where the literal stands;
+// the literal is the closure it hands back, applied to the list of the
+// interpolated values. A conversion that wraps the assembler of `Str` is
+// walked through `Str.from_interpolation`, whose fold over the values the
+// literal fixes the length of, so the translator sees the `Str.concat` chain
+// the literal at `Str` describes as.
 const staged_custom_interpolation = stage ++
     \\Label := { text : Str }.{
     \\    from_interpolation : List(Str) -> Try((List(Str) -> Label), [InvalidInterpolation(Str)])
@@ -1174,6 +1540,49 @@ const staged_custom_interpolation = stage ++
     \\
     \\mark : F32 -> F32
     \\mark = |x| "a${x.to_str()}b".Label.width(x)
+    \\main = Stage.describe(mark)
+;
+
+// A conversion that rejects segments branches in its first stage. The program
+// compiled, so the stage returned `Ok` for these segments, and the arm that
+// only delivers `Err` is not described. A conversion that also transforms
+// the values has the transform on each value, inside the chain.
+const staged_escaping_interpolation = stage ++
+    \\Html := [Html(Str)].{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Html), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments|
+    \\        if segments.any(|segment| segment.contains("<script")) {
+    \\            Err(InvalidInterpolation("no scripts"))
+    \\        } else {
+    \\            Str.from_interpolation(segments).map_ok(|assemble|
+    \\                |values| Html(assemble(values.map(|value| value.replace_each("<", "&lt;")))))
+    \\        }
+    \\    width : Html, F32 -> F32
+    \\    width = |h, f| match h {
+    \\        Html(text) => if text.is_empty() 0.0.F32 else f
+    \\    }
+    \\}
+    \\
+    \\mark : F32 -> F32
+    \\mark = |x| "<p>${x.to_str()}!</p>".Html.width(x)
+    \\main = Stage.describe(mark)
+;
+
+// An interpolated literal is a value like any other, so it is described as an
+// argument of a call too.
+const staged_interpolation_argument = stage ++
+    \\Wrapped := { text : Str }.{
+    \\    from_interpolation : List(Str) -> Try((List(Str) -> Wrapped), [InvalidInterpolation(Str)])
+    \\    from_interpolation = |segments| Str.from_interpolation(segments).map_ok(|assemble| |values| Wrapped.{ text: assemble(values) })
+    \\    size : Wrapped -> U64
+    \\    size = |w| w.text.count_utf8_bytes()
+    \\}
+    \\
+    \\measure : Wrapped, F32 -> F32
+    \\measure = |w, f| if Wrapped.size(w) > 3 f else 0.0.F32
+    \\
+    \\mark : F32 -> F32
+    \\mark = |x| measure("x${x.to_str()}y", x)
     \\main = Stage.describe(mark)
 ;
 
@@ -1236,21 +1645,22 @@ const staged_record_update_binds = stage ++
     \\main = Stage.describe(move)
 ;
 
-// A record literal that leaves an optional field unset has no form in the
-// normal form, so the walk refuses it.
+// A record literal that unsets an optional field is a `Record` that leaves
+// the member out; the record's type says it may be absent.
 const staged_unset_field = stage ++
     \\Cfg : { a : F32, b ?: F32 }
-    \\pick : F32 -> F32
+    \\pick : F32 -> Cfg
     \\pick = |v| {
     \\    c : Cfg
     \\    c = { a: v, b: _ }
-    \\    c.a
+    \\    c
     \\}
     \\main = Stage.describe(pick)
 ;
 
-// A record literal that leaves out an optional field has no form in the
-// normal form, so the walk refuses it before the `.?` read is reached.
+// A record literal that leaves out an optional field leaves the member unset,
+// and the `.?` read of it is the node it is: the stage learns the field is
+// absent from the record's `Record` node, which lists the fields it sets.
 const staged_optional_field = stage ++
     \\Cfg : { a : F32, b ?: F32 }
     \\pick : F32 -> F32
@@ -1289,8 +1699,9 @@ const staged_list_pattern = stage ++
     \\main = Stage.describe(pick)
 ;
 
-// A string pattern with interpolation has no form in the normal form, so the
-// walk refuses it.
+// A string pattern with interpolation is the decisions and reads Roc makes
+// for it: the prefix test, then a split at the first place each delimiter
+// appears, and an exact end that leaves no text.
 const staged_str_pattern = stage ++
     \\pick : Str -> Str
     \\pick = |s| match s {
@@ -1301,8 +1712,402 @@ const staged_str_pattern = stage ++
     \\main = Stage.describe(pick)
 ;
 
+// A tag union whose row nothing closed has the variants the function names
+// and no others, the way Monotype seals the row it lowers.
+const staged_open_tag_union = stage ++
+    \\pick : [Red, Green, ..], F32 -> F32
+    \\pick = |c, x| match c {
+    \\    Red => x
+    \\    Green => 2.0
+    \\    _ => 0.0
+    \\}
+    \\main = Stage.describe(pick)
+;
+
+// An unset field is a member the `Record` leaves out, and the record's type
+// says it may be absent. A field the literal leaves out says the same.
+const staged_unset_and_omitted = stage ++
+    \\Cfg : { a : F32, b ?: F32, c ?: F32 }
+    \\pick : F32 -> Cfg
+    \\pick = |v| {
+    \\    first : Cfg
+    \\    first = { a: v, b: _, c: 1.0 }
+    \\    second : Cfg
+    \\    second = { a: v }
+    \\    if v < 1.0 first else second
+    \\}
+    \\main = Stage.describe(pick)
+;
+
+// A record update takes an optional field the update did not write from its
+// subject if the subject holds it: a switch on the subject's own `Try`.
+const staged_update_optional = stage ++
+    \\Cfg : { a : F32, b ?: F32 }
+    \\bump : Cfg -> Cfg
+    \\bump = |cfg| { ..cfg, a: 1.0 }
+    \\main = Stage.describe(bump)
+;
+
+// An update that unsets the optional field does not read the subject for it.
+const staged_update_unsets = stage ++
+    \\Cfg : { a : F32, b ?: F32 }
+    \\clear : Cfg -> Cfg
+    \\clear = |cfg| { ..cfg, b: _ }
+    \\main = Stage.describe(clear)
+;
+
+// A `.?` before the last segment is a switch on its own `Try`: the first
+// missing field is the `Err` of the whole path, and what follows rides in `Ok`.
+const staged_optional_path = stage ++
+    \\Inner : { depth : F32 }
+    \\Outer : { inner ?: Inner, size : F32 }
+    \\depth_of : Outer -> Try(F32, [MissingField])
+    \\depth_of = |o| o.?inner.depth
+    \\main = Stage.describe(depth_of)
+;
+
+// The same path ending in an optional segment: the last `Try` is the path's.
+const staged_optional_path_chain = stage ++
+    \\Leaf : { note ?: F32 }
+    \\Outer : { leaf ?: Leaf, size : F32 }
+    \\note_of : Outer -> Try(F32, [MissingField])
+    \\note_of = |o| o.?leaf.?note
+    \\main = Stage.describe(note_of)
+;
+
+// A `..` that binds a name is the record of the fields the pattern does not
+// name, read out of the matched record.
+const staged_record_rest_named = stage ++
+    \\pick : { x : F32, y : F32, z : F32 } -> F32
+    \\pick = |p| match p {
+    \\    { x, ..others } => x + others.y + others.z
+    \\}
+    \\main = Stage.describe(pick)
+;
+
+// A rest that binds a name over a record with an optional field carries the
+// field when the matched record holds it.
+const staged_record_rest_optional = stage ++
+    \\Cfg : { a : F32, b ?: F32, c : F32 }
+    \\drop_a : Cfg -> { b ?: F32, c : F32 }
+    \\drop_a = |cfg| match cfg {
+    \\    { a: _, ..others } => others
+    \\}
+    \\main = Stage.describe(drop_a)
+;
+
+// A string pattern that ends in a capture takes the text that is left.
+const staged_str_pattern_tail = stage ++
+    \\pick : Str -> Str
+    \\pick = |s| match s {
+    \\    "users/${id}" => id
+    \\    _ => ""
+    \\}
+    \\main = Stage.describe(pick)
+;
+
 /// Staging cases, consumed by the parallel runner through `eval_tests.zig`.
+// A translator whose result is a `Code.Bound` receives what a lambda reads
+// from around itself as input slots (roc-reify-proposal.md section 10.1). It
+// runs once, while the compiler runs, and prints the description with the
+// number of slots; the values arrive when the program runs.
+const bind = stage ++
+    \\Bind :: {}.{
+    \\    render : Code(f) -> Code.Bound(Str)
+    \\    render = |code| {
+    \\        graph = Code.graph(code)
+    \\        Code.bound(code, "${Stage.root(code)} / ${graph.slots().len().to_str()} slots")
+    \\    }
+    \\
+    \\    shown : Code.Bound(Str) -> Str
+    \\    shown = |bound| "${bound.value()} / ${Bind.all(bound.inputs())}"
+    \\
+    \\    value : Code.Value -> Str
+    \\    value = |v| match v {
+    \\        Int(i) => "Int(${i.to_str()})"
+    \\        U128(u) => "U128(${u.to_str()})"
+    \\        Frac(f) => "Frac(${f.to_str()})"
+    \\        Dec(d) => "Dec(${d.to_str()})"
+    \\        Bool(b) => if b "True" else "False"
+    \\        Str(text) => "'${text}'"
+    \\        Record(vs) => "{${Bind.all(vs)}}"
+    \\        Tuple(vs) => "(${Bind.all(vs)})"
+    \\        List(vs) => "[${Bind.all(vs)}]"
+    \\        Tag(name, vs) => "${name}(${Bind.all(vs)})"
+    \\        Wrap(inner) => "Wrap(${Bind.value(inner)})"
+    \\    }
+    \\
+    \\    all : List(Code.Value) -> Str
+    \\    all = |vs| Str.join_with(vs.map(Bind.value), ", ")
+    \\}
+    \\
+;
+
+// A parameter of the function around the lambda is a slot. The function is
+// described once; each call gives the program the value of its own argument.
+const bound_parameter = bind ++
+    \\scaled : U16 -> Str
+    \\scaled = |n| Bind.shown(Bind.render(|x| n + x))
+    \\main = "${scaled(7)} | ${scaled(9)}"
+;
+
+// A slot is a name with the fields it reads, so `order.price` is one slot and
+// `order` is none. Each slot's value follows its type.
+const bound_projections = bind ++
+    \\Money := { cents : I64 }
+    \\
+    \\Order : { price : I64, tags : List(Str), status : [Open, Closed(U8)], limit : Money, ratio : F32 }
+    \\
+    \\check : Order -> Str
+    \\check = |order| Bind.shown(Bind.render(|x| (order.price + x, order.tags, order.status, order.limit, order.ratio)))
+    \\
+    \\main = check({ price: 5, tags: ["a", "b"], status: Closed(3), limit: Money.({ cents: 250 }), ratio: 0.5 })
+;
+
+// A slot whose type is a recursive nominal: each value of the type is built
+// by one helper, which reaches itself again.
+const bound_recursive = bind ++
+    \\Chain := [End, Link(I64, Chain)]
+    \\
+    \\paired : Chain -> Str
+    \\paired = |chain| Bind.shown(Bind.render(|x| (1.I64 + x, chain)))
+    \\
+    \\main = paired(Chain.Link(1, Chain.Link(2, Chain.End)))
+;
+
+// A slot whose type is a nominal with type parameters: the backing's value
+// is read at the type the slot fixes for each parameter.
+const bound_generic_nominal = bind ++
+    \\Tree(a) := [Leaf(a), Node(Tree(a), Tree(a))]
+    \\
+    \\shown_tree : Tree(Str), Try(I64, Str) -> Str
+    \\shown_tree = |tree, result| Bind.shown(Bind.render(|x| (1.I64 + x, tree, result)))
+    \\
+    \\main = shown_tree(Tree.Node(Tree.Leaf("l"), Tree.Leaf("r")), Err("bad"))
+;
+
+// A `Bool` slot, alone and nested inside a record and a list.
+const bound_bool = bind ++
+    \\g : Bool -> Str
+    \\g = |b| Bind.shown(Bind.render(|x| (x == 1.I64, b)))
+    \\main = g(True)
+;
+
+const bound_nested_bool = bind ++
+    \\Flags : { on : Bool, all : List(Bool) }
+    \\
+    \\g : Flags -> Str
+    \\g = |flags| Bind.shown(Bind.render(|x| (x == 1.I64, flags)))
+    \\main = g({ on: False, all: [True, False] })
+;
+
+// A `var` can be written again before the call, so it is no slot.
+const bound_var = bind ++
+    \\counted : U16 -> Str
+    \\counted = |n| {
+    \\    var $total = n
+    \\    $total = $total + 1
+    \\    Bind.shown(Bind.render(|x| $total + x))
+    \\}
+    \\main = counted(1)
+;
+
+// A function value has no `Code.Value`.
+const bound_function = bind ++
+    \\applied : (I64 -> I64) -> Str
+    \\applied = |f| Bind.shown(Bind.render(|x| f(x)))
+    \\main = applied(|y| y + 1)
+;
+
+// A translator whose result is not a `Code.Bound` is refused the read.
+const unbound_capture = stage ++
+    \\scaled : U16 -> Str
+    \\scaled = |n| Stage.describe(|x| n + x)
+    \\main = scaled(7)
+;
+
+// V3: the `outline` view. A stage reads `Code.Outlined(f)`, so each
+// computation of at least K nodes that repeats is one row every place calls.
+const outline_stage = stage ++
+    \\Outline :: {}.{
+    \\    describe : Code.Outlined(f) -> Str
+    \\    describe = |code| {
+    \\        graph = code.outline()
+    \\        first = graph.root_row()
+    \\        others = graph.rows().keep_if(|other| other.id != first.id)
+    \\        shown = [first].concat(others).map(|each| "r${each.id.to_str()} = ${Stage.row(graph, each)}")
+    \\        Str.join_with(shown, " ; ")
+    \\    }
+    \\
+    \\    same : Code.Outlined(f), Code.Outlined(f) -> Bool
+    \\    same = |a, b| a == b
+    \\}
+    \\
+;
+
+const outline_step =
+    \\step : U64 -> U64
+    \\step = |x| ((x * 3 + 1) * x + 5) * x
+    \\
+    \\twice : U64, U64 -> U64
+    \\twice = |a, b| step(a) + step(b)
+    \\
+    \\written : U64, U64 -> U64
+    \\written = |a, b| ((a * 3 + 1) * a + 5) * a + ((b * 3 + 1) * b + 5) * b
+    \\
+;
+
+const staged_outlined = outline_stage ++ outline_step ++
+    \\main = Outline.describe(twice)
+;
+
+const staged_outlined_same = outline_stage ++ outline_step ++
+    \\main = Outline.same(twice, written)
+;
+
+// A loop that repeats is one row too: its slots and index are bound inside
+// the cone, and the loop's bound is a hole.
+const staged_outlined_loop = outline_stage ++
+    \\squares : U64 -> U64
+    \\squares = |n| {
+    \\    var $total = 0
+    \\    for i in 0..<n {
+    \\        $total = $total + i * i + 1
+    \\    }
+    \\    $total
+    \\}
+    \\
+    \\both : U64, U64 -> U64
+    \\both = |a, b| squares(a) * squares(b)
+    \\main = Outline.describe(both)
+;
+
+// M10: layer L. A stage reads `Code.Lawful(f)`, so a loop that appends to
+// an empty list is `List.map`, and a length compared with 0 is
+// `List.is_empty`. A `Code(f)` stage reads the forms as written.
+const lawful_stage = stage ++
+    \\Lawful :: {}.{
+    \\    describe : Code.Lawful(f) -> Str
+    \\    describe = |code| {
+    \\        graph = code.graph()
+    \\        first = graph.root_row()
+    \\        others = graph.rows().keep_if(|other| other.id != first.id)
+    \\        shown = [first].concat(others).map(|each| "r${each.id.to_str()} = ${Stage.row(graph, each)}")
+    \\        Str.join_with(shown, " ; ")
+    \\    }
+    \\
+    \\    same : Code.Lawful(f), Code.Lawful(f) -> Bool
+    \\    same = |a, b| a == b
+    \\}
+    \\
+    \\looped : List(U64) -> List(U64)
+    \\looped = |xs| {
+    \\    var $out = []
+    \\    for x in xs {
+    \\        $out = $out.append(x + 1)
+    \\    }
+    \\    $out
+    \\}
+    \\
+    \\mapped : List(U64) -> List(U64)
+    \\mapped = |xs| xs.map(|x| x + 1)
+    \\
+;
+
+const staged_lawful_loop = lawful_stage ++
+    \\main = Lawful.describe(looped)
+;
+
+const staged_lawful_same = lawful_stage ++
+    \\main = Lawful.same(looped, mapped)
+;
+
+const staged_lawful_not_opted = lawful_stage ++
+    \\main = Stage.describe(looped)
+;
+
+const staged_lawful_empty = lawful_stage ++
+    \\nonempty : List(U64) -> Bool
+    \\nonempty = |xs| xs.len() > 0
+    \\
+    \\main = Lawful.describe(nonempty)
+;
+
+// A translator called as a method takes the cut its direct call takes: the
+// translator is the method the call dispatches to, and its type declares
+// `twice` a primitive, so both sites keep `Tr.twice` a named call. A wrapper
+// is the translator of the site passed to it, and no type owns `wrapper`, so
+// that site has an empty cut and `twice` is walked (normal-form 3.8).
+const staged_cut_by_method = stage ++
+    \\Tr := {}.{
+    \\    twice : F32 -> F32
+    \\    twice = |x| x * 2.0.F32
+    \\
+    \\    code_primitives = [Code.prim(Tr.twice)]
+    \\
+    \\    show : Tr, Code(f) -> Str
+    \\    show = |_, code| Stage.describe(code)
+    \\}
+    \\
+    \\bump : F32 -> F32
+    \\bump = |x| Tr.twice(x) + 1.0.F32
+    \\
+    \\wrapper : Code(f) -> Str
+    \\wrapper = |code| Tr.show(Tr.({}), code)
+    \\
+    \\main = Str.join_with([Tr.show(Tr.({}), bump), Tr.({}).show(bump), wrapper(bump)], " ; ")
+;
+
+/// The staging test cases that the eval test runner runs.
 pub const tests = [_]TestCase{
+    .{
+        .name = "staging - a translator called as a method keeps the functions of its cut primitives, as its direct call does, and a wrapper has its own cut",
+        .source_kind = .module,
+        .source = staged_cut_by_method,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.plus(Tr.twice(p0), 1) ; r0 = |F32| -> F32 Num.F32.plus(Tr.twice(p0), 1) ; r0 = |F32| -> F32 Num.F32.plus(Num.F32.times(p0, 2), 1)\"" },
+    },
+    .{
+        .name = "staging - a Code.Lawful site describes a loop that appends to an empty list as List.map",
+        .source_kind = .module,
+        .source = staged_lawful_loop,
+        .expected = .{ .inspect_str = "\"r0 = |List(U64)| -> List(U64) List.map(p0, closure r1()) ; r1 = |U64| -> U64 Num.U64.plus(p0, 1)\"" },
+    },
+    .{
+        .name = "staging - the loop and the List.map it means are one Code.Lawful value",
+        .source_kind = .module,
+        .source = staged_lawful_same,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "staging - a Code site keeps the loop as written, without layer L",
+        .source_kind = .module,
+        .source = staged_lawful_not_opted,
+        .expected = .{ .inspect_str = "\"r0 = |List(U64)| -> List(U64) for_list(p0, [], continue(List.append(s4.2, Num.U64.plus(s4.1, 1))))\"" },
+    },
+    .{
+        .name = "staging - a Code.Lawful site describes a length above 0 as not is_empty",
+        .source_kind = .module,
+        .source = staged_lawful_empty,
+        .expected = .{ .inspect_str = "\"r0 = |List(U64)| -> Bool Bool.not(List.is_empty(p0))\"" },
+    },
+    .{
+        .name = "staging - a Code.Outlined site makes one row of a helper called from two places",
+        .source_kind = .module,
+        .source = staged_outlined,
+        .expected = .{ .inspect_str = "\"r0 = |U64, U64| -> U64 Num.U64.plus(r1(p0), r1(p1)) ; r1 = |U64| -> U64 Num.U64.times(Num.U64.plus(Num.U64.times(Num.U64.plus(Num.U64.times(p0, 3), 1), p0), 5), p0)\"" },
+    },
+    .{
+        .name = "staging - a helper called twice and its body written twice are one Code.Outlined value",
+        .source_kind = .module,
+        .source = staged_outlined_same,
+        .expected = .{ .inspect_str = "True" },
+    },
+    .{
+        .name = "staging - a loop that repeats is one row of the outline view",
+        .source_kind = .module,
+        .source = staged_outlined_loop,
+        .expected = .{ .inspect_str = "\"r0 = |U64, U64| -> U64 Num.U64.times(r1(p0), r1(p1)) ; r1 = |U64| -> U64 for_range<(0, p0, 0, continue(Num.U64.plus(Num.U64.plus(s5.1, Num.U64.times(s5.0, s5.0)), 1)))\"" },
+    },
     .{
         .name = "staging - a staged function's body becomes a description the stage reads",
         .source_kind = .module,
@@ -1331,13 +2136,55 @@ pub const tests = [_]TestCase{
         .name = "staging - a generic callee is fixed through a record parameter",
         .source_kind = .module,
         .source = staged_generic_record,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> Str Str.concat(Num.F32.to_str(r1({ v: p0 })), r2({ v: 's' }), Num.F32.to_str(r1({ v: Num.F32.plus(p0, 1) })), r2({ v: 't' })) ; r1 = |{ v : F32 }| -> F32 p0.v ; r2 = |{ v : Str }| -> Str p0.v\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> Str Str.concat(Num.F32.to_str(r1(p0)), r2('s'), Num.F32.to_str(r1(Num.F32.plus(p0, 1))), r2('t')) ; r1 = |F32| -> F32 p0 ; r2 = |Str| -> Str p0\"" },
     },
     .{
         .name = "staging - a where-constrained callee names the type the call fixed",
         .source_kind = .module,
         .source = staged_generic_where,
         .expected = .{ .inspect_str = "\"r0 = |F32| -> Str Num.F32.to_str(p0) | r0 = |F32| -> Str Num.F32.to_str(p0)\"" },
+    },
+    .{
+        .name = "staging - a lambda in a generic callee describes at each instantiation",
+        .source_kind = .module,
+        .source = staged_generic_lambdas,
+        .expected = .{ .inspect_str = "\"r0 = |List(F32), List(Str)| -> U64 Num.U64.plus(Num.U64.plus(List.len(List.map(List.map(p0, closure r1('k')), closure r2())), List.len(List.map(List.map(p1, closure r3(1)), closure r4()))), List.len(List.map(List.repeat(p0, List.len(p1)), closure r5()))) ; r1 = |Str, F32| -> (F32, Str) (p1, p0) ; r2 = |(F32, Str)| -> F32 p0.0 ; r3 = |F32, Str| -> (Str, F32) (p1, p0) ; r4 = |(Str, F32)| -> Str p0.0 ; r5 = |List(F32)| -> List((F32, F32)) List.map(p0, closure r6()) ; r6 = |F32| -> (F32, F32) (p0, p0)\"" },
+    },
+    .{
+        .name = "staging - a lambda in a where-constrained generic callee dispatches at the fixed type",
+        .source_kind = .module,
+        .source = staged_generic_lambda_where,
+        .expected = .{ .inspect_str = "\"r0 = |List(U16)| -> U64 Num.U64.plus(List.len(List.map(p0, closure r1())), List.len(List.map(p0, closure r2()))) ; r1 = |U16| -> U16 Num.U16.plus(p0, 1) ; r2 = |U16| -> (U16, U16) (p0, p0)\"" },
+    },
+    .{
+        .name = "staging - an arithmetic parameter no literal pins describes at Dec",
+        .source_kind = .module,
+        .source = staged_numeric_default,
+        .expected = .{ .inspect_str = "\"r0 = |Dec| -> Dec Num.Dec.times(p0, 2.0) | r0 = |Dec, Dec| -> Dec Num.Dec.plus(p0, p1) | r0 = |Dec| -> Dec Num.Dec.minus(p0, 1.0)\"" },
+    },
+    .{
+        .name = "staging - a literal of an unannotated helper describes at the type each use fixed",
+        .source_kind = .module,
+        .source = staged_unannotated_literal,
+        .expected = .{ .inspect_str = "\"r0 = |Dec| -> Dec Num.Dec.times(p0, 3.0) | r0 = |U8| -> U8 Num.U8.times(p0, 3)\"" },
+    },
+    .{
+        .name = "staging - a lambda written at the site calls unannotated helpers at the types it fixes",
+        .source_kind = .module,
+        .source = staged_inline_unannotated_calls,
+        .expected = .{ .inspect_str = "\"r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) [Num.U64.plus(Str.count_utf8_bytes(p0), 1)] | r0 = |Str| -> U64 r1(r1(Str.count_utf8_bytes(p0))) ; r1 = |U64| -> U64 Num.U64.plus(p0, 1)\"" },
+    },
+    .{
+        .name = "staging - an unannotated helper calls another at the evidence its caller supplied",
+        .source_kind = .module,
+        .source = staged_generic_calls_generic,
+        .expected = .{ .inspect_str = "\"r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) [Num.U64.times(Str.count_utf8_bytes(p0), 2)] | r0 = |Str| -> List(U64) [Num.U64.times(Str.count_utf8_bytes(p0), 2)] | r0 = |Str| -> U64 Num.U64.plus(Str.count_utf8_bytes(p0), 1) | r0 = |Str| -> List(U64) [Num.U64.times(Str.count_utf8_bytes(p0), 2)]\"" },
+    },
+    .{
+        .name = "staging - a lambda that captures a fixed function parameter names its definition",
+        .source_kind = .module,
+        .source = staged_bound_capture,
+        .expected = .{ .inspect_str = "\"r0 = |List(I64)| -> (List(I64), List(I64), List(I64)) (List.map(p0, closure r1()), List.map(p0, closure r2()), List.map(p0, closure r3())) ; r1 = |I64| -> I64 Num.I64.times(p0, 3) ; r2 = |I64| -> I64 Num.I64.plus(p0, 1) ; r3 = |I64| -> I64 r4(r4(p0)) ; r4 = |I64| -> I64 Num.I64.minus(p0, 1)\"" },
     },
     .{
         .name = "staging - a type-level statement in a block leaves no node behind",
@@ -1361,7 +2208,7 @@ pub const tests = [_]TestCase{
         .name = "staging - a parametric nominal reads its backing at its type arguments",
         .source_kind = .module,
         .source = staged_parametric_nominal,
-        .expected = .{ .inspect_str = "\"r0 = |Crate| -> Crate derived map(p0, closure r1()) ; r1 = |F32| -> F32 Num.F32.times(p0, 2)\"" },
+        .expected = .{ .inspect_str = "\"r0 = |Crate(F32)| -> Crate(F32) derived map(p0, closure r1()) ; r1 = |F32| -> F32 Num.F32.times(p0, 2)\"" },
     },
     .{
         .name = "staging - a function argument fixes the parameter it is passed for",
@@ -1385,13 +2232,13 @@ pub const tests = [_]TestCase{
         .name = "staging - a derived codec folds its construction and its use into one node",
         .source_kind = .module,
         .source = staged_derived_codec,
-        .expected = .{ .inspect_str = "\"r0 = |{ a : Str }| -> Builtin.Try derived encoder_for(Format.(Default()), p0, 0)\"" },
+        .expected = .{ .inspect_str = "\"r0 = |{ a : Str }| -> Builtin.Try(U64, []) derived encoder_for(Format.(Default()), p0, 0)\"" },
     },
     .{
         .name = "staging - a codec the author wrote describes as a call, not a Derived",
         .source_kind = .module,
         .source = staged_codec_origin,
-        .expected = .{ .inspect_str = "\"r0 = |{ a : Str }| -> { a : Str }, U64 -> Builtin.Try derived encoder_for(Format.(Default())) | r0 = |Token| -> Token, U64 -> Builtin.Try closure r1() ; r1 = |Token, U64| -> Builtin.Try Builtin.Try.(Ok(Num.U64.plus(p1, Str.count_utf8_bytes(unwrap(p0).raw))))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |{ a : Str }| -> { a : Str }, U64 -> Builtin.Try(U64, []) derived encoder_for(Format.(Default())) | r0 = |Token| -> Token, U64 -> Builtin.Try(U64, []) closure r1() ; r1 = |Token, U64| -> Builtin.Try(U64, []) Builtin.Try.(Ok(Num.U64.plus(p1, Str.count_utf8_bytes(unwrap(p0).raw))))\"" },
     },
     .{
         .name = "staging - a lambda the staged body returns is a Closure of its own row",
@@ -1403,7 +2250,7 @@ pub const tests = [_]TestCase{
         .name = "staging - a codec the author wrote runs its own body over the arguments a derived one reads",
         .source_kind = .module,
         .source = staged_codec_applied,
-        .expected = .{ .inspect_str = "\"r0 = |{ a : Str }, U64| -> Builtin.Try derived encoder_for(Format.(Default()), p0, p1) | r0 = |Token, U64| -> Builtin.Try Builtin.Try.(Ok(Num.U64.plus(p1, Str.count_utf8_bytes(unwrap(p0).raw))))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |{ a : Str }, U64| -> Builtin.Try(U64, []) derived encoder_for(Format.(Default()), p0, p1) | r0 = |Token, U64| -> Builtin.Try(U64, []) Builtin.Try.(Ok(Num.U64.plus(p1, Str.count_utf8_bytes(unwrap(p0).raw))))\"" },
     },
     .{
         .name = "staging - every spelling of inversion describes as one Bool.not",
@@ -1451,7 +2298,7 @@ pub const tests = [_]TestCase{
         .name = "staging - children hands back every region, so a walk reaches guards and loop bodies",
         .source_kind = .module,
         .source = staged_ir_children,
-        .expected = .{ .inspect_str = "\"15 nodes, Num.F32.times Num.F32.plus Num.U16.min Num.U16.is_lt Num.F32.plus Num.U16.to_f32 Num.F32.min\"" },
+        .expected = .{ .inspect_str = "\"16 nodes, Num.U16.to_u64 List.repeat Num.F32.times Num.F32.plus Num.U16.min Num.U16.is_lt Num.F32.plus Num.U16.to_f32 Num.F32.min\"" },
     },
     .{
         .name = "staging - numeric answers what a number is and name spells any type",
@@ -1496,10 +2343,76 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n0 = r1(p0); Num.F32.plus(n0, r1(n0)) } ; r1 = |F32| -> F32 Num.F32.plus(p0, 1)\"" },
     },
     .{
+        .name = "staging - a callee whose loop can return stays a row, not inlined",
+        .source_kind = .module,
+        .source = staged_loop_return_call,
+        .expected = .{ .inspect_str = "\"r0 = |List(U8), U8| -> U8 Num.U8.times(r1(p1, p0), 2) ; r1 = |U8, List(U8)| -> U8 { n4 = for_list(p1, switch Num.U8.is_eq(s4.1, p0) { False => continue() | True => return s4.1 }); Num.U8.plus(p0, 1) }\"" },
+    },
+    .{
         .name = "staging - a recursive call describes, because the callee is named rather than inlined",
         .source_kind = .module,
         .source = staged_recursive_call,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.F32.is_lt(0, p0) { False => 0 | True => r0(Num.F32.minus(p0, 1)) }\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.F32.is_lt(0, p0) { False => 0 | True => Num.F32.plus(1, r0(Num.F32.minus(p0, 1))) }\"" },
+    },
+    .{
+        .name = "staging - a for over a list iterates over the list, reading the item and not the index",
+        .source_kind = .module,
+        .source = staged_iteration_list,
+        .expected = .{ .inspect_str = "\"OverList(exits_early=False, item=Read, index=Unread)\"" },
+    },
+    .{
+        .name = "staging - a for over xs.iter() iterates over the list as the plain for does",
+        .source_kind = .module,
+        .source = staged_iteration_iter,
+        .expected = .{ .inspect_str = "\"OverList(exits_early=False, item=Read, index=Unread)\"" },
+    },
+    .{
+        .name = "staging - a while over the indices of a list iterates over the list, reading the item and not the index",
+        .source_kind = .module,
+        .source = staged_iteration_index_while,
+        .expected = .{ .inspect_str = "\"OverList(exits_early=False, item=Read, index=Unread)\"" },
+    },
+    .{
+        .name = "staging - a for with a break over a list can exit early",
+        .source_kind = .module,
+        .source = staged_iteration_break,
+        .expected = .{ .inspect_str = "\"OverList(exits_early=True, item=Read, index=Unread)\"" },
+    },
+    .{
+        .name = "staging - a for over a range iterates over the range, reading the index",
+        .source_kind = .module,
+        .source = staged_iteration_range,
+        .expected = .{ .inspect_str = "\"OverRange(inclusive=False, exits_early=False, index=Read)\"" },
+    },
+    .{
+        .name = "staging - a counter while iterates over the range as the for does",
+        .source_kind = .module,
+        .source = staged_iteration_counter_while,
+        .expected = .{ .inspect_str = "\"OverRange(inclusive=False, exits_early=False, index=Read)\"" },
+    },
+    .{
+        .name = "staging - a for over an inclusive range says it is inclusive",
+        .source_kind = .module,
+        .source = staged_iteration_inclusive,
+        .expected = .{ .inspect_str = "\"OverRange(inclusive=True, exits_early=False, index=Read)\"" },
+    },
+    .{
+        .name = "staging - a while that steps by 2 is a general loop",
+        .source_kind = .module,
+        .source = staged_iteration_general,
+        .expected = .{ .inspect_str = "\"General\"" },
+    },
+    .{
+        .name = "staging - a tail-recursive function iterates over the range as the for does",
+        .source_kind = .module,
+        .source = staged_iteration_tail_call,
+        .expected = .{ .inspect_str = "\"OverRange(inclusive=False, exits_early=False, index=Read)\"" },
+    },
+    .{
+        .name = "staging - a tail call describes as the loop it is",
+        .source_kind = .module,
+        .source = staged_tail_call,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 loop(p0, switch Num.F32.is_lt(0, s5.0) { False => break(s5.0) | True => continue(Num.F32.minus(s5.0, 1)) })\"" },
     },
     .{
         .name = "staging - a callee's description arrives beside the root, once however many calls reach it",
@@ -1523,7 +2436,7 @@ pub const tests = [_]TestCase{
         .name = "staging - a recursive function is a row of its own table",
         .source_kind = .module,
         .source = staged_recursive_table,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.F32.is_lt(0, p0) { False => 0 | True => r0(Num.F32.minus(p0, 1)) }\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.F32.is_lt(0, p0) { False => 0 | True => Num.F32.plus(1, r0(Num.F32.minus(p0, 1))) }\"" },
     },
     .{
         .name = "staging - a derived == over a tag union describes as the match it is",
@@ -1559,7 +2472,7 @@ pub const tests = [_]TestCase{
         .name = "staging - a template takes a list, and a staged body writes one",
         .source_kind = .module,
         .source = staged_list,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, Num.U64.to_f32(List.len([2, 4])))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, Num.U64.to_f32(List.len(List.keep_if([2, 4], closure r1(p0))))) ; r1 = |F32, F32| -> Bool Num.F32.is_lt(p0, p1)\"" },
     },
     .{
         .name = "staging - a template takes a record, and a field read of it folds",
@@ -1622,13 +2535,13 @@ pub const tests = [_]TestCase{
         .name = "staging - a computed top-level value folds to the computation it holds",
         .source_kind = .module,
         .source = staged_computed_constant,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, Num.F32.times(7, 2))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, 14)\"" },
     },
     .{
         .name = "staging - a computed top-level value reads another one through its definition",
         .source_kind = .module,
         .source = staged_constant_from_constant,
-        .expected = .{ .inspect_str = "\"r0 = |U64| -> U64 Num.U64.plus(p0, List.len([1, 2, 3]))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |U64| -> U64 Num.U64.plus(p0, 3)\"" },
     },
     .{
         .name = "staging - a computed value another module exports folds the same way",
@@ -1643,12 +2556,53 @@ pub const tests = [_]TestCase{
             \\}
             ,
         }},
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, Num.F32.times(7, 2))\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, 14)\"" },
     },
     .{
-        .name = "staging - a top-level value that computes a function is refused",
+        .name = "staging - a top-level value that computes a function describes as the lambda it holds",
         .source_kind = .module,
         .source = staged_function_constant,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.times(p0, 2)\"" },
+    },
+    .{
+        .name = "staging - a function captured by a top-level value that computes a function is a row too",
+        .source_kind = .module,
+        .source = staged_function_constant_capture,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 r1(r1(p0)) ; r1 = |F32| -> F32 Num.F32.plus(p0, 1)\"" },
+    },
+    .{
+        .name = "staging - two calls on a top-level value that computes a function share one row",
+        .source_kind = .module,
+        .source = staged_function_constant_twice,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.plus(r1(p0, 2), r1(Num.F32.plus(p0, 1), 2)) ; r1 = |F32, F32| -> F32 Num.F32.times(p0, p1)\"" },
+    },
+    .{
+        .name = "staging - a top-level value that computes a function is a function value too",
+        .source_kind = .module,
+        .source = staged_function_constant_value,
+        .expected = .{ .inspect_str = "\"r0 = |List(F32)| -> List(F32) List.map(p0, closure r1(2)) ; r1 = |F32, F32| -> F32 Num.F32.times(p1, p0)\"" },
+    },
+    .{
+        .name = "staging - a top-level value that computes a function and another module exports describes as the lambda it holds",
+        .source_kind = .module,
+        .source = staged_imported_function_constant,
+        .imports = &.{.{
+            .name = "Scaler",
+            .source =
+            \\Scaler :: {}.{
+            \\    make : F32 -> (F32 -> F32)
+            \\    make = |k| |x| x * k
+            \\
+            \\    doubler = make(2.0.F32)
+            \\}
+            ,
+        }},
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 Num.F32.plus(Num.F32.times(p0, 2), 1)\"" },
+    },
+    .{
+        .name = "staging - a site that names a top-level value computing a function is refused",
+        .source_kind = .module,
+        .source = staged_function_constant_as_site,
         .expected = .{ .problem = {} },
     },
     .{
@@ -1684,10 +2638,17 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"r0 = |I64| -> I64 Num.I64.times(Num.I64.plus(p0, 1), 2)\"" },
     },
     .{
+        .name = "staging - a where on the result of a Code argument is met by the type the call fixes",
+        .source_kind = .module,
+        .source = staged_where_on_code_result,
+        .imports = &.{.{ .name = "Put", .source = put_module }},
+        .expected = .{ .inspect_str = "\"1 / 5\"" },
+    },
+    .{
         .name = "staging - a default operand describes as a switch on the Try",
         .source_kind = .module,
         .source = staged_default_operand,
-        .expected = .{ .inspect_str = "\"r0 = |Builtin.Try, F32| -> F32 { n0 = unwrap(p0); switch n0 { Err => p1 | Ok => n0.Ok.0 } }\"" },
+        .expected = .{ .inspect_str = "\"r0 = |Builtin.Try(F32, [Bad]), F32| -> F32 { n0 = unwrap(p0); switch n0 { Err => p1 | Ok => n0.Ok.0 } }\"" },
     },
     .{
         .name = "staging - an as pattern reads the value it renames",
@@ -1699,19 +2660,19 @@ pub const tests = [_]TestCase{
         .name = "staging - a numeral of the author's own type names the conversion that makes it",
         .source_kind = .module,
         .source = staged_custom_numeral,
-        .expected = .{ .problem = {} },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n2 = unwrap(Num.F32.from_numeral(numeral Ok(3.0))); Num.F32.times(unwrap(switch n2 { Err => crash('this literal was rejected by its conversion') | Ok => Meters.({ m: n2.Ok.0 }) }).m, p0) }\"" },
     },
     .{
         .name = "staging - a quoted literal of the author's own type names its conversion",
         .source_kind = .module,
         .source = staged_custom_quote,
-        .expected = .{ .problem = {} },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty('hi') { False => p0 | True => 0 }\"" },
     },
     .{
         .name = "staging - each alternative of a literal pattern carries its own condition",
         .source_kind = .module,
         .source = staged_custom_literal_pattern,
-        .expected = .{ .problem = {} },
+        .expected = .{ .inspect_str = "\"r0 = |Count, F32| -> F32 { n2 = unwrap(r1(numeral Ok(7.0))); switch or(r2(p0, switch n2 { Err => crash('this literal was rejected by its conversion') | Ok => n2.Ok.0 }), { n10 = unwrap(r1(numeral Ok(8.0))); r2(p0, switch n10 { Err => crash('this literal was rejected by its conversion') | Ok => n10.Ok.0 }) }) { False => 0 | True => p1 } } ; r1 = |Num.Numeral| -> Builtin.Try(Count, [InvalidNumeral(Str)]) { n1 = unwrap(Num.U32.from_numeral(p0)); switch n1 { Err => Builtin.Try.(Err(n1.Err.0)) | Ok => Builtin.Try.(Ok(Count.({ n: n1.Ok.0 }))) } } ; r2 = |Count, Count| -> Bool Num.U32.is_eq(unwrap(p0).n, unwrap(p1).n)\"" },
     },
     .{
         .name = "staging - a plain call to a builtin takes the name a method call on it takes",
@@ -1732,10 +2693,22 @@ pub const tests = [_]TestCase{
         .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(Str.concat('p', Num.F32.to_str(p0), 'q')) { False => 0 | True => p0 } | r0 = |F32| -> F32 switch Str.is_empty(Num.F32.to_str(p0)) { False => 0 | True => p0 }\"" },
     },
     .{
-        .name = "staging - an interpolated literal of the author's own type is refused",
+        .name = "staging - an interpolated literal of the author's own type describes as the concatenation its conversion hands back",
         .source_kind = .module,
         .source = staged_custom_interpolation,
-        .expected = .{ .problem = {} },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(Str.concat('a', Num.F32.to_str(p0), 'b')) { False => p0 | True => 0 }\"" },
+    },
+    .{
+        .name = "staging - an interpolated literal of a type that escapes its values has the escape inside the concatenation",
+        .source_kind = .module,
+        .source = staged_escaping_interpolation,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Str.is_empty(Str.concat('<p>', Str.replace_each(Num.F32.to_str(p0), '<', '&lt;'), '!</p>')) { False => p0 | True => 0 }\"" },
+    },
+    .{
+        .name = "staging - an interpolated literal of the author's own type describes as an argument",
+        .source_kind = .module,
+        .source = staged_interpolation_argument,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.U64.is_lt(3, Str.count_utf8_bytes(Str.concat('x', Num.F32.to_str(p0), 'y'))) { False => 0 | True => p0 }\"" },
     },
     .{
         .name = "staging - a top-level value folds at the wider union its use reads",
@@ -1747,7 +2720,7 @@ pub const tests = [_]TestCase{
         .name = "staging - a call result of the union its callee's body closed reaches a wider match by name",
         .source_kind = .module,
         .source = staged_widened_call,
-        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch switch Num.F32.is_lt(p0, 1) { False => Big() | True => Small() } { Big => 2 | Small => p0 }\"" },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 switch Num.F32.is_lt(p0, 1) { False => 2 | True => p0 }\"" },
     },
     .{
         .name = "staging - a record update folds into the fields its reads use",
@@ -1765,13 +2738,13 @@ pub const tests = [_]TestCase{
         .name = "staging - an unset field is left out, and the type says it may be absent",
         .source_kind = .module,
         .source = staged_unset_field,
-        .expected = .{ .problem = {} },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> { a : F32, b : F32 } { a: p0 }\"" },
     },
     .{
         .name = "staging - a read of an optional field carries the Try it hands back",
         .source_kind = .module,
         .source = staged_optional_field,
-        .expected = .{ .problem = {} },
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> F32 { n2 = unwrap({ a: p0 }.?b); switch n2 { Err => p0 | Ok => n2.Ok.0 } }\"" },
     },
     .{
         .name = "staging - a record pattern drops a rest that binds nothing",
@@ -1789,6 +2762,168 @@ pub const tests = [_]TestCase{
         .name = "staging - a string pattern is transcribed step by step",
         .source_kind = .module,
         .source = staged_str_pattern,
+        .expected = .{ .inspect_str = "\"r0 = |Str| -> Str switch Str.starts_with(p0, 'a') { False => { n4 = unwrap(Str.split_first(p0, 'z')); switch n4 { Err => p0 | Ok => { n5 = n4.Ok.0; switch Str.is_empty(n5.after) { False => p0 | True => n5.before } } } } | True => { n14 = unwrap(Str.split_first(Str.drop_prefix(p0, 'a'), 'b')); switch n14 { Err => { n17 = unwrap(Str.split_first(p0, 'z')); switch n17 { Err => p0 | Ok => { n18 = n17.Ok.0; switch Str.is_empty(n18.after) { False => p0 | True => n18.before } } } } | Ok => n14.Ok.0.before } } }\"" },
+    },
+    .{
+        .name = "staging - a tag union whose row nothing closed has the variants the function names",
+        .source_kind = .module,
+        .source = staged_open_tag_union,
+        .expected = .{ .inspect_str = "\"r0 = |[Green, Red], F32| -> F32 switch p0 { Green => 2 | Red => p1 }\"" },
+    },
+    .{
+        .name = "staging - an unset field and a field left out are members the record does not set",
+        .source_kind = .module,
+        .source = staged_unset_and_omitted,
+        .expected = .{ .inspect_str = "\"r0 = |F32| -> { a : F32, b : F32, c : F32 } switch Num.F32.is_lt(p0, 1) { False => { a: p0 } | True => { a: p0, c: 1 } }\"" },
+    },
+    .{
+        .name = "staging - a record update takes an optional field from its subject by a switch on its Try",
+        .source_kind = .module,
+        .source = staged_update_optional,
+        .expected = .{ .inspect_str = "\"r0 = |{ a : F32, b : F32 }| -> { a : F32, b : F32 } { n1 = unwrap(p0.?b); switch n1 { Err => { a: 1 } | Ok => { a: 1, b: n1.Ok.0 } } }\"" },
+    },
+    .{
+        .name = "staging - a record update that unsets an optional field reads nothing for it",
+        .source_kind = .module,
+        .source = staged_update_unsets,
+        .expected = .{ .inspect_str = "\"r0 = |{ a : F32, b : F32 }| -> { a : F32, b : F32 } { a: p0.a }\"" },
+    },
+    .{
+        .name = "staging - a path with an optional segment before the last is a switch on its Try",
+        .source_kind = .module,
+        .source = staged_optional_path,
+        .expected = .{ .inspect_str = "\"r0 = |{ inner : { depth : F32 }, size : F32 }| -> Builtin.Try(F32, [MissingField]) { n1 = unwrap(p0.?inner); switch n1 { Err => Builtin.Try.(Err(MissingField())) | Ok => Builtin.Try.(Ok(n1.Ok.0.depth)) } }\"" },
+    },
+    .{
+        .name = "staging - a path that ends in an optional segment keeps the last Try",
+        .source_kind = .module,
+        .source = staged_optional_path_chain,
+        .expected = .{ .inspect_str = "\"r0 = |{ leaf : { note : F32 }, size : F32 }| -> Builtin.Try(F32, [MissingField]) { n1 = unwrap(p0.?leaf); switch n1 { Err => Builtin.Try.(Err(MissingField())) | Ok => n1.Ok.0.?note } }\"" },
+    },
+    .{
+        .name = "staging - a record pattern rest that binds a name is the fields the pattern leaves",
+        .source_kind = .module,
+        .source = staged_record_rest_named,
+        .expected = .{ .inspect_str = "\"r0 = |{ x : F32, y : F32, z : F32 }| -> F32 Num.F32.plus(Num.F32.plus(p0.x, p0.y), p0.z)\"" },
+    },
+    .{
+        .name = "staging - a record pattern rest over an optional field carries the field when it is held",
+        .source_kind = .module,
+        .source = staged_record_rest_optional,
+        .expected = .{ .inspect_str = "\"r0 = |{ a : F32, b : F32, c : F32 }| -> { b : F32, c : F32 } { n1 = unwrap(p0.?b); n2 = p0.c; switch n1 { Err => { c: n2 } | Ok => { b: n1.Ok.0, c: n2 } } }\"" },
+    },
+    .{
+        .name = "staging - a string pattern that ends in a capture takes the text that is left",
+        .source_kind = .module,
+        .source = staged_str_pattern_tail,
+        .expected = .{ .inspect_str = "\"r0 = |Str| -> Str switch Str.starts_with(p0, 'users/') { False => '' | True => Str.drop_prefix(p0, 'users/') }\"" },
+    },
+    .{
+        .name = "staging - a translator that returns a Code.Bound receives a captured parameter as an input slot",
+        .source_kind = .module,
+        .source = bound_parameter,
+        .expected = .{ .inspect_str = "\"Num.U16.plus(in0, p0) / 1 slots / Int(7) | Num.U16.plus(in0, p0) / 1 slots / Int(9)\"" },
+    },
+    .{
+        .name = "staging - each field a lambda reads from a captured record is one input slot with the value of its type",
+        .source_kind = .module,
+        .source = bound_projections,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(in0, p0), in1, in2, in3, in4) / 5 slots / Int(5), ['a', 'b'], Closed(Int(3)), Wrap({Int(250)}), Frac(0.5)\"" },
+    },
+    .{
+        .name = "staging - a captured value of a recursive type is built by a helper that reaches itself",
+        .source_kind = .module,
+        .source = bound_recursive,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0) / 1 slots / Wrap(Link(Int(1), Wrap(Link(Int(2), Wrap(End())))))\"" },
+    },
+    .{
+        .name = "staging - a captured value of a generic nominal type is read at the type the slot fixes",
+        .source_kind = .module,
+        .source = bound_generic_nominal,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0, in1) / 2 slots / Wrap(Node(Wrap(Leaf('l')), Wrap(Leaf('r')))), Wrap(Err('bad'))\"" },
+    },
+    .{
+        .name = "staging - boxy: a translator that returns a Code.Bound receives a captured parameter as an input slot",
+        .source_kind = .module,
+        .source = bound_parameter,
+        .expected = .{ .inspect_str = "\"Num.U16.plus(in0, p0) / 1 slots / Int(7) | Num.U16.plus(in0, p0) / 1 slots / Int(9)\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - boxy: each field a lambda reads from a captured record is one input slot with the value of its type",
+        .source_kind = .module,
+        .source = bound_projections,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(in0, p0), in1, in2, in3, in4) / 5 slots / Int(5), ['a', 'b'], Closed(Int(3)), Wrap({Int(250)}), Frac(0.5)\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - boxy: a captured value of a recursive type is built by a procedure that reaches itself",
+        .source_kind = .module,
+        .source = bound_recursive,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0) / 1 slots / Wrap(Link(Int(1), Wrap(Link(Int(2), Wrap(End())))))\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - boxy: a captured value of a generic nominal type is read at the type the slot fixes",
+        .source_kind = .module,
+        .source = bound_generic_nominal,
+        .expected = .{ .inspect_str = "\"(Num.I64.plus(p0, 1), in0, in1) / 2 slots / Wrap(Node(Wrap(Leaf('l')), Wrap(Leaf('r')))), Wrap(Err('bad'))\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - a captured Bool is one input slot with a Bool value",
+        .source_kind = .module,
+        .source = bound_bool,
+        .expected = .{ .inspect_str = "\"(Num.I64.is_eq(p0, 1), in0) / 1 slots / True\"" },
+    },
+    .{
+        .name = "staging - a captured Bool inside a record and a list is read as Bool values",
+        .source_kind = .module,
+        .source = bound_nested_bool,
+        .expected = .{ .inspect_str = "\"(Num.I64.is_eq(p0, 1), in0) / 1 slots / {[True, False], False}\"" },
+    },
+    .{
+        .name = "staging - boxy: a captured Bool is one input slot with a Bool value",
+        .source_kind = .module,
+        .source = bound_bool,
+        .expected = .{ .inspect_str = "\"(Num.I64.is_eq(p0, 1), in0) / 1 slots / True\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - boxy: a captured Bool inside a record and a list is read as Bool values",
+        .source_kind = .module,
+        .source = bound_nested_bool,
+        .expected = .{ .inspect_str = "\"(Num.I64.is_eq(p0, 1), in0) / 1 slots / {[True, False], False}\"" },
+        .specialization_strategy = .boxy,
+        // The wasm evaluator runs a module without the Boxy runtime object.
+        .skip = .{ .wasm = true },
+    },
+    .{
+        .name = "staging - a captured var is refused as an input slot",
+        .source_kind = .module,
+        .source = bound_var,
+        .expected = .{ .problem = {} },
+    },
+    .{
+        .name = "staging - a captured function value is refused as an input slot",
+        .source_kind = .module,
+        .source = bound_function,
+        .expected = .{ .problem = {} },
+    },
+    .{
+        .name = "staging - a translator that does not return a Code.Bound is refused a captured value",
+        .source_kind = .module,
+        .source = unbound_capture,
         .expected = .{ .problem = {} },
     },
 };

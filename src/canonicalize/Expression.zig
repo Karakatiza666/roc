@@ -62,8 +62,12 @@ pub const TypeDispatchOwner = union(enum) {
 
 /// Why an annotation-only expression has no Roc implementation.
 pub const AnnotationOnlyKind = enum(u8) {
+    /// The annotation has no body and is not yet classified.
     ordinary,
     unsupported_generated_method,
+    /// An annotated value binding without a body, outside the builtin module
+    /// and outside platform modules. It names a compiler-known operation.
+    intrinsic,
 };
 
 /// An expression in the Roc language.

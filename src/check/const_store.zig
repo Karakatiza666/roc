@@ -545,6 +545,14 @@ pub const ConstFnEvidenceFrame = struct {
     }
 };
 
+/// The Code instance table a stored function describes its instance sites
+/// from (D1 of roc-reify-structural-proposal.md): a `tables` index in the
+/// `CodeInstanceTable` of `module`.
+pub const ConstFnInstances = struct {
+    module: names.CheckedModuleDigest,
+    table: u32,
+};
+
 /// Function value stored by compile-time evaluation.
 pub const ConstFn = struct {
     fn_def: FnDef,
@@ -559,6 +567,7 @@ pub const ConstFn = struct {
     evidence: ConstFnEvidenceVector = .{},
     evidence_frames: []const ConstFnEvidenceFrame = &.{},
     evidence_frame_head: ?u32 = null,
+    instances: ?ConstFnInstances = null,
 };
 
 /// Explicit old-to-current checked occurrence correspondence, established by
@@ -719,6 +728,7 @@ const StoredFn = struct {
     evidence_structurals: ConstRange = .{},
     evidence_frames: ConstRange = .{},
     evidence_frame_head: ?u32 = null,
+    instances: ?ConstFnInstances = null,
 };
 
 /// A type node as `ConstTypeStore` keeps it: `ConstType` with its two large
@@ -1544,6 +1554,7 @@ pub const ConstStore = struct {
             .evidence_structurals = evidence_structurals,
             .evidence_frames = evidence_frames,
             .evidence_frame_head = fn_value.evidence_frame_head,
+            .instances = fn_value.instances,
         });
         return id;
     }
@@ -1764,6 +1775,7 @@ pub const ConstStore = struct {
             },
             .evidence_frames = self.evidence_frame_pool.items[stored.evidence_frames.start .. stored.evidence_frames.start + stored.evidence_frames.len],
             .evidence_frame_head = stored.evidence_frame_head,
+            .instances = stored.instances,
         };
     }
 

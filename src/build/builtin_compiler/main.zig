@@ -26,7 +26,7 @@ const CIR = can.CIR;
 const CompactWriter = collections.CompactWriter;
 const CheckedModuleArtifact = check.CheckedArtifact.CheckedModuleArtifact;
 
-const max_builtin_bytes = 1024 * 1024;
+const max_builtin_bytes = 2 * 1024 * 1024;
 
 // Stderr writer for diagnostic reporting
 var stderr_buffer: [4096]u8 = undefined;
@@ -504,13 +504,17 @@ fn findTypeDeclarationByQualifiedName(env: *const ModuleEnv, qualified_name: []c
     const all_stmts = env.store.sliceStatements(env.all_statements);
     for (all_stmts) |stmt_idx| {
         const stmt = env.store.getStatement(stmt_idx);
-        if (stmt == .s_nominal_decl) {
-            const header = env.store.getTypeHeader(stmt.s_nominal_decl.header);
-            const ident_idx = header.name;
-            const ident_text = env.getIdentText(ident_idx);
-            if (std.mem.eql(u8, ident_text, qualified_name)) {
-                return stmt_idx;
-            }
+        // A nested alias (`Code.Binds`) is registered as a nominal is.
+        const header_idx = if (stmt == .s_nominal_decl)
+            stmt.s_nominal_decl.header
+        else if (stmt == .s_alias_decl)
+            stmt.s_alias_decl.header
+        else
+            continue;
+        const header = env.store.getTypeHeader(header_idx);
+        const ident_text = env.getIdentText(header.name);
+        if (std.mem.eql(u8, ident_text, qualified_name)) {
+            return stmt_idx;
         }
     }
 

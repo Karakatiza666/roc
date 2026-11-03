@@ -2,20 +2,34 @@
 # program runs.
 #
 # The walk replays the statement that bound `k`, and that statement reads the
-# parameter `n`. A description is written while the compiler runs, when no call
-# has supplied `n`, so the report names the parameter rather than `k`.
+# parameter `n`. The translator returns a `Code.Bound`, so `n` is an input
+# slot: the translator runs once, while the compiler runs, and each call of
+# `scaled` gives the program the value of its own `n`.
 Stage := {}.{
-	render : Code(U16 -> U16) -> Str
-	render = |code| "lambda/${Code.graph(code).root_row().params.len().to_str()}"
+	render : Code(U16 -> U16) -> Code.Bound(Str)
+	render = |code| {
+		graph = Code.graph(code)
+		Code.bound(code, "lambda/${graph.root_row().params.len().to_str()} slots/${graph.slots().len().to_str()}")
+	}
 }
 
 scaled : U16 -> Str
 scaled = |n| {
 	k = n * 2
-	Stage.render(|x| x + k)
+	bound = Stage.render(|x| x + k)
+	values = bound.inputs().map(
+		|value| match value {
+			Int(i) => i.to_str()
+			_ => "not an integer"
+		},
+	)
+	"${bound.value()} n=${Str.join_with(values, ",")}"
 }
 
-main! = |_args| {
+# The first call is folded while the compiler runs. The second reads the
+# arguments, so its `n` exists only when the program runs.
+main! = |args| {
 	echo!("${scaled(3)}\n")
+	echo!("${scaled(args.len().to_u16_wrap() * 0 + 5)}\n")
 	Ok({})
 }

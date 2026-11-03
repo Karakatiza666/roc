@@ -83,7 +83,7 @@ Tree := [Leaf, Node].{
 		(e-lambda
 			(args
 				(p-assign (ident "t")))
-			(e-call (constraint-fn-var 397)
+			(e-call (constraint-fn-var 478)
 				(e-lookup-local
 					(p-assign (ident "Tree.isOdd")))
 				(e-lookup-local
@@ -97,7 +97,7 @@ Tree := [Leaf, Node].{
 		(e-lambda
 			(args
 				(p-assign (ident "t")))
-			(e-call (constraint-fn-var 399)
+			(e-call (constraint-fn-var 480)
 				(e-lookup-local
 					(p-assign (ident "Tree.isEven")))
 				(e-lookup-local

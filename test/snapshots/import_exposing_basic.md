@@ -15,7 +15,7 @@ main = {
 }
 ~~~
 # EXPECTED
-DUPLICATE DEFINITION - import_exposing_basic.md:1:1:1:43
+BUILTIN TYPE SHADOWED - import_exposing_basic.md:1:1:1:43
 DOES NOT EXIST - import_exposing_basic.md:5:15:5:21
 DOES NOT EXIST - import_exposing_basic.md:6:15:6:21
 # PROBLEMS
@@ -23,25 +23,16 @@ DOES NOT EXIST - import_exposing_basic.md:6:15:6:21
 (reports
 	(report
 		(severity warning)
-		(title "Duplicate Definition")
+		(title "Builtin Type Shadowed")
 		(region (start 1 1) (end 1 43))
 		(headline
-			(reflow "The name ")
+			(text "The type ")
 			(annotated symbol-unqualified "Json")
-			(reflow " is being redeclared here."))
+			(text " shadows a builtin type."))
 		(document
-			(source-region (file "import_exposing_basic.md") (start 1 1) (end 1 43) (annotation error) (line-text "import json.Json exposing [decode, to_str]"))
+			(reflow "This may make the builtin type inaccessible in this scope.")
 			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Json")
-			(reflow " was already defined in ")
-			(source-location
-				(file "import_exposing_basic.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "import_exposing_basic.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import json.Json exposing [decode, to_str]"))))
+			(source-region (file "import_exposing_basic.md") (start 1 1) (end 1 43) (annotation warning) (line-text "import json.Json exposing [decode, to_str]"))))
 	(report
 		(severity runtime_error)
 		(title "Does Not Exist")

@@ -29,6 +29,7 @@ Stage := {}.{
 	tree = |t| match t {
 		Op(o) => Stage.op(o.op, o.args)
 		Param(k) => "p${k.to_str()}"
+		Input(k) => "in${k.to_str()}"
 		Arg(a) => "s${a.owner.to_str()}.${a.k.to_str()}"
 		Out(o) => "n${o.node.to_str()}.${o.k.to_str()}"
 		Def(n) => "n${n.to_str()}"
@@ -93,6 +94,7 @@ Stage := {}.{
 		Fixed(number) => number.to_str()
 		Str(text) => "'${text}'"
 		Bytes(bytes) => "bytes[${Str.join_with(bytes.map(|b| b.to_str()), " ")}]"
+		Numeral(n) => "numeral ${Str.inspect(Dec.from_numeral(n))}"
 	}
 
 	key : Code.Key -> Str

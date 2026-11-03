@@ -2,9 +2,10 @@
 # source out.
 #
 # This is ordinary Roc that runs at compile time. Naming a Roc function where
-# `fragment_330` expects a `Code(f)` is what reifies it: the compiler describes
-# the function, `Code.graph` opens the description, and this emits the GLSL that
-# raylib accepts together with the interface the application binds through.
+# `fragment_330` expects a `Code.Inlined(f)` is what reifies it: the compiler
+# describes the function, `Code.Inlined.inline` opens the description, and this
+# emits the GLSL that raylib accepts together with the interface the
+# application binds through.
 #
 # A fragment shader takes two records. The first holds the varyings the vertex
 # stage interpolates, which become `in` declarations; the second holds the
@@ -110,15 +111,41 @@ Glsl :: {}.{
 	## construct and, where there is one, the alternative.
 	Error := [Unsupported(Str), BadType(Str), BadInterface(Str)]
 
+	no_input : Error
+	no_input = Unsupported("a value the shader reads from around itself has no GLSL form; pass it as a uniform")
+
+	## The functions this translator reads by name: its cut. Each one is a
+	## GLSL operator or function, so a shader that calls it receives a `Prim`
+	## named `Glsl.Vec3` and `scale`, never the CPU body below, which would
+	## turn one vector product into three lane products. Every other function
+	## a shader calls, in this package or in any other, arrives as its body.
+	code_primitives = [
+		Code.prim(Vec2.plus),
+		Code.prim(Vec2.times),
+		Code.prim(Vec2.scale),
+		Code.prim(Vec2.offset),
+		Code.prim(Vec3.plus),
+		Code.prim(Vec3.times),
+		Code.prim(Vec3.scale),
+		Code.prim(Vec3.offset),
+		Code.prim(Vec4.plus),
+		Code.prim(Vec4.times),
+		Code.prim(Vec4.scale),
+		Code.prim(Vec4.offset),
+		Code.prim(Sampler.texture),
+	]
+
 	## Compile a reified Roc function to a GLSL 330 fragment shader.
 	##
 	## Naming a function here reifies it: the compiler describes the function
-	## during `roc build` and hands the description over as a `Code(f)`. The
-	## root row is the shader; `to_tree` gives it as nested expressions, with a
-	## def for each value the body reads more than once.
-	fragment_330 : Code(f) -> Try(Fragment, Error)
+	## during `roc build` and hands the description over as a `Code.Inlined(f)`.
+	## That is the `inline` view, because GLSL needs no function form here: every
+	## call of a helper is inlined, however many calls it has. The root row is
+	## the shader; `to_tree` gives it as nested expressions, with a def for each
+	## value the body reads more than once.
+	fragment_330 : Code.Inlined(f) -> Try(Fragment, Error)
 	fragment_330 = |code| {
-		graph = Code.graph(code)
+		graph = code.inline()
 		row = graph.root_row()
 		inputs = match row.params {
 			[interpolated, per_draw] => { interpolated, per_draw }
@@ -160,16 +187,17 @@ Glsl :: {}.{
 	bindings_of : Code.Ty, [In, Uniform] -> Try(List(Binding), Error)
 	bindings_of = |ty, storage| match ty {
 		Record(fields) => fields.map_try(|field| Glsl.binding_for(field, storage))
-		Named(_, Record(fields)) => fields.map_try(|field| Glsl.binding_for(field, storage))
+		Named(_, _, Record(fields)) => fields.map_try(|field| Glsl.binding_for(field, storage))
 		_ => Err(BadInterface("a shader's parameters are records; each field is one shader input"))
 	}
 
 	## A shader input is declared once and is there on every invocation, so a
 	## field the record type says may be absent is not one.
-	binding_for : { name : Str, ty : Code.Ty, presence : [Required, Optional] }, [In, Uniform] -> Try(Binding, Error)
+	binding_for : { name : Str, ty : Code.Ty, presence : [Required, Optional, Default(Code.Value), DefaultComputed] }, [In, Uniform] -> Try(Binding, Error)
 	binding_for = |field, storage| match field.presence {
 		Optional => Err(BadInterface("`${field.name}` may be absent, and a shader input is always there"))
-		Required => Ok(Binding.({ name: field.name, kind: Glsl.kind_for(field.ty)?, storage }))
+		# A default fills the field in, so every value of the type has it.
+		Required | Default(_) | DefaultComputed => Ok(Binding.({ name: field.name, kind: Glsl.kind_for(field.ty)?, storage }))
 	}
 
 	declare : Binding -> Str
@@ -188,13 +216,13 @@ Glsl :: {}.{
 		I32 => Ok(Kind.Int)
 		U32 => Ok(Kind.Uint)
 		Bool => Ok(Kind.Boolean)
-		Named("Glsl.Sampler", _) => Ok(Kind.Sampler2D)
-		Named(name, backing) => match Glsl.vector_kind(name) {
+		Named("Glsl.Sampler", _, _) => Ok(Kind.Sampler2D)
+		Named(name, _, backing) => match Glsl.vector_kind(name) {
 			Ok(vec) => Ok(vec)
 			Err(_) => Glsl.kind_for(backing)
 		}
 		Recursive(name) => Err(BadType("`${name}` reaches itself, and GLSL 330 has no recursive type"))
-		Opaque("Glsl.Sampler", _) => Ok(Kind.Sampler2D)
+		Opaque("Glsl.Sampler", _, _) => Ok(Kind.Sampler2D)
 		Tuple(elems) => match elems.len() {
 			2 => Ok(Kind.Vec2)
 			3 => Ok(Kind.Vec3)
@@ -242,12 +270,10 @@ Glsl :: {}.{
 						kind = Glsl.kind_for(Glsl.value_ty(def.value, acc.scope)?)?
 						local = "n${def.id.to_str()}"
 						declaration = "\t${kind.to_str()} ${local} = ${text};"
-						Ok(
-							{
-								scope: { ..acc.scope, locals: acc.scope.locals.append({ id: def.id, text: local }) },
-								statements: Glsl.both(acc.statements, declaration),
-							},
-						)
+						Ok({
+							scope: { ..acc.scope, locals: acc.scope.locals.append({ id: def.id, text: local }) },
+							statements: Glsl.both(acc.statements, declaration),
+						})
 					}
 				},
 			)?
@@ -262,7 +288,7 @@ Glsl :: {}.{
 			}
 			Ok(Rendered.({ statements: placed.statements, value }))
 		}
-		Op(_) | Param(_) | Arg(_) | Out(_) | Def(_) => Ok(Rendered.({ statements: "", value: Glsl.render(tree, scope)? }))
+		Op(_) | Param(_) | Input(_) | Arg(_) | Out(_) | Def(_) => Ok(Rendered.({ statements: "", value: Glsl.render(tree, scope)? }))
 	}
 
 	## Whether a def only reads a field, a lane or a nominal's backing out of a
@@ -274,7 +300,7 @@ Glsl :: {}.{
 			(Field(_), [inner]) | (Index(_), [inner]) | (Unwrap, [inner]) => Glsl.is_read(inner)
 			_ => Bool.False
 		}
-		Arg(_) | Out(_) | Block(_) => Bool.False
+		Input(_) | Arg(_) | Out(_) | Block(_) => Bool.False
 	}
 
 	## The type a def is declared at. A nominal's backing is read under the
@@ -291,6 +317,7 @@ Glsl :: {}.{
 		}
 		Def(n) => Ok(scope.row.node(n).ty)
 		Arg(_) | Out(_) | Block(_) => Err(Unsupported("a value that carries a loop's or a branch's state has no GLSL local"))
+		Input(_) => Err(Glsl.no_input)
 	}
 
 	## Render one expression. A field read straight off one of the shader's two
@@ -304,6 +331,7 @@ Glsl :: {}.{
 			Err(_) => Err(Unsupported("a value read before the translator placed it"))
 		}
 		Arg(_) | Out(_) => Err(Unsupported("a value that carries a loop's or a branch's state has no GLSL expression"))
+		Input(_) => Err(Glsl.no_input)
 		Block(_) => {
 			inner = Glsl.render_block(tree, scope)?
 			if inner.statements.is_empty() {
@@ -332,7 +360,7 @@ Glsl :: {}.{
 								Ok(field) => Glsl.render(field, scope)
 								Err(_) => Err(BadType("a ${kind.to_str()} with no value for `${lane}`"))
 							}
-							Err(_) => Err(BadType("a ${kind.to_str()} is built from lanes named ${Str.join_with(lanes, ", ")}; this one has no `${lane}`")),
+							Err(_) => Err(BadType("a ${kind.to_str()} is built from lanes named ${Str.join_with(lanes, ", ")}; this one has no `${lane}`"))
 						},
 					)?
 					Ok("${kind.to_str()}(${Str.join_with(rendered, ", ")})")
@@ -369,7 +397,7 @@ Glsl :: {}.{
 			}
 		}
 		Switch(sw) => Glsl.conditional(sw, args, scope)
-		Call(_) => Err(Unsupported("a shader calls builtins and `Glsl` functions, and this one calls a function of its own package"))
+		Call(_) => Err(Unsupported("a shader cannot call a function that reaches itself, and GLSL 330 has no recursion"))
 		Closure(_) => Err(Unsupported("a shader cannot contain a nested function"))
 		Lambda(_) => Err(Unsupported("a shader cannot contain a nested function"))
 		List => Err(Unsupported("GLSL 330 has no list; a fixed-lane vector is built from a tuple"))
@@ -437,6 +465,11 @@ Glsl :: {}.{
 		Fixed(_) => Err(BadType("Dec is 128-bit fixed point and no GPU has it; annotate this literal as F32"))
 		Str(_) => Err(BadType("GLSL has no strings"))
 		Bytes(_) => Err(BadType("GLSL has no byte arrays; upload this file as a texture or a buffer instead"))
+		# A shader computes in `float`, so a numeral is the `F32` it is.
+		Numeral(n) => match F32.from_numeral(n) {
+			Ok(number) => Ok(Glsl.float_str(number.to_f64(), F32))
+			Err(_) => Err(BadType("this numeral has no F32 value"))
+		}
 	}
 
 	## A literal arrives widened to `F64`, so an `F32` prints back through `F32`

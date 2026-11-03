@@ -59,8 +59,7 @@ combineTrys = |jsonTry, httpStatus|
     }
 ~~~
 # EXPECTED
-DUPLICATE DEFINITION - can_import_exposing_types.md:1:1:1:49
-DUPLICATE DEFINITION - can_import_exposing_types.md:3:1:3:32
+BUILTIN TYPE SHADOWED - can_import_exposing_types.md:1:1:1:49
 BUILTIN TYPE SHADOWED - can_import_exposing_types.md:3:1:3:32
 DOES NOT EXIST - can_import_exposing_types.md:22:5:22:16
 MOD NOT FOUND - can_import_exposing_types.md:6:20:6:23
@@ -100,46 +99,16 @@ DOES NOT EXIST - can_import_exposing_types.md:50:33:50:44
 (reports
 	(report
 		(severity warning)
-		(title "Duplicate Definition")
+		(title "Builtin Type Shadowed")
 		(region (start 1 1) (end 1 49))
 		(headline
-			(reflow "The name ")
+			(text "The type ")
 			(annotated symbol-unqualified "Json")
-			(reflow " is being redeclared here."))
+			(text " shadows a builtin type."))
 		(document
-			(source-region (file "can_import_exposing_types.md") (start 1 1) (end 1 49) (annotation error) (line-text "import json.Json exposing [Value, Error, Config]"))
+			(reflow "This may make the builtin type inaccessible in this scope.")
 			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Json")
-			(reflow " was already defined in ")
-			(source-location
-				(file "can_import_exposing_types.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "can_import_exposing_types.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import json.Json exposing [Value, Error, Config]"))))
-	(report
-		(severity warning)
-		(title "Duplicate Definition")
-		(region (start 3 1) (end 3 32))
-		(headline
-			(reflow "The name ")
-			(annotated symbol-unqualified "Try")
-			(reflow " is being redeclared here."))
-		(document
-			(source-region (file "can_import_exposing_types.md") (start 3 1) (end 3 32) (annotation error) (line-text "import utils.Try exposing [Try]"))
-			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Try")
-			(reflow " was already defined in ")
-			(source-location
-				(file "can_import_exposing_types.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "can_import_exposing_types.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import json.Json exposing [Value, Error, Config]"))))
+			(source-region (file "can_import_exposing_types.md") (start 1 1) (end 1 49) (annotation warning) (line-text "import json.Json exposing [Value, Error, Config]"))))
 	(report
 		(severity warning)
 		(title "Builtin Type Shadowed")

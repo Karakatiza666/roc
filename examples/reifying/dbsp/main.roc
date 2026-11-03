@@ -88,12 +88,12 @@ is_urgent = |b| b.over_by > 5.0 and !b.room.starts_with("test-")
 ## with different limits, so Roc keeps it as a function and the translator
 ## writes it as one.
 clamp : F64, F64, F64 -> F64
-clamp = |degrees, low, high| if degrees < low low else if degrees > high high else degrees
+clamp = |degrees, low, high| if (degrees < low) low else if (degrees > high) high else degrees
 
 ## Integer power by repeated multiplication. It calls itself, so Roc keeps it
 ## as a function whatever the number of its callers.
 power : I64, I64 -> I64
-power = |base, times| if times <= 0 1 else base * power(base, times - 1)
+power = |base, times| if (times <= 0) 1 else base * power(base, times - 1)
 
 reading : Str, F64 -> Reading
 reading = |sensor, celsius| Reading.({ sensor, celsius })
@@ -366,7 +366,7 @@ consolidate = |entries| {
 	merged = entries.fold(
 		[],
 		|acc, entry| match acc.find_first_index(|seen| seen.row == entry.row) {
-			Ok(at) => acc.map_with_index(|seen, i| { row: seen.row, weight: if i == at seen.weight + entry.weight else seen.weight })
+			Ok(at) => acc.map_with_index(|seen, i| { row: seen.row, weight: if (i == at) seen.weight + entry.weight else seen.weight })
 			Err(_) => acc.append(entry)
 		},
 	)
@@ -388,7 +388,7 @@ count_of = |counts, sensor| counts.get(sensor) ?? 0
 
 ## The alert a sensor has when `n` of its readings are hot, at a weight.
 alert_at : Str, I64, I64 -> ZSet(Alert)
-alert_at = |sensor, n, weight| if is_noisy((sensor, n)) [{ row: to_alert((sensor, n)), weight }] else []
+alert_at = |sensor, n, weight| if (is_noisy((sensor, n))) [{ row: to_alert((sensor, n)), weight }] else []
 
 ## What one batch of readings changes: the counts afterwards, and the alerts
 ## that appear (weight 1) or go away (weight -1). Only the sensors the batch
@@ -396,7 +396,7 @@ alert_at = |sensor, n, weight| if is_noisy((sensor, n)) [{ row: to_alert((sensor
 step : Counts, ZSet(Reading) -> { counts : Counts, out : ZSet(Alert) }
 step = |counts, batch| {
 	hot = batch.keep_if(|entry| is_hot(entry.row))
-	touched = hot.fold([], |seen, entry| if seen.contains(entry.row.sensor) seen else seen.append(entry.row.sensor))
+	touched = hot.fold([], |seen, entry| if (seen.contains(entry.row.sensor)) seen else seen.append(entry.row.sensor))
 	moves = touched.map(
 		|sensor| {
 			before = count_of(counts, sensor)
@@ -414,8 +414,8 @@ step = |counts, batch| {
 from_scratch : List(Reading) -> ZSet(Alert)
 from_scratch = |all| {
 	hot = all.keep_if(is_hot)
-	sensors = hot.fold([], |seen, r| if seen.contains(r.sensor) seen else seen.append(r.sensor))
-	sensors.join_map(|sensor| alert_at(sensor, hot.fold(0, |n, r| if r.sensor == sensor n + 1 else n), 1))
+	sensors = hot.fold([], |seen, r| if (seen.contains(r.sensor)) seen else seen.append(r.sensor))
+	sensors.join_map(|sensor| alert_at(sensor, hot.fold(0, |n, r| if (r.sensor == sensor) n + 1 else n), 1))
 }
 
 batch_one : ZSet(Reading)
@@ -451,6 +451,21 @@ expect {
 	one_goes = same(third.out, [{ row: to_alert(("a", 3)), weight: -1 }])
 	nothing_yet and both_appear and one_goes and same(integrated, from_scratch(everything))
 }
+
+# A literal of a type with its own `from_numeral` reifies as a `Numeral`
+# literal, which the circuit holds as the `F64` it is.
+Written := [Written(Numeral)].{
+	from_numeral : Numeral -> Try(Written, [InvalidNumeral(Str)])
+	from_numeral = |n| Ok(Written(n))
+}
+
+written : Written -> Code.Lit
+written = |value| match value {
+	Written(n) => Numeral(n)
+}
+
+expect Dbsp.literal(written(2.5.Written)).map_ok(|ex| ex.text).ok_or("") == "F64::new(2.5)"
+expect Dbsp.literal(written(3.Written)).map_ok(|ex| ex.text).ok_or("") == "F64::new(3.0)"
 
 main! = |_args| {
 	match program {
