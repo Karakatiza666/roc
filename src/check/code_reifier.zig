@@ -13786,6 +13786,10 @@ const OccurrenceScan = struct {
                 try s.expr(loop.body, null);
             },
             .run_low_level => |run| try s.exprs(run.args),
+            // A retired expression still evaluates the operands it records,
+            // up to and including the erroneous one, so a use among them is
+            // lowered and needs its table like any other.
+            .runtime_error => |runtime_error| try s.exprs(runtime_error.evaluated),
             .pending,
             .numeral,
             .str_from_quote,
@@ -13796,7 +13800,6 @@ const OccurrenceScan = struct {
             .empty_list,
             .empty_record,
             .zero_argument_tag,
-            .runtime_error,
             .crash,
             .ellipsis,
             .anno_only,

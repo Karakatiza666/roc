@@ -23666,7 +23666,12 @@ Invariants:
   by the loop's body. The checked module builder also reads each compile-time constant
   body and each top-level binding evaluation computes; a use there at a
   variable of the binding's own type is closed by the binding's use. It
-  reads each top-level `expect` too, where every use is a closing use. A
+  reads each top-level `expect` too, where every use is a closing use. It
+  reads the `evaluated` operands of a checked `runtime_error`: an
+  expression retired because an operand is erroneous (an unresolved name
+  passed at a `Code` position, say) still evaluates its operands up to the
+  erroneous one (see "Erroneous Call Operand Retirement"), so a use among
+  them is lowered and gets its table like any other. A
   stored function value keeps the table it was built with
   (`ConstFn.instances`), and a restore puts it on the root frame of the
   restored evidence. A binding stored at its own type variables keeps none,
