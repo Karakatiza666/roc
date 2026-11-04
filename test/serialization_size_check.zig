@@ -38,7 +38,7 @@ const expected_string_literal_store_size = 24;
 const expected_node_payload_size = 16;
 const expected_node_payload_align = 4;
 const expected_node_size = 20;
-const expected_moduleenv_size = 3112; // Includes the `Code.Inlined`, `Code.Outlined`, `Code.PrimId`, `Code.Proxy` and `Code.Binds` idents, the bound-capture-encoding records, the recorded `Code.prim` and `Code.type_id` calls, the `code_primitives` ident and the serialized invoking-definitions, reify-only-definition, reify-only-frame and reify-only-text, callable-checking-fact, checking-dependency, hosted-error origin, slot-kind, numeral-fact, interpolation-metadata, derived-map-plan, generated-codec-renaming, and identifier end and fingerprint columns.
+const expected_moduleenv_size = 3136; // Includes the `Code.Inlined`, `Code.Outlined`, `Code.PrimId`, `Code.Proxy` and `Code.Binds` idents, the bound-capture-encoding records, the recorded `Code.prim` and `Code.type_id` calls, the `code_primitives` ident and the serialized invoking-definitions, reify-only-definition, reify-only-frame and reify-only-text, callable-checking-fact, checking-dependency, hosted-error origin, slot-kind, numeral-fact, interpolation-metadata, derived-map-plan, generated-codec-renaming, and identifier end and fingerprint columns.
 const expected_nodestore_size = 648; // Platform-independent size, with the recorded `Code.prim` and `Code.type_id` calls
 
 // Compile-time assertions - build will fail if sizes don't match expected values
