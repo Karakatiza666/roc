@@ -12290,9 +12290,16 @@ follow, each a debug assertion:
   records whether the declaration is an intrinsic, and the `.unimplemented`
   arms of Monotype (`lowerUnimplementedTemplateAtNode`, the constant use)
   assert that it is not. Boxy has no requests: a unit lowers every template
-  of its module (see "`.boxy` Runtime Lowering"), so it lowers an
-  intrinsic's declaration as a crash body and lowers the bodies of
-  reify-only definitions too. No run-time code a root reaches calls either.
+  of its module that run-time code may call (see "`.boxy` Runtime
+  Lowering"). So the checked module records the set Monotype never lowers
+  as explicit data: `CheckedProcedureTemplate.description_only` is set on
+  the template of an intrinsic's declaration, of a reify-only definition and
+  of a Code template (a definition whose annotation returns `Code`, listed
+  in `ModuleEnv.code_template_defs`; its body is read only by the
+  reifier). A Boxy unit emits no worker for such a template
+  (`unitEmitsTemplate`), and `Program.templateWorker` asserts that no use
+  asks for one. The flag is part of the cached checked module, and the
+  object key of an importer reads it through the template's interface.
 
 Boxy needs one more rule. Monotype lowers only the code that a request
 reaches, but Boxy fills each dictionary that a call passes with one slot for
@@ -12300,15 +12307,23 @@ each relation of the callee's scheme. A fragment such as
 `|q| Db.Q.filter(q, |x| x.t.now())` has the relation `now` in its scheme, and
 only the described lambda uses it, so its runs bit is clear. A call of the
 fragment at `Clock` selects `Clock.now`, an intrinsic, for that slot. Evidence
-output sets `CheckedEvidence.description_only_intrinsic` when the
-resolution is direct to an intrinsic and the callee's relation has a clear
-runs bit. Boxy then fills the slot with the crashing dictionary
-`description_only_intrinsic` (`CrashDictionary` in
+output sets `CheckedEvidence.description_only_target` when the
+resolution is direct to a template flagged `description_only` (an
+intrinsic, a reify-only definition or a Code template) and the callee's
+relation has a clear runs bit. Boxy then fills the slot with the crashing dictionary
+`description_only_target` (`CrashDictionary` in
 `src/postcheck/boxy/lower.zig`), as it fills an `unreachable` slot, in
 place of a worker. No run-time code reads the
 slot. The resolution stays `direct`, because the reifier reads the target to
 describe the fragment. A slot of an ordinary method keeps its worker, whatever
 its runs bit.
+
+A nominal's `is_eq`, `to_hash` or `to_inspect` override that is an
+intrinsic is a slot of the type's descriptor in the same way. The
+descriptor holds it, but checking rejects every run-time comparison, hash
+or inspection that reaches it, so `Program.nominalOverrides` fills the slot
+with the crashing dictionary `description_only_target` in place of a
+worker.
 
 `ModuleEnv.reify_only_defs` stores the reify-only definitions that are not
 roots, in ascending order of definition id. Each entry holds its witness,
@@ -14590,6 +14605,47 @@ instantiation resolves. The runtime has no numeral table and no descriptor
 selection among candidate types: `dyn_numeral` and `dyn_desc_index` do not
 exist.
 
+#### Code Instance Tables
+
+A Code site in a generic function (an *instance site*, whose rules the Code description
+section gives) has no description of its own: each closing use describes it at
+the types that use fixes, and checking records the descriptions in the use's
+module as a `CodeInstanceTable` table, one entry per entry of the template's
+inventory. A node entry is a description; a forward entry names the table of
+a nested use, which a closing use further out fixes. Boxy follows the rule of
+literal arguments: the template is lowered once, and the caller that fixes
+the types supplies the table.
+
+- A worker whose template has an inventory takes one more hidden parameter,
+  after its literal arguments (`Worker.instances`, `hiddenCount`): the
+  *instance word*, an immortal erased callable of the table worker
+  `WorkerKey.code_instances` (module and table), which takes no arguments and
+  returns a tuple of one `anyFunction` callable per inventory entry.
+- A node entry is a `WorkerKey.code_description` thunk (module, table, entry)
+  that restores the description at the closed representation of the site's
+  type. A forward entry is the nested table's own callable, so a recursive or
+  cyclic table never materializes as static data: each table is composed
+  only when an entry is read.
+- A Code site reads its entry from the worker's own word
+  (`Body.lowerCodeSite`, `instanceTableEntry`) and calls it. A closing use
+  composes its table from the use's module (`instanceWordForUse`); a forward
+  use passes the entry of the enclosing word. A use through an exact
+  procedure alias carries the table checking keyed at the use down the chain
+  to the final target. Lambdas capture the word with the literal arguments,
+  and a stored function records its table (`stored_fn` tag
+  `code_instances`).
+- The table workers of a closing use are emitted by the unit of the use's
+  module, from that module's own checked data, so no object reads another
+  module's tables.
+
+The alternative, a worker per (template, table), would lower a generic
+template once per closing use. That breaks the per-module rule that a
+template is lowered once in its own unit, needs the importer to emit the
+exporter's template, and grows code with every use; a table word costs one
+hidden argument at the templates that have an inventory, none elsewhere.
+Monotype carries the same tables on its specialization evidence, so both
+strategies read the same checked data.
+
 #### Function Values
 
 A function value is an erased callable: one Roc refcounted allocation whose
@@ -14720,6 +14776,11 @@ reference. Mutable slots are never content-deduplicated or pooled between
 program images. Dev run images place them on separate writable pages outside
 the code and read-only data sections and outside the retained static pool.
 Saved objects and LirImages carry the initial zero bytes, never runtime pointers.
+The static descriptor of a closed recursive type is a cyclic node graph. A
+dev run image's static pool (`src/backend/dev/StaticDataPool.zig`) keys an
+entry by a content hash over its relocation targets' hashes, which a cycle
+has none of, so an entry on a relocation cycle, and every entry reaching
+one, stays in its own image and is never pooled.
 Each interpreter owns its own instances of these slots, with
 the lifetime of its composition arena.
 
@@ -18204,6 +18265,10 @@ passes on the nested table its entry names (`instancesForUse`). An instance
 site restores the node of its entry in the table in force
 (`restoreCodeSiteAtNode`). A template with an inventory requested with no
 table is a compiler invariant.
+
+Boxy lowers the template once and passes the table as a hidden instance
+word, composed by the caller from the use's table, or taken from the
+enclosing word's entry at a forward use ("Code Instance Tables").
 
 ### Iterator `for`
 
@@ -23589,7 +23654,8 @@ Invariants:
   computed by its entry template at each use: the constant's body is read
   at that template's variables, and a use of the constant is a use of the
   template, whose table rides on the root frame of the evaluation (Monotype)
-  or selects the entry worker (Boxy). A lambda written at an instance site
+  or is the entry worker's instance word (Boxy, see "Code Instance
+  Tables"). A lambda written at an instance site
   keeps its checked form under a new id, which a walk from another module
   reads. The walk refuses by name: a site that binds inputs
   (`bound_instance`, "Cannot Bind Inputs In A Generic Function"), a use

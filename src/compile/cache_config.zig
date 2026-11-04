@@ -532,7 +532,11 @@ pub const Constants = struct {
     ///      the cached checking outcome keeps the frames of its chains.
     /// 230: the code provenance of a module names, per node, the intrinsics
     ///      its `Prim` names, and a translation refusal keeps their names.
-    pub const CACHE_VERSION = 230;
+    /// 231: a procedure template records whether only reified code reads it
+    ///      (`description_only`); a module lists its Code templates
+    ///      (`code_template_defs`); a Code instance table records the
+    ///      template each table serves (`table_templates`).
+    pub const CACHE_VERSION = 231;
 };
 
 /// Configuration for the Roc cache system.

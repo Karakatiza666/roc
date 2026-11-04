@@ -22384,18 +22384,16 @@ const EvidencePass = struct {
         return self.evidenceFromResolution(context, resolution);
     }
 
-    /// Whether an evidence node's target is an intrinsic: an annotation-only
-    /// declaration of a module that is not a platform, so it has no Roc body.
-    fn evidenceNodeTargetsIntrinsic(self: *EvidencePass, node: static_dispatch.EvidenceNodeId) bool {
+    /// Whether an evidence node's target is a template no lowering emits
+    /// (`CheckedProcedureTemplate.description_only`): an intrinsic, a
+    /// reify-only definition, or a template returning `Code`.
+    fn evidenceNodeTargetsDescriptionOnly(self: *EvidencePass, node: static_dispatch.EvidenceNodeId) bool {
         const target = self.evidence_nodes.items[@backingInt(node)].target;
         switch (target.kind) {
             .procedure => {},
             .local_proc, .structural => return false,
         }
-        return switch (self.procedureEvidenceView(target).template.body) {
-            .unimplemented => |declaration| declaration.intrinsic,
-            .checked_body, .intrinsic_wrapper, .entry_wrapper => false,
-        };
+        return self.procedureEvidenceView(target).template.description_only;
     }
 
     fn evidenceFromResolution(
@@ -22409,8 +22407,8 @@ const EvidencePass = struct {
         const dispatcher_ty = context.dispatcher_ty;
         return .{
             .dispatcher_ty = dispatcher_ty,
-            .description_only_intrinsic = switch (resolution) {
-                .direct_pending => |node| !param.constraint.runs and self.evidenceNodeTargetsIntrinsic(node),
+            .description_only_target = switch (resolution) {
+                .direct_pending => |node| !param.constraint.runs and self.evidenceNodeTargetsDescriptionOnly(node),
                 .direct_closed, .direct_parametric, .evidence_dependent, .structural, .checked_error, .@"unreachable" => false,
             },
             .resolution = switch (resolution) {
@@ -22589,7 +22587,7 @@ const EvidencePass = struct {
             checkedArtifactInvariant("checked stored-function dispatcher type was not published", .{});
         return .{
             .dispatcher_ty = dispatcher_ty,
-            .description_only_intrinsic = false,
+            .description_only_target = false,
             .resolution = .from_callable,
         };
     }
@@ -22768,7 +22766,7 @@ const EvidencePass = struct {
                     checkedArtifactInvariant("checked nested-procedure evidence dispatcher type was not published", .{});
                 entries.appendAssumeCapacity(.{
                     .dispatcher_ty = dispatcher_ty,
-                    .description_only_intrinsic = false,
+                    .description_only_target = false,
                     .resolution = if (param.source == .scheme_requirement) .from_scheme else .from_callable,
                 });
                 continue;
@@ -24010,6 +24008,12 @@ pub const CheckedProcedureTemplate = struct {
     /// Monotype specializes the template over only this much of each
     /// variable's substitution (design.md "Specialization By Demand").
     demands: artifact_serialize.Span = .{},
+    /// Whether only reified code reads the template, so no run-time code
+    /// reaches it and no lowering emits it (design.md "Reify-Only
+    /// Definitions", invariant 1): an intrinsic's declaration, a reify-only
+    /// definition, or a template (a definition whose annotation returns a
+    /// `Code`), whose body each call describes.
+    description_only: bool = false,
 };
 
 /// Whether a row variable is one the checker closed to `[]`.
@@ -24280,6 +24284,9 @@ pub const CheckedProcedureTemplateTable = struct {
                 else
                     .roc,
                 .provided_low_level = module.moduleEnvConst().providedLowLevelForDef(def_idx),
+                .description_only = (def.expr.data == .e_anno_only and def.expr.data.e_anno_only.kind == .intrinsic) or
+                    module.moduleEnvConst().reifyOnlyDef(def_idx) != null or
+                    module.moduleEnvConst().isCodeTemplateDef(def_idx),
             });
         }
 
@@ -36607,6 +36614,7 @@ pub const CodeCutTable = struct {
 /// | `exprs` | template-call argument of a recipe | an expression of the site's module |
 /// | `modules` | module a recipe's root lives in | its key |
 /// | `tables` | table this module's closing uses built | its span of `table_entries` |
+/// | `table_templates` | table, parallel to `tables` | the template whose inventory it serves |
 /// | `table_entries` | inventory entry of a table's template | a description node, or a nested table |
 /// | `reads` | literal root a description's walk met | `CheckedCodeRead` |
 /// | `uses` | closing use of this module, by expression | its table |
@@ -36666,6 +36674,12 @@ pub const CodeInstanceTable = struct {
         /// A template call's arguments, a span of `exprs`.
         args: Span,
     };
+    /// The template a table serves: its module's key, and its id there,
+    /// or `none` for a table whose use is refused.
+    pub const TableTemplate = extern struct {
+        module: CheckedModuleArtifactKey,
+        template: u32,
+    };
     pub const TableEntryKind = enum(u32) { node, table };
     pub const TableEntry = extern struct {
         kind: TableEntryKind,
@@ -36684,6 +36698,7 @@ pub const CodeInstanceTable = struct {
     exprs: []const CheckedExprId = &.{},
     modules: []const CheckedModuleArtifactKey = &.{},
     tables: []const Span = &.{},
+    table_templates: []const TableTemplate = &.{},
     table_entries: []const TableEntry = &.{},
     reads: []const CheckedCodeRead = &.{},
     uses: []const Indexed = &.{},
@@ -36698,6 +36713,7 @@ pub const CodeInstanceTable = struct {
         exprs: SerializedSlice(CheckedExprId) = .{},
         modules: SerializedSlice(CheckedModuleArtifactKey) = .{},
         tables: SerializedSlice(Span) = .{},
+        table_templates: SerializedSlice(TableTemplate) = .{},
         table_entries: SerializedSlice(TableEntry) = .{},
         reads: SerializedSlice(CheckedCodeRead) = .{},
         uses: SerializedSlice(Indexed) = .{},
@@ -36740,6 +36756,11 @@ pub const CodeInstanceTable = struct {
         return indexOf(self.uses, expr);
     }
 
+    /// The template table `table` serves.
+    pub fn tableTemplate(self: *const CodeInstanceTable, table: u32) TableTemplate {
+        return self.table_templates[table];
+    }
+
     /// The entries of table `table`.
     pub fn tableEntries(self: *const CodeInstanceTable, table: u32) []const TableEntry {
         const span = self.tables[table];
@@ -36761,6 +36782,7 @@ pub const CodeInstanceTable = struct {
             try checkSpan(recipe.args, self.exprs.len);
             if (recipe.root_module != none and recipe.root_module >= self.modules.len) return error.CorruptArtifact;
         }
+        if (self.table_templates.len != self.tables.len) return error.CorruptArtifact;
         for (self.tables) |span| try checkSpan(span, self.table_entries.len);
         for (self.table_entries) |entry| {
             try checkSpan(entry.reads, self.reads.len);
@@ -36783,6 +36805,7 @@ pub const CodeInstanceTable = struct {
         allocator.free(self.exprs);
         allocator.free(self.modules);
         allocator.free(self.tables);
+        allocator.free(self.table_templates);
         allocator.free(self.table_entries);
         allocator.free(self.reads);
         allocator.free(self.uses);
@@ -37320,8 +37343,8 @@ pub const CheckedModuleArtifact = struct {
             // code provenance table adds its ten slices, and the calls that
             // bind input slots four in the body store, and the roots a Code site
             // reads one. The code cut table adds its two slices, and the code
-            // instance table (D1) its twelve.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 287);
+            // instance table (D1) its thirteen.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 288);
         }
 
         /// Every field but the inline POD `key`, `source_hash`, and
@@ -44523,8 +44546,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0xBB, 0x85, 0x8B, 0xA6, 0x59, 0x0D, 0x36, 0xE1, 0x2B, 0x23, 0x14, 0x33, 0xA3, 0x9A, 0xD4, 0x7D,
-        0x37, 0x2B, 0xE3, 0xCA, 0x89, 0x3B, 0x45, 0xDA, 0x03, 0xF0, 0x0C, 0xEF, 0x27, 0xC9, 0xCB, 0x42,
+        0x5C, 0x7C, 0xAC, 0x02, 0x4C, 0xDF, 0xB9, 0x7C, 0x05, 0x37, 0x3E, 0x8D, 0x5B, 0xB2, 0x9C, 0x8B,
+        0x48, 0x88, 0x03, 0xE2, 0x0E, 0x69, 0x95, 0xCD, 0x04, 0x79, 0x6C, 0x60, 0xB3, 0x29, 0xFF, 0x9A,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }
@@ -44544,9 +44567,9 @@ test "closed direct evidence excludes specialization-dependent nested recipes" {
     const context_anchor = testIndexId(CheckedStatementId, 0);
 
     var refs = [_]static_dispatch.CheckedEvidence{
-        .{ .dispatcher_ty = callable_ty, .description_only_intrinsic = false, .resolution = .{ .constraint = .{ .index = .{ .depth = 0, .index = 0 } } } },
-        .{ .dispatcher_ty = callable_ty, .description_only_intrinsic = false, .resolution = .{ .direct = evidence_0 } },
-        .{ .dispatcher_ty = callable_ty, .description_only_intrinsic = false, .resolution = .{ .direct = evidence_1 } },
+        .{ .dispatcher_ty = callable_ty, .description_only_target = false, .resolution = .{ .constraint = .{ .index = .{ .depth = 0, .index = 0 } } } },
+        .{ .dispatcher_ty = callable_ty, .description_only_target = false, .resolution = .{ .direct = evidence_0 } },
+        .{ .dispatcher_ty = callable_ty, .description_only_target = false, .resolution = .{ .direct = evidence_1 } },
     };
     const procedure_target = static_dispatch.MethodTarget{
         .module_idx = 0,
@@ -45248,7 +45271,7 @@ test "issue 11737: identical callable contract vectors share their checked stora
     defer pass.callable_contracts.deinit(allocator);
     const contract = [_]static_dispatch.CheckedEvidence{.{
         .dispatcher_ty = @fromBackingInt(@intCast(1)),
-        .description_only_intrinsic = false,
+        .description_only_target = false,
         .resolution = .unreachable_value,
     }};
     const first = try pass.internCallableContracts(&contract);

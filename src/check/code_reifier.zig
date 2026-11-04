@@ -13145,6 +13145,7 @@ const InstancePlan = struct {
         self.table = .{};
         errdefer table.deinit(gpa);
         table.tables = try tables.tables.toOwnedSlice(gpa);
+        table.table_templates = try tables.templates.toOwnedSlice(gpa);
         table.table_entries = try tables.entries.toOwnedSlice(gpa);
         table.reads = try tables.reads.toOwnedSlice(gpa);
         table.uses = try gpa.dupe(Instances.Indexed, uses);
@@ -14125,6 +14126,8 @@ const TableBuilder = struct {
     /// The reader of the module whose closing uses are built.
     reifier: *Reifier,
     tables: std.ArrayList(Instances.Span) = .empty,
+    /// The template each of `tables` serves.
+    templates: std.ArrayList(Instances.TableTemplate) = .empty,
     entries: std.ArrayList(Instances.TableEntry) = .empty,
     reads: std.ArrayList(checked.CheckedCodeRead) = .empty,
     /// The refusal of each table, or null.
@@ -14156,6 +14159,7 @@ const TableBuilder = struct {
 
     fn deinit(self: *TableBuilder) void {
         self.tables.deinit(self.gpa);
+        self.templates.deinit(self.gpa);
         self.entries.deinit(self.gpa);
         self.reads.deinit(self.gpa);
         self.rejections.deinit(self.gpa);
@@ -14210,6 +14214,7 @@ const TableBuilder = struct {
         if (self.memo.get(memo_key)) |existing| return existing;
         const index: u32 = @intCast(self.tables.items.len);
         try self.tables.append(self.gpa, .{});
+        try self.templates.append(self.gpa, .{ .module = est.reader.artifact, .template = @backingInt(est.template) });
         try self.rejections.append(self.gpa, null);
         try self.memo.put(self.gpa, memo_key, index);
 
@@ -14258,6 +14263,7 @@ const TableBuilder = struct {
     fn refusedTable(self: *TableBuilder, rejection: Rejection) Allocator.Error!u32 {
         const index: u32 = @intCast(self.tables.items.len);
         try self.tables.append(self.gpa, .{});
+        try self.templates.append(self.gpa, .{ .module = .{}, .template = Instances.none });
         try self.rejections.append(self.gpa, rejection);
         return index;
     }

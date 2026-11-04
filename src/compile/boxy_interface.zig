@@ -274,6 +274,10 @@ pub const Digests = struct {
             hasher.update(std.mem.asBytes(&(param.slot orelse @as(u32, std.math.maxInt(u32)))));
         }
         hasher.update(std.mem.asBytes(&@as(u32, @intCast(templates.templateLiteralRequirements(&template).len))));
+        // A template with a Code inventory takes an instance table whose
+        // tuple has one callable per entry (design.md "Code Instance Tables").
+        const inventory_len: u32 = if (artifact.code_instances.inventoryOf(ref.template)) |inventory| @intCast(inventory.len) else std.math.maxInt(u32);
+        hasher.update(std.mem.asBytes(&inventory_len));
     }
 
     /// How an importer reads a constant: the value stored for it, or the

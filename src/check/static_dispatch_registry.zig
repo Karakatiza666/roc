@@ -1559,13 +1559,15 @@ pub const CheckedEvidence = struct {
     /// runtime representation still needs an explicit descriptor).
     dispatcher_ty: CheckedTypeId,
     resolution: Resolution,
-    /// Whether the resolution is `direct` to an intrinsic, and the callee's
-    /// relation for this obligation has a clear runs bit, so only
+    /// Whether the resolution is `direct` to a template no lowering emits
+    /// (`CheckedProcedureTemplate.description_only`: an intrinsic, a
+    /// reify-only definition, or a template returning `Code`), and the
+    /// callee's relation for this obligation has a clear runs bit, so only
     /// description-only bodies of the callee use it (design.md "The Runs
-    /// Bit"). No run-time code reads a dictionary slot for it, and an
-    /// intrinsic has no Roc body, so Boxy stores a crashing slot in place of
-    /// a worker. Descriptions still read the direct target.
-    description_only_intrinsic: bool,
+    /// Bit"). No run-time code reads a dictionary slot for it, so Boxy stores
+    /// a crashing slot in place of a worker. Descriptions still read the
+    /// direct target.
+    description_only_target: bool,
     /// Independent callable contracts in `evidence_refs`, sharing one target slot.
     callable_contracts: artifact_serialize.Span = .{},
 
@@ -3399,12 +3401,12 @@ test "StaticDispatchPlanTable: relocates with a constant number of fixups, opera
             .nested = .{ .resolved = .{ .start = 0, .len = 1 } },
         }};
         var evidence_refs = [_]CheckedEvidence{
-            .{ .dispatcher_ty = @fromBackingInt(@intCast(14)), .description_only_intrinsic = false, .resolution = .{ .structural = .{
+            .{ .dispatcher_ty = @fromBackingInt(@intCast(14)), .description_only_target = false, .resolution = .{ .structural = .{
                 .derivation = .encoder,
                 .dispatcher_ty = @fromBackingInt(@intCast(14)),
                 .callable_ty = @fromBackingInt(@intCast(15)),
             } } },
-            .{ .dispatcher_ty = @fromBackingInt(@intCast(12)), .description_only_intrinsic = false, .resolution = .{ .direct = @fromBackingInt(@intCast(fixtureTableIndex(0))) } },
+            .{ .dispatcher_ty = @fromBackingInt(@intCast(12)), .description_only_target = false, .resolution = .{ .direct = @fromBackingInt(@intCast(fixtureTableIndex(0))) } },
         };
         var site_evidence = [_]SiteEvidenceEntry{.{
             .key = 16,

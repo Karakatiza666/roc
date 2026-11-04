@@ -257,13 +257,36 @@ pub const WorkerKey = union(enum) {
     /// component built by the worker of its own type, so a recursive type
     /// reaches its own worker. Each module binding inputs has its own.
     code_value: struct { module: ModuleIndex, ty: TypeId, value: TypeId },
+    /// Code instance table `table` of `module` (design.md "Code Instance
+    /// Tables"): an erased worker with no arguments returning a tuple of
+    /// one callable per entry of the inventory the table serves, the
+    /// description thunk of a site's entry and the table of a forward
+    /// entry. A closing use passes it to the template it calls.
+    code_instances: struct { module: ModuleIndex, table: u32 },
+    /// The description thunk of entry `entry` of Code instance table
+    /// `table` of `module`: an erased worker with no arguments restoring
+    /// the entry's node of `module`'s constant store at the closed
+    /// representation of the site's type.
+    code_description: struct { module: ModuleIndex, table: u32, entry: u32 },
 };
 
-/// Why a dictionary slot's method crashes. `description_only_intrinsic` is a
-/// slot whose target is an intrinsic that only description-only bodies use
-/// (`CheckedEvidence.description_only_intrinsic`): no run-time code reads it
-/// (design.md, the section on definitions only a description reads).
-pub const CrashDictionary = enum { checked_error, unreachable_value, description_only_intrinsic };
+/// The template whose inventory a worker's instance table serves (design.md
+/// "Code Instance Tables").
+pub const InstanceInventory = struct {
+    module: ModuleIndex,
+    template: checked_names.CheckedProcedureTemplateId,
+    /// The inventory's entry count: the arity of the tuple the table's
+    /// worker returns.
+    entries: u32,
+};
+
+/// Why a dictionary slot's method crashes. `description_only_target` is a
+/// slot whose target no lowering emits (a template checking flags
+/// `description_only`: an intrinsic, a definition only descriptions reach, or
+/// a template returning `Code`) and that only description-only bodies use
+/// (`CheckedEvidence.description_only_target`): no run-time code reads it
+/// (design.md, invariant 1 of intrinsics).
+pub const CrashDictionary = enum { checked_error, unreachable_value, description_only_target };
 
 /// Where a stored constant lives: a checked module's constant store.
 pub const ConstSource = union(enum) { module: ModuleIndex };
@@ -354,6 +377,11 @@ pub const Worker = struct {
     /// For a generalized local procedure: how many literal arguments of its
     /// own scope its argument record carries after its own dictionaries.
     own_literals: u32 = 0,
+    /// The inventory whose Code instance table the worker takes as its last
+    /// hidden parameter (a template with an inventory, and its dictionary
+    /// entry's captures), or captures after its literal arguments (a lambda
+    /// of such a template), or null (design.md "Code Instance Tables").
+    instances: ?InstanceInventory = null,
 
     /// The bytes of the worker's procedure identity.
     pub fn identityBytes(self: Worker, program: *const Program) [32]u8 {
@@ -373,6 +401,19 @@ pub const Worker = struct {
         var count: u32 = 0;
         for (self.literal_scopes) |scope| count += @intCast(scope.len);
         return count - self.own_literals;
+    }
+
+    /// The instance table words the worker takes or captures: one for a
+    /// worker with an inventory in scope, else none.
+    pub fn instanceWords(self: Worker) u32 {
+        return @intFromBool(self.instances != null);
+    }
+
+    /// The hidden words a call of a template worker passes after its
+    /// explicit arguments: descriptors, dictionaries, literal arguments,
+    /// and the instance table.
+    pub fn hiddenCount(self: Worker) usize {
+        return self.scheme_vars.len + self.dictionary_params.len + self.literal_params + self.instanceWords();
     }
 };
 
@@ -619,7 +660,7 @@ pub const Program = struct {
                 hasher.update(&self.modules.linkName(default.module));
                 hasher.update(std.mem.asBytes(&self.defaultOrdinal(default.module, default.expr)));
             },
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("a worker no module's object exports has no content identity"),
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("a worker no module's object exports has no content identity"),
         }
         return .{ .bytes = hasher.finalResult() };
     }
@@ -638,7 +679,7 @@ pub const Program = struct {
     pub fn exportableKind(key: WorkerKey) bool {
         return switch (key) {
             .template, .lambda, .method_entry, .default => true,
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => false,
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => false,
         };
     }
 
@@ -719,6 +760,7 @@ pub const Program = struct {
         const erased = try self.result.layouts.insertErasedCallable();
         for (imported.dictionary_params) |_| try args.append(self.allocator, try store.addLocal(.{ .layout_idx = erased }));
         for (0..imported.literal_params) |_| try args.append(self.allocator, try store.addLocal(.{ .layout_idx = erased }));
+        for (0..imported.instanceWords()) |_| try args.append(self.allocator, try store.addLocal(.{ .layout_idx = erased }));
         const proc = store.getProcSpecPtr(imported.proc);
         proc.args = try store.addLocalSpan(args.items);
         if (try self.converter().representationClosed(imported.ret)) {
@@ -801,6 +843,11 @@ pub const Program = struct {
     /// The worker for a procedure template, requested if new.
     /// The worker of a procedure template, queued for lowering.
     pub fn templateWorker(self: *Program, module_index: ModuleIndex, template_id: checked_names.CheckedProcedureTemplateId) Allocator.Error!WorkerId {
+        // Invariant 1 of intrinsics (design.md): no run-time code reaches a
+        // template only a Code description reads, so no use asks for its
+        // worker, and no unit emits one.
+        if (self.module(module_index).view.checked_procedure_templates.get(template_id).description_only)
+            invariant("lowering reached a template only a Code description reads");
         const id = try self.templateScope(module_index, template_id);
         if (self.worker(id).imported) {
             // A call compiles against the signature the worker's own object
@@ -899,6 +946,10 @@ pub const Program = struct {
             .dict_scope_params = try self.arena.allocator().dupe([]const static_dispatch.EvidenceParamRecord, &.{evidence_params}),
             .literal_params = @intCast(literal_requirements.len),
             .literal_scopes = try self.arena.allocator().dupe([]const checked.LiteralRequirement, &.{literal_requirements}),
+            .instances = if (view.view.code_instances.inventoryOf(template_id)) |inventory|
+                .{ .module = module_index, .template = template_id, .entries = @intCast(inventory.len) }
+            else
+                null,
             .imported = imported,
             .lowered = imported,
         });
@@ -973,6 +1024,7 @@ pub const Program = struct {
             .own_dicts = if (own) |scheme| (if (scheme.per_call) @intCast(scheme.dictionaries.len) else 0) else 0,
             .literal_scopes = if (own) |scheme| try std.mem.concat(self.arena.allocator(), []const checked.LiteralRequirement, &.{ &.{scheme.literal_requirements}, outer_worker.literal_scopes }) else outer_worker.literal_scopes,
             .own_literals = if (own) |scheme| (if (scheme.per_call) @intCast(scheme.literal_requirements.len) else 0) else 0,
+            .instances = outer_worker.instances,
             .imported = imported,
             .lowered = imported,
             .queued = imported,
@@ -1481,6 +1533,16 @@ pub const Program = struct {
                         continue;
                     },
                 };
+                // An override only a Code description reads (an intrinsic method)
+                // is in the descriptor's slot, but checking rejects every
+                // run-time comparison, hash or inspection that would call it
+                // (`CheckedEvidence.description_only_target`), so the slot
+                // crashes as a dictionary slot of such a target does.
+                if (self.templateRefDescriptionOnly(template)) {
+                    const crash = try self.crashDictionaryWorker(nominal.decl.module, .description_only_target);
+                    slot.* = .{ .procedure = .{ .entry = crash, .target = crash, .bound = &.{}, .dicts = &.{} } };
+                    continue;
+                }
                 const worker_id = try self.templateRefWorker(template);
                 const target_worker = self.worker(worker_id).*;
                 const formal = try self.store.intern(.{ .function = .{ .args = target_worker.params, .ret = target_worker.ret, .effectful = false } });
@@ -1595,7 +1657,7 @@ pub const Program = struct {
         if (requirements.len == 0) return .{ .bound = bound, .requirements = requirements };
         const key = switch (target_worker.key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("a worker with dictionary parameters is not a template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("a worker with dictionary parameters is not a template's"),
         };
         const templates = self.module(key.module).view.checked_procedure_templates;
         const params = poolSlice(static_dispatch.EvidenceParamRecord, templates.evidence_params_pool, templates.templates.items[@backingInt(key.template)].evidence_params);
@@ -1751,7 +1813,7 @@ pub const Program = struct {
         if (target_worker.dictionary_params.len == 0) return;
         const key = switch (target_worker.key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("a worker with dictionary parameters is not a template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("a worker with dictionary parameters is not a template's"),
         };
         const templates = self.module(key.module).view.checked_procedure_templates;
         const all_params = poolSlice(static_dispatch.EvidenceParamRecord, templates.evidence_params_pool, templates.templates.items[@backingInt(key.template)].evidence_params);
@@ -1865,7 +1927,13 @@ pub const Program = struct {
             if (self.registeredMethod(requirement.module, owned.module, owned.owner, method_text)) |found| switch (found) {
                 .rejected => return .{ .crash = .checked_error },
                 .target => |target| switch (target.kind) {
-                    .procedure => |procedure| return .{ .target = try self.templateRefWorker(procedure.template) },
+                    // A method only a Code description reads fills its slot with
+                    // a crash, as checked evidence's
+                    // `description_only_target` does.
+                    .procedure => |procedure| return if (self.templateRefDescriptionOnly(procedure.template))
+                        .{ .crash = .description_only_target }
+                    else
+                        .{ .target = try self.templateRefWorker(procedure.template) },
                     .structural => |kind| return structuralResolution(kind, requirement.dispatcher),
                     .local_proc => invariant("a method a local procedure implements belongs to a type declared in a function body, which no type-resolved requirement outside that body names"),
                 },
@@ -2126,7 +2194,7 @@ pub const Program = struct {
             const scoped = self.worker(current).*;
             const outer: ?WorkerId = switch (scoped.key) {
                 .lambda => |lambda| lambda.outer,
-                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => null,
+                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => null,
             };
             const own = if (outer) |o| scoped.literal_scopes.len != self.worker(o).literal_scopes.len else scoped.literal_scopes.len != 0;
             if (own) try owners.append(allocator, current);
@@ -2258,6 +2326,72 @@ pub const Program = struct {
         const key: WorkerKey = .{ .root_slot = .{ .module = module_index, .root = root } };
         if (self.worker_ids.get(key)) |existing| return existing;
         return try self.addErasedWorker(key, module_index, &.{}, &.{}, ty, "boxy.root_slot");
+    }
+
+    /// The worker of Code instance table `table` of `module_index` (see
+    /// `WorkerKey.code_instances`).
+    pub fn codeInstancesWorker(self: *Program, module_index: ModuleIndex, table: u32) Allocator.Error!WorkerId {
+        const key: WorkerKey = .{ .code_instances = .{ .module = module_index, .table = table } };
+        if (self.worker_ids.get(key)) |existing| return existing;
+        const entries = self.module(module_index).view.code_instances.tableEntries(table);
+        return try self.addErasedWorker(key, module_index, &.{}, &.{}, try self.instanceTupleType(@intCast(entries.len)), "boxy.code_instances");
+    }
+
+    /// What a Code instance table's worker returns: one callable per entry
+    /// of the inventory it serves, in inventory order.
+    pub fn instanceTupleType(self: *Program, count: u32) Allocator.Error!TypeId {
+        const callable = try self.anyFunction();
+        const items = try self.allocator.alloc(TypeId, count);
+        defer self.allocator.free(items);
+        @memset(items, callable);
+        return try self.store.intern(.{ .tuple = items });
+    }
+
+    /// The description thunk of entry `entry` of Code instance table
+    /// `table` of `module_index` (see `WorkerKey.code_description`).
+    pub fn codeDescriptionWorker(self: *Program, module_index: ModuleIndex, table: u32, entry: u32) Allocator.Error!WorkerId {
+        const key: WorkerKey = .{ .code_description = .{ .module = module_index, .table = table, .entry = entry } };
+        if (self.worker_ids.get(key)) |existing| return existing;
+        const served = try self.servedInventory(module_index, table);
+        const site = served.entries[entry];
+        if (site.kind != .site) invariant("a description thunk names an inventory entry that is no site");
+        // The site's type in its template's own variables: the
+        // representation of a `Code(f)`, a `Code.Ty` or a `Code.TypeId`
+        // reads none of them, so every instance has this one.
+        const scope = self.worker(try self.templateScope(served.module, served.template)).*;
+        const bound = try self.allocator.alloc(TypeId, scope.scheme_vars.len);
+        defer self.allocator.free(bound);
+        for (bound, 0..) |*slot, index| slot.* = try self.store.variable(@intCast(index));
+        const view = self.module(served.module);
+        const site_ty = try self.converter().convert(served.module, view.bodies().expr(site.expr).ty, .{ .module = served.module, .vars = scope.scheme_vars, .bound = bound });
+        return try self.addErasedWorker(key, module_index, &.{}, &.{}, try self.closedRepresentation(site_ty), "boxy.code_description");
+    }
+
+    /// The template Code instance table `table` of `module_index` serves,
+    /// and that template's inventory.
+    pub fn servedInventory(self: *Program, module_index: ModuleIndex, table: u32) Allocator.Error!struct { module: ModuleIndex, template: checked_names.CheckedProcedureTemplateId, entries: []const checked.CodeInstanceTable.Entry } {
+        const served = self.module(module_index).view.code_instances.tableTemplate(table);
+        if (served.template == checked.CodeInstanceTable.none) invariant("a refused Code instance table reached lowering");
+        const holder = self.moduleByKey(.{ .bytes = served.module.bytes });
+        const template_id: checked_names.CheckedProcedureTemplateId = @fromBackingInt(served.template);
+        const entries = holder.view.code_instances.inventoryOf(template_id) orelse invariant("a Code instance table serves a template with no inventory");
+        if (entries.len != self.module(module_index).view.code_instances.tableEntries(table).len) invariant("a Code instance table's entries differ from its template's inventory");
+        return .{ .module = holder.index, .template = template_id, .entries = entries };
+    }
+
+    /// The closed type whose layout values of `ty` share: `ty` when it is
+    /// closed, else the backing of the nominal it is, which a nominal's
+    /// value shares (design.md "One Representation Per Type").
+    pub fn closedRepresentation(self: *Program, ty: TypeId) Allocator.Error!TypeId {
+        var current = ty;
+        while (!self.store.isClosed(current)) switch (self.store.get(current)) {
+            .nominal => |nominal| {
+                if (!nominal.has_backing) invariant("an open nominal with no backing has no closed representation");
+                current = try self.converter().backing(current);
+            },
+            .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .function, .variable => invariant("a Code instance site's type has no closed representation"),
+        };
+        return current;
     }
 
     /// The structural method worker of `method`, generic over one type `a`
@@ -2437,6 +2571,12 @@ pub const Program = struct {
         });
         try self.root_value_slots.put(self.allocator, key, slot);
         return slot;
+    }
+
+    /// Whether the template `ref` names is one only a Code description reads
+    /// (`CheckedProcedureTemplate.description_only`).
+    pub fn templateRefDescriptionOnly(self: *Program, ref: checked_names.ProcedureTemplateRef) bool {
+        return self.moduleByKey(.{ .bytes = ref.artifact.bytes }).view.checked_procedure_templates.get(ref.template).description_only;
     }
 
     pub fn templateRefWorker(self: *Program, ref: checked_names.ProcedureTemplateRef) Allocator.Error!WorkerId {
@@ -2673,7 +2813,7 @@ pub fn run(allocator: Allocator, input: Input) Allocator.Error!Output {
                     const export_name = names.procBase(template.proc_base).export_name orelse break :blk "boxy.template";
                     break :blk names.exportNameText(export_name);
                 },
-                inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => |_, kind| "boxy." ++ @tagName(kind),
+                inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => |_, kind| "boxy." ++ @tagName(kind),
             };
             try program.result.store.setProcDebugName(worker.proc, name);
         }
@@ -2735,6 +2875,10 @@ fn templateRejected(program: *Program, view: *const types.ModuleView, template: 
 /// wrappers of `expect` and REPL roots. Nothing reaches those but a test
 /// plan's or a REPL's own roots, and each of those lowers as one program.
 fn unitEmitsTemplate(view: *const types.ModuleView, template: checked.CheckedProcedureTemplate) bool {
+    // No run-time code reaches a template only a Code description reads
+    // (invariant 1): an intrinsic's declaration, a definition only descriptions reach, or
+    // a template returning `Code`.
+    if (template.description_only) return false;
     return switch (template.body) {
         .checked_body, .unimplemented => true,
         // The checked module stores every call of `Code.prim`, `Code.type_id` and

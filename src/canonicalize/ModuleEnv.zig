@@ -1170,6 +1170,11 @@ top_level_demand_dependencies_ready: bool,
 /// Demand"): functions whose bodies can, and definitions holding values.
 /// Checking produces it with the strict-demand relation; importers read it.
 invoking_defs: collections.SafeList(CIR.Def.Idx),
+/// The top-level definitions whose annotation returns a `Code` (templates),
+/// in ascending order (design.md "Code Reification"). A template's body is
+/// described at each call and never runs. Checking produces it; the checked
+/// module builder reads it.
+code_template_defs: collections.SafeList(CIR.Def.Idx),
 /// The top-level definitions that only reified code can use, in ascending
 /// order of definition id, each with its witness (design.md "Reify-Only
 /// Definitions"). Checking produces it after the module is checked;
@@ -1579,6 +1584,7 @@ pub fn initCIRFields(self: *Self, module_name: []const u8) Allocator.Error!void 
     self.top_level_demand_dependencies = .{};
     self.top_level_demand_dependencies_ready = false;
     self.invoking_defs = .{};
+    self.code_template_defs = .{};
     self.reify_only_defs = .{};
     self.reify_only_frames = .{};
     self.reify_only_text = .{};
@@ -1636,6 +1642,7 @@ pub fn init(gpa: std.mem.Allocator, source: []const u8) std.mem.Allocator.Error!
         .top_level_demand_dependencies = .{},
         .top_level_demand_dependencies_ready = false,
         .invoking_defs = .{},
+        .code_template_defs = .{},
         .reify_only_defs = .{},
         .reify_only_frames = .{},
         .reify_only_text = .{},
@@ -1706,6 +1713,7 @@ pub fn deinit(self: *Self) void {
     self.inspect_override_instances.deinit(self.gpa);
     self.top_level_demand_dependencies.deinit(self.gpa);
     self.invoking_defs.deinit(self.gpa);
+    self.code_template_defs.deinit(self.gpa);
     self.reify_only_defs.deinit(self.gpa);
     self.reify_only_frames.deinit(self.gpa);
     self.reify_only_text.deinit(self.gpa);
@@ -1734,6 +1742,37 @@ pub fn setInvokingDefs(self: *Self, defs: []const CIR.Def.Idx) std.mem.Allocator
     for (defs) |def_idx| _ = try list.append(self.gpa, def_idx);
     self.invoking_defs.deinit(self.gpa);
     self.invoking_defs = list;
+}
+
+/// Replace the checked record of the module's templates. `defs` must be
+/// ascending.
+pub fn setCodeTemplateDefs(self: *Self, defs: []const CIR.Def.Idx) std.mem.Allocator.Error!void {
+    var list = try collections.SafeList(CIR.Def.Idx).initCapacity(self.gpa, defs.len);
+    errdefer list.deinit(self.gpa);
+    for (defs) |def_idx| _ = try list.append(self.gpa, def_idx);
+    self.code_template_defs.deinit(self.gpa);
+    self.code_template_defs = list;
+}
+
+/// Whether top-level `def_idx` is a template: its annotation returns a
+/// `Code`, so its body is described at each call and never runs.
+pub fn isCodeTemplateDef(self: *const Self, def_idx: CIR.Def.Idx) bool {
+    const defs = self.code_template_defs.items.items;
+    const wanted: u32 = @backingInt(def_idx);
+    var low: usize = 0;
+    var high: usize = defs.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const candidate: u32 = @backingInt(defs[mid]);
+        if (candidate < wanted) {
+            low = mid + 1;
+        } else if (candidate > wanted) {
+            high = mid;
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Whether calling top-level `def_idx` can invoke a function value it does
@@ -4207,6 +4246,7 @@ pub const Serialized = extern struct {
     store: NodeStore.Serialized,
     top_level_demand_dependencies: DependencyGraph.Dependency.SafeList.Serialized,
     invoking_defs: collections.SafeList(CIR.Def.Idx).Serialized,
+    code_template_defs: collections.SafeList(CIR.Def.Idx).Serialized,
     reify_only_defs: ReifyOnlyDef.SafeList.Serialized,
     reify_only_frames: ReifyOnlyFrame.SafeList.Serialized,
     reify_only_text: collections.SafeList(u8).Serialized,
@@ -4318,6 +4358,7 @@ pub const Serialized = extern struct {
             writer,
         );
         try self.invoking_defs.serialize(&env.invoking_defs, allocator, writer);
+        try self.code_template_defs.serialize(&env.code_template_defs, allocator, writer);
         try self.reify_only_defs.serialize(&env.reify_only_defs, allocator, writer);
         try self.reify_only_frames.serialize(&env.reify_only_frames, allocator, writer);
         try self.reify_only_text.serialize(&env.reify_only_text, allocator, writer);
@@ -4424,6 +4465,7 @@ pub const Serialized = extern struct {
             .top_level_demand_dependencies = self.top_level_demand_dependencies.deserializeInto(base_addr),
             .top_level_demand_dependencies_ready = self.top_level_demand_dependencies_ready,
             .invoking_defs = self.invoking_defs.deserializeInto(base_addr),
+            .code_template_defs = self.code_template_defs.deserializeInto(base_addr),
             .reify_only_defs = self.reify_only_defs.deserializeInto(base_addr),
             .reify_only_frames = self.reify_only_frames.deserializeInto(base_addr),
             .reify_only_text = self.reify_only_text.deserializeInto(base_addr),
@@ -4514,6 +4556,7 @@ pub const Serialized = extern struct {
             .top_level_demand_dependencies = self.top_level_demand_dependencies.deserializeInto(base_addr),
             .top_level_demand_dependencies_ready = self.top_level_demand_dependencies_ready,
             .invoking_defs = self.invoking_defs.deserializeInto(base_addr),
+            .code_template_defs = self.code_template_defs.deserializeInto(base_addr),
             .reify_only_defs = self.reify_only_defs.deserializeInto(base_addr),
             .reify_only_frames = self.reify_only_frames.deserializeInto(base_addr),
             .reify_only_text = self.reify_only_text.deserializeInto(base_addr),
@@ -4616,6 +4659,7 @@ pub const Serialized = extern struct {
             .top_level_demand_dependencies = try self.top_level_demand_dependencies.deserializeWithCopy(base_addr, gpa),
             .top_level_demand_dependencies_ready = self.top_level_demand_dependencies_ready,
             .invoking_defs = try self.invoking_defs.deserializeWithCopy(base_addr, gpa),
+            .code_template_defs = try self.code_template_defs.deserializeWithCopy(base_addr, gpa),
             .reify_only_defs = try self.reify_only_defs.deserializeWithCopy(base_addr, gpa),
             .reify_only_frames = try self.reify_only_frames.deserializeWithCopy(base_addr, gpa),
             .reify_only_text = try self.reify_only_text.deserializeWithCopy(base_addr, gpa),

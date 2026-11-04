@@ -205,10 +205,15 @@ pub const Plan = struct {
         }
         plan.target_starts[exports.len] = cursor;
 
-        plan.order = try postOrder(allocator, exports.len, plan.targets, plan.target_starts);
+        // An export on a relocation cycle (the static descriptor of a
+        // recursive type, whose node graph is cyclic by design; see
+        // `src/postcheck/boxy/static_descs.zig`) has no content hash that
+        // does not depend on itself, so it is never pooled.
+        @memset(plan.poolable, true);
+        plan.order = try postOrder(allocator, exports.len, plan.targets, plan.target_starts, plan.poolable);
 
         for (plan.order) |i| {
-            var poolable = !exports[i].is_mutable;
+            var poolable = !exports[i].is_mutable and plan.poolable[i];
             for (plan.targets[plan.target_starts[i]..plan.target_starts[i + 1]]) |target| {
                 if (target == none or !plan.poolable[target]) poolable = false;
             }
@@ -337,8 +342,9 @@ fn relocationOffsetLessThan(relocations: []const StaticDataRelocation, a: u32, b
     return relocations[a].offset < relocations[b].offset;
 }
 
-/// Order exports so every address target precedes the exports pointing at it.
-fn postOrder(allocator: Allocator, count: usize, targets: []const u32, target_starts: []const u32) Allocator.Error![]u32 {
+/// Order exports so every address target precedes the exports pointing at it,
+/// except along a relocation cycle, whose members it clears in `acyclic`.
+fn postOrder(allocator: Allocator, count: usize, targets: []const u32, target_starts: []const u32, acyclic: []bool) Allocator.Error![]u32 {
     const order = try allocator.alloc(u32, count);
     errdefer allocator.free(order);
     const state = try allocator.alloc(enum(u2) { unvisited, open, done }, count);
@@ -368,7 +374,16 @@ fn postOrder(allocator: Allocator, count: usize, targets: []const u32, target_st
             if (target == none) continue;
             switch (state[target]) {
                 .done => {},
-                .open => base.invariant("static data invariant violated: export {d} reaches itself through address relocations", .{target}),
+                // A back edge: every export from `target` up the stack is on
+                // the cycle it closes.
+                .open => {
+                    var depth = stack.items.len;
+                    while (depth > 0) {
+                        depth -= 1;
+                        acyclic[stack.items[depth].node] = false;
+                        if (stack.items[depth].node == target) break;
+                    }
+                },
                 .unvisited => {
                     state[target] = .open;
                     try stack.append(allocator, .{ .node = target, .next_target = target_starts[target] });
@@ -498,6 +513,19 @@ fn mappedSlice(comptime T: type, mapping: []const u8, offset: u64, count: u64) E
     if (start > mapping.len or byte_len > mapping.len - start) return error.InvalidStaticPool;
     const ptr: [*]align(1) const T = @ptrCast(mapping.ptr + start);
     return ptr[0..len];
+}
+
+test "exports on a relocation cycle, and those reaching one, are never pooled" {
+    const exports = [_]StaticDataExport{
+        .{ .symbol_name = "leaf", .bytes = &@as([8]u8, @splat(0)), .alignment = 8 },
+        .{ .symbol_name = "a", .bytes = &@as([16]u8, @splat(0)), .alignment = 8, .relocations = &.{ .{ .offset = 0, .target_symbol_name = "b", .target = .{ .data_symbol = @fromBackingInt(2) } }, .{ .offset = 8, .target_symbol_name = "leaf", .target = .{ .data_symbol = @fromBackingInt(0) } } } },
+        .{ .symbol_name = "b", .bytes = &@as([8]u8, @splat(0)), .alignment = 8, .relocations = &.{.{ .offset = 0, .target_symbol_name = "a", .target = .{ .data_symbol = @fromBackingInt(1) } }} },
+        .{ .symbol_name = "slot", .bytes = &@as([8]u8, @splat(0)), .alignment = 8, .relocations = &.{.{ .offset = 0, .target_symbol_name = "a", .target = .{ .data_symbol = @fromBackingInt(1) } }} },
+    };
+    var plan = try Plan.init(std.testing.allocator, &exports, true);
+    defer plan.deinit();
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false, false }, plan.poolable);
+    try std.testing.expectEqual(@as(usize, exports.len), plan.order.len);
 }
 
 test "boxy composition slots and their parents are never pooled between images" {

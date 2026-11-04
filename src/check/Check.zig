@@ -19918,7 +19918,12 @@ fn predeclareAnnotatedDefSchemes(self: *Self, env: *Env) std.mem.Allocator.Error
 ///
 /// The predeclared scheme is the type read, because `predeclareAnnotationScheme`
 /// resets the annotation's own nodes for the body pass to regenerate.
+///
+/// The templates are published (`ModuleEnv.code_template_defs`): no
+/// run-time code runs a template's body, so no lowering emits it.
 fn collectStagedTemplates(self: *Self) std.mem.Allocator.Error!void {
+    var template_defs: std.ArrayList(CIR.Def.Idx) = .empty;
+    defer template_defs.deinit(self.gpa);
     for (0..self.cir.all_defs.span.len) |def_offset| {
         const def_idx = self.cir.store.defAt(self.cir.all_defs, def_offset);
         const scheme_var = self.predeclaredSchemeVar(def_idx) orelse continue;
@@ -19926,7 +19931,14 @@ fn collectStagedTemplates(self: *Self) std.mem.Allocator.Error!void {
         const staged = self.stagedCode(returns) orelse continue;
         const def = self.cir.store.getDef(def_idx);
         try self.staged_templates.put(self.gpa, def.pattern, staged);
+        try template_defs.append(self.gpa, def_idx);
     }
+    std.mem.sort(CIR.Def.Idx, template_defs.items, {}, struct {
+        fn lessThan(_: void, a: CIR.Def.Idx, b_: CIR.Def.Idx) bool {
+            return @backingInt(a) < @backingInt(b_);
+        }
+    }.lessThan);
+    try self.cir.setCodeTemplateDefs(template_defs.items);
 }
 
 /// What a function type returns, following aliases. Null for every other type.

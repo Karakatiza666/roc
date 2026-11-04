@@ -180,8 +180,9 @@ over a type whose `iter` is a fragment.
 The checked module builder records these descriptions in an instance table
 (`CodeInstanceTable`), keyed by template and instantiation, so equal
 instances share one table. Monotype and Boxy read the table in force where
-the program runs the fragment. Boxy plans one worker per table, not a hidden
-argument. `Code.ty_of` and `Code.type_id` calls (section 5) whose proxy type
+the program runs the fragment. Boxy lowers the fragment once and passes the
+table as one hidden argument, as it passes a literal argument: the caller
+that fixes the types supplies it. `Code.ty_of` and `Code.type_id` calls (section 5) whose proxy type
 names a type variable of the function around them are entries of the same
 table.
 
@@ -943,8 +944,12 @@ One case needed a rule in Boxy. Boxy fills a dictionary slot for each
 relation of a callee's scheme. A fragment `|q| Db.Q.filter(q, |x| x.t.now())`
 has `now` in its scheme, but only the described lambda uses it. At `Clock`,
 whose `now` is an intrinsic, the evidence is marked
-`description_only_intrinsic`, and Boxy gives the slot a crashing value in
-place of a worker. No run-time code reads it.
+`description_only_target`, and Boxy gives the slot a crashing value in
+place of a worker. No run-time code reads it. The same holds for a slot
+whose target is a reify-only definition or a function that returns `Code`,
+and for a nominal's `is_eq`, `to_hash` or `to_inspect` override that is an
+intrinsic. The checked module flags each such template, and Boxy emits no
+worker for it.
 
 ### 9.5 Across modules
 

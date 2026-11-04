@@ -60,7 +60,7 @@ pub fn captureShape(program: *Program, id: WorkerId) CaptureShape {
         .lambda => .{
             .values = worker.capture_types,
             .descs = @intCast(worker.scheme_vars.len - worker.own_descs),
-            .dicts = worker.capturedDictionaryCount() + worker.capturedLiteralCount(),
+            .dicts = worker.capturedDictionaryCount() + worker.capturedLiteralCount() + worker.instanceWords(),
             .composed = false,
         },
         .adapter => .{ .values = worker.capture_types, .descs = @intCast(worker.scheme_vars.len), .dicts = 0, .composed = false },
@@ -69,19 +69,19 @@ pub fn captureShape(program: *Program, id: WorkerId) CaptureShape {
             break :blk .{
                 .values = &.{},
                 .descs = @intCast(target_worker.scheme_vars.len),
-                .dicts = @intCast(target_worker.dictionary_params.len + target_worker.literal_params),
+                .dicts = @intCast(target_worker.dictionary_params.len + target_worker.literal_params + target_worker.instanceWords()),
                 .composed = true,
             };
         },
         .structural, .structural_map => .{ .values = &.{}, .descs = worker.structural_descs, .dicts = 0, .composed = true },
-        .crash_dictionary, .literal_thunk, .root_slot => .{ .values = &.{}, .descs = 0, .dicts = 0, .composed = true },
+        .crash_dictionary, .literal_thunk, .root_slot, .code_instances => .{ .values = &.{}, .descs = 0, .dicts = 0, .composed = true },
         .codec => |index| .{
             .values = worker.capture_types,
             .descs = @intCast(worker.scheme_vars.len),
             .dicts = 0,
             .composed = program.codec.pieces.items[index].kind == .constructor,
         },
-        .template, .default, .root, .static_data, .convert, .code_value => invariant("a worker that is no function value reached a stored function"),
+        .template, .default, .root, .static_data, .convert, .code_value, .code_description => invariant("a worker that is no function value reached a stored function"),
     };
 }
 
@@ -174,7 +174,7 @@ pub const Retained = struct {
         // from the types rather than stored as a cycle.
         const rebuilt = switch (program.worker(worker_id).key) {
             .method_entry => |target| try program.dictionaryCapturesItself(target, bound),
-            .lambda, .adapter, .structural, .structural_map, .crash_dictionary, .literal_thunk, .root_slot, .codec, .template, .default, .root, .static_data, .convert, .code_value => false,
+            .lambda, .adapter, .structural, .structural_map, .crash_dictionary, .literal_thunk, .root_slot, .codec, .template, .default, .root, .static_data, .convert, .code_value, .code_instances, .code_description => false,
         };
         try recipe.bytes.append(allocator, @intFromBool(rebuilt));
         if (rebuilt) return .{ .recipe = try recipe.finish(), .captures = &.{} };
@@ -272,6 +272,7 @@ const Tag = enum(u8) {
     structural_map,
     crash_dictionary,
     codec,
+    code_instances,
 };
 
 fn appendWord(allocator: Allocator, list: *std.ArrayList(u8), value: u32) Allocator.Error!void {
@@ -555,7 +556,14 @@ const Encoder = struct {
                 try self.typeOf(record.ret);
                 try self.typeSpan(record.capture_types);
             },
-            .root, .static_data, .convert, .code_value => invariant("a worker that is no function value reached a stored function"),
+            .code_instances => |key| {
+                try self.tag(.code_instances);
+                try self.module(key.module);
+                try self.word(key.table);
+            },
+            // Only a table's worker composes a description thunk, so no
+            // function value captures one.
+            .root, .static_data, .convert, .code_value, .code_description => invariant("a worker that is no function value reached a stored function"),
         }
     }
 };
@@ -767,6 +775,10 @@ const Decoder = struct {
                 const ret = self.typeOf();
                 const captures = try self.typeSpan();
                 return try Codec.restorePiece(program, module_index, root, kind, a, b_operand, params, ret, captures);
+            },
+            .code_instances => {
+                const module_index = self.module();
+                return try program.codeInstancesWorker(module_index, self.word());
             },
         }
     }

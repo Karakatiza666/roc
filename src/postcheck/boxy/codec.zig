@@ -1267,10 +1267,10 @@ const Gen = struct {
                 const instance = switch (node.instantiation) {
                     .alias => blk: {
                         if (b.module != self.fam().module) invariant("a generated codec piece is lowered outside its family's module");
-                        break :blk try b.aliasTargetInstance(node, callee, .{ .node = callable.node });
+                        break :blk try b.aliasTargetInstance(node, callee, .{ .node = callable.node }, null);
                     },
                     .derived_from_callable => |callable_ty| try b.callableDerivedInstance(callee, &.{}, try b.convert(callable_ty)),
-                    .callable, .monomorphic => try b.callInstanceAt(callee, subst, nested, callable.fn_ty, .{ .node = callable.node }),
+                    .callable, .monomorphic => try b.callInstanceAt(callee, subst, nested, callable.fn_ty, .{ .node = callable.node }, null),
                 };
                 defer b.allocator.free(instance.hidden);
                 const ret_ty = fnRet(program_, callable.fn_ty);
