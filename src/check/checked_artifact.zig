@@ -27111,7 +27111,7 @@ fn checkedTypeIsCustomNominal(store: *const CheckedTypeStore, root: CheckedTypeI
     while (true) switch (store.payload(current)) {
         .alias => |alias| current = alias.backing,
         .nominal => |nominal| return nominal.builtin == null,
-        .pending, .err, .flex, .rigid, .record, .tuple, .function, .tag_union, .empty_record, .empty_tag_union => return false,
+        .pending, .field_kind, .err, .flex, .rigid, .record, .tuple, .function, .tag_union, .empty_record, .empty_tag_union => return false,
     };
 }
 
@@ -27517,7 +27517,7 @@ fn publishLiteralArgumentRoots(
             const ty = switch (literal_expr.data) {
                 .interpolation => |interpolation| interpolation.assembler_ty,
                 .numeral, .str_from_quote => literal_expr.ty,
-                .pending, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => checkedArtifactInvariant("a literal conversion plan's expression is not a literal", .{}),
+                .pending, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => checkedArtifactInvariant("a literal conversion plan's expression is not a literal", .{}),
             };
             const slot = try entry.value_ptr.index.getOrPut(allocator, .{ .site = site, .ty = try literalRequirementTypeIdentity(store, &identity_orderer, ty) });
             if (slot.found_existing) continue;
@@ -44523,8 +44523,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0x86, 0x08, 0x40, 0x43, 0x02, 0x9B, 0xB8, 0xD8, 0xB9, 0xA5, 0x3E, 0x92, 0xCC, 0xD5, 0x04, 0xE8,
-        0xE6, 0xF9, 0x4D, 0x94, 0x85, 0xA5, 0xBE, 0x28, 0xAE, 0x28, 0xF3, 0x0C, 0xAA, 0xD2, 0xE6, 0x19,
+        0xBB, 0x85, 0x8B, 0xA6, 0x59, 0x0D, 0x36, 0xE1, 0x2B, 0x23, 0x14, 0x33, 0xA3, 0x9A, 0xD4, 0x7D,
+        0x37, 0x2B, 0xE3, 0xCA, 0x89, 0x3B, 0x45, 0xDA, 0x03, 0xF0, 0x0C, 0xEF, 0x27, 0xC9, 0xCB, 0x42,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

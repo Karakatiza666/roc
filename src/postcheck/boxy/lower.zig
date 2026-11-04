@@ -1530,9 +1530,16 @@ pub const Program = struct {
                 },
                 .list, .box => |child| try pending.append(self.allocator, child),
                 .nominal => |nominal| {
-                    for (try self.nominalOverrides(ty)) |maybe| {
-                        if (maybe) |override| if (override == .local) break :walk true;
-                    }
+                    // A method's static callable captures the descriptors of
+                    // the types its scheme is bound to, so a method bound to
+                    // a type only a body describes (a phantom argument of a
+                    // nominal whose backing is closed) is composed there too.
+                    for (try self.nominalOverrides(ty)) |maybe| if (maybe) |override| switch (override) {
+                        .local => break :walk true,
+                        .procedure => |procedure| for (procedure.bound) |bound| {
+                            if (!store.isClosed(bound)) break :walk true;
+                        },
+                    };
                     try pending.appendSlice(self.allocator, store.nominalArgs(nominal));
                     if (nominal.has_backing) try pending.append(self.allocator, try self.converter().backing(ty));
                 },
@@ -2461,7 +2468,7 @@ pub fn run(allocator: Allocator, input: Input) Allocator.Error!Output {
             try program.local_scopes.put(allocator, .{ .module = view.index, .expr = scope.checked_expr }, id);
             switch (bodies.expr(scope.checked_expr).data) {
                 .closure => |closure| try program.local_scopes.put(allocator, .{ .module = view.index, .expr = closure.lambda }, id),
-                .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+                .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
             }
         }
         try program.by_identity.put(allocator, view.view.module_identity.stable_hash, view.index);
@@ -2485,7 +2492,7 @@ pub fn run(allocator: Allocator, input: Input) Allocator.Error!Output {
                     try program.local_procs.put(allocator, .{ .module = view.index, .expr = local.expr }, {});
                     switch (bodies.expr(local.expr).data) {
                         .closure => |closure| try program.local_procs.put(allocator, .{ .module = view.index, .expr = closure.lambda }, {}),
-                        .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+                        .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
                     }
                 },
                 .procedure, .structural => {},
@@ -2501,7 +2508,7 @@ pub fn run(allocator: Allocator, input: Input) Allocator.Error!Output {
             try program.local_procs.put(allocator, .{ .module = view.index, .expr = local.expr }, {});
             switch (bodies.expr(local.expr).data) {
                 .closure => |closure| try program.local_procs.put(allocator, .{ .module = view.index, .expr = closure.lambda }, {}),
-                .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+                .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
             }
         }
     }
@@ -2650,7 +2657,9 @@ fn seedUnitWorkers(program: *Program) Allocator.Error!void {
                 .local_proc, .structural => continue,
             };
             const owner = program.moduleByKey(.{ .bytes = template.artifact.bytes });
-            if (try templateRejected(program, owner, owner.view.checked_procedure_templates.get(template.template))) continue;
+            const owner_template = owner.view.checked_procedure_templates.get(template.template);
+            if (!unitEmitsTemplate(owner, owner_template)) continue;
+            if (try templateRejected(program, owner, owner_template)) continue;
             const worker = try program.templateRefWorker(template);
             if (program.worker(worker).imported) continue;
             _ = try program.methodEntryWorker(worker);
@@ -2674,10 +2683,16 @@ fn templateRejected(program: *Program, view: *const types.ModuleView, template: 
 /// plan's or a REPL's own roots, and each of those lowers as one program.
 fn unitEmitsTemplate(view: *const types.ModuleView, template: checked.CheckedProcedureTemplate) bool {
     return switch (template.body) {
-        .checked_body, .intrinsic_wrapper, .unimplemented => true,
+        .checked_body, .unimplemented => true,
+        // Publication writes every call of `Code.prim`, `Code.type_id` and
+        // `Code.ty_of` as a constant, so no object calls their wrappers.
+        .intrinsic_wrapper => |wrapper_id| switch (view.view.intrinsic_wrappers.get(wrapper_id).intrinsic) {
+            .code_prim, .code_type_id, .code_ty_of => false,
+            .str_inspect, .structural_eq, .parse_tag_union, .field_names_rename_fields, .field_names_shortest_name, .field_names_longest_name, .field_names_iter, .field_names_for_size, .field_name => true,
+        },
         .entry_wrapper => |wrapper_id| switch (view.view.compile_time_roots.root(view.view.entry_wrappers.get(wrapper_id).root).kind) {
             .expect, .repl_expr => false,
-            .callable_binding, .constant, .hoisted_constant, .hoisted_validation, .numeral_conversion, .quote_conversion, .literal_argument => true,
+            .callable_binding, .constant, .hoisted_constant, .hoisted_validation, .numeral_conversion, .quote_conversion, .literal_argument, .interpolation_conversion => true,
         },
     };
 }

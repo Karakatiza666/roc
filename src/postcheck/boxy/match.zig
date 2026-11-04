@@ -475,6 +475,12 @@ pub const Ctx = struct {
         return self.b.store.cfStmtCount();
     }
 
+    /// The match machinery's statement bound counts every statement this
+    /// lowering emits, so it reports no host work of its own.
+    pub fn hostStmtCount(_: Ctx) usize {
+        return 0;
+    }
+
     pub fn freshJoinPointId(self: Ctx) LIR.JoinPointId {
         return self.b.freshJoin();
     }

@@ -829,7 +829,7 @@ pub fn restoreRuntime(b: *Builder, source: lower.ConstSource, fn_id: check.Const
     const owner_view = program.moduleByKey(.{ .bytes = owner.artifact.bytes });
     const plan_id = switch (owner_view.bodies().expr(expr).data) {
         .dispatch_call, .type_dispatch_call => |maybe| maybe orelse invariant("a stored generated codec runtime's dispatch has no plan"),
-        .pending, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .interpolation, .structural_eq, .structural_hash, .method_eq, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => invariant("a stored generated codec runtime does not name a dispatch"),
+        .pending, .numeral, .str_from_quote, .str_segment, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .interpolation, .structural_eq, .structural_hash, .method_eq, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => invariant("a stored generated codec runtime does not name a dispatch"),
     };
     const plan = owner_view.view.static_dispatch_plans.plans[@backingInt(plan_id)];
     // A dispatch on a constrained variable reaches its derivation through
@@ -903,6 +903,7 @@ pub fn lowerIntrinsic(b: *Builder, intrinsic: checked.IntrinsicId, params: []con
         .field_names_iter => try gen.fieldNamesIter(params[0], null, worker.ret),
         .field_names_for_size => try gen.fieldNamesIter(params[0], params[1], worker.ret),
         .field_name => (try gen.field(params[0], worker.params[0], "name")).value,
+        .code_prim, .code_type_id, .code_ty_of => invariant("Code.prim, Code.type_id and Code.ty_of lower as the constant the checked module builder wrote at each call"),
         // The descriptor-guided walkers (design.md "Dynamic Values In LIR").
         .str_inspect => blk: {
             const text = try b.closedLocal(.str);

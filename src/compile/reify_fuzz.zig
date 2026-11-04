@@ -575,7 +575,7 @@ fn storedAnswer(coord: *Coordinator, name: []const u8) error{ AnswerWasNotStored
                 .i8, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u128, .f32_bits, .f64_bits, .dec_bits => error.AnswerWasNotU64,
             },
             .crash => null,
-            .pending, .zst, .str, .list, .box, .tuple, .record, .tag, .nominal, .fn_value, .checked_error => error.AnswerWasNotU64,
+            .pending, .zst, .str, .list, .box, .tuple, .record, .tag, .nominal, .fn_value, .boxy_fn, .checked_error => error.AnswerWasNotU64,
         };
     }
     return error.AnswerWasNotStored;

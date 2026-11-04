@@ -1903,15 +1903,18 @@ pub const Reifier = struct {
         const called_payload = called.reader.types.payload(called.id);
         // A position the callable leaves open fixes nothing inside.
         switch (called_payload) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .flex, .rigid, .pending, .err => return,
             .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => {},
             .alias => unreachable, // settledType reads through every alias
         }
         switch (self.types.payload(own)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| try self.relateType(related, alias.backing, called),
             .flex, .rigid, .pending, .err, .empty_record, .empty_tag_union => {},
             .function => |own_fn| {
                 const called_fn = switch (called_payload) {
+                    .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                     .function => |function| function,
                     .record, .tuple, .nominal, .empty_record, .tag_union, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a function type of a definition relates to a function of its callable"),
                 };
@@ -1921,6 +1924,7 @@ pub const Reifier = struct {
             },
             .tuple => |own_elements| {
                 const called_elements = switch (called_payload) {
+                    .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                     .tuple => |elements| elements,
                     .record, .function, .nominal, .empty_record, .tag_union, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a tuple of a definition relates to a tuple of its callable"),
                 };
@@ -1929,6 +1933,7 @@ pub const Reifier = struct {
             },
             .nominal => |own_nominal| {
                 const called_nominal = switch (called_payload) {
+                    .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                     .nominal => |nominal| nominal,
                     .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a nominal of a definition relates to that nominal of its callable"),
                 };
@@ -1938,6 +1943,7 @@ pub const Reifier = struct {
                 for (own_nominal.args, called_nominal.args) |arg, called_arg| try self.relateType(related, arg, called.reader.resolvedTypeIn(called.frame, called_arg));
             },
             .record => |own_record| switch (called_payload) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .record => |called_record| {
                     var own_fields = std.ArrayList(checked.CheckedRecordField).empty;
                     defer own_fields.deinit(self.gpa);
@@ -1962,6 +1968,7 @@ pub const Reifier = struct {
                 .tuple, .function, .empty_record, .tag_union, .empty_tag_union, .flex, .rigid, .pending, .err, .alias => invariant("a record of a definition relates to a record of its callable, or to a nominal it lifted into"),
             },
             .tag_union => |own_union| switch (called_payload) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .tag_union => |called_union| {
                     var own_tags = std.ArrayList(checked.CheckedTag).empty;
                     defer own_tags.deinit(self.gpa);
@@ -1995,6 +2002,7 @@ pub const Reifier = struct {
                 continue;
             }
             switch (current.reader.types.payload(current.id)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .alias => |alias| current.id = alias.backing,
                 .flex, .rigid, .pending, .err, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => return current,
             }
@@ -5749,6 +5757,7 @@ pub const Reifier = struct {
     fn mentionsOpaqueOf(self: *Reifier, seen: *collections.DenseMapUnmanaged(CheckedTypeId, void), module: canonical.ModuleIdentityId, id: CheckedTypeId) Allocator.Error!bool {
         if ((try seen.getOrPut(self.gpa, id)).found_existing) return false;
         switch (self.types.payload(id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| return self.mentionsOpaqueOf(seen, module, alias.backing),
             .function => |fn_ty| {
                 for (fn_ty.args) |arg| if (try self.mentionsOpaqueOf(seen, module, arg)) return true;
@@ -6094,6 +6103,7 @@ pub const Reifier = struct {
     ) Error!void {
         const reader = dispatcher.reader;
         switch (reader.types.payload(dispatcher.id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| return self.receiverEntry(words, param, text, method, reader.resolvedTypeIn(dispatcher.frame, alias.backing), region),
             .nominal => {
                 const target = receiverMethod(dispatcher, text) orelse
@@ -6710,6 +6720,7 @@ pub const Reifier = struct {
         const requested = constant.requested orelse invariant("a constant use an inventory names fixes no type");
         const template = reader.procedure_templates.templates.items[@backingInt(constant.template)];
         const value_ty = switch (reader.types.payload(template.checked_fn_root)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .function => |function| function.ret,
             .pending,
             .err,
@@ -6915,6 +6926,7 @@ pub const Reifier = struct {
         while (work.pop()) |id| {
             if ((try seen.getOrPut(self.gpa, id)).found_existing) continue;
             switch (self.types.payload(id)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .flex, .rigid => |variable| {
                     try out.put(self.gpa, id, {});
                     for (variable.constraints) |constraint| try work.append(self.gpa, constraint.fn_ty);
@@ -6942,6 +6954,7 @@ pub const Reifier = struct {
     fn mentionsIn(self: *Reifier, id: CheckedTypeId, vars: *const RowVars, seen: *RowVars) Allocator.Error!bool {
         if ((try seen.getOrPut(self.gpa, id)).found_existing) return false;
         switch (self.types.payload(id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .flex, .rigid => |variable| {
                 if (vars.contains(id)) return true;
                 for (variable.constraints) |constraint| if (try self.mentionsIn(constraint.fn_ty, vars, seen)) return true;
@@ -8116,6 +8129,7 @@ pub const Reifier = struct {
         const resolved = self.resolvedType(type_id);
         if (resolved.reader != self) return resolved.reader.typeName(resolved.id);
         return switch (self.types.payload(resolved.id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| self.typeName(alias.backing),
             .nominal => |nominal| self.names.typeNameText(nominal.name),
             .pending,
@@ -8143,6 +8157,7 @@ pub const Reifier = struct {
         if (resolved.reader != self) return resolved.reader.eqOver(lhs, rhs, resolved.id, region);
         const b = self.bld();
         return switch (self.types.payload(resolved.id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| self.eqOver(lhs, rhs, alias.backing, region),
             .nominal => |nominal| self.nominalEq(lhs, rhs, nominal, resolved.id, region),
             .record => |record| blk: {
@@ -8484,6 +8499,7 @@ pub const Reifier = struct {
         if (resolved.reader != self) return resolved.reader.hashOver(value, acc, resolved.id, writer, hasher_ty, region);
         const b = self.bld();
         switch (self.types.payload(resolved.id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| return self.hashOver(value, acc, alias.backing, writer, hasher_ty, region),
             .nominal => |nominal| {
                 if (nominal.builtin) |builtin_nominal| {
@@ -8556,6 +8572,7 @@ pub const Reifier = struct {
         const value = try self.exprRef(operand);
         var subject_ty = value_ty;
         while (true) switch (self.types.payload(subject_ty)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| subject_ty = alias.backing,
             .nominal => |nominal| {
                 const target = self.walk.foreign.findInspectOverride(self.foreignNominal(nominal)) orelse break;
@@ -8709,6 +8726,7 @@ pub const Reifier = struct {
         const types = self.rt();
         const payload = self.types.payload(type_id);
         return switch (payload) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| self.tyOf(alias.backing, region),
             .flex, .rigid => |variable| blk: {
                 if (try self.sealedVariable(type_id, variable, region)) |target| break :blk switch (target) {
@@ -8808,6 +8826,7 @@ pub const Reifier = struct {
             for (link_tags) |tag| try self.collectVariant(collected, reader, frame, tag);
             const next = link_ext orelse break;
             switch (reader.types.payload(next)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .empty_tag_union => break,
                 .tag_union => |more| {
                     link_tags = more.tags;
@@ -9191,6 +9210,7 @@ pub const Reifier = struct {
                 continue;
             }
             switch (ref.reader.types.payload(ref.id)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .alias => |alias| ref.id = alias.backing,
                 .nominal => |nominal| return ref.reader.typeIdentity(nominal),
                 .pending, .err, .flex, .rigid, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => return null,
@@ -9202,6 +9222,7 @@ pub const Reifier = struct {
     /// `Code.type_id` or `Code.ty_of` call is, as checking typed it.
     fn proxyTarget(self: *Reifier, arg: CheckedExprId) CheckedTypeId {
         const proxy = switch (self.types.payload(self.throughAliases(self.bodies.expr(arg).ty))) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .nominal => |nominal| nominal,
             .pending,
             .err,
@@ -9242,6 +9263,7 @@ pub const Reifier = struct {
     fn throughAliases(self: *Reifier, id: CheckedTypeId) CheckedTypeId {
         var current = id;
         while (true) switch (self.types.payload(current)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| current = alias.backing,
             .pending,
             .err,
@@ -9350,6 +9372,7 @@ pub const Reifier = struct {
 
     fn valueClass(self: *Reifier, type_id: CheckedTypeId) ValueClass {
         return switch (self.types.payload(self.throughAliases(type_id))) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .nominal => |nominal| if (nominal.builtin) |builtin| switch (builtin) {
                 .bool => .bool_,
                 .str => .str,
@@ -9653,6 +9676,7 @@ pub const Reifier = struct {
     fn recordTypeFields(self: *Reifier, type_id: CheckedTypeId, out: *std.ArrayList(checked.CheckedRecordField)) Allocator.Error!bool {
         var current = type_id;
         while (true) switch (self.types.payload(current)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| current = alias.backing,
             .nominal => |nominal| current = self.types.nominalBackingTemplateForPayload(nominal) orelse return false,
             .record => |record| {
@@ -9711,6 +9735,7 @@ pub const Reifier = struct {
             for (link_fields) |field| try self.collectField(collected, reader, frame, field);
             const next = link_ext orelse break;
             switch (reader.types.payload(next)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .empty_record => break,
                 .record => |record| {
                     link_fields = record.fields;
@@ -9826,6 +9851,7 @@ pub const Reifier = struct {
     fn rejectOpen(self: *Reifier, type_id: CheckedTypeId, region: base.Region) error{Rejected} {
         const named = self.walk.through orelse FramedType{ .reader = self, .id = type_id, .frame = self.frame };
         const variable = switch (named.reader.types.payload(named.id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .flex, .rigid => |variable| variable,
             .pending,
             .err,
@@ -9845,6 +9871,7 @@ pub const Reifier = struct {
         // only that the use left it open.
         const own = self.types.payload(type_id);
         const cause: OpenVariable.Cause = if (self.walk.through != null) switch (own) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .rigid => .use_leaves_open,
             .flex => |own_variable| if (own_variable.name != null) .use_leaves_open else .inferred_use_leaves_open,
             .pending, .err, .alias, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => invariant("a type variable was refused at a type that is not a variable"),
@@ -9899,6 +9926,7 @@ pub const Reifier = struct {
 
     fn functionOf(self: *Reifier, type_id: CheckedTypeId) ?checked.CheckedFunctionType {
         return switch (self.types.payload(type_id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .function => |function| function,
             .alias => |alias| self.functionOf(alias.backing),
             .pending, .err, .flex, .rigid, .record, .tuple, .nominal, .empty_record, .tag_union, .empty_tag_union => null,
@@ -9910,6 +9938,7 @@ pub const Reifier = struct {
     /// store.
     fn nominalOf(self: *Reifier, type_id: CheckedTypeId) ?checked.CheckedNominalType {
         return switch (self.types.payload(type_id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .nominal => |nominal| nominal,
             .alias => |alias| self.nominalOf(alias.backing),
             .pending, .err, .flex, .rigid, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => null,
@@ -9919,6 +9948,7 @@ pub const Reifier = struct {
     /// The elements a checked id is a tuple of, reading through an alias.
     fn tupleOf(self: *Reifier, type_id: CheckedTypeId) ?[]const CheckedTypeId {
         return switch (self.types.payload(type_id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .tuple => |elements| elements,
             .alias => |alias| self.tupleOf(alias.backing),
             .pending, .err, .flex, .rigid, .record, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => null,
@@ -9931,6 +9961,7 @@ pub const Reifier = struct {
         const resolved = self.resolvedType(type_id);
         if (resolved.reader != self) return resolved.reader.builtinNominalOf(resolved.id);
         return switch (self.types.payload(resolved.id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| self.builtinNominalOf(alias.backing),
             .nominal => |nominal| nominal.builtin,
             .flex, .rigid => |variable| if (self.unfit.contains(resolved.id)) null else if (defaultedVariable(variable)) |sealed| defaultBuiltin(sealed) else null,
@@ -10032,6 +10063,7 @@ pub const Reifier = struct {
             if (substitution.contains(scheme_var)) continue;
             if (rows.contains(scheme_var)) continue;
             const variable = switch (self.types.payload(scheme_var)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .flex, .rigid => |variable| variable,
                 .pending,
                 .err,
@@ -10084,6 +10116,7 @@ pub const Reifier = struct {
     fn collectRowVars(self: *Reifier, found: *RowVars, seen: *RowVars, id: CheckedTypeId) Allocator.Error!void {
         if ((try seen.getOrPut(self.gpa, id)).found_existing) return;
         switch (self.types.payload(id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| try self.collectRowVars(found, seen, alias.backing),
             .function => |fn_ty| {
                 for (fn_ty.args) |arg| try self.collectRowVars(found, seen, arg);
@@ -10113,6 +10146,7 @@ pub const Reifier = struct {
     /// Follow one extension chain to what it ends at, which is the row.
     fn collectRowTail(self: *Reifier, found: *RowVars, seen: *RowVars, id: CheckedTypeId) Allocator.Error!void {
         switch (self.types.payload(id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| try self.collectRowTail(found, seen, alias.backing),
             .record => |record| {
                 for (record.fields) |field| try self.collectRowVars(found, seen, field.ty);
@@ -10159,6 +10193,7 @@ pub const Reifier = struct {
             return;
         }
         switch (self.types.payload(scheme_id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| try self.matchType(substitution, scheme_vars, alias.backing, use),
             .function => |scheme_fn| {
                 const use_fn = use.reader.functionOf(use.id) orelse return;
@@ -10190,6 +10225,7 @@ pub const Reifier = struct {
             .record, .tag_union => if (use.reader.nominalOf(use.id) != null) {
                 if (!substitution.contains(scheme_id)) try substitution.put(self.gpa, scheme_id, use);
             } else switch (self.types.payload(scheme_id)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .record => |scheme_record| try self.matchRecord(
                     substitution,
                     scheme_vars,
@@ -10236,6 +10272,7 @@ pub const Reifier = struct {
         var use_fields = std.ArrayList(checked.CheckedRecordField).empty;
         defer use_fields.deinit(self.gpa);
         switch (use.reader.types.payload(use.id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .record => |use_record| try use.reader.recordFields(&use_fields, use_record.fields, use_record.ext),
             // A use written through an alias is its backing (D2).
             .alias => |alias| return self.matchRecord(substitution, scheme_vars, fields, ext, use.reader.resolvedTypeIn(use.frame, alias.backing)),
@@ -10279,6 +10316,7 @@ pub const Reifier = struct {
         var link = ext orelse return null;
         while (true) {
             switch (self.types.payload(link)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .flex, .rigid => return link,
                 .record => |record| link = record.ext,
                 .alias => |alias| link = alias.backing,
@@ -10311,6 +10349,7 @@ pub const Reifier = struct {
             try into.appendSlice(self.gpa, link_fields);
             const next = link_ext orelse break;
             switch (self.types.payload(next)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .record => |record| {
                     link_fields = record.fields;
                     link_ext = record.ext;
@@ -10351,6 +10390,7 @@ pub const Reifier = struct {
         var use_tags = std.ArrayList(checked.CheckedTag).empty;
         defer use_tags.deinit(self.gpa);
         switch (use.reader.types.payload(use.id)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .tag_union => |use_union| try use.reader.unionTags(&use_tags, use_union.tags, use_union.ext),
             .alias,
             .record,
@@ -10397,6 +10437,7 @@ pub const Reifier = struct {
         var link = ext;
         while (true) {
             switch (self.types.payload(link)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .flex, .rigid => return link,
                 .tag_union => |more| link = more.ext,
                 .alias => |alias| link = alias.backing,
@@ -10426,6 +10467,7 @@ pub const Reifier = struct {
             try into.appendSlice(self.gpa, link_tags);
             const next = link_ext orelse break;
             switch (self.types.payload(next)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .tag_union => |more| {
                     link_tags = more.tags;
                     link_ext = more.ext;
@@ -10566,6 +10608,8 @@ pub const Reifier = struct {
         var id = bound.id;
         while (bound.reader.types.payload(id) == .alias) id = bound.reader.types.payload(id).alias.backing;
         const record = switch (bound.reader.types.payload(id)) {
+            // A substitution binds a quantified kind variable to a field kind.
+            .field_kind => return false,
             .record => |record| record,
             .pending,
             .err,
@@ -10592,6 +10636,7 @@ pub const Reifier = struct {
             for (link_fields) |field| try reader.collectField(&fields, reader, frame, field);
             const next = link_ext orelse break;
             switch (reader.types.payload(next)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .empty_record => break,
                 .record => |link| {
                     link_fields = link.fields;
@@ -10638,6 +10683,8 @@ pub const Reifier = struct {
         var id = bound.id;
         while (bound.reader.types.payload(id) == .alias) id = bound.reader.types.payload(id).alias.backing;
         const tag_union = switch (bound.reader.types.payload(id)) {
+            // A substitution binds a quantified kind variable to a field kind.
+            .field_kind => return false,
             .tag_union => |tag_union| tag_union,
             .pending,
             .err,
@@ -10664,6 +10711,7 @@ pub const Reifier = struct {
             for (link_tags) |tag| try reader.collectVariant(&variants, reader, frame, tag);
             const next = link_ext orelse break;
             switch (reader.types.payload(next)) {
+                .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                 .empty_tag_union => break,
                 .tag_union => |link| {
                     link_tags = link.tags;
@@ -10778,6 +10826,7 @@ pub const Reifier = struct {
         const use = target.reader.resolvedTypeIn(target.frame, target.id);
         const use_payload = use.reader.types.payload(use.id);
         switch (use_payload) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .alias => |alias| return self.fitsTarget(callable, .{ .reader = use.reader, .id = alias.backing, .frame = use.frame }),
             // The target leaves this part to the callable.
             .flex, .rigid => return true,
@@ -10785,6 +10834,7 @@ pub const Reifier = struct {
             .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => {},
         }
         return switch (self.types.payload(callable)) {
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
             .flex, .rigid => true,
             .alias => |alias| self.fitsTarget(alias.backing, use),
             .pending, .err => false,
@@ -10792,6 +10842,7 @@ pub const Reifier = struct {
             .empty_tag_union => use_payload == .empty_tag_union,
             .function => |fn_ty| blk: {
                 const use_fn = switch (use_payload) {
+                    .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                     .function => |use_fn| use_fn,
                     .pending, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .empty_record, .tag_union, .empty_tag_union => break :blk false,
                 };
@@ -10803,6 +10854,7 @@ pub const Reifier = struct {
             },
             .nominal => |nominal| blk: {
                 const use_nominal = switch (use_payload) {
+                    .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                     .nominal => |use_nominal| use_nominal,
                     .pending, .err, .flex, .rigid, .alias, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
                 };
@@ -10818,6 +10870,7 @@ pub const Reifier = struct {
             },
             .tuple => |parts| blk: {
                 const use_parts = switch (use_payload) {
+                    .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                     .tuple => |use_parts| use_parts,
                     .pending, .err, .flex, .rigid, .alias, .record, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
                 };
@@ -10829,6 +10882,7 @@ pub const Reifier = struct {
             },
             .record => |record| blk: {
                 const use_record = switch (use_payload) {
+                    .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                     .record => |use_record| use_record,
                     .pending, .err, .flex, .rigid, .alias, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => break :blk false,
                 };
@@ -10844,6 +10898,7 @@ pub const Reifier = struct {
             },
             .tag_union => |union_ty| blk: {
                 const use_union = switch (use_payload) {
+                    .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
                     .tag_union => |use_union| use_union,
                     .pending, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .function, .empty_record, .empty_tag_union => break :blk false,
                 };
@@ -10886,6 +10941,8 @@ pub const Reifier = struct {
     fn collectVariables(self: *Reifier, found: *std.ArrayList(CheckedTypeId), seen: *RowVars, id: CheckedTypeId) Allocator.Error!void {
         if ((try seen.getOrPut(self.gpa, id)).found_existing) return;
         switch (self.types.payload(id)) {
+            // A field kind a substitution binds names no variable.
+            .field_kind => {},
             .flex, .rigid => try found.append(self.gpa, id),
             .alias => |alias| try self.collectVariables(found, seen, alias.backing),
             .function => |fn_ty| {
