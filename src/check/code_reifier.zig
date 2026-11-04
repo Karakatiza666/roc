@@ -7326,7 +7326,12 @@ pub const Reifier = struct {
             // The checker picked a compiler-derived implementation, so there is
             // no Roc body behind this name.
             .structural => |derivation| return self.structuralDispatch(plan, derivation, result_ty, region),
-            .checked_error, .@"unreachable" => return self.rejectError(.unresolved_reference, region, "this call"),
+            .checked_error => return self.rejectError(.unresolved_reference, region, "this call"),
+            // A dispatcher no edge pins reaches the method of its default
+            // owner when the walk seals it (`defaultOwnerMethod`).
+            .@"unreachable" => if (self.defaultOwnerMethod(plan.resolution, plan.dispatcher_ty, plan.method) == null) {
+                return self.rejectError(.unresolved_reference, region, "this call");
+            },
             // The body forwards this obligation to its own evidence param, and
             // the call that instantiated the body says what discharged it.
             .evidence_dependent => |forwarded| {
@@ -7557,7 +7562,40 @@ pub const Reifier = struct {
             const target = receiverMethod(fixed, method) orelse return .none;
             return fixed.reader.methodTargetCallee(fixed.reader, target, .{ .receiver = fixed }, region, use_kind);
         }
+        if (self.defaultOwnerMethod(spec.resolution, spec.dispatcher_ty, spec.method)) |target| {
+            return self.methodTargetCallee(self, target, .{ .receiver = self.resolvedType(spec.dispatcher_ty) }, region, use_kind);
+        }
         return .none;
+    }
+
+    /// The method a dispatch reaches whose dispatcher no edge pins and the
+    /// walk seals to its numeric default (`defaultedVariable`): the default
+    /// owner's registered method, or null for any other dispatch.
+    ///
+    /// Checking unifies a defaulting dispatcher with its default owner only
+    /// where a value of the program reaches it, so the dispatch of a
+    /// parameter of a lambda at a `Code` position, which nothing calls, is
+    /// left `unreachable`, with no target selected. A description is the
+    /// specialization that reaches it, at the type the walk seals the
+    /// dispatcher to, so the method is the one that type's owner registers,
+    /// read from the registries as a receiver's method is
+    /// (`receiverMethod`). `relateSelectedTargets` relates it to the
+    /// dispatch's callable, and marks a dispatcher whose default's method
+    /// does not fit it (`x` in `|x| x * 2.U8`).
+    fn defaultOwnerMethod(self: *Reifier, resolution: static_dispatch.CheckedCallResolution, dispatcher_ty: CheckedTypeId, method: canonical.MethodNameId) ?static_dispatch.MethodTarget {
+        if (resolution != .@"unreachable") return null;
+        const variable = switch (self.types.payload(self.throughAliases(dispatcher_ty))) {
+            .flex, .rigid => |variable| variable,
+            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
+            .pending, .err, .alias, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => return null,
+        };
+        const sealed = defaultedVariable(variable) orelse return null;
+        const owner: ForeignNominal = .{
+            .module = &self.artifact.bytes,
+            .source_decl = 0,
+            .builtin = static_dispatch.builtinOwnerForCheckedBuiltin(defaultBuiltin(sealed)),
+        };
+        return self.walk.foreign.findMethod(owner, self.names.methodNameText(method));
     }
 
     /// The target the method registries declare for `method` on the nominal
@@ -8176,7 +8214,7 @@ pub const Reifier = struct {
                     const ty: FramedType = .{ .reader = field.reader, .id = field.field.ty, .frame = field.frame };
                     // An optional field is read as its `OptField`, the `Try`
                     // that says whether the record holds it.
-                    try parts.append(self.gpa, if (field.field.kind.tag == .optional) .{
+                    try parts.append(self.gpa, if (field.reader.fieldKindIn(field.frame, field.field.kind) == .optional) .{
                         .lhs = try self.optionalFieldRead(l, try self.fieldIndex(l, name, region)),
                         .rhs = try self.optionalFieldRead(r, try self.fieldIndex(r, name, region)),
                         .ty = ty,
@@ -8528,7 +8566,7 @@ pub const Reifier = struct {
                 // `[#Missing, #Present(value)]`, and the walk leaves the hash
                 // of a tag union to the stage.
                 for (fields.items) |field| {
-                    if (field.field.kind.tag == .optional) return null;
+                    if (field.reader.fieldKindIn(field.frame, field.field.kind) == .optional) return null;
                 }
                 const subject = try self.readable(value);
                 var threaded = acc;
@@ -9303,8 +9341,8 @@ pub const Reifier = struct {
     }
 
     /// A record type's fields, following its extension. A field is optional
-    /// only where the checker pinned it so; a defaulted field is filled in,
-    /// and an unpinned one is what the checker commits to required.
+    /// where the checker pinned it so or where the frame fixes its kind
+    /// variable so (`fieldKindIn`); a defaulted field is filled in.
     fn recordTy(self: *Reifier, fields: []const checked.CheckedRecordField, ext: ?CheckedTypeId, region: base.Region) Error!TyId {
         var collected = std.ArrayList(FieldRef).empty;
         defer collected.deinit(self.gpa);
@@ -9314,9 +9352,10 @@ pub const Reifier = struct {
         const specs = try self.gpa.alloc(reify.types.FieldSpec, collected.items.len);
         defer self.gpa.free(specs);
         for (collected.items, specs) |field, *spec| {
-            const optional = switch (field.field.kind.tag) {
-                .required, .defaulted, .undetermined => false,
+            const optional = switch (field.reader.fieldKindIn(field.frame, field.field.kind)) {
+                .required, .defaulted => false,
                 .optional => true,
+                .undetermined => invariant("a field kind read in its frame is determined"),
                 .err => return self.rejectError(.unresolved_type, region, "a record field whose presence is an error"),
             };
             spec.* = .{
@@ -9327,6 +9366,28 @@ pub const Reifier = struct {
             };
         }
         return self.rt().recordTy(specs);
+    }
+
+    /// The kind of a record field read in `frame` (design.md "Field
+    /// Kinds"): its own kind, or, for a field whose kind is a quantified kind
+    /// variable, the kind the frame's substitution fixed the variable to (a
+    /// `field_kind` entry the checker published for the use). A kind
+    /// variable no substitution fixes is `required`, the kind a
+    /// specialization commits a still-undetermined kind to (Monotype's
+    /// relation freeze), and so is a field the checker left undetermined.
+    fn fieldKindIn(self: *Reifier, frame: FrameId, kind: checked.CheckedFieldKind) checked.CheckedFieldKind.Tag {
+        if (kind.tag != .undetermined) return kind.tag;
+        const variable = kind.undeterminedVariable() orelse invariant("an undetermined field kind names no kind variable");
+        const fixed = self.fixedTypeIn(frame, variable) orelse return .required;
+        return switch (fixed.reader.types.payload(fixed.id)) {
+            .field_kind => |committed| switch (committed) {
+                .required => .required,
+                .optional => .optional,
+            },
+            // A kind variable of the caller's own scheme that nothing fixes.
+            .flex, .rigid => .required,
+            .pending, .err, .alias, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => invariant("a kind variable is fixed to a type"),
+        };
     }
 
     /// What a field's type says about its default (D5): its value where the
@@ -10668,7 +10729,7 @@ pub const Reifier = struct {
             const label = field.reader.names.recordFieldLabelText(field.field.name);
             hasher.update(std.mem.asBytes(&label.len));
             hasher.update(label);
-            hasher.update(std.mem.asBytes(&@backingInt(field.field.kind.tag)));
+            hasher.update(std.mem.asBytes(&@backingInt(field.reader.fieldKindIn(field.frame, field.field.kind))));
             try hashBinding(hasher, field.reader.resolvedTypeIn(field.frame, field.field.ty));
         }
         if (tail) |end| try hashBinding(hasher, end) else hasher.update("closed");
@@ -10780,15 +10841,17 @@ pub const Reifier = struct {
     /// module.
     ///
     /// Such an edge is `derived_from_callable`: publication chose the target
-    /// (the numeric default owner of a dispatcher no edge pins, the procedure
-    /// an alias reaches, or a literal conversion), and the edge's contract is
-    /// that specialization relates the target's type to the callable. That is
-    /// what fixes `y` in `|x, y| x + y`: `x` seals to `Dec`, publication
-    /// selected `Dec.plus`, and `Dec.plus : Dec, Dec -> Dec` fixes the other
-    /// argument and the result. Monotype honours the contract when it lowers
-    /// the dispatch, and a description is the same specialization read
-    /// without lowering, so the walk honours it here. A generic target fixes
-    /// none of the callable's variables by its own type, so it is not related.
+    /// (the procedure an alias reaches, or a literal conversion), and the
+    /// edge's contract is that specialization relates the target's type to
+    /// the callable. Monotype honours the contract when it lowers the
+    /// dispatch, and a description is the same specialization read without
+    /// lowering, so the walk honours it here. A dispatcher no edge pins has
+    /// no selected target: the walk reaches its default owner's method
+    /// (`defaultOwnerMethod`) and relates it the same way. That is what
+    /// fixes `y` in `|x, y| x + y`: `x` seals to `Dec`, its owner's `plus`
+    /// is `Dec.plus : Dec, Dec -> Dec`, and that fixes the other argument
+    /// and the result. A generic target fixes none of the callable's
+    /// variables by its own type, so it is not related.
     fn relateSelectedTargets(self: *Reifier) Allocator.Error!void {
         if (self.related_ready) return;
         self.related_ready = true;
@@ -10816,6 +10879,27 @@ pub const Reifier = struct {
             seen.clearRetainingCapacity();
             try self.collectVariables(&variables, &seen, callable);
             try self.matchType(&self.related, variables.items, callable, target_fn);
+        }
+        // A dispatcher no edge pins reaches its default owner's method in
+        // the walk (`defaultOwnerMethod`), which relates to the dispatch's
+        // callable as a selected target does.
+        for (self.plans.plans) |plan| {
+            const target = self.defaultOwnerMethod(plan.resolution, plan.dispatcher_ty, plan.method) orelse continue;
+            const procedure = switch (target.kind) {
+                .procedure => |procedure| procedure,
+                .local_proc, .structural => continue,
+            };
+            const found = try self.targetTemplate(procedure.template, target.def_idx) orelse continue;
+            if (found.reader.schemeVars(found.template).len != 0) continue;
+            const target_fn: FramedType = .{ .reader = found.reader, .id = found.template.checked_fn_root, .frame = empty_frame };
+            if (!self.fitsTarget(plan.callable_ty, target_fn)) {
+                try self.unfit.put(self.gpa, self.throughAliases(plan.dispatcher_ty), {});
+                continue;
+            }
+            variables.clearRetainingCapacity();
+            seen.clearRetainingCapacity();
+            try self.collectVariables(&variables, &seen, plan.callable_ty);
+            try self.matchType(&self.related, variables.items, plan.callable_ty, target_fn);
         }
     }
 

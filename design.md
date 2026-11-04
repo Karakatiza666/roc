@@ -3894,25 +3894,20 @@ Monotype reads a record extended by a record-backed nominal through the
 nominal's backing (`rowExtensionChainResolved` in
 `src/postcheck/monotype/solve.zig` follows an inspectable, non-recursive
 backing), so the nominal's fields are fields of the record. The Boxy
-pipeline (`--specialize=no`) reads it the same way. Every Boxy walk over a
-record row's extension chain goes on in the nominal's planned backing
-(`recordExtensionBacking` in `src/postcheck/boxy/plan.zig:1618`, the same
-backing `planNominalRep` plans for the nominal):
-
-| Walk | What it does at a nominal in the chain |
-|---|---|
-| `planRecordRep` (`src/postcheck/boxy/plan.zig:10753`) | collects the backing's fields, so `{ ..Owner }` is a closed record |
-| `hostRecordExtensionBacking` (`src/postcheck/boxy/plan.zig:9499`) | for a host ABI row, binds the nominal's formals in a fresh context, as `beginHostNominal` does |
-| `planNominalDeclaredFields` (`src/postcheck/boxy/plan.zig:11105`) | gives each field an extension brings a declared field too, at its alphabetical rank, so the declared fields cover every payload field. A row that ends in a quantified row variable (`Labeled(r)` in the body of a function generic over `r`) is open: the nominal has no declared field order, and its record field order is structural |
-| `storedRecordTypeMatchesChecked`, `openRecordRowVariable` | read the backing's fields and row variable |
-
-A field can come from the nominal's own module, so a record whose field
-labels belong to more than one module sorts its fields by label text
-(`src/postcheck/boxy/plan.zig:11283`). A transparent nominal without a
-declared field order, and every alias, has the runtime layout of its
-backing (`immediateRuntimeStep` in `src/postcheck/boxy/layouts.zig`). So a
-wrapper of an open row is a dynamic box, as the row is. Any other nominal
-in a record extension slot is a compiler invariant. The shapes are pinned
+pipeline (`--specialize=no`) reads it the same way. A nominal shares its
+backing's representation, so type conversion (`Converter.finish` in
+`src/postcheck/boxy/types.zig`) reads a transparent nominal in a record's
+remainder through its backing: the backing's fields join the record's
+fields, with the defaults the backing's own conversion recorded, and the
+backing's remainder is the record's. An empty-record backing closes the
+row. Substituting a template's variables does the same where a remainder
+variable is bound to such a nominal (`rewriteType` in
+`src/postcheck/boxy/lower.zig`), and so does the run-time composition of
+an open row's descriptor, through the nominal descriptor's backing
+(`recordExtended` in `src/boxy_runtime/compose.zig`). A record's fields are sorted by label text, so a field from the
+nominal's own module takes its place among the others. An opaque or builtin
+nominal in a record's remainder, or a nominal there whose backing is not a
+record, is a compiler invariant. The shapes are pinned
 by `test/cli/RecordExtension/shapes.roc` in both lowerings.
 
 A variable that stands in a row slot through an application (`r` in
@@ -12293,8 +12288,11 @@ follow, each a debug assertion:
   references to one are poisoned, and no root reaches a reify-only
   definition, so no lowering request names one. `UnimplementedDeclaration`
   records whether the declaration is an intrinsic, and the `.unimplemented`
-  arms of Monotype (`lowerUnimplementedTemplateAtNode`, the constant use) and
-  of Boxy (`rootProcedureTemplateBody`) assert that it is not.
+  arms of Monotype (`lowerUnimplementedTemplateAtNode`, the constant use)
+  assert that it is not. Boxy has no requests: a unit lowers every template
+  of its module (see "`.boxy` Runtime Lowering"), so it lowers an
+  intrinsic's declaration as a crash body and lowers the bodies of
+  reify-only definitions too. No run-time code a root reaches calls either.
 
 Boxy needs one more rule. Monotype lowers only the code that a request
 reaches, but Boxy fills each dictionary that a call passes with one slot for
@@ -12304,9 +12302,10 @@ only the described lambda uses it, so its runs bit is clear. A call of the
 fragment at `Clock` selects `Clock.now`, an intrinsic, for that slot. Evidence
 output sets `CheckedEvidence.description_only_intrinsic` when the
 resolution is direct to an intrinsic and the callee's relation has a clear
-runs bit. Boxy then gives the slot the resolution
-`description_only_intrinsic`, which lowers to a crashing slot, as
-`unreachable_value` does, in place of a worker. No run-time code reads the
+runs bit. Boxy then fills the slot with the crashing dictionary
+`description_only_intrinsic` (`CrashDictionary` in
+`src/postcheck/boxy/lower.zig`), as it fills an `unreachable` slot, in
+place of a worker. No run-time code reads the
 slot. The resolution stays `direct`, because the reifier reads the target to
 describe the fragment. A slot of an ordinary method keeps its worker, whatever
 its runs bit.
@@ -19361,10 +19360,7 @@ terminal.
 In debug builds the emitter checks that its statement count stays within a
 linear bound of the pattern node count (`LINT_MULT` and `LINT_BASE` in
 `src/postcheck/match_tree.zig`). The count leaves out statements of bodies and
-guards, and statements the host reports through `hostStmtCount`. `.boxy`
-reports the reads and binds it lowers (`scopedRead` and `bindPatternLocal` in
-`src/postcheck/boxy/lower.zig`), because each converts between representations
-and its size follows the type, not the pattern.
+guards.
 
 Named record-rest binders are derived values, not durable pattern decisions.
 Monotype pattern lowering removes the rest binder from the record pattern,
@@ -23500,7 +23496,7 @@ rules are in `roc-reify-proposal.md`, `roc-reify-normal-form.md` and
 |---|---|---|
 | Checking | Types a function at a `Code` position as usual, records a `CodeReificationSite` and a `code_from_lambda` expression, and rejects a `Code` anywhere except a parameter of the annotation's outermost function or what that function returns (see the position rules below) | `src/check/Check.zig` (`stagedCode`, `checkStagedCodePositions`) |
 | Description | Walks each site's checked bodies, solved types and dispatch plans, builds the normal form with `src/reify`, and writes the `Code` value into the module's `ConstStore`. It walks a site once, or, for an instance site, once per closing use, in the module of the use (see the instance invariant below). A refusal is one `staged_code` problem (when the caller asks for compile-time problems), and its site becomes a `runtime_error` exactly like one checking poisoned | `src/check/code_reifier.zig`, `reifyStagedCode` |
-| Lowering | Restores the stored node as a constant, or, for an instance site, the node the instance table in force names. It walks no function, and a refused site has already become a checked error, so lowering has no refused case | `.code_from_lambda` in `src/postcheck/monotype/lower.zig`, `pushCodeConversion` in `src/postcheck/boxy/plan.zig` |
+| Lowering | Restores the stored node as a constant, or, for an instance site, the node the instance table in force names. It walks no function, and a refused site has already become a checked error, so lowering has no refused case | `.code_from_lambda` in `src/postcheck/monotype/lower.zig` and `lowerCodeSite` in `src/postcheck/boxy/body.zig` |
 | Evaluation | Runs a translator as any other Roc. `Code.refuse_at` lowers to a crash statement that carries a `Refusal`, and compile-time evaluation reports it at the source regions of the node | `src/lir/LIR.zig` (`Refusal`), `CodeProvenanceTable` in the checked module data |
 
 Invariants:
@@ -23520,8 +23516,13 @@ Invariants:
   variable with no default (`same = |x| x`), or a dispatcher whose selected
   target does not fit its callable (`x` in `|x| x * 2.U8`), is refused. A
   variable that an enclosing template quantifies is never sealed: the site
-  is an instance site, described at each closing use. See
-  `relateSelectedTargets` and `defaultedVariable` in
+  is an instance site, described at each closing use. A dispatcher that no
+  use pins (a parameter of a lambda nothing calls) has the resolution
+  `unreachable`, since no run-time code reaches it. When its variable has a
+  numeric default, the walk reads the method of the default's owner
+  (`defaultOwnerMethod`), the method the sealed variable dispatches to, and
+  relates or refuses it the same way. See
+  `relateSelectedTargets`, `defaultOwnerMethod` and `defaultedVariable` in
   `src/check/code_reifier.zig`. A record or tag row tail still open seals to
   its recorded row default by `CheckedTypePayload.variableSealsToRowDefault`,
   as Monotype seals it (`r` in `|r| r.id > 0` is `{ id : Dec }`), so checking
@@ -24012,17 +24013,21 @@ Invariants:
   `Code.Value` when it does. Both lowerings read the field's presence from
   explicit post-check data and never from the shape of the slot: Monotype
   from the field's `value_ty` (`optionalFieldCodeValue`), which only an
-  optional field has, and `.boxy` from the record child's
-  `record_field_kind` and the presence slot's planned Present discriminant
-  (`lowerOptionalFieldCodeValueInto`). Each matches on the field's
+  optional field has, and `.boxy` from the field's kind (`presence_slot`)
+  and the slot's `#Present` tag (`optionalFieldCodeValue` in
+  `src/postcheck/boxy/body.zig`). Each matches on the field's
   `#Missing` and `#Present` slot. A field default never uses `Absent`: a
   default record that leaves out an optional field stays `DefaultComputed`.
-- `.boxy` reads the same recorded slots. It runs the call where the program
-  reads it, and builds the call's `Code.Bound` again around the result's
-  `value` with one `Code.Value` per slot. A value is built by one generated
-  procedure per representation and formal environment, and in debug builds
-  lowering asserts each slot's representation against the recorded shape (see
-  "`.boxy` Runtime Lowering").
+- `.boxy` reads the same recorded slots (`bindCodeInputs` in
+  `src/postcheck/boxy/body.zig`). It reads the call as the program reads
+  any expression, from its stored value or where it runs, and builds the
+  call's `Code.Bound` again around the result's `value` with one
+  `Code.Value` per slot. A slot's value is its binder read through the
+  path steps. Its `Code.Value` is built by one worker per closed type and
+  module (`WorkerKey.code_value`, program-local like a conversion worker),
+  which builds one layer and calls the worker of each component's type, so
+  a recursive type reaches its own worker. In debug builds lowering asserts
+  each slot's type against the recorded shape.
 - Typing rule "Bound Capture Encoding" (`roc-reify-opaque-proposal.md`
   D5). `Code.Binds(code, fmt) : code` is a builtin transparent alias whose
   second parameter is phantom, so a parameter of type

@@ -136,6 +136,10 @@ pub const Task = union(enum) {
     finish_tuple_access: CheckedExprId,
     /// Pop a value of this type, report it through `dbg`, and push it back.
     finish_dbg: TypeId,
+    /// Pop the `Code.Bound` value of the call `expr`, which binds input
+    /// slots, and push it with `inputs` set to the slots' values
+    /// (`bindCodeInputs`).
+    bind_code_inputs: CheckedExprId,
     /// Restore stored constant `node` at `ty`. `root` is the compile-time
     /// root whose own value the node is, when the restore reads one: a read
     /// of a failed root's value then fails as that root did, reported once
@@ -1279,6 +1283,7 @@ pub const Builder = struct {
             .codec => |piece| return try Codec.lowerPiece(self, piece),
             .crash_dictionary => |kind| return try self.lowerCrashDictionary(kind),
             .convert => |key| return try self.lowerConvertBody(key.from, key.to),
+            .code_value => |key| return try self.lowerCodeValueBody(key.ty, key.value),
             .literal_thunk => |key| return try self.lowerLiteralThunkBody(key),
             .root_slot => |key| return try self.lowerRootSlotThunkBody(key),
         };
@@ -1393,13 +1398,16 @@ pub const Builder = struct {
                     // An interpolation conversion root runs the literal's
                     // first stage only, so a rejection fails the build; the
                     // assembler it yields is dropped, and the root's value is
-                    // `{}` (design.md "Code Reification").
+                    // `{}` (design.md, the section on `Code` descriptions).
                     .interpolation_conversion => {
                         const interpolation = switch (self.bodies().expr(wrapper.body_expr).data) {
                             .interpolation => |interpolation| interpolation,
                             .pending, .numeral, .str_from_quote, .str, .code_from_lambda, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level, .str_segment => invariant("an interpolation conversion root's body is not an interpolation"),
                         };
                         const plan_id = interpolation.plan orelse invariant("an interpolation conversion root has no conversion plan");
+                        // The checker gives a literal such a root only when
+                        // its conversion is closed (`CheckedInterpolation.conversion_root`).
+                        if (std.debug.runtime_safety and self.dispatchPlan(plan_id).resolution != .direct_closed) invariant("an interpolation conversion root's conversion is not closed");
                         try self.push(.unreachable_or_unit);
                         try self.push(.discard);
                         try self.lowerLiteralConversion(wrapper.body_expr, .interpolation, plan_id, try self.convert(interpolation.assembler_ty));
@@ -2472,6 +2480,10 @@ pub const Builder = struct {
                 const literal = try self.store.insertString("dispatch on a value that can never exist");
                 try self.emitTerminal(.{ .crash = .{ .msg = .{ .literal = literal } } });
             },
+            .description_only_intrinsic => {
+                const literal = try self.store.insertString("an intrinsic, which exists only inside a function that a translator describes, was called at run time");
+                try self.emitTerminal(.{ .crash = .{ .msg = .{ .literal = literal } } });
+            },
         }
     }
 
@@ -2677,6 +2689,7 @@ pub const Builder = struct {
                 try self.pushValue(try self.localOf(crash.result, .frame));
             },
             .push_value => |local| try self.pushValue(local),
+            .bind_code_inputs => |expr| try self.bindCodeInputs(expr),
             .unreachable_value => |ty| try self.pushValue(try self.localOf(ty, .frame)),
             .unreachable_or_unit => try self.pushValue(try self.unitValue()),
             .segments_arg => |arg| {
@@ -3034,6 +3047,10 @@ pub const Builder = struct {
             const own = try self.convert(expr.ty);
             if (try self.retagTarget(expr_id, own)) |destination| try self.push(.{ .retag = .{ .from = own, .to = destination } });
         }
+        // A call that binds input slots is read, from its stored value or
+        // where it runs in place, with the slots' values as its `inputs`
+        // (design.md, the section on `Code` descriptions).
+        if (self.bodies().codeBinding(expr_id) != null) try self.push(.{ .bind_code_inputs = expr_id });
         // An expression compile-time evaluation hoisted and stored is read
         // (design.md "Runtime Programs Read Stored Values").
         if (self.storedHoisted(expr_id)) |read| switch (read) {
@@ -3646,7 +3663,7 @@ pub const Builder = struct {
                 const export_name = view.nameStore().procBase(template.proc_base).export_name orelse break :blk "a template";
                 break :blk view.nameStore().exportNameText(export_name);
             },
-            inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => |_, kind| @tagName(kind),
+            inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => |_, kind| @tagName(kind),
         };
     }
 
@@ -4075,6 +4092,513 @@ pub const Builder = struct {
         try self.push(.{ .restore = .{ .source = .{ .module = self.module }, .node = node, .ty = try self.exprType(expr_id) } });
     }
 
+    // -- Captured run-time inputs (design.md, the section on `Code` descriptions) --
+    //
+    // A call whose result is a `Code.Bound` and that binds input slots is a
+    // compile-time root of its own. The program reads its value, and builds
+    // the `Code.Bound` again around its `value` with `inputs` set to one
+    // `Code.Value` per slot, in slot order. A slot is a binder of the body
+    // read through the path steps the checked module builder recorded, and
+    // its `Code.Value` is built by the worker of its closed type
+    // (`WorkerKey.code_value`), which calls the worker of each component's
+    // type, so a recursive type reaches its own worker again.
+
+    /// The `Code.Bound` value of `expr` rebuilt with the values of the
+    /// input slots it binds (`Task.bind_code_inputs`).
+    pub fn bindCodeInputs(self: *Builder, expr: CheckedExprId) Allocator.Error!void {
+        const raw = self.popValue();
+        const bound_ty = try self.exprType(expr);
+        // A value no execution produces is not rebuilt.
+        if (self.hole == null) return try self.pushValue(raw);
+        const slots = self.bodies().codeBinding(expr) orelse invariant("a code binding task names a call that binds no input slots");
+        const store = &self.program.store;
+        if (!store.isClosed(bound_ty)) invariant("a call that binds input slots has an open type");
+        const bound_nominal = switch (store.get(bound_ty)) {
+            .nominal => |nominal| nominal,
+            .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .function, .variable => invariant("a call that binds input slots did not return a nominal Code.Bound"),
+        };
+        if (!bound_nominal.has_backing) invariant("Code.Bound has no backing");
+        const backing = try self.structuralType(bound_ty);
+        const fields = switch (store.get(backing)) {
+            .record => |record| try self.allocator.dupe(types.Field, store.fieldSpan(record.fields)),
+            .primitive, .empty_record, .tuple, .tag_union, .list, .box, .nominal, .function, .variable => invariant("Code.Bound's backing is not a record"),
+        };
+        defer self.allocator.free(fields);
+        var inputs_index: ?usize = null;
+        var value_index: ?usize = null;
+        for (fields, 0..) |field, index| {
+            if (field.kind != .inline_slot) invariant("Code.Bound has a field that is not an inline slot");
+            const text = store.nameText(field.name);
+            if (std.mem.eql(u8, text, "inputs")) {
+                inputs_index = index;
+            } else if (std.mem.eql(u8, text, "value")) {
+                value_index = index;
+            } else invariant("Code.Bound has a field other than value and inputs");
+        }
+        const inputs_field = fields[inputs_index orelse invariant("Code.Bound has no field inputs")];
+        const value_field = fields[value_index orelse invariant("Code.Bound has no field value")];
+        const code_value_ty = switch (store.get(inputs_field.ty)) {
+            .list => |elem| elem,
+            .primitive, .empty_record, .record, .tuple, .tag_union, .box, .nominal, .function, .variable => invariant("Code.Bound inputs is not a list"),
+        };
+        const value = try self.readField(backing, raw, @intCast(value_index.?), value_field.ty);
+        const values = try self.allocator.alloc(LocalId, slots.len);
+        defer self.allocator.free(values);
+        for (slots, values) |slot, *out| out.* = try self.boundSlotValue(slot, code_value_ty);
+        const inputs = try self.buildList(inputs_field.ty, values);
+        const components = try self.allocator.alloc(LocalId, fields.len);
+        defer self.allocator.free(components);
+        components[inputs_index.?] = inputs;
+        components[value_index.?] = value;
+        try self.pushValue(try self.buildStruct(backing, components));
+    }
+
+    /// The `Code.Value` of one input slot: its binder's value read through
+    /// its path steps, then built by the worker of its type, or, for a slot
+    /// whose type holds an opaque type, the bytes its recorded encoder
+    /// writes.
+    fn boundSlotValue(self: *Builder, slot: checked.CheckedCodeSlot, code_value_ty: TypeId) Allocator.Error!LocalId {
+        const store = &self.program.store;
+        const binder = self.bodies().patternBinder(slot.leaf);
+        var ty = try self.patternType(binder.pattern);
+        if (!store.isClosed(ty)) invariant("an input slot's binder has an open type");
+        var value = self.binders.get(slot.leaf) orelse invariant("an input slot reads a binder the body has not bound");
+        for (self.bodies().codeSlotSteps(slot)) |path_step| switch (path_step.kind) {
+            .field => {
+                const text = self.view.nameStore().recordFieldLabelText(@fromBackingInt(path_step.value));
+                const record = switch (store.get(ty)) {
+                    .record => |record| record,
+                    .primitive, .empty_record, .tuple, .tag_union, .list, .box, .nominal, .function, .variable => invariant("an input slot's field step read a value that is not a record"),
+                };
+                const record_fields = store.fieldSpan(record.fields);
+                const index = for (record_fields, 0..) |field, index| {
+                    if (std.mem.eql(u8, store.nameText(field.name), text)) break index;
+                } else invariant("an input slot read a field its record type does not have");
+                const field = record_fields[index];
+                // A path with an optional segment ends before it.
+                if (field.kind != .inline_slot) invariant("an input slot's path reads a field that is not an inline slot");
+                value = try self.readField(ty, value, @intCast(index), field.ty);
+                ty = field.ty;
+            },
+            .index => {
+                const items = switch (store.get(ty)) {
+                    .tuple => |items| try self.allocator.dupe(TypeId, store.span(items)),
+                    .primitive, .empty_record, .record, .tag_union, .list, .box, .nominal, .function, .variable => invariant("an input slot's item step read a value that is not a tuple"),
+                };
+                defer self.allocator.free(items);
+                if (path_step.value >= items.len) invariant("an input slot read an item its tuple type does not have");
+                value = try self.readField(ty, value, path_step.value, items[path_step.value]);
+                ty = items[path_step.value];
+            },
+            // A nominal value shares its backing's representation.
+            .unwrap => switch (store.get(ty)) {
+                .nominal => |nominal| {
+                    if (!nominal.has_backing) invariant("an input slot unwrapped a nominal value with no backing");
+                    ty = try self.program.converter().backing(ty);
+                },
+                .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .function, .variable => invariant("an input slot unwrapped a value that is not nominal"),
+            },
+        };
+        if (slot.encoder.get()) |encoder| {
+            if (std.debug.runtime_safety) {
+                const shape = self.bodies().codeSlotShape(slot);
+                if (shape.len != 1 or shape[0] != @backingInt(checked.CodeValueShape.encoded)) invariant("an input slot with an encoder was not recorded as encoded");
+            }
+            return try self.encodedSlotValue(encoder, value, ty, code_value_ty);
+        }
+        if (std.debug.runtime_safety) {
+            if (!try self.codeValueShapeMatches(ty, self.bodies().codeSlotShape(slot))) invariant("an input slot's type differs from the shape of its slot type");
+        }
+        return try self.codeValueCall(value, ty, code_value_ty);
+    }
+
+    /// The `Code.Value` `Encoded(bytes)` of a slot value of type `ty` whose
+    /// type holds an opaque type: `encoder`, the expression
+    /// `T.encoder_for(fmt.default())` the checker planned for the capture
+    /// read the slot is, applied to the value and `[]`. Its error type is
+    /// `[]`, which no value has, so the result holds `Ok` of the bytes.
+    fn encodedSlotValue(self: *Builder, encoder: CheckedExprId, value: LocalId, ty: TypeId, code_value_ty: TypeId) Allocator.Error!LocalId {
+        const store = &self.program.store;
+        const encoder_ty = try self.exprType(encoder);
+        const function = switch (store.get(encoder_ty)) {
+            .function => |function| function,
+            .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .nominal, .variable => invariant("a bound capture's encoder is not a function"),
+        };
+        const params = store.span(function.args);
+        if (params.len != 2) invariant("a bound capture's encoder does not take a value and its bytes");
+        if (params[0] != ty) invariant("a bound capture's encoder takes a type other than its slot's");
+        const bytes_ty = params[1];
+        const result_ty = function.ret;
+        const encode = try self.lowerExprNow(encoder);
+        const no_bytes = try self.buildList(bytes_ty, &.{});
+        const result = try self.emitErasedCall(encode, encoder_ty, &.{ value, no_bytes }, result_ty);
+        const bytes = try self.tagPayloadValue(result, result_ty, try store.internName("Ok"), 0);
+        return try self.buildTag(code_value_ty, try store.internName("Encoded"), &.{bytes.value});
+    }
+
+    /// A call of the worker that builds the `Code.Value` of `value`, of the
+    /// closed type `ty`.
+    fn codeValueCall(self: *Builder, value: LocalId, ty: TypeId, code_value_ty: TypeId) Allocator.Error!LocalId {
+        const worker = try self.program.codeValueWorker(self.module, ty, code_value_ty);
+        const target = try self.localOf(code_value_ty, .frame);
+        try self.emitLinear(.{ .assign_call = .{ .target = target, .proc = self.program.worker(worker).proc, .args = try self.store.addLocalSpan(&.{value}), .next = undefined } });
+        return target;
+    }
+
+    /// The `Code.Value` variant `text` of `code_value_ty` holding `payloads`.
+    fn codeValueVariant(self: *Builder, code_value_ty: TypeId, comptime text: []const u8, payloads: []const LocalId) Allocator.Error!LocalId {
+        return try self.buildTag(code_value_ty, try self.program.store.internName(text), payloads);
+    }
+
+    /// The type of payload `index` of the `Code.Value` variant `text`.
+    fn codeValuePayloadType(self: *Builder, code_value_ty: TypeId, comptime text: []const u8, index: usize) Allocator.Error!TypeId {
+        const value_union = try self.structuralType(code_value_ty);
+        const variant = try self.closedVariant(value_union, try self.program.store.internName(text));
+        return variant.payloads[index];
+    }
+
+    /// A `Code.Value` builder's body (`WorkerKey.code_value`): one layer of
+    /// the `Code.Value` of its parameter, each component's built by a call
+    /// of its type's worker.
+    pub fn lowerCodeValueBody(self: *Builder, ty: TypeId, code_value_ty: TypeId) Allocator.Error!void {
+        self.entry_hole = try self.newHole();
+        const entry = self.entry_hole;
+        self.var_descs = &.{};
+        self.dict_locals = &.{};
+        const param = try self.localOf(ty, .param);
+        const ret_layout = try self.program.layouts.layoutOf(code_value_ty);
+        const body_start = try self.newHole();
+        self.hole = body_start;
+        try self.codeValueLayer(param, ty, code_value_ty);
+        try self.finishProc(entry, body_start, &.{param}, ret_layout);
+    }
+
+    /// Return the `Code.Value` of `value`, of the closed type `ty`, built one
+    /// layer deep.
+    fn codeValueLayer(self: *Builder, value: LocalId, ty: TypeId, code_value_ty: TypeId) Allocator.Error!void {
+        const store = &self.program.store;
+        switch (store.get(ty)) {
+            .primitive => |primitive| {
+                const widened: ?struct { op: LIR.LowLevel, prim: types.Primitive } = switch (primitive) {
+                    .u8 => .{ .op = .u8_to_i128, .prim = .i128 },
+                    .i8 => .{ .op = .i8_to_i128, .prim = .i128 },
+                    .u16 => .{ .op = .u16_to_i128, .prim = .i128 },
+                    .i16 => .{ .op = .i16_to_i128, .prim = .i128 },
+                    .u32 => .{ .op = .u32_to_i128, .prim = .i128 },
+                    .i32 => .{ .op = .i32_to_i128, .prim = .i128 },
+                    .u64 => .{ .op = .u64_to_i128, .prim = .i128 },
+                    .i64 => .{ .op = .i64_to_i128, .prim = .i128 },
+                    .f32 => .{ .op = .f32_to_f64, .prim = .f64 },
+                    .bool, .str, .u128, .i128, .f64, .dec => null,
+                    .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => invariant("a slot type holds a vector, which the walk refuses"),
+                };
+                const payload = if (widened) |widen| blk: {
+                    const wide = try self.localOf(try store.primitive(widen.prim), .frame);
+                    try self.emitLowLevel(wide, widen.op, &.{value});
+                    break :blk wide;
+                } else value;
+                const built = switch (primitive) {
+                    .bool => try self.codeValueVariant(code_value_ty, "Bool", &.{payload}),
+                    .str => try self.codeValueVariant(code_value_ty, "Str", &.{payload}),
+                    .u128 => try self.codeValueVariant(code_value_ty, "U128", &.{payload}),
+                    .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .i128 => try self.codeValueVariant(code_value_ty, "Int", &.{payload}),
+                    .f32, .f64 => try self.codeValueVariant(code_value_ty, "Frac", &.{payload}),
+                    .dec => try self.codeValueVariant(code_value_ty, "Dec", &.{payload}),
+                    .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => unreachable, // `widened` refuses a vector
+                };
+                try self.emitTerminal(.{ .ret = .{ .value = built } });
+            },
+            .nominal => |nominal| {
+                // `Bool` is a nominal tag union, and its `Code.Value` is
+                // `Bool`, not `Wrap`.
+                if (nominal.builtin == .bool) {
+                    try self.emitTerminal(.{ .ret = .{ .value = try self.codeValueVariant(code_value_ty, "Bool", &.{value}) } });
+                    return;
+                }
+                if (nominal.is_opaque or !nominal.has_backing) invariant("a slot type holds an opaque type, which only an encoded slot holds");
+                // A nominal value shares its backing's representation.
+                const inner = try self.codeValueCall(value, try self.program.converter().backing(ty), code_value_ty);
+                try self.emitTerminal(.{ .ret = .{ .value = try self.codeValueVariant(code_value_ty, "Wrap", &.{inner}) } });
+            },
+            .empty_record => {
+                const list = try self.buildList(try self.codeValuePayloadType(code_value_ty, "Record", 0), &.{});
+                try self.emitTerminal(.{ .ret = .{ .value = try self.codeValueVariant(code_value_ty, "Record", &.{list}) } });
+            },
+            .record => |record| {
+                if (record.ext != null) invariant("a slot type holds an open record, which the walk seals");
+                const fields = try self.allocator.dupe(types.Field, store.fieldSpan(record.fields));
+                defer self.allocator.free(fields);
+                const items = try self.allocator.alloc(LocalId, fields.len);
+                defer self.allocator.free(items);
+                for (fields, items, 0..) |field, *item, index| {
+                    const storage = try self.program.layouts.fieldStorage(field);
+                    const read = try self.readField(ty, value, @intCast(index), storage);
+                    item.* = switch (field.kind) {
+                        .inline_slot => try self.codeValueCall(read, field.ty, code_value_ty),
+                        .presence_slot => try self.optionalFieldCodeValue(read, storage, field.ty, code_value_ty),
+                        .variable_slot => invariant("a slot type holds a field whose kind is a variable"),
+                    };
+                }
+                const list = try self.buildList(try self.codeValuePayloadType(code_value_ty, "Record", 0), items);
+                try self.emitTerminal(.{ .ret = .{ .value = try self.codeValueVariant(code_value_ty, "Record", &.{list}) } });
+            },
+            .tuple => |span| {
+                const item_types = try self.allocator.dupe(TypeId, store.span(span));
+                defer self.allocator.free(item_types);
+                const items = try self.allocator.alloc(LocalId, item_types.len);
+                defer self.allocator.free(items);
+                for (item_types, items, 0..) |item_ty, *item, index| {
+                    item.* = try self.codeValueCall(try self.readField(ty, value, @intCast(index), item_ty), item_ty, code_value_ty);
+                }
+                const list = try self.buildList(try self.codeValuePayloadType(code_value_ty, "Tuple", 0), items);
+                try self.emitTerminal(.{ .ret = .{ .value = try self.codeValueVariant(code_value_ty, "Tuple", &.{list}) } });
+            },
+            .tag_union => |union_ty| {
+                if (union_ty.ext != null) invariant("a slot type holds an open tag union, which the walk seals");
+                const tags = try self.allocator.dupe(types.Tag, store.tagSpan(union_ty.tags));
+                defer self.allocator.free(tags);
+                // No value has the empty union.
+                if (tags.len == 0) return try self.emitTerminal(.runtime_error);
+                const committed = self.program.result.layouts.getLayout(try self.program.layouts.layoutOf(ty));
+                const arms = try self.allocator.alloc(CFStmtId, tags.len);
+                defer self.allocator.free(arms);
+                if (tags.len > 1) {
+                    if (committed.tag != .tag_union) invariant("a tag union of several variants has no discriminant storage");
+                    const discriminant = try self.closedLocal(.u32);
+                    try self.emitLinear(.{ .assign_ref = .{ .target = discriminant, .op = LIR.RefOp.discriminant(value), .next = undefined } });
+                    for (arms) |*arm| arm.* = try self.newHole();
+                    const branches = try self.allocator.alloc(LIR.CFSwitchBranch, tags.len - 1);
+                    defer self.allocator.free(branches);
+                    for (branches, 0..) |*branch, index| branch.* = .{ .value = @intCast(index), .body = arms[index] };
+                    try self.emitTerminal(.{ .switch_stmt = .{ .cond = discriminant, .branches = try self.store.addCFSwitchBranches(branches), .default_branch = arms[tags.len - 1] } });
+                } else {
+                    arms[0] = try self.currentHole();
+                }
+                const payload_list_ty = try self.codeValuePayloadType(code_value_ty, "Tag", 1);
+                for (tags, arms, 0..) |tag, arm, variant| {
+                    self.hole = arm;
+                    const payload_types = try self.allocator.dupe(TypeId, store.span(tag.payloads));
+                    defer self.allocator.free(payload_types);
+                    const payloads = try self.allocator.alloc(LocalId, payload_types.len);
+                    defer self.allocator.free(payloads);
+                    for (payloads, payload_types, 0..) |*slot, payload_ty, index| {
+                        const payload = if (committed.tag != .tag_union) blk: {
+                            // A union without storage has only zero-sized payloads.
+                            const payload_local = try self.localOf(payload_ty, .frame);
+                            if (self.store.getLocal(payload_local).layout_idx != .zst) invariant("a storage-free union has a payload with storage");
+                            try self.emitLinear(.{ .assign_struct = .{ .target = payload_local, .fields = LIR.LocalSpan.empty(), .next = undefined } });
+                            break :blk payload_local;
+                        } else try self.readTagPayload(value, ty, variant, payload_types, index);
+                        slot.* = try self.codeValueCall(payload, payload_ty, code_value_ty);
+                    }
+                    const name = try self.strLiteral(store.nameText(tag.name));
+                    const list = try self.buildList(payload_list_ty, payloads);
+                    try self.emitTerminal(.{ .ret = .{ .value = try self.codeValueVariant(code_value_ty, "Tag", &.{ name, list }) } });
+                }
+            },
+            .list => |elem_ty| {
+                // loop (index = 0, out = with_capacity(len))
+                //   if index == len then List(out)
+                //   else continue (index + 1, append_unsafe(out, value_of(get_unsafe(value, index))))
+                const out_ty = try self.codeValuePayloadType(code_value_ty, "List", 0);
+                const u64_ty = try store.primitive(.u64);
+                const len = try self.closedLocal(.u64);
+                try self.emitListLowLevel(len, .list_len, &.{value}, elem_ty, ty);
+                const initial = try self.localOf(out_ty, .frame);
+                try self.emitListLowLevel(initial, .list_with_capacity, &.{len}, code_value_ty, out_ty);
+                const zero = try self.intValue(0, u64_ty);
+                const head = self.freshJoin();
+                const index = try self.closedLocal(.u64);
+                const out = try self.localOf(out_ty, .frame);
+                const head_body = try self.declareJoin(head, &.{ index, out });
+                try self.emitLinear(.{ .set_local = .{ .target = index, .value = zero, .mode = .initialize_join_param, .next = undefined } });
+                try self.emitLinear(.{ .set_local = .{ .target = out, .value = initial, .mode = .initialize_join_param, .next = undefined } });
+                try self.emitTerminal(.{ .jump = .{ .target = head } });
+                self.store.shapes.loop = true;
+                self.hole = head_body;
+                const done = try self.closedLocal(.bool);
+                try self.emitLowLevel(done, .num_is_eq, &.{ index, len });
+                const branches = try self.emitBoolSwitch(done);
+                self.hole = branches.then;
+                try self.emitTerminal(.{ .ret = .{ .value = try self.codeValueVariant(code_value_ty, "List", &.{out}) } });
+                self.hole = branches.otherwise;
+                const item = try self.localOf(elem_ty, .frame);
+                try self.emitListLowLevel(item, .list_get_unsafe, &.{ value, index }, elem_ty, ty);
+                const item_value = try self.codeValueCall(item, elem_ty, code_value_ty);
+                const next_out = try self.localOf(out_ty, .frame);
+                try self.emitListLowLevel(next_out, .list_append_unsafe, &.{ out, item_value }, code_value_ty, out_ty);
+                const next_index = try self.closedLocal(.u64);
+                try self.emitLowLevel(next_index, .num_int_add_wrap, &.{ index, try self.intValue(1, u64_ty) });
+                try self.emitLinear(.{ .set_local = .{ .target = index, .value = next_index, .mode = .initialize_join_param, .next = undefined } });
+                try self.emitLinear(.{ .set_local = .{ .target = out, .value = next_out, .mode = .initialize_join_param, .next = undefined } });
+                try self.emitTerminal(.{ .jump = .{ .target = head } });
+            },
+            .box, .function, .variable => invariant("a slot type holds a shape no Code.Value expresses, which the walk refuses"),
+        }
+    }
+
+    /// The `Code.Value` of an optional field read as `slot`, its presence
+    /// slot of type `slot_ty`: `Absent` when the record does not hold the
+    /// field, and the value of `payload_ty` the slot holds when it does.
+    /// The field's presence is the slot's explicit tag, never its shape.
+    fn optionalFieldCodeValue(self: *Builder, slot: LocalId, slot_ty: TypeId, payload_ty: TypeId, code_value_ty: TypeId) Allocator.Error!LocalId {
+        const store = &self.program.store;
+        if (store.presence_payloads.get(slot_ty)) |held| {
+            if (held != payload_ty) invariant("an optional field's presence slot holds a type other than the field's value type");
+        } else invariant("an optional field's storage is no presence slot");
+        const present = try store.internName(types.present_label);
+        const result = try self.localOf(code_value_ty, .frame);
+        const join = self.freshJoin();
+        const after = try self.declareMergeJoin(join, result, null);
+        const missing_hole = try self.newHole();
+        try self.branchOnTag(slot, slot_ty, present, missing_hole);
+        const payload = try self.tagPayloadValue(slot, slot_ty, present, 0);
+        try self.emitJump(join, try self.codeValueCall(payload.value, payload_ty, code_value_ty));
+        self.hole = missing_hole;
+        try self.emitJump(join, try self.codeValueVariant(code_value_ty, "Absent", &.{}));
+        self.hole = after;
+        return result;
+    }
+
+    /// Whether `ty` has the shape `words` (`checked.CodeValueShape`) say,
+    /// which the walk wrote from the slot's type. Debug builds only.
+    fn codeValueShapeMatches(self: *Builder, ty: TypeId, words: []const u32) Allocator.Error!bool {
+        const store = &self.program.store;
+        const S = checked.CodeValueShape;
+        const names = self.view.nameStore();
+        // `opt_field` holds the value type of an optional field.
+        const Item = union(enum) { ty: TypeId, opt_field: TypeId, field: types.NameId, tag: types.Tag };
+        var pending: std.ArrayList(Item) = .empty;
+        defer pending.deinit(self.allocator);
+        try pending.append(self.allocator, .{ .ty = ty });
+        var at: usize = 0;
+        while (pending.pop()) |item| {
+            if (at >= words.len) return false;
+            const word = words[at];
+            at += 1;
+            const current = switch (item) {
+                .field => |name| {
+                    if (!std.mem.eql(u8, names.recordFieldLabelText(@fromBackingInt(word)), store.nameText(name))) return false;
+                    continue;
+                },
+                .tag => |tag| {
+                    if (!std.mem.eql(u8, names.tagLabelText(@fromBackingInt(word)), store.nameText(tag.name))) return false;
+                    if (at >= words.len or words[at] != tag.payloads.len) return false;
+                    at += 1;
+                    continue;
+                },
+                .opt_field => |payload_ty| {
+                    if (word != @backingInt(S.opt_field)) return false;
+                    try pending.append(self.allocator, .{ .ty = payload_ty });
+                    continue;
+                },
+                .ty => |current| current,
+            };
+            const shape = std.enums.fromInt(S, word) orelse return false;
+            const node = store.get(current);
+            switch (shape) {
+                .int => {
+                    if (at >= words.len) return false;
+                    const want = words[at];
+                    at += 1;
+                    const primitive = switch (node) {
+                        .primitive => |primitive| primitive,
+                        .empty_record, .record, .tuple, .tag_union, .list, .box, .nominal, .function, .variable => return false,
+                    };
+                    switch (primitive) {
+                        .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => {},
+                        .bool, .str, .f32, .f64, .dec, .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => return false,
+                    }
+                    if (@backingInt(primitive) - @backingInt(types.Primitive.u8) != want) return false;
+                },
+                .frac => {
+                    if (at >= words.len) return false;
+                    const want: types.Primitive = if (words[at] == 1) .f64 else .f32;
+                    at += 1;
+                    if (node != .primitive or node.primitive != want) return false;
+                },
+                .dec => if (node != .primitive or node.primitive != .dec) return false,
+                .bool_ => switch (node) {
+                    .primitive => |primitive| if (primitive != .bool) return false,
+                    .nominal => |nominal| if (nominal.builtin != .bool) return false,
+                    .empty_record, .record, .tuple, .tag_union, .list, .box, .function, .variable => return false,
+                },
+                .str => if (node != .primitive or node.primitive != .str) return false,
+                .list => switch (node) {
+                    .list => |elem| try pending.append(self.allocator, .{ .ty = elem }),
+                    .primitive, .empty_record, .record, .tuple, .tag_union, .box, .nominal, .function, .variable => return false,
+                },
+                .wrap => switch (node) {
+                    .nominal => |nominal| {
+                        if (!nominal.has_backing) return false;
+                        try pending.append(self.allocator, .{ .ty = try self.program.converter().backing(current) });
+                    },
+                    .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .function, .variable => return false,
+                },
+                .recursive => if (node != .nominal) return false,
+                // An encoded slot's whole shape; its value comes from its encoder.
+                .encoded => return false,
+                // Only the field of a record that is optional has this shape.
+                .opt_field => return false,
+                .tuple => {
+                    const items = switch (node) {
+                        .tuple => |items| store.span(items),
+                        .primitive, .empty_record, .record, .tag_union, .list, .box, .nominal, .function, .variable => return false,
+                    };
+                    if (at >= words.len or items.len != words[at]) return false;
+                    at += 1;
+                    var index = items.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try pending.append(self.allocator, .{ .ty = items[index] });
+                    }
+                },
+                .record => {
+                    if (at >= words.len) return false;
+                    const fields: []const types.Field = switch (node) {
+                        .record => |record| store.fieldSpan(record.fields),
+                        .empty_record => &.{},
+                        .primitive, .tuple, .tag_union, .list, .box, .nominal, .function, .variable => return false,
+                    };
+                    if (fields.len != words[at]) return false;
+                    at += 1;
+                    var index = fields.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const field = fields[index];
+                        try pending.append(self.allocator, switch (field.kind) {
+                            .inline_slot => .{ .ty = field.ty },
+                            .presence_slot => .{ .opt_field = field.ty },
+                            .variable_slot => return false,
+                        });
+                        try pending.append(self.allocator, .{ .field = field.name });
+                    }
+                },
+                .tag_union => {
+                    const tags = switch (node) {
+                        .tag_union => |union_ty| store.tagSpan(union_ty.tags),
+                        .primitive, .empty_record, .record, .tuple, .list, .box, .nominal, .function, .variable => return false,
+                    };
+                    if (at >= words.len or tags.len != words[at]) return false;
+                    at += 1;
+                    var index = tags.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const tag = tags[index];
+                        const payloads = store.span(tag.payloads);
+                        var payload = payloads.len;
+                        while (payload > 0) {
+                            payload -= 1;
+                            try pending.append(self.allocator, .{ .ty = payloads[payload] });
+                        }
+                        try pending.append(self.allocator, .{ .tag = tag });
+                    }
+                },
+            }
+        }
+        return at == words.len;
+    }
+
     pub fn lowerInterpolation(self: *Builder, expr_id: CheckedExprId, interpolation: checked.CheckedInterpolation) Allocator.Error!void {
         const plan_id = interpolation.plan orelse invariant("an interpolation has no checked conversion plan");
         const plan = self.dispatchPlan(plan_id);
@@ -4458,7 +4982,7 @@ pub const Builder = struct {
             if (self.program.worker_ids.get(.{ .lambda = .{ .module = self.module, .expr = lambda_expr, .outer = scope_worker } })) |id| return .{ scope_worker, id };
             switch (self.program.worker(scope_worker).key) {
                 .lambda => |key| scope_worker = key.outer,
-                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => break,
+                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => break,
             }
         }
         // No body of the chain declared it: the chain is a stored closure
@@ -5208,7 +5732,7 @@ pub const Builder = struct {
         if (decoded.rebuilt) {
             const target = switch (self.program.worker(decoded.worker).key) {
                 .method_entry => |target| target,
-                .template, .adapter, .default, .lambda, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => invariant("a rebuilt stored dictionary is not a method entry's"),
+                .template, .adapter, .default, .lambda, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("a rebuilt stored dictionary is not a method entry's"),
             };
             const instance = try self.program.targetRequirements(target, decoded.bound);
             return try self.pushValue(try self.dictionaryOfTree(.{ .target = .{ .target = target, .instance = instance } }));
@@ -5346,7 +5870,7 @@ pub const Builder = struct {
     pub fn templateEvidenceParams(self: *Builder, worker_id: WorkerId) []const static_dispatch.EvidenceParamRecord {
         const key = switch (self.program.worker(worker_id).key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => invariant("evidence parameters of a worker that is not a procedure template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("evidence parameters of a worker that is not a procedure template's"),
         };
         const view = self.program.module(key.module).view;
         const template = view.checked_procedure_templates.templates.items[@backingInt(key.template)];
@@ -5899,6 +6423,14 @@ pub const Builder = struct {
         switch (evidence.resolution) {
             .constraint => |constraint| return try self.scopeDictionary(constraint.index),
             .direct => |node_id| {
+                // A slot whose target is an intrinsic that only the described
+                // lambda uses holds a crash: no run-time code reads it
+                // (design.md, the section on definitions only a description
+                // reads). The resolution stays `direct` for the reifier,
+                // which reads the target.
+                if (evidence.description_only_intrinsic) {
+                    return try self.composeDictionary(try self.program.crashDictionaryWorker(self.module, .description_only_intrinsic), &.{});
+                }
                 const node = table.evidenceNode(node_id);
                 if (node.target.kind == .local_proc) {
                     const fn_ty = (try self.instantiationCallable(node.instantiation)) orelse try self.convert(node.target.callable_ty);
@@ -5968,7 +6500,7 @@ pub const Builder = struct {
         const target = self.program.worker(callee).*;
         const key = switch (target.key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => invariant("a worker with dictionary parameters is not a template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("a worker with dictionary parameters is not a template's"),
         };
         const templates = self.program.module(key.module).view.checked_procedure_templates;
         return .{

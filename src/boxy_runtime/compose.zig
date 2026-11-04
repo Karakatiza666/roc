@@ -555,9 +555,15 @@ pub fn record(cache: *Cache, ops: *RocOps, fields: []const FieldInput) *const Ty
 
 /// A record of `fields` together with the fields of the record `ext`
 /// describes: an open row's explicit fields and its remainder's.
+///
+/// A nominal shares its backing's representation, so a remainder that is a
+/// record-backed nominal contributes its backing's fields (design.md "Record
+/// Extension Well-Formedness").
 pub fn recordExtended(cache: *Cache, ops: *RocOps, fields: []const FieldInput, ext: *const TypeDesc) *const TypeDesc {
-    const ext_fields: []const desc_mod.Field = switch (ext.kind) {
-        .record => ext.fields(),
+    var remainder = ext;
+    while (remainder.kind == .nominal) remainder = remainder.child orelse invariant(ops, "a nominal descriptor has no backing");
+    const ext_fields: []const desc_mod.Field = switch (remainder.kind) {
+        .record => remainder.fields(),
         .zst => &.{},
         .scalar, .str, .bool, .list, .box, .tuple, .tag_union, .erased_callable, .nominal, .recursive_box => invariant(ops, "a record row's remainder descriptor is not a record"),
     };

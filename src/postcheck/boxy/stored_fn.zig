@@ -81,7 +81,7 @@ pub fn captureShape(program: *Program, id: WorkerId) CaptureShape {
             .dicts = 0,
             .composed = program.codec.pieces.items[index].kind == .constructor,
         },
-        .template, .default, .root, .static_data, .convert => invariant("a worker that is no function value reached a stored function"),
+        .template, .default, .root, .static_data, .convert, .code_value => invariant("a worker that is no function value reached a stored function"),
     };
 }
 
@@ -174,7 +174,7 @@ pub const Retained = struct {
         // from the types rather than stored as a cycle.
         const rebuilt = switch (program.worker(worker_id).key) {
             .method_entry => |target| try program.dictionaryCapturesItself(target, bound),
-            .lambda, .adapter, .structural, .structural_map, .crash_dictionary, .literal_thunk, .root_slot, .codec, .template, .default, .root, .static_data, .convert => false,
+            .lambda, .adapter, .structural, .structural_map, .crash_dictionary, .literal_thunk, .root_slot, .codec, .template, .default, .root, .static_data, .convert, .code_value => false,
         };
         try recipe.bytes.append(allocator, @intFromBool(rebuilt));
         if (rebuilt) return .{ .recipe = try recipe.finish(), .captures = &.{} };
@@ -555,7 +555,7 @@ const Encoder = struct {
                 try self.typeOf(record.ret);
                 try self.typeSpan(record.capture_types);
             },
-            .root, .static_data, .convert => invariant("a worker that is no function value reached a stored function"),
+            .root, .static_data, .convert, .code_value => invariant("a worker that is no function value reached a stored function"),
         }
     }
 };

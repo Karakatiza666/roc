@@ -1304,8 +1304,29 @@ pub const Converter = struct {
                         try fields.appendSlice(allocator, self.store.fieldSpan(ext_record.fields));
                         ext = null;
                     },
+                    // A `:=` nominal in an extension slot is read
+                    // transparently: its backing's fields join this row, and
+                    // the backing's own remainder is this row's (design.md
+                    // "Record Extension Well-Formedness").
+                    .nominal => |nominal| {
+                        if (nominal.is_opaque or nominal.builtin != null) invariant("a record extension slot holds an opaque or builtin nominal");
+                        const ext_backing = try self.backing(ext_ty);
+                        switch (self.store.get(ext_backing)) {
+                            .empty_record => ext = null,
+                            .record => |backing_record| {
+                                for (self.store.fieldSpan(backing_record.fields)) |field| {
+                                    try fields.append(allocator, field);
+                                    if (self.store.field_defaults.get(.{ .record = ext_backing, .name = field.name })) |default| {
+                                        try defaults.append(allocator, .{ .name = field.name, .default = default });
+                                    }
+                                }
+                                ext = backing_record.ext;
+                            },
+                            .primitive, .tuple, .tag_union, .list, .box, .nominal, .function, .variable => invariant("a record extension nominal's backing is not a record"),
+                        }
+                    },
                     .variable => {},
-                    .primitive, .tuple, .tag_union, .list, .box, .nominal, .function => invariant("a record row's remainder converted to a non-record type"),
+                    .primitive, .tuple, .tag_union, .list, .box, .function => invariant("a record row's remainder converted to a non-record type"),
                 };
                 if (fields.items.len == 0 and ext == null) return try self.store.emptyRecord();
                 const store = self.store;

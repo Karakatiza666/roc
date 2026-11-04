@@ -251,10 +251,19 @@ pub const WorkerKey = union(enum) {
     /// reach (design.md "Sealed Result Rows"). Each module converting a pair
     /// has its own worker for it.
     convert: struct { module: ModuleIndex, from: TypeId, to: TypeId },
+    /// The builder of `module` of the `Code.Value` (of type `value`) of a
+    /// value of the closed type `ty`, an input slot's type or a component of
+    /// one (design.md, the section on `Code` descriptions): one layer of the value, each
+    /// component built by the worker of its own type, so a recursive type
+    /// reaches its own worker. Each module binding inputs has its own.
+    code_value: struct { module: ModuleIndex, ty: TypeId, value: TypeId },
 };
 
-/// Why a dictionary slot's method crashes.
-pub const CrashDictionary = enum { checked_error, unreachable_value };
+/// Why a dictionary slot's method crashes. `description_only_intrinsic` is a
+/// slot whose target is an intrinsic that only description-only bodies use
+/// (`CheckedEvidence.description_only_intrinsic`): no run-time code reads it
+/// (design.md, the section on definitions only a description reads).
+pub const CrashDictionary = enum { checked_error, unreachable_value, description_only_intrinsic };
 
 /// Where a stored constant lives: a checked module's constant store.
 pub const ConstSource = union(enum) { module: ModuleIndex };
@@ -610,7 +619,7 @@ pub const Program = struct {
                 hasher.update(&self.modules.linkName(default.module));
                 hasher.update(std.mem.asBytes(&self.defaultOrdinal(default.module, default.expr)));
             },
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => invariant("a worker no module's object exports has no content identity"),
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("a worker no module's object exports has no content identity"),
         }
         return .{ .bytes = hasher.finalResult() };
     }
@@ -629,7 +638,7 @@ pub const Program = struct {
     pub fn exportableKind(key: WorkerKey) bool {
         return switch (key) {
             .template, .lambda, .method_entry, .default => true,
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => false,
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => false,
         };
     }
 
@@ -1319,8 +1328,25 @@ pub const Program = struct {
                             try fields.appendSlice(allocator, self.store.fieldSpan(ext_record.fields));
                             ext = ext_record.ext;
                         },
+                        // A nominal shares its backing's representation, so
+                        // a remainder substituted to a transparent nominal is
+                        // read through its backing, whose own remainder its
+                        // conversion already resolved (design.md "Record
+                        // Extension Well-Formedness").
+                        .nominal => |nominal| {
+                            if (nominal.is_opaque or nominal.builtin != null or !nominal.has_backing) invariant("a record row's remainder substituted to an opaque or builtin nominal");
+                            const ext_backing = try self.converter().backing(ext_ty);
+                            switch (self.store.get(ext_backing)) {
+                                .empty_record => ext = null,
+                                .record => |backing_record| {
+                                    try fields.appendSlice(allocator, self.store.fieldSpan(backing_record.fields));
+                                    ext = backing_record.ext;
+                                },
+                                .primitive, .tuple, .tag_union, .list, .box, .nominal, .function, .variable => invariant("a record row's remainder substituted to a nominal whose backing is not a record"),
+                            }
+                        },
                         .variable => {},
-                        .primitive, .tuple, .tag_union, .list, .box, .nominal, .function => invariant("a record row's remainder substituted to a non-record type"),
+                        .primitive, .tuple, .tag_union, .list, .box, .function => invariant("a record row's remainder substituted to a non-record type"),
                     };
                     // A declared order's slots index its row, which no
                     // substitution of its closed remainder extends.
@@ -1569,7 +1595,7 @@ pub const Program = struct {
         if (requirements.len == 0) return .{ .bound = bound, .requirements = requirements };
         const key = switch (target_worker.key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => invariant("a worker with dictionary parameters is not a template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("a worker with dictionary parameters is not a template's"),
         };
         const templates = self.module(key.module).view.checked_procedure_templates;
         const params = poolSlice(static_dispatch.EvidenceParamRecord, templates.evidence_params_pool, templates.templates.items[@backingInt(key.template)].evidence_params);
@@ -1725,7 +1751,7 @@ pub const Program = struct {
         if (target_worker.dictionary_params.len == 0) return;
         const key = switch (target_worker.key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => invariant("a worker with dictionary parameters is not a template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => invariant("a worker with dictionary parameters is not a template's"),
         };
         const templates = self.module(key.module).view.checked_procedure_templates;
         const all_params = poolSlice(static_dispatch.EvidenceParamRecord, templates.evidence_params_pool, templates.templates.items[@backingInt(key.template)].evidence_params);
@@ -2100,7 +2126,7 @@ pub const Program = struct {
             const scoped = self.worker(current).*;
             const outer: ?WorkerId = switch (scoped.key) {
                 .lambda => |lambda| lambda.outer,
-                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => null,
+                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => null,
             };
             const own = if (outer) |o| scoped.literal_scopes.len != self.worker(o).literal_scopes.len else scoped.literal_scopes.len != 0;
             if (own) try owners.append(allocator, current);
@@ -2150,6 +2176,33 @@ pub const Program = struct {
             .dictionary_params = &.{},
             .params = try self.arena.allocator().dupe(TypeId, &.{from}),
             .ret = to,
+        });
+        try self.worker_ids.put(self.allocator, key, id);
+        try self.worklist.append(self.allocator, id);
+        return id;
+    }
+
+    /// The `Code.Value` builder of `module_index` for the closed type `ty`
+    /// (see `WorkerKey.code_value`).
+    pub fn codeValueWorker(self: *Program, module_index: ModuleIndex, ty: TypeId, value: TypeId) Allocator.Error!WorkerId {
+        const key: WorkerKey = .{ .code_value = .{ .module = module_index, .ty = ty, .value = value } };
+        if (self.worker_ids.get(key)) |existing| return existing;
+        const id: WorkerId = @fromBackingInt(@intCast(self.workers.items.len));
+        const proc = try self.result.store.addProcSpec(.{
+            .name = self.result.store.freshSyntheticSymbol(),
+            .identity = LIR.ProcIdentity.programLocal("boxy.code_value", @backingInt(id)),
+            .emission_unit = LIR.EmissionUnit.module(@backingInt(module_index)),
+            .args = .empty(),
+            .ret_layout = .zst,
+        }, base.SourceLoc.none);
+        try self.workers.append(self.allocator, .{
+            .key = key,
+            .proc = proc,
+            .module = module_index,
+            .scheme_vars = &.{},
+            .dictionary_params = &.{},
+            .params = try self.arena.allocator().dupe(TypeId, &.{ty}),
+            .ret = value,
         });
         try self.worker_ids.put(self.allocator, key, id);
         try self.worklist.append(self.allocator, id);
@@ -2620,7 +2673,7 @@ pub fn run(allocator: Allocator, input: Input) Allocator.Error!Output {
                     const export_name = names.procBase(template.proc_base).export_name orelse break :blk "boxy.template";
                     break :blk names.exportNameText(export_name);
                 },
-                inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .static_data, .crash_dictionary, .convert, .literal_thunk, .root_slot => |_, kind| "boxy." ++ @tagName(kind),
+                inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot => |_, kind| "boxy." ++ @tagName(kind),
             };
             try program.result.store.setProcDebugName(worker.proc, name);
         }
@@ -2684,7 +2737,7 @@ fn templateRejected(program: *Program, view: *const types.ModuleView, template: 
 fn unitEmitsTemplate(view: *const types.ModuleView, template: checked.CheckedProcedureTemplate) bool {
     return switch (template.body) {
         .checked_body, .unimplemented => true,
-        // Publication writes every call of `Code.prim`, `Code.type_id` and
+        // The checked module stores every call of `Code.prim`, `Code.type_id` and
         // `Code.ty_of` as a constant, so no object calls their wrappers.
         .intrinsic_wrapper => |wrapper_id| switch (view.view.intrinsic_wrappers.get(wrapper_id).intrinsic) {
             .code_prim, .code_type_id, .code_ty_of => false,

@@ -11633,11 +11633,6 @@ const Lowerer = struct {
             return self.l.result.store.cf_stmts.len();
         }
 
-        /// This lowering emits no host work inside a read.
-        pub fn hostStmtCount(_: MatchTreeCtx) usize {
-            return 0;
-        }
-
         pub fn freshJoinPointId(self: MatchTreeCtx) LIR.JoinPointId {
             return self.l.freshJoinPointId();
         }
