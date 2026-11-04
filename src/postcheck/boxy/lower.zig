@@ -261,7 +261,10 @@ pub const WorkerKey = union(enum) {
     /// Tables"): an erased worker with no arguments returning a tuple of
     /// one callable per entry of the inventory the table serves, the
     /// description thunk of a site's entry and the table of a forward
-    /// entry. A closing use passes it to the template it calls.
+    /// entry. A closing use passes it to the template it calls. The unit
+    /// of `module` defines it for every object, which names it by content
+    /// identity: a stored function that captured it can be restored in
+    /// another module's object, which then reads none of `module`'s tables.
     code_instances: struct { module: ModuleIndex, table: u32 },
     /// The description thunk of entry `entry` of Code instance table
     /// `table` of `module`: an erased worker with no arguments restoring
@@ -660,7 +663,14 @@ pub const Program = struct {
                 hasher.update(&self.modules.linkName(default.module));
                 hasher.update(std.mem.asBytes(&self.defaultOrdinal(default.module, default.expr)));
             },
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("a worker no module's object exports has no content identity"),
+            // A table is named by its position in its module's tables, which
+            // a stored function's recipe records.
+            .code_instances => |instances| {
+                hasher.update("code_instances");
+                hasher.update(&self.modules.linkName(instances.module));
+                hasher.update(std.mem.asBytes(&instances.table));
+            },
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_description => invariant("a worker no module's object exports has no content identity"),
         }
         return .{ .bytes = hasher.finalResult() };
     }
@@ -678,8 +688,8 @@ pub const Program = struct {
     /// defines for other objects, named by content identity.
     pub fn exportableKind(key: WorkerKey) bool {
         return switch (key) {
-            .template, .lambda, .method_entry, .default => true,
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => false,
+            .template, .lambda, .method_entry, .default, .code_instances => true,
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_description => false,
         };
     }
 
@@ -2329,12 +2339,32 @@ pub const Program = struct {
     }
 
     /// The worker of Code instance table `table` of `module_index` (see
-    /// `WorkerKey.code_instances`).
+    /// `WorkerKey.code_instances`). Another module's table is its object's.
     pub fn codeInstancesWorker(self: *Program, module_index: ModuleIndex, table: u32) Allocator.Error!WorkerId {
         const key: WorkerKey = .{ .code_instances = .{ .module = module_index, .table = table } };
         if (self.worker_ids.get(key)) |existing| return existing;
         const entries = self.module(module_index).view.code_instances.tableEntries(table);
-        return try self.addErasedWorker(key, module_index, &.{}, &.{}, try self.instanceTupleType(@intCast(entries.len)), "boxy.code_instances");
+        const ret = try self.instanceTupleType(@intCast(entries.len));
+        const identity = self.workerIdentity(key);
+        if (!self.ownsModule(module_index)) {
+            const id: WorkerId = @fromBackingInt(@intCast(self.workers.items.len));
+            const proc = try self.addImportedProc(identity, module_index, .erased_record);
+            try self.workers.append(self.allocator, .{
+                .key = key,
+                .proc = proc,
+                .module = module_index,
+                .scheme_vars = &.{},
+                .dictionary_params = &.{},
+                .params = &.{},
+                .ret = ret,
+                .imported = true,
+                .lowered = true,
+                .queued = true,
+            });
+            try self.worker_ids.put(self.allocator, key, id);
+            return id;
+        }
+        return try self.addErasedWorkerWithIdentity(key, module_index, &.{}, &.{}, ret, identity);
     }
 
     /// What a Code instance table's worker returns: one callable per entry
@@ -2859,6 +2889,21 @@ fn seedUnitWorkers(program: *Program) Allocator.Error!void {
         }
         for (view.bodies().default_exprs) |default| {
             _ = try program.defaultWorker(view.index, default.checked_expr);
+        }
+        // A stored function can capture any table of the module, and an
+        // importer restoring it calls this object's table worker (design.md
+        // "Code Instance Tables"). A table serves a template this unit's
+        // rules would emit; any other has no run-time use.
+        const instances = view.view.code_instances;
+        for (0..instances.tables.len) |index| {
+            const table: u32 = @intCast(index);
+            const served = instances.tableTemplate(table);
+            if (served.template == checked.CodeInstanceTable.none) continue;
+            const holder = program.moduleByKey(.{ .bytes = served.module.bytes });
+            const template = holder.view.checked_procedure_templates.get(@fromBackingInt(served.template));
+            if (!unitEmitsTemplate(holder, template)) continue;
+            if (try templateRejected(program, holder, template)) continue;
+            _ = try program.codeInstancesWorker(view.index, table);
         }
     }
     try program.drain();

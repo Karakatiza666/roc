@@ -159,6 +159,7 @@ pub const Digests = struct {
         hasher.update(&self.nameOf(artifact.key.bytes));
         hasher.update(&CheckedArtifact.checkingContextPolicyHash(artifact.checking_context_identity));
         try self.hashStoredValues(&hasher, artifact, .every_root);
+        try self.hashCodeDescriptions(&hasher, artifact);
         for (artifact.direct_import_module_keys) |key| {
             const imported = self.artifacts.get(key.bytes) orelse base.invariant("a module of a link imports a module outside it", .{});
             hasher.update(&try self.interfaceOf(imported));
@@ -174,6 +175,8 @@ pub const Digests = struct {
     fn traceObjectInput(self: *Digests, artifact: *const Artifact, digest: Digest) Allocator.Error!void {
         var values = Sha256.init(.{});
         try self.hashStoredValues(&values, artifact, .every_root);
+        var code = Sha256.init(.{});
+        try self.hashCodeDescriptions(&code, artifact);
         var imports = Sha256.init(.{});
         for (artifact.direct_import_module_keys) |key| {
             const imported = self.artifacts.get(key.bytes) orelse base.invariant("a module of a link imports a module outside it", .{});
@@ -181,13 +184,14 @@ pub const Digests = struct {
         }
         var exports = Sha256.init(.{});
         self.hashImportedExports(&exports, artifact);
-        std.debug.print("boxy-work: object input of {s}: {s} source {s} name {s} policy {s} values {s} imports {s} exports {s}\n", .{
+        std.debug.print("boxy-work: object input of {s}: {s} source {s} name {s} policy {s} values {s} code {s} imports {s} exports {s}\n", .{
             artifact.moduleEnvConst().module_name,
             &std.fmt.bytesToHex(digest[0..8], .lower),
             &std.fmt.bytesToHex(artifact.source_hash[0..8], .lower),
             &std.fmt.bytesToHex(self.nameOf(artifact.key.bytes)[0..8], .lower),
             &std.fmt.bytesToHex(CheckedArtifact.checkingContextPolicyHash(artifact.checking_context_identity)[0..8], .lower),
             &std.fmt.bytesToHex(values.finalResult()[0..8], .lower),
+            &std.fmt.bytesToHex(code.finalResult()[0..8], .lower),
             &std.fmt.bytesToHex(imports.finalResult()[0..8], .lower),
             &std.fmt.bytesToHex(exports.finalResult()[0..8], .lower),
         });
@@ -214,6 +218,56 @@ pub const Digests = struct {
         hashNominals(hasher, artifact);
         try self.hashConsts(hasher, artifact);
         try self.hashStoredValues(hasher, artifact, .read_by_importers);
+    }
+
+    /// The Code descriptions `artifact`'s object restores: the node of each
+    /// Code site of its bodies, and each Code instance table its closing
+    /// uses built (design.md "Code Instance Tables"). The reifier writes a
+    /// description from the bodies of the definitions it describes, which
+    /// can be an import's implementation, so neither the module's source
+    /// nor its imports' interfaces determine it.
+    fn hashCodeDescriptions(self: *Digests, hasher: *Sha256, artifact: *const Artifact) Allocator.Error!void {
+        hashTag(hasher, "code_sites");
+        const context: ValueContext = .{ .digests = self, .artifact = artifact };
+        for (artifact.checked_bodies.view().stored_exprs, 0..) |stored, index| {
+            if (stored.data != .code_from_lambda) continue;
+            // An instance site has no node: its closing uses' tables hold
+            // its descriptions.
+            const node = stored.data.code_from_lambda.node orelse continue;
+            hasher.update(std.mem.asBytes(&@as(u32, @intCast(index))));
+            try artifact.const_store.hashGraph(node, hasher, context);
+        }
+        try self.hashInstanceTables(hasher, artifact);
+    }
+
+    /// Each Code instance table of `artifact`: the template it serves and
+    /// its entries, a description by value or a nested table by index. Only
+    /// the module's own object reads them: an importer that restores a
+    /// stored function capturing one calls this object's table worker.
+    fn hashInstanceTables(self: *Digests, hasher: *Sha256, artifact: *const Artifact) Allocator.Error!void {
+        const instances = &artifact.code_instances;
+        hashTag(hasher, "code_instances");
+        hasher.update(std.mem.asBytes(&@as(u32, @intCast(instances.tables.len))));
+        const context: ValueContext = .{ .digests = self, .artifact = artifact };
+        for (0..instances.tables.len) |index| {
+            const table: u32 = @intCast(index);
+            const served = instances.tableTemplate(table);
+            if (served.template == CheckedArtifact.CodeInstanceTable.none) {
+                hashTag(hasher, "refused");
+            } else {
+                hasher.update(&self.nameOf(served.module.bytes));
+                hasher.update(std.mem.asBytes(&served.template));
+            }
+            const entries = instances.tableEntries(table);
+            hasher.update(std.mem.asBytes(&@as(u32, @intCast(entries.len))));
+            for (entries) |entry| {
+                hashTag(hasher, @tagName(entry.kind));
+                switch (entry.kind) {
+                    .node => try artifact.const_store.hashGraph(@fromBackingInt(entry.value), hasher, context),
+                    .table => hasher.update(std.mem.asBytes(&entry.value)),
+                }
+            }
+        }
     }
 
     fn hashBindings(self: *const Digests, hasher: *Sha256, artifact: *const Artifact) void {
@@ -275,9 +329,22 @@ pub const Digests = struct {
         }
         hasher.update(std.mem.asBytes(&@as(u32, @intCast(templates.templateLiteralRequirements(&template).len))));
         // A template with a Code inventory takes an instance table whose
-        // tuple has one callable per entry (design.md "Code Instance Tables").
-        const inventory_len: u32 = if (artifact.code_instances.inventoryOf(ref.template)) |inventory| @intCast(inventory.len) else std.math.maxInt(u32);
-        hasher.update(std.mem.asBytes(&inventory_len));
+        // tuple has one callable per entry, and the module of a closing use
+        // restores each site entry's description at the representation of
+        // the site's kind (design.md "Code Instance Tables").
+        const instances = &artifact.code_instances;
+        const inventory = instances.inventoryOf(ref.template) orelse {
+            hasher.update(std.mem.asBytes(&@as(u32, std.math.maxInt(u32))));
+            return;
+        };
+        hasher.update(std.mem.asBytes(&@as(u32, @intCast(inventory.len))));
+        for (inventory) |entry| {
+            hashTag(hasher, @tagName(entry.kind));
+            switch (entry.kind) {
+                .site => hashTag(hasher, @tagName(instances.recipes[entry.recipe].kind)),
+                .forward => {},
+            }
+        }
     }
 
     /// How an importer reads a constant: the value stored for it, or the

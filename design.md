@@ -14636,7 +14636,24 @@ the types supplies the table.
   `code_instances`).
 - The table workers of a closing use are emitted by the unit of the use's
   module, from that module's own checked data, so no object reads another
-  module's tables.
+  module's tables. That unit emits every table whose template it would
+  emit, and a table worker is named by content identity (the module's link
+  name and the table's position), since a stored function can capture any
+  table: an importer that restores one calls the defining object's worker,
+  as it calls an imported lambda.
+- The object key of a module covers the Code descriptions its object
+  restores (`Digests.objectInput`): the node of each Code site of its
+  bodies and each of its tables, with the template the table serves and
+  each entry, a description by value or a nested table by position. A
+  description is a function of the bodies it describes, which are often
+  another module's (a fragment's site, a helper or method the walk reads,
+  and the checked keys a `Prim` names), so the module's source and its
+  imports' interfaces do not determine it. A module's interface adds the
+  shape of each exported template's inventory, entry kinds and site kinds,
+  which a closing use's tables are built against. No interface carries a
+  table's contents: an importer's object reads none, and the recipe of a
+  stored function that captured a table, which an importer's key hashes,
+  names the table by link name and position.
 
 The alternative, a worker per (template, table), would lower a generic
 template once per closing use. That breaks the per-module rule that a
@@ -14885,10 +14902,13 @@ and Per-Module Output is the invariant that makes it possible:
   extended with the compiler version, the opt level, and the target
   (`compile.boxy_interface`, `Digests.objectInput`): the module's source
   inputs, its name in the link, the policy of its checking context, the value
-  of every compile-time root it holds, and its direct imports' interfaces. No
-  import's implementation is an input, so an edit that leaves a module's
-  interface alone rebuilds that module's object and no other. A key names one
-  file.
+  of every compile-time root it holds, the Code descriptions it restores
+  (Code Instance Tables), and its direct imports' interfaces. No import's
+  implementation is an input except through the module's own checked data
+  (its root values and its descriptions), so an edit that leaves a module's
+  interface alone rebuilds that module's object and the objects whose own
+  values or descriptions read the edited body, and no other. A key names
+  one file.
 - A module's INTERFACE is what lowering its importers reads of it. Its checked
   half (`Digests.interfaceOf`) is its checking interface (names, schemes and
   their evidence, nominal backings, method bindings; Checking dependencies and

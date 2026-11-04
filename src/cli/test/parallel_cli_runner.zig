@@ -629,6 +629,7 @@ const CustomCase = enum {
     boxy_platform_evaluation,
     boxy_platform_bindings,
     boxy_interface_edits,
+    code_instance_cache,
     issue_11710_shared_object_cache,
     issue_12220_shared_object_cache_literals,
     issue_12564_package_from_numeral_cache,
@@ -3494,6 +3495,9 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "--specialize=no platform evaluation retains app units waiting for later roots", .timeout_ms = 120_000, .body = .{ .custom = .boxy_platform_evaluation } },
     .{ .id = 0, .suite = .subcommands, .name = "--specialize=no build files one object per module and rebuilds only edited modules", .timeout_ms = 600_000, .body = .{ .custom = .boxy_module_object_cache } },
     .{ .id = 0, .suite = .subcommands, .name = "--specialize=no objects depend on their imports' interfaces, not their implementations", .timeout_ms = 900_000, .body = .{ .custom = .boxy_interface_edits } },
+    .{ .id = 0, .suite = .subcommands, .name = "--specialize=no: an edit to a body a Code description reads, in a fragment's module or in the module of its closing uses, rebuilds the objects that restore the description and no others", .timeout_ms = 900_000, .body = .{ .custom = .code_instance_cache } },
+    .{ .id = 0, .suite = .subcommands, .name = "Code descriptions of a package's sites, instance tables and stored function", .body = .{ .command = .{ .args = &.{ "run", "--no-cache" }, .roc_file = "test/cli/CodeInstanceCache/main.roc", .exit = .success, .stdout_exact = code_instance_cache_stdout } } },
+    .{ .id = 0, .suite = .subcommands, .name = "Code descriptions of a package's sites, instance tables and stored function (boxy)", .body = .{ .command = .{ .args = &.{ "run", "--no-cache", "--specialize=no" }, .roc_file = "test/cli/CodeInstanceCache/main.roc", .exit = .success, .stdout_exact = code_instance_cache_stdout } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 11710: shared object cache serves a second app's dev build", .timeout_ms = 600_000, .body = .{ .custom = .issue_11710_shared_object_cache } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 12220: shared object cache keeps each module's list literals in a second app's dev build", .timeout_ms = 600_000, .body = .{ .custom = .issue_12220_shared_object_cache_literals } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 12564: a package from_numeral cached by one app's check converts another app's literal", .timeout_ms = 600_000, .body = .{ .custom = .issue_12564_package_from_numeral_cache } },
@@ -6219,6 +6223,7 @@ fn runCustomCase(
         .boxy_platform_evaluation => customBoxyPlatformEvaluation(io, allocator, &env, &timer, timeout_ms),
         .boxy_module_object_cache => customBoxyModuleObjectCache(io, allocator, &env, &timer, timeout_ms),
         .boxy_interface_edits => customBoxyInterfaceEdits(io, allocator, &env, &timer, timeout_ms),
+        .code_instance_cache => customCodeInstanceCache(io, allocator, &env, &timer, timeout_ms),
         .issue_11710_shared_object_cache => customIssue11710SharedObjectCache(io, allocator, &env, &timer, timeout_ms),
         .issue_12220_shared_object_cache_literals => customIssue12220SharedObjectCacheLiterals(io, allocator, &env, &timer, timeout_ms),
         .issue_12564_package_from_numeral_cache => customIssue12564PackageFromNumeralCache(io, allocator, &env, &timer, timeout_ms),
@@ -10791,6 +10796,118 @@ fn customBoxyInterfaceEdits(
         return customInfraFailure(allocator, timer, "run the build: {}", .{err});
     if (!processSucceeded(packages_ran.term)) return failureFromRun(allocator, timer, packages_ran, "the two-package build did not run");
     if (std.mem.find(u8, packages_ran.stdout, "left 3") == null or std.mem.find(u8, packages_ran.stdout, "right 3") == null) return customFailure(allocator, timer, "the two-package build ran the other package's module: `{s}`", .{packages_ran.stdout});
+    return null;
+}
+
+const code_instance_cache_stdout = "site: pets | check-one\ntable: pets | frag-one\nmethod table: tags | pick-one\nstored table: tags | pick-one\n";
+
+/// A Code description is a function of the bodies it describes, which can
+/// be another module's (design.md "Code Instance Tables"). Every value of
+/// the fixture's app is a constant, so the compile-time program computes it
+/// against the cached objects of the package's modules: Pick's object holds
+/// the description of a Code site that reads `Frag.check` and the instance
+/// tables of its closing uses of Frag's fragments, and Made's restores a
+/// stored function of Pick that captured one of Pick's tables. Each edit
+/// changes only a body a description reads, first in the fragments' module
+/// and then in the module of the closing uses, and the next warm run prints
+/// the edited descriptions and files exactly the objects that hold them.
+/// Every run also rebuilds every object it restores and compares the bytes
+/// (`ROC_VERIFY_BOXY_OBJECT_REUSE`).
+fn customCodeInstanceCache(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+) ?TestResult {
+    var main_path: []const u8 = undefined;
+    if (stageEditableApp(io, allocator, env, timer, .{
+        .dir_name = "code_instance_cache",
+        .platform = "test/fx/platform/main.roc",
+        .platform_spelling = "../../fx/platform/main.roc",
+        .sources = &.{"test/cli/CodeInstanceCache/main.roc"},
+        .app_name = "main.roc",
+    }, &main_path)) |failure| return failure;
+    const package_dir = std.fs.path.join(allocator, &.{ std.fs.path.dirname(main_path).?, "pa" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate the package dir: {}", .{err});
+    std.Io.Dir.cwd().createDirPath(io, package_dir) catch |err|
+        return customInfraFailure(allocator, timer, "failed to create {s}: {}", .{ package_dir, err });
+    for ([_][]const u8{ "main.roc", "Db.roc", "Frag.roc", "Pick.roc", "Made.roc" }) |name| {
+        const from = std.fmt.allocPrint(allocator, "{s}/test/cli/CodeInstanceCache/pa/{s}", .{ project_root_path, name }) catch |err|
+            return customInfraFailure(allocator, timer, "failed to allocate a package path: {}", .{err});
+        const to = std.fs.path.join(allocator, &.{ package_dir, name }) catch |err|
+            return customInfraFailure(allocator, timer, "failed to allocate a package path: {}", .{err});
+        const data = std.Io.Dir.cwd().readFileAlloc(io, from, allocator, .limited(1024 * 1024)) catch |err|
+            return customInfraFailure(allocator, timer, "failed to read {s}: {}", .{ from, err });
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = to, .data = data }) catch |err|
+            return customInfraFailure(allocator, timer, "failed to write {s}: {}", .{ to, err });
+    }
+
+    var isolated = CaseEnv{ .dirs = env.dirs, .env_map = env.env_map.clone(allocator) catch |err| return customInfraFailure(allocator, timer, "clone environment: {}", .{err}) };
+    defer isolated.env_map.deinit();
+    const cache_root = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "code_instance_cache_cache" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate the cache root: {}", .{err});
+    for ([_][]const u8{ "ROC_CACHE_DIR", "XDG_CACHE_HOME" }) |key| {
+        isolated.env_map.put(key, cache_root) catch |err| return customInfraFailure(allocator, timer, "failed to set the cache root: {}", .{err});
+    }
+    isolated.env_map.put("ROC_VERIFY_BOXY_OBJECT_REUSE", "1") catch |err| return customInfraFailure(allocator, timer, "failed to enable verification: {}", .{err});
+
+    const run = struct {
+        fn app(run_io: std.Io, run_allocator: Allocator, run_env: *const CaseEnv, run_timer: *harness.Timer, run_timeout_ms: u64, path: []const u8, stdout: []const u8) ?TestResult {
+            const remaining = childCommandTimeoutMs(run_timer, run_timeout_ms) orelse return timeoutFailure(run_allocator, run_timer, .run, "Code instance cache test timed out");
+            const ran = runRocInEnv(run_io, run_allocator, run_env, &.{ "--opt=dev", "--specialize=no" }, path, .absolute, &.{}, null, remaining) catch |err|
+                return customInfraFailure(run_allocator, run_timer, "run: {}", .{err});
+            if (!processSucceeded(ran.term)) return failureFromRun(run_allocator, run_timer, ran, "the app did not run");
+            if (!std.mem.eql(u8, ran.stdout, stdout)) return customFailure(run_allocator, run_timer, "the app printed `{s}`, expected `{s}`", .{ ran.stdout, stdout });
+            return null;
+        }
+    }.app;
+    // A cold run and a warm one.
+    for (0..2) |_| {
+        if (run(io, allocator, &isolated, timer, timeout_ms, main_path, code_instance_cache_stdout)) |failure| return failure;
+    }
+    var objects = boxyObjectCount(io, allocator, cache_root) catch |err| return customInfraFailure(allocator, timer, "read the cache: {}", .{err});
+
+    const Edit = struct { name: []const u8, file: []const u8, from: []const u8, to: []const u8, stdout: []const u8, objects: usize };
+    // `objects` counts the module objects the edit files: the edited
+    // module's, and Pick's when a description Pick holds reads the edit.
+    // Made restores Pick's stored function by calling Pick's table worker,
+    // so no edit files Made's.
+    const edits = [_]Edit{
+        .{
+            .name = "a fragment's site in the fragments' module",
+            .file = "Frag.roc",
+            .from = "\"frag-one\"",
+            .to = "\"frag-two\"",
+            .stdout = "site: pets | check-one\ntable: pets | frag-two\nmethod table: tags | pick-one\nstored table: tags | pick-one\n",
+            .objects = 2,
+        },
+        .{
+            .name = "a helper a site describes, in the fragments' module",
+            .file = "Frag.roc",
+            .from = "\"check-one\"",
+            .to = "\"check-two\"",
+            .stdout = "site: pets | check-two\ntable: pets | frag-two\nmethod table: tags | pick-one\nstored table: tags | pick-one\n",
+            .objects = 2,
+        },
+        .{
+            .name = "a method the instance tables describe, in the closing uses' module",
+            .file = "Pick.roc",
+            .from = "\"pick-one\"",
+            .to = "\"pick-two\"",
+            .stdout = "site: pets | check-two\ntable: pets | frag-two\nmethod table: tags | pick-two\nstored table: tags | pick-two\n",
+            .objects = 1,
+        },
+    };
+    for (edits) |edit| {
+        const path = std.fs.path.join(allocator, &.{ package_dir, edit.file }) catch |err|
+            return customInfraFailure(allocator, timer, "failed to allocate an edit path: {}", .{err});
+        replaceInFile(io, allocator, path, edit.from, edit.to) catch |err| return customInfraFailure(allocator, timer, "edit {s}: {}", .{ edit.name, err });
+        if (run(io, allocator, &isolated, timer, timeout_ms, main_path, edit.stdout)) |failure| return failure;
+        const after = boxyObjectCount(io, allocator, cache_root) catch |err| return customInfraFailure(allocator, timer, "read the cache: {}", .{err});
+        if (after - objects != edit.objects) return customFailure(allocator, timer, "editing {s} filed {d} objects, expected {d}", .{ edit.name, after - objects, edit.objects });
+        objects = after;
+    }
     return null;
 }
 
