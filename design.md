@@ -22449,6 +22449,12 @@ solver—born unique, destroyed by any flow edge that can add a holder—
 over the same alias and call edges the solver already walks. The third is a
 query against liveness state emission already maintains.
 
+A low-level argument at a `retain_args` or `result_shares_args` position
+loses its uniqueness. A `result_shares_args` op (`str_split_on`,
+`str_split_first`, `str_to_utf8` and the others) increments the argument's
+count inside the builtin for each handle it puts in the result. Thus it adds
+a holder that the unit masks do not show.
+
 `RcEffect` gains one more explicit mask, `result_unique`: the result's
 outermost allocation has count 1 on return. Mutating ops qualify on both of
 their paths—in place keeps an allocation whose count was already 1, and

@@ -1302,6 +1302,17 @@ const method_alias_generic_callers_stdout =
     \\
 ;
 
+const slice_shares_argument_allocation_stdout =
+    \\["--", "replaces", "alpha_one", "beta_two", "0"] True
+    \\["split", "on:", "a", "string", "long", "enough", "for", "the", "heap", "0"] SPLIT ON: A STRING LONG ENOUGH FOR THE HEAP 0
+    \\Ok({ after: " a string long enough for the heap 0", before: "split first" }) SPLIT FIRST: A STRING LONG ENOUGH FOR THE HEAP 0
+    \\Ok({ after: "0", before: "split last: a string long enough for the heap" }) SPLIT LAST: A STRING LONG ENOUGH FOR THE HEAP 0
+    \\Ok("caseless: a string long enough for the heap 0") prefix-caseless: a string long enough for the heap 0
+    \\to utf8: a string long enough for the heap 0 TO UTF8: A STRING LONG ENOUGH FOR THE HEAP 0
+    \\from utf8: a string long enough for the heap 0! From utf8: a string long enough for the heap 0!
+    \\prefix: a string long enough for the heap 0 DROP PREFIX: A STRING LONG ENOUGH FOR THE HEAP 0
+    \\
+;
 const method_alias_literal_helpers_stdout =
     \\Top(4) 7 plain 1
     \\Top(4) 7 plain 1
@@ -1733,6 +1744,9 @@ const echo_cases = [_]CliCase{
     .{ .id = 0, .suite = .echo, .name = "echo platform: statically dispatched, propagated, open error union does not crash (regression test #9588)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--no-cache" }, .roc_file = "test/echo/issue_9588.roc", .exit = .success, .not_contains = &.{ .{ .stream = .stderr, .text = "panic" }, .{ .stream = .stderr, .text = "invariant violated" } } } } },
     .{ .id = 0, .suite = .echo, .name = "echo platform: issue 11217 Boxy polymorphic captures and aliases (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--specialize=no" }, .roc_file = "test/echo/issue_11217.roc", .stdout_exact = "ok\n" } } },
     .{ .id = 0, .suite = .echo, .name = "echo platform: issue 11217 Boxy polymorphic captures and aliases (dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--specialize=no" }, .roc_file = "test/echo/issue_11217.roc", .stdout_exact = "ok\n" } } },
+    .{ .id = 0, .suite = .echo, .name = "echo platform: an op whose result shares its argument's allocation leaves the argument shared for a later in-place op (interpreter)", .backend = .interpreter, .body = .{ .command = .{ .args = &.{ "--opt=interpreter", "--no-cache" }, .roc_file = "test/echo/slice_shares_argument_allocation.roc", .stdout_exact = slice_shares_argument_allocation_stdout, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .echo, .name = "echo platform: an op whose result shares its argument's allocation leaves the argument shared for a later in-place op (dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/echo/slice_shares_argument_allocation.roc", .stdout_exact = slice_shares_argument_allocation_stdout, .not_contains = &no_panic_or_invariant_needles } } },
+    .{ .id = 0, .suite = .echo, .name = "echo platform: an op whose result shares its argument's allocation leaves the argument shared for a later in-place op (speed)", .backend = .speed, .body = .{ .command = .{ .args = &.{ "--opt=speed", "--no-cache" }, .roc_file = "test/echo/slice_shares_argument_allocation.roc", .stdout_exact = slice_shares_argument_allocation_stdout, .not_contains = &no_panic_or_invariant_needles } } },
     .{ .id = 0, .suite = .echo, .name = "echo platform: an item field dropped on one branch while the rest of the item lives past the join (speed)", .backend = .speed, .body = .{ .command = .{ .args = &.{ "--opt=speed", "--no-cache" }, .roc_file = "test/echo/item_field_dropped_on_one_branch.roc", .stdout_exact = "[{ name: \"from\", value: \"a\" }, { name: \"to\", value: \"c\" }]\n[{ name: \"in\", value: \"d\" }, { name: \"!\", value: \"d\" }, { name: \"out\", value: \"d\" }]\n" } } },
     .{ .id = 0, .suite = .echo, .name = "echo platform: an item field dropped on one branch while the rest of the item lives past the join (dev)", .backend = .dev, .body = .{ .command = .{ .args = &.{ "--opt=dev", "--no-cache" }, .roc_file = "test/echo/item_field_dropped_on_one_branch.roc", .stdout_exact = "[{ name: \"from\", value: \"a\" }, { name: \"to\", value: \"c\" }]\n[{ name: \"in\", value: \"d\" }, { name: \"!\", value: \"d\" }, { name: \"out\", value: \"d\" }]\n" } } },
     .{ .id = 0, .suite = .echo, .name = "echo platform: SpecConstr worker budget ends a function that rebuilds its argument deeper (speed)", .backend = .speed, .timeout_ms = 60_000, .body = .{ .command = .{ .args = &.{ "--opt=speed", "--no-cache" }, .roc_file = "test/echo/spec_constr_deepen.roc", .stdout_exact = "45" } } },
