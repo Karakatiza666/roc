@@ -20723,11 +20723,15 @@ const EvidencePass = struct {
                             );
                         }
                         const nested = self.plan_table.generated_codec_derivations[raw_nested];
-                        // The nested and parent contracts snapshot the same
-                        // checked edge independently. Their open identities
-                        // are therefore renamed copies, while every sharing
-                        // relation and constraint must remain exact.
-                        if (!try type_view.rootsAlphaExactEql(
+                        // The nested and parent contracts snapshot their
+                        // checked edges independently, so their open
+                        // identities are renamed copies, while every sharing
+                        // relation and constraint must remain exact. A repeated
+                        // application reuses the derivation of an equal earlier
+                        // one, and the checker compares applications with
+                        // transparent aliases expanded, so the two edges can
+                        // spell one type through different aliases.
+                        if (!try type_view.rootsAliasTransparentAlphaEql(
                             &scratch,
                             &.{ nested.constructor_ty, nested.shape_ty },
                             &.{ call.callable_ty, call.dispatcher_ty },
@@ -38172,10 +38176,12 @@ pub const CheckedModuleArtifact = struct {
                             return .{ .kind = .generated_codec_call_nested_derivation_invalid, .index = @intCast(i), .method = call.method };
                         }
                         const nested = table.generated_codec_derivations[raw_nested];
+                        // A repeated application can spell the nested
+                        // derivation's types through other transparent aliases.
                         if (@backingInt(nested.constructor_ty) >= self.checked_types.payloadCount() or
                             @backingInt(nested.shape_ty) >= self.checked_types.payloadCount() or
-                            !std.meta.eql(type_view.rootKey(nested.constructor_ty), type_view.rootKey(call.callable_ty)) or
-                            !std.meta.eql(type_view.rootKey(nested.shape_ty), type_view.rootKey(call.dispatcher_ty)))
+                            type_view.aliasTransparentBucketKey(nested.constructor_ty) != type_view.aliasTransparentBucketKey(call.callable_ty) or
+                            type_view.aliasTransparentBucketKey(nested.shape_ty) != type_view.aliasTransparentBucketKey(call.dispatcher_ty))
                         {
                             return .{ .kind = .generated_codec_call_nested_derivation_invalid, .index = @intCast(i), .method = call.method };
                         }

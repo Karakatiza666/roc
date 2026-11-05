@@ -7607,12 +7607,15 @@ interpret the shape to recover a call absent from
 `StaticDispatchPlanTable.generated_codec_derivations`. Debug compiler builds
 audit that every producer-required call was consumed and that repeated roles
 have equal checked type graphs up to transparent aliases. A parent
-structural-call edge and its nested derivation independently snapshot one
-checker relation, so their debug audit requires equal checked root keys plus
-full graph equality under a bijective
+structural-call edge and its nested derivation independently snapshot checker
+relations that denote one type. A repeated application reuses the derivation
+of an earlier equal application, and the checker compares applications with
+transparent aliases expanded, so the two can spell that type through different
+aliases. Their debug audit therefore requires full graph equality, with
+transparent aliases expanded at every depth, under a bijective
 renaming of flex and rigid identities shared across both relation roots;
-variable sharing, constraints, defaults, and every non-variable payload remain
-exact. Conditional capabilities are
+variable sharing, constraints, defaults, and every other non-variable payload
+remain exact. Conditional capabilities are
 omitted from the consumption requirement unless the specialization selects
 their generated-code path. A format procedure's specialization identity does
 not name the individual call edge that first reached it. Equivalent checked

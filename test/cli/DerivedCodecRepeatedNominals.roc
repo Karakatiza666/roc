@@ -66,6 +66,15 @@ Holder(a) := { x : a }.{
 	encoder_for : _
 }
 
+Spread(row) := { ..row }.{
+	parser_for : _
+	encoder_for : _
+}
+
+SiteRow : { id : Str }
+
+CarerRow : { id : Str }
+
 Left := { right : List(Right) }.{ parser_for : _ }
 
 Right := { left : List(Left), name : Str }.{ parser_for : _ }
@@ -188,6 +197,34 @@ expect {
 }
 
 expect Json.to_str({ c: Holder.({ x: "a" }), d: Holder.({ x: "b" }), e: Holder.({ x: 7.U8 }) }) == "{\"c\":{\"x\":\"a\"},\"d\":{\"x\":\"b\"},\"e\":{\"x\":7}}"
+
+# A generic derived nominal at one argument, spelled through two aliases and without one.
+expect {
+	v : Try({ c : Holder(SiteRow), d : Holder(CarerRow), e : Holder({ id : Str }) }, [InvalidJson(Str), MissingRequiredField(Str)])
+	v = Json.parse("{\"c\":{\"x\":{\"id\":\"a\"}},\"d\":{\"x\":{\"id\":\"b\"}},\"e\":{\"x\":{\"id\":\"c\"}}}")
+	match v {
+		Ok({ c: Holder.({ x: c }), d: Holder.({ x: d }), e: Holder.({ x: e }) }) => c.id == "a" and d.id == "b" and e.id == "c"
+		Err(_) => False
+	}
+}
+
+expect {
+	c : Holder(SiteRow)
+	c = Holder.({ x: { id: "a" } })
+	d : Holder(CarerRow)
+	d = Holder.({ x: { id: "b" } })
+	Json.to_str({ c, d }) == "{\"c\":{\"x\":{\"id\":\"a\"}},\"d\":{\"x\":{\"id\":\"b\"}}}"
+}
+
+# A nominal that spreads its argument's fields, at two aliases of one record.
+expect {
+	v : Try({ c : Spread(SiteRow), d : Spread(CarerRow) }, [InvalidJson(Str), MissingRequiredField(Str)])
+	v = Json.parse("{\"c\":{\"id\":\"a\"},\"d\":{\"id\":\"b\"}}")
+	match v {
+		Ok({ c: Spread.({ id: c }), d: Spread.({ id: d }) }) => c == "a" and d == "b"
+		Err(_) => False
+	}
+}
 
 # Mutually recursive derived parsers.
 expect {
