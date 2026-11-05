@@ -538,7 +538,10 @@ pub const Constants = struct {
     ///      template each table serves (`table_templates`).
     /// 233: a record field of a type annotation and a where-clause method
     ///      record the region of their name in source.
-    pub const CACHE_VERSION = 234;
+    /// 235: a method binding of a nominal with a `code_primitives` item
+    ///      depends on that item in the definition identities, so a root's
+    ///      value identity covers the cut its Code sites read.
+    pub const CACHE_VERSION = 235;
 };
 
 /// Configuration for the Roc cache system.

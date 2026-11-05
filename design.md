@@ -2353,7 +2353,10 @@ the definitions a body names (`DependencyGraph.collectNameReferences`) and the
 methods the body's checked plans resolve to (`StaticDispatchPlanTable`): the
 target of each dispatch site and of each literal's conversion, the evidence
 each call's instantiation edge records for its callee's requirements, and every
-nested obligation those targets' instantiations resolve. A site dispatching on
+nested obligation those targets' instantiations resolve. A method binding of a
+nominal that has a `code_primitives` item also has an edge to that item: a
+Code site reads the cut of its translator from the nominal that has the
+translator as an item (`Walk.useCut`), and no body names the item. A site dispatching on
 a scheme variable takes its target from the evidence of the instantiating call,
 whose plan resolves it. An edge whose nested obligations are derived from the
 concrete callable at lowering covers every method binding of the module and, in

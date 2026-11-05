@@ -413,10 +413,13 @@ const State = struct {
         defer edges.deinit(allocator);
         var reached = std.ArrayList(CIR.Def.Idx).empty;
         defer reached.deinit(allocator);
+        var cut_items = try self.cutItems();
+        defer cut_items.deinit();
         for (nodes, 0..) |def_idx, index| {
             edge_starts[index] = @intCast(edges.items.len);
             reached.clearRetainingCapacity();
             try self.collectReached(env.store.getDef(def_idx).expr, &reached, null);
+            if (cut_items.get(def_idx)) |cut_item| try reached.append(allocator, cut_item);
             for (reached.items) |target| {
                 const target_index = index_of.get(target) orelse
                     base.invariant("compile-time value identity reached a definition outside the module's definitions and method bindings", .{});
@@ -525,6 +528,33 @@ const State = struct {
             .components = try components.toOwnedSlice(allocator),
             .dependencies = try dependencies.toOwnedSlice(allocator),
         };
+    }
+
+    /// The `code_primitives` item of the nominal each method binding is an
+    /// item of. A Code site reads its translator's cut from the nominal that
+    /// has the translator as an item (`Walk.useCut`), and no body names that
+    /// item, so each item of a nominal with a cut depends on the cut.
+    fn cutItems(self: *State) Allocator.Error!collections.DenseMap(CIR.Def.Idx, CIR.Def.Idx) {
+        const env = self.inputs.env;
+        var cuts = std.AutoHashMapUnmanaged(CIR.Statement.Idx, CIR.Def.Idx).empty;
+        defer cuts.deinit(self.allocator);
+        for (env.method_defs.entries.items) |entry| {
+            if (!entry.key.methodIdent().eql(env.idents.code_primitives)) continue;
+            if (env.store.getStatement(entry.key.owner) != .s_nominal_decl) continue;
+            try cuts.put(self.allocator, entry.key.owner, entry.value.def_idx);
+        }
+        var items = collections.DenseMap(CIR.Def.Idx, CIR.Def.Idx).init(self.allocator);
+        errdefer items.deinit();
+        if (cuts.count() == 0) return items;
+        // The walk takes a definition's first nominal owner (`Reifier.ownerOf`).
+        var owned = collections.DenseMap(CIR.Def.Idx, void).init(self.allocator);
+        defer owned.deinit();
+        for (env.method_defs.entries.items) |entry| {
+            if (env.store.getStatement(entry.key.owner) != .s_nominal_decl) continue;
+            if ((try owned.getOrPut(entry.value.def_idx)).found_existing) continue;
+            if (cuts.get(entry.key.owner)) |cut_item| try items.put(entry.value.def_idx, cut_item);
+        }
+        return items;
     }
 
     /// Append to `reached` the definitions of this module that `root` names

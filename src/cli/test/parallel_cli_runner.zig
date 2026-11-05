@@ -630,6 +630,7 @@ const CustomCase = enum {
     boxy_platform_bindings,
     boxy_interface_edits,
     code_instance_cache,
+    code_cut_cache,
     issue_11710_shared_object_cache,
     issue_12220_shared_object_cache_literals,
     issue_12564_package_from_numeral_cache,
@@ -3510,6 +3511,7 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "--specialize=no build files one object per module and rebuilds only edited modules", .timeout_ms = 600_000, .body = .{ .custom = .boxy_module_object_cache } },
     .{ .id = 0, .suite = .subcommands, .name = "--specialize=no objects depend on their imports' interfaces, not their implementations", .timeout_ms = 900_000, .body = .{ .custom = .boxy_interface_edits } },
     .{ .id = 0, .suite = .subcommands, .name = "--specialize=no: an edit to a body a Code description reads, in a fragment's module or in the module of its closing uses, rebuilds the objects that restore the description and no others", .timeout_ms = 900_000, .body = .{ .custom = .code_instance_cache } },
+    .{ .id = 0, .suite = .subcommands, .name = "an edit to a translator's cut, which no body names, gives a root with a Code site a new value identity", .timeout_ms = 300_000, .body = .{ .custom = .code_cut_cache } },
     .{ .id = 0, .suite = .subcommands, .name = "Code descriptions of a package's sites, instance tables and stored function", .body = .{ .command = .{ .args = &.{ "run", "--no-cache" }, .roc_file = "test/cli/CodeInstanceCache/main.roc", .exit = .success, .stdout_exact = code_instance_cache_stdout } } },
     .{ .id = 0, .suite = .subcommands, .name = "Code descriptions of a package's sites, instance tables and stored function (boxy)", .body = .{ .command = .{ .args = &.{ "run", "--no-cache", "--specialize=no" }, .roc_file = "test/cli/CodeInstanceCache/main.roc", .exit = .success, .stdout_exact = code_instance_cache_stdout } } },
     .{ .id = 0, .suite = .subcommands, .name = "issue 11710: shared object cache serves a second app's dev build", .timeout_ms = 600_000, .body = .{ .custom = .issue_11710_shared_object_cache } },
@@ -6244,6 +6246,7 @@ fn runCustomCase(
         .boxy_module_object_cache => customBoxyModuleObjectCache(io, allocator, &env, &timer, timeout_ms),
         .boxy_interface_edits => customBoxyInterfaceEdits(io, allocator, &env, &timer, timeout_ms),
         .code_instance_cache => customCodeInstanceCache(io, allocator, &env, &timer, timeout_ms),
+        .code_cut_cache => customCodeCutCache(io, allocator, &env, &timer, timeout_ms),
         .issue_11710_shared_object_cache => customIssue11710SharedObjectCache(io, allocator, &env, &timer, timeout_ms),
         .issue_12220_shared_object_cache_literals => customIssue12220SharedObjectCacheLiterals(io, allocator, &env, &timer, timeout_ms),
         .issue_12564_package_from_numeral_cache => customIssue12564PackageFromNumeralCache(io, allocator, &env, &timer, timeout_ms),
@@ -10817,6 +10820,48 @@ fn customBoxyInterfaceEdits(
     if (!processSucceeded(packages_ran.term)) return failureFromRun(allocator, timer, packages_ran, "the two-package build did not run");
     if (std.mem.find(u8, packages_ran.stdout, "left 3") == null or std.mem.find(u8, packages_ran.stdout, "right 3") == null) return customFailure(allocator, timer, "the two-package build ran the other package's module: `{s}`", .{packages_ran.stdout});
     return null;
+}
+
+/// A Code site's description depends on the cut of its translator, which
+/// the walk reads from the translator's nominal (design.md "Value
+/// identity"). The fixture's cut is a top-level constant that no body names.
+/// The edit changes only the cut and the expected value, so the warm run
+/// must evaluate `shown` again, not reuse its old value.
+fn customCodeCutCache(
+    io: std.Io,
+    allocator: Allocator,
+    env: *const CaseEnv,
+    timer: *harness.Timer,
+    timeout_ms: u64,
+) ?TestResult {
+    var path: []const u8 = undefined;
+    if (stageEditableApp(io, allocator, env, timer, .{
+        .dir_name = "code_cut_cache",
+        .platform = "test/fx/platform/main.roc",
+        .platform_spelling = "../../fx/platform/main.roc",
+        .sources = &.{"test/cli/CodeCutCache/Lib.roc"},
+        .app_name = "Lib.roc",
+    }, &path)) |failure| return failure;
+    var isolated = CaseEnv{ .dirs = env.dirs, .env_map = env.env_map.clone(allocator) catch |err| return customInfraFailure(allocator, timer, "clone environment: {}", .{err}) };
+    defer isolated.env_map.deinit();
+    const cache_root = std.fs.path.join(allocator, &.{ env.dirs.work_dir, "code_cut_cache_cache" }) catch |err|
+        return customInfraFailure(allocator, timer, "failed to allocate the cache root: {}", .{err});
+    for ([_][]const u8{ "ROC_CACHE_DIR", "XDG_CACHE_HOME" }) |key| {
+        isolated.env_map.put(key, cache_root) catch |err| return customInfraFailure(allocator, timer, "failed to set the cache root: {}", .{err});
+    }
+    const passed: []const OutputNeedle = &.{.{ .stream = .stdout, .text = "All (1) tests passed" }};
+    // A cold run and a warm one.
+    for (0..2) |_| {
+        if (runRocAndCheck(io, allocator, &isolated, timer, timeout_ms, .{ .args = &.{ "test", "--no-color" }, .roc_file = path, .contains = passed })) |failure| return failure;
+    }
+    const edits = [_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "cut = [Code.prim(double)]", .to = "cut = [Code.prim(double), Code.prim(triple)]" },
+        .{ .from = "expect shown == \"[3]\"", .to = "expect shown == \"[2]\"" },
+    };
+    for (edits) |edit| {
+        replaceInFile(io, allocator, path, edit.from, edit.to) catch |err| return customInfraFailure(allocator, timer, "edit the cut: {}", .{err});
+    }
+    return runRocAndCheck(io, allocator, &isolated, timer, timeout_ms, .{ .args = &.{ "test", "--no-color" }, .roc_file = path, .contains = passed });
 }
 
 const code_instance_cache_stdout = "site: pets | check-one\ntable: pets | frag-one\nmethod table: tags | pick-one\nstored table: tags | pick-one\n";
