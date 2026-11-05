@@ -91,7 +91,7 @@ main = {
 					(p-assign (ident "parse"))))
 			(e-lookup-local
 				(p-assign (ident "result")))))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes
 			(exposed (name "parse") (wildcard false)))))
 ~~~

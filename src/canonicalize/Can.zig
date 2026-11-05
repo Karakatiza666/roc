@@ -7284,12 +7284,13 @@ fn importAliased(
     // 6. Store the mapping from module name to Import.Idx
     try self.import_indices.put(module_name, module_import_idx);
 
-    // 7. Create CIR import statement
+    // 7. Create CIR import statement. It records the alias the import binds,
+    // so later stages read the qualifier that names this import.
     const cir_import = Statement{
         .s_import = .{
             .module_name_tok = module_name,
             .qualifier_tok = null,
-            .alias_tok = null,
+            .alias_tok = alias,
             .exposes = exposed_items_span,
         },
     };
@@ -8124,11 +8125,13 @@ fn canonicalizedLocalLookup(
     self: *Self,
     pattern_idx: Pattern.Idx,
     region: Region,
+    member_region: ?Region,
 ) std.mem.Allocator.Error!CanonicalizedExpr {
     try self.used_patterns.put(pattern_idx, {});
 
     const expr_idx = try self.env.addExpr(CIR.Expr{ .e_lookup_local = .{
         .pattern_idx = pattern_idx,
+        .member_region = member_region,
     } }, region);
 
     return CanonicalizedExpr{
@@ -8144,6 +8147,7 @@ fn canonicalizedAssociatedLookup(
     ident: Ident.Idx,
     pattern_idx: Pattern.Idx,
     region: Region,
+    member_region: ?Region,
 ) std.mem.Allocator.Error!CanonicalizedExpr {
     if (self.isDefiningBoundVar(pattern_idx)) {
         return try self.canonicalizedMalformedExpr(Diagnostic{ .self_referential_definition = .{
@@ -8152,7 +8156,7 @@ fn canonicalizedAssociatedLookup(
         } });
     }
     try self.used_patterns.put(pattern_idx, {});
-    return self.canonicalizedAssociatedForwardLookup(owner_path, pattern_idx, region);
+    return self.canonicalizedAssociatedForwardLookup(owner_path, pattern_idx, region, member_region);
 }
 
 fn canonicalizedAssociatedForwardLookup(
@@ -8160,9 +8164,11 @@ fn canonicalizedAssociatedForwardLookup(
     owner_path: AST.DeclIndex.TypePathIdx,
     pattern_idx: Pattern.Idx,
     region: Region,
+    member_region: ?Region,
 ) std.mem.Allocator.Error!CanonicalizedExpr {
     const expr_idx = try self.env.addExpr(CIR.Expr{ .e_lookup_local = .{
         .pattern_idx = pattern_idx,
+        .member_region = member_region,
     } }, region);
 
     const free_vars = if (self.associatedOwnerIsModuleVisible(owner_path))
@@ -8205,6 +8211,7 @@ fn canonicalizedLocalAssociatedLookup(
         .type_node_idx = type_node_idx,
         .type_ident = type_ident,
         .item_ident = item_ident,
+        .member_region = self.qualifiedMemberRegion(item_ident, region),
     } }, region);
 
     return .{ .idx = expr_idx, .free_vars = DataSpan.empty(), .diverges = false };
@@ -8350,7 +8357,7 @@ fn canonicalizeQualifiedIdentExpr(
                     .region = region,
                 } }) };
             }
-            return .{ .expr = try self.canonicalizedLocalLookup(found_pattern_idx, region) };
+            return .{ .expr = try self.canonicalizedLocalLookup(found_pattern_idx, region, self.qualifiedMemberRegion(ident, region)) };
         },
         .not_found => {},
     }
@@ -8358,7 +8365,7 @@ fn canonicalizeQualifiedIdentExpr(
     const owner_path = try self.qualifierTypePath(qualifier_tokens);
     if (owner_path) |path| {
         if (try self.lookupOrCreateAssocValuePattern(path, ident, qualified_ident, region)) |pattern_idx| {
-            return .{ .expr = try self.canonicalizedAssociatedLookup(path, qualified_ident, pattern_idx, region) };
+            return .{ .expr = try self.canonicalizedAssociatedLookup(path, qualified_ident, pattern_idx, region, self.qualifiedMemberRegion(ident, region)) };
         }
         if (self.typeStatementForPath(path)) |type_stmt_idx| {
             if (self.env.store.getStatement(type_stmt_idx) == .s_alias_decl) {
@@ -8496,7 +8503,7 @@ fn canonicalizeTypeAssociatedLookup(
 
     if (self.typePathForBinding(binding_location.binding.*)) |owner_path| {
         if (try self.lookupOrCreateAssocValuePattern(owner_path, ident, type_qualified_idx, region)) |pattern_idx| {
-            return try self.canonicalizedAssociatedLookup(owner_path, type_qualified_idx, pattern_idx, region);
+            return try self.canonicalizedAssociatedLookup(owner_path, type_qualified_idx, pattern_idx, region, self.qualifiedMemberRegion(ident, region));
         }
     }
 
@@ -8560,7 +8567,7 @@ fn canonicalizeTypeAssociatedLookup(
 
     switch (self.scopeLookup(.ident, type_qualified_idx)) {
         .found => |found_pattern_idx| {
-            return try self.canonicalizedLocalLookup(found_pattern_idx, region);
+            return try self.canonicalizedLocalLookup(found_pattern_idx, region, self.qualifiedMemberRegion(ident, region));
         },
         .not_found => {
             return try self.canonicalizedMalformedExpr(Diagnostic{ .nested_value_not_found = .{
@@ -8734,7 +8741,7 @@ fn canonicalizeUnqualifiedIdentExpr(
                 }
             }
 
-            return try self.canonicalizedLocalLookup(found_pattern_idx, region);
+            return try self.canonicalizedLocalLookup(found_pattern_idx, region, null);
         },
         .not_found => {
             if (self.scopeLookupExposedItem(ident)) |exposed_info| {
@@ -8831,7 +8838,7 @@ fn canonicalizeUnqualifiedIdentExpr(
                         region,
                         self.associatedOwnerIsModuleVisible(owner_path),
                     );
-                    return try self.canonicalizedAssociatedForwardLookup(owner_path, pattern_idx, region);
+                    return try self.canonicalizedAssociatedForwardLookup(owner_path, pattern_idx, region, null);
                 }
             }
 
@@ -8864,7 +8871,7 @@ fn canonicalizeUnqualifiedIdentExpr(
             };
 
             try self.markGloballyResolvablePattern(ref_pattern_idx);
-            return try self.canonicalizedLocalLookup(ref_pattern_idx, region);
+            return try self.canonicalizedLocalLookup(ref_pattern_idx, region, null);
         },
     }
 }
@@ -14339,7 +14346,7 @@ fn addBoolNotCall(self: *Self, operand: Expr.Idx, region: Region) std.mem.Alloca
         const qualified = try self.insertQualifiedIdent("Builtin.Bool", "not");
         const pattern = (try self.lookupOrCreateAssocValuePattern(owner_path, self.env.idents.not, qualified, region)) orelse
             base.invariant("compiler invariant violated: Builtin.roc has no Builtin.Bool.not value", .{});
-        break :blk try self.canonicalizedAssociatedLookup(owner_path, self.env.idents.not, pattern, region);
+        break :blk try self.canonicalizedAssociatedLookup(owner_path, self.env.idents.not, pattern, region, null);
     };
     const args_start = self.env.store.scratchExprTop();
     try self.env.store.addScratchExpr(operand);
@@ -18258,6 +18265,8 @@ const TypeAnnoKernelRecordAfterFieldWork = struct {
     scratch_seen_record_fields_top: u32,
     field_name: Ident.Idx,
     field_region: Region,
+    /// The label token of the field.
+    label_region: Region,
     is_nominal_backing: bool,
     /// True when this field is unnamed padding (kept in the canonical record
     /// annotation but excluded from the backing record row).
@@ -18847,6 +18856,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                     .scratch_seen_record_fields_top = state.scratch_seen_record_fields_top,
                     .field_name = field_name,
                     .field_region = self.parse_ir.tokenizedRegionToRegion(ast_field.region),
+                    .label_region = self.parse_ir.tokens.resolve(ast_field.name),
                     .is_nominal_backing = state.is_nominal_backing,
                     .is_unnamed = is_unnamed,
                     .is_optional = ast_field.optional_mark != null,
@@ -18872,6 +18882,7 @@ fn runTypeAnnoKernel(self: *Self, anno_idx: AST.TypeAnno.Idx, type_anno_ctx: *Ty
                 null;
             const field_cir_idx = try self.env.addAnnoRecordField(.{
                 .name = state.field_name,
+                .label_region = state.label_region,
                 .ty = canonicalized_ty,
                 .is_unnamed = state.is_unnamed,
                 .is_optional = state.is_optional,
@@ -21084,12 +21095,20 @@ fn canonicalizeWhereClause(self: *Self, ast_where_idx: AST.WhereClause.Idx, type
                 break :blk try self.env.insertIdent(Ident.for_text(method_name_clean));
             };
 
+            // The name token includes the leading dot, which the name region leaves out.
+            const method_name_region = blk: {
+                const token_region = self.parse_ir.tokens.resolve(mm.name_tok);
+                const has_dot = self.parse_ir.resolve(mm.name_tok).len > 0 and self.parse_ir.resolve(mm.name_tok)[0] == '.';
+                break :blk Region.from_raw_offsets(token_region.start.offset + @intFromBool(has_dot), token_region.end.offset);
+            };
+
             var anno_ctx = TypeAnnoCtx.init(type_anno_ctx);
             const anno = try self.runTypeAnnoKernel(mm.anno, &anno_ctx);
 
             return try self.env.addWhereClause(WhereClause{ .w_method = .{
                 .var_ = var_anno_idx,
                 .method_name = method_ident,
+                .method_name_region = method_name_region,
                 .anno = anno,
             } }, region);
         },

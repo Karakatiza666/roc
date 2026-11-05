@@ -13690,6 +13690,8 @@ fn reifyOnlyFramePlace(self: *Self, env: *const ModuleEnv, region: Region) Alloc
         .path = try self.problems.putExtraString(env.diagnosticSourceName()),
         .line = info.start_line_idx + 1,
         .column = info.start_col_idx + 1,
+        .end_line = info.end_line_idx + 1,
+        .end_column = info.end_col_idx + 1,
     } };
 }
 
@@ -13702,7 +13704,7 @@ const ReifyOnlyChainFrame = struct {
         source: struct { env: *const ModuleEnv, region: Region },
         /// The place of a frame that an imported module exported. The path
         /// is a range of the chain's text.
-        exported: struct { path: ModuleEnv.ReifyOnlyText, line: u32, column: u32 },
+        exported: struct { path: ModuleEnv.ReifyOnlyText, line: u32, column: u32, end_line: u32, end_column: u32 },
     },
 };
 
@@ -13782,6 +13784,8 @@ fn appendReifyOnlyChain(
                         .path = try chain.appendText(self.gpa, current.env.reifyOnlyText(frame.path)),
                         .line = frame.line,
                         .column = frame.column,
+                        .end_line = frame.end_line,
+                        .end_column = frame.end_column,
                     } },
                 });
             }
@@ -13845,6 +13849,8 @@ fn publishReifyOnlyDefs(self: *Self, local_defs: []const reify_only.Entry(CIR.De
                         .path = try append.bytes(self.gpa, &text, place.env.diagnosticSourceName()),
                         .line = info.start_line_idx + 1,
                         .column = info.start_col_idx + 1,
+                        .end_line = info.end_line_idx + 1,
+                        .end_column = info.end_col_idx + 1,
                     };
                 },
                 .exported => |place| .{
@@ -13852,6 +13858,8 @@ fn publishReifyOnlyDefs(self: *Self, local_defs: []const reify_only.Entry(CIR.De
                     .path = try append.bytes(self.gpa, &text, chain.get(place.path)),
                     .line = place.line,
                     .column = place.column,
+                    .end_line = place.end_line,
+                    .end_column = place.end_column,
                 },
             });
         }
@@ -13903,6 +13911,8 @@ fn reportExistsOnlyInReifiedCode(
                     .path = try self.problems.putExtraString(chain.get(place.path)),
                     .line = place.line,
                     .column = place.column,
+                    .end_line = place.end_line,
+                    .end_column = place.end_column,
                 } },
             },
         });
@@ -35811,18 +35821,39 @@ fn staticDispatchBindingIsDerivedMarker(lookup: StaticDispatchMethodBinding) boo
     return derivedMethodDef(lookup.env, lookup.binding.def_idx) != null;
 }
 
-fn staticDispatchBindingIsUnsupportedGeneratedMethod(lookup: StaticDispatchMethodBinding) bool {
-    const def = lookup.env.store.getDef(lookup.binding.def_idx);
-    const expr = lookup.env.store.getExpr(def.expr);
-    if (expr != .e_anno_only) return false;
-    return expr.e_anno_only.kind == .unsupported_generated_method;
+/// Why a dispatch cannot select a method: its declaration names no value.
+pub const ValuelessMethod = enum {
+    /// A hosted declaration that is not an effectful function, or a method
+    /// whose annotation is erroneous. Its declaration reports the problem.
+    reported_at_declaration,
+    /// A bare underscore that requests an unsupported generated method. Its
+    /// declaration reports the problem.
+    unsupported_generated,
+    /// Any other annotation without a body. The dispatch reports the problem.
+    annotation_only,
+};
+
+/// Whether a dispatch that selects `def_idx`, a method of `module_env`, is
+/// refused because the method names no value. Null when the dispatch can
+/// select it. An intrinsic is a value, so a dispatch always selects it. Its
+/// `DispatchTargetInstantiation` keeps the edge, and the roots rule judges
+/// an edge that runs after checking (design.md "Reify-Only Definitions").
+pub fn valuelessMethod(module_env: *const ModuleEnv, def_idx: CIR.Def.Idx) ?ValuelessMethod {
+    if (hostedDeclarationIsNotEffectful(module_env, def_idx) or methodAnnotationErroneous(module_env, def_idx)) {
+        return .reported_at_declaration;
+    }
+    if (!annotationOnlyValueDef(module_env, def_idx)) return null;
+    const def = module_env.store.getDef(def_idx);
+    if (defReference(module_env, def) == .intrinsic) return null;
+    const expr = module_env.store.getExpr(def.expr);
+    std.debug.assert(expr == .e_anno_only);
+    if (expr.e_anno_only.kind == .unsupported_generated_method) return .unsupported_generated;
+    return .annotation_only;
 }
 
-/// Reject a dispatch whose method declaration names no value, or is a hosted
-/// declaration that is not an effectful function. A bare underscore requesting
-/// an unsupported generated method, like such a hosted declaration, reports
-/// itself at the declaration; every other annotation without a body reports
-/// here, because the dispatch is the site with nothing to call.
+/// Reject a dispatch whose method declaration names no value
+/// (`valuelessMethod`). Only an annotation without a body reports here,
+/// because the dispatch is the site with nothing to call.
 fn rejectValuelessMethodDispatch(
     self: *Self,
     lookup: StaticDispatchMethodBinding,
@@ -35831,19 +35862,8 @@ fn rejectValuelessMethodDispatch(
     env: *Env,
     failure_expr: ?CIR.Expr.Idx,
 ) Allocator.Error!bool {
-    if (hostedDeclarationIsNotEffectful(lookup.env, lookup.binding.def_idx) or
-        methodAnnotationErroneous(lookup))
-    {
-        try self.poisonConstraintFailure(dispatcher_var, constraint, env, failure_expr);
-        try self.markStaticDispatchRejected(constraint);
-        return true;
-    }
-    if (!annotationOnlyValueDef(lookup.env, lookup.binding.def_idx)) return false;
-    // An intrinsic is a value, so a dispatch always selects it. Its
-    // `DispatchTargetInstantiation` keeps the edge, and the roots rule judges
-    // an edge that runs after checking (design.md "Reify-Only Definitions").
-    if (defReference(lookup.env, lookup.env.store.getDef(lookup.binding.def_idx)) == .intrinsic) return false;
-    if (!staticDispatchBindingIsUnsupportedGeneratedMethod(lookup)) {
+    const valueless = valuelessMethod(lookup.env, lookup.binding.def_idx) orelse return false;
+    if (valueless == .annotation_only) {
         if (failure_expr orelse self.constraintSourceExpr(dispatcher_var, constraint)) |expr_idx| {
             _ = try self.problems.appendProblem(.{ .annotation_only_value_use = .{
                 .region = self.cir.store.getExprRegion(expr_idx),
@@ -35860,9 +35880,9 @@ fn rejectValuelessMethodDispatch(
 /// instantiation that dispatch reaches. The dispatch is rejected instead. The
 /// method's own module records this on the annotation when it generates the
 /// annotation's type, which happens before any dispatch can select the method.
-fn methodAnnotationErroneous(lookup: StaticDispatchMethodBinding) bool {
-    const annotation_idx = lookup.env.store.getDef(lookup.binding.def_idx).annotation orelse return false;
-    return lookup.env.store.getAnnotation(annotation_idx).erroneous;
+fn methodAnnotationErroneous(module_env: *const ModuleEnv, def_idx: CIR.Def.Idx) bool {
+    const annotation_idx = module_env.store.getDef(def_idx).annotation orelse return false;
+    return module_env.store.getAnnotation(annotation_idx).erroneous;
 }
 
 /// The method `owner_env`'s declaration `owner_source_decl` declares under

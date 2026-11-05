@@ -1,6 +1,8 @@
 //! Functionality for rendering pretty reports, Errors and Warnings etc.
 
 pub const Report = @import("report.zig").Report;
+pub const Location = @import("report.zig").Location;
+pub const RelatedLocation = @import("report.zig").RelatedLocation;
 pub const Document = @import("document.zig").Document;
 pub const CommonMisspellings = @import("common_misspellings.zig").CommonMisspellings;
 pub const DocumentElement = @import("document.zig").DocumentElement;

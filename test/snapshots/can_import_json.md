@@ -63,7 +63,7 @@ NO CHANGE
 	(d-let
 		(p-assign (ident "main"))
 		(e-runtime-error (tag "qualified_ident_does_not_exist")))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes)))
 ~~~
 # TYPES

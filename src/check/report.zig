@@ -25,6 +25,7 @@ const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
 
 const Report = reporting.Report;
+const Location = reporting.Location;
 const Document = reporting.Document;
 const UnderlineRegion = reporting.UnderlineRegion;
 const SourceCodeDisplayRegion = reporting.SourceCodeDisplayRegion;
@@ -5947,12 +5948,10 @@ pub const ReportBuilder = struct {
         try document.startAnnotation(.code_block);
         for (self.problems.getRefusalCalls(data.chain), 0..) |frame, index| {
             if (index != 0) try document.addLineBreak();
-            try document.addText(self.problems.getExtraString(frame.text));
+            const text = self.problems.getExtraString(frame.text);
+            try document.addText(text);
             try document.addText(" at ");
-            switch (frame.place) {
-                .local => |region| try document.addSourceLocation(self.module_env.calcRegionInfo(region), self.filename),
-                .foreign => |place| try document.addForeignSourceLocation(self.problems.getExtraString(place.path), place.line, place.column),
-            }
+            try report.addRelatedSourceLocation(self.refusalCallLocation(frame.place), text);
         }
         try document.endAnnotation();
         try report.document.addLineBreaks(2);
@@ -6447,6 +6446,7 @@ pub const ReportBuilder = struct {
         // A refusal outside the site's own source is shown where it is, and
         // the site is where the walk reached it from (F4, D9).
         if (data.foreign) |place| {
+            const path = self.problems.getExtraString(place.path);
             try report.document.addSourceExcerpt(.{
                 .line_text = self.problems.getExtraString(place.line_text),
                 .start_line = place.start_line,
@@ -6454,8 +6454,16 @@ pub const ReportBuilder = struct {
                 .end_line = place.end_line,
                 .end_column = place.end_column,
                 .region_annotation = .error_highlight,
-                .filename = self.problems.getExtraString(place.path),
+                .filename = path,
             });
+            try report.setPrimary(.{
+                .file = path,
+                .start_line = place.start_line,
+                .start_column = place.start_column,
+                .end_line = place.end_line,
+                .end_column = place.end_column,
+            });
+            try report.setReachedFrom(self.localLocation(data.region));
             try report.document.addLineBreak();
             try report.document.addText("The reified function reaches it from the site at ");
             try report.document.addSourceLocation(self.module_env.calcRegionInfo(data.region), self.filename);
@@ -6896,7 +6904,7 @@ pub const ReportBuilder = struct {
             try report.document.addLineBreak();
         } else if (data.origin) |place| {
             try report.document.addText("The refused expression is at ");
-            try report.document.addForeignSourceLocation(self.problems.getExtraString(place.path), place.line, place.column);
+            try report.addRelatedSourceLocation(self.foreignLocation(place), "The refused expression.");
             try report.document.addText(", outside this module.");
             try report.document.addLineBreak();
             try report.document.addLineBreak();
@@ -6934,21 +6942,37 @@ pub const ReportBuilder = struct {
         try document.startAnnotation(.code_block);
         for (calls, 0..) |call, index| {
             if (index != 0) try document.addLineBreak();
-            try document.addCodeLines(self.problems.getExtraString(call.text));
-            switch (call.place) {
-                .local => |region| {
-                    try document.addText(" (");
-                    try document.addSourceLocation(self.module_env.calcRegionInfo(region), self.filename);
-                    try document.addText(")");
-                },
-                .foreign => |place| {
-                    try document.addText(" (");
-                    try document.addForeignSourceLocation(self.problems.getExtraString(place.path), place.line, place.column);
-                    try document.addText(")");
-                },
-            }
+            const text = self.problems.getExtraString(call.text);
+            try document.addCodeLines(text);
+            try document.addText(" (");
+            try report.addRelatedSourceLocation(self.refusalCallLocation(call.place), text);
+            try document.addText(")");
         }
         try document.endAnnotation();
+    }
+
+    /// The location of `region` in this module's file.
+    fn localLocation(self: *const Self, region: Region) Location {
+        return .fromRegionInfo(self.filename, self.module_env.calcRegionInfo(region));
+    }
+
+    /// The location of a place in another module's file.
+    fn foreignLocation(self: *const Self, place: problem_mod.SourcePlace) Location {
+        return .{
+            .file = self.problems.getExtraString(place.path),
+            .start_line = place.line,
+            .start_column = place.column,
+            .end_line = place.end_line,
+            .end_column = place.end_column,
+        };
+    }
+
+    /// The location of one call of a refusal chain.
+    fn refusalCallLocation(self: *const Self, place: problem_mod.RefusalCall.Place) Location {
+        return switch (place) {
+            .local => |region| self.localLocation(region),
+            .foreign => |foreign| self.foreignLocation(foreign),
+        };
     }
 
     /// Build a report for compile-time evaluation error

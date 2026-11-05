@@ -653,7 +653,7 @@ pub const Diagnostic = union(enum) {
         );
         try report.document.addLineBreak();
         try report.document.addText("The outer type was declared in ");
-        try report.document.addSourceLocation(original_region_info, owned_filename);
+        try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, original_region_info), "The outer type is declared here.");
         try report.document.addText(".");
         try report.document.addLineBreak();
         try report.document.addSourceRegion(
@@ -727,7 +727,7 @@ pub const Diagnostic = union(enum) {
         try report.document.addText("But ");
         try report.document.addUnqualifiedSymbol(owned_parameter_name);
         try report.document.addText(" was already declared in ");
-        try report.document.addSourceLocation(original_region_info, owned_filename);
+        try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, original_region_info), "This name was first declared here.");
         try report.document.addText(".");
         try report.document.addLineBreak();
         try report.document.addSourceRegion(
@@ -770,7 +770,7 @@ pub const Diagnostic = union(enum) {
         try report.document.addReflowingText("The tag ");
         try report.document.addUnqualifiedSymbol(owned_tag_name);
         try report.document.addReflowingText(" was first defined in ");
-        try report.document.addSourceLocation(original_region_info, owned_filename);
+        try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, original_region_info), "The tag was first defined here.");
         try report.document.addReflowingText(".");
         try report.document.addLineBreak();
         try report.document.addSourceRegion(

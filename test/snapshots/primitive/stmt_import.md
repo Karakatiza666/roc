@@ -158,7 +158,7 @@ import json.Json
 # CANONICALIZE
 ~~~clojure
 (can-ir
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes)))
 ~~~
 # TYPES

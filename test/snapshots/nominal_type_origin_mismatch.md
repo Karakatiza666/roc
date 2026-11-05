@@ -120,7 +120,7 @@ main =
 			(e-runtime-error (tag "erroneous_value_expr"))
 			(e-string
 				(e-literal (string "not a person")))))
-	(s-import (mod "Data")
+	(s-import (mod "Data") (alias "Data")
 		(exposes
 			(exposed (name "Person") (wildcard false)))))
 ~~~

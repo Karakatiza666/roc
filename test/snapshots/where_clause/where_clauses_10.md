@@ -103,7 +103,7 @@ decode_things # After member name
 				(alias
 					(ty-rigid-var-lookup (ty-rigid-var (name "a")))
 					(ty-malformed)))))
-	(s-import (mod "Decode")
+	(s-import (mod "Decode") (alias "Decode")
 		(exposes
 			(exposed (name "Decode") (wildcard false)))))
 ~~~

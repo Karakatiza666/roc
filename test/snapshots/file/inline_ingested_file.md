@@ -98,7 +98,7 @@ NO CHANGE
 	(d-let
 		(p-assign (ident "foo"))
 		(e-runtime-error (tag "erroneous_value_expr")))
-	(s-import (mod "Json")
+	(s-import (mod "Json") (alias "Json")
 		(exposes)))
 ~~~
 # TYPES

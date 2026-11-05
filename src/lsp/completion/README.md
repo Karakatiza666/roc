@@ -133,13 +133,15 @@ every kind of completion the system can produce, grouped by context.
 **Trigger:** `Str.`, `List.`, `Json.`, or `MyNominalType.`
 
 **What happens:**
-1. `resolveModuleAlias(module_env, name)`—if the module was imported with
-   `import Json as J`, this maps `J` back to `Json`.
-2. `builder.addModuleMemberCompletions(env, resolved_name, module_env_opt)`—
-   walks all `exposed_items` from the target module's `ModuleEnv`. For builtin
-   type names (recognised via `isBuiltinType`), it uses the special
-   `builtin_module.env`. Items are classified as `function` (lowercase) or
-   `class` (uppercase).
+1. `findModuleEnvForCompletion(...)` finds the module the qualifier names.
+   A builtin type name (recognised via `isBuiltinType`) names the special
+   `builtin_module.env`. Otherwise the import whose alias is the qualifier
+   gives the import name, and `BuildEnv.importedModuleEnv` gives the module
+   that the importer was checked against. The alias is the `as` name, or else
+   the last segment of the module path.
+2. `builder.addModuleMemberCompletions(env, qualifier, imported_env, module_env_opt)`
+   walks all `exposed_items` from that module's `ModuleEnv`. Items are
+   classified as `function` (lowercase) or `class` (uppercase).
 3. `builder.addTagCompletionsForNominalType(module_env, name, null)`—if the
    name is also a nominal type in the current module, adds its tag constructors
    (e.g., `Color.Red`, `Color.Green`).
@@ -161,8 +163,13 @@ every kind of completion the system can produce, grouped by context.
 3. Once a `types.Var` is in hand:
    - `addFieldsFromTypeVar()`—unwraps aliases/nominals up to 8 levels, then
      iterates record fields. Each field gets a `detail` string showing its type.
+     It opens a `::` opaque type only in its own module, the rule the checker
+     applies (`NominalType.canLiftInner`). Tuple indices never come from a
+     nominal's backing, since the checker refuses tuple access on a nominal.
    - `addMethodsFromTypeVar()`—independently looks up the type identity in
-     `method_idents`. It does not inspect record fields.
+     `method_idents` of the module that declares the type, found by its
+     content identity. It offers only items whose first parameter is the
+     owner type or a type variable. It does not inspect record fields.
 
 At `value.` the source is incomplete: selecting a field and stopping produces
 `value.field`, while adding an argument list produces the distinct method syntax
@@ -349,7 +356,7 @@ Every public `add*` method on `CompletionBuilder`:
 | `addItem(item)` | Core: appends one item with deduplication. Returns `true` if added. |
 | `addModuleNameCompletionsFromEnv(env)` | All module names from `BuildEnv` coordinator state + `addBuiltinModuleNameCompletions()`. |
 | `addModuleNameCompletions(module_env)` | Imported module aliases from `s_import` statements. |
-| `addModuleMemberCompletions(env, name, opt)` | Exposed items from a named module (handles builtins and imports). |
+| `addModuleMemberCompletions(env, qualifier, imported_env, opt)` | Exposed items from the module a qualifier names (builtins and imports). |
 | `addModuleMemberCompletionsFromModuleEnv(env, name)` | Exposed items from a specific `ModuleEnv`. |
 | `addTypeCompletions(module_env)` | Alias and nominal type names from one module. |
 | `addTypeCompletionsFromEnv(env)` | Type names from all modules in `BuildEnv`. |
@@ -382,7 +389,7 @@ Dec  Num
 used to:
 - Route method lookups through the builtin `ModuleEnv` instead of the user's.
 - Add builtin module names to completion lists.
-- Recognise when `addModuleMemberCompletions` should use `builtin_module.env`.
+- Recognise when a qualifier names `builtin_module.env`.
 
 ---
 
@@ -396,7 +403,7 @@ used to:
 | `test/handler_unit_tests.zig` | Handler response-shape tests that run through the test syntax driver instead of real compiler checking. |
 | `test/syntax_test.zig` | Mid-level tests. Creates a `SyntaxChecker`, builds real Roc source, and calls `getCompletionsAtPosition()` directly. |
 | `completion/context.zig` (inline) | Unit tests for `detectCompletionContext` and `computeOffset`. |
-| `completion/builder.zig` (inline) | Unit tests for helper functions (`stripModulePrefix`, `firstSegment`, `lastSegment`). |
+| `completion/builder.zig` (inline) | Unit tests for helper functions (`stripModulePrefix`, `firstSegment`). |
 | `completion/builtins.zig` (inline) | Unit tests for `isBuiltinType` and `BUILTIN_TYPES.len`. |
 
 ### Handler test structure (handler_integration_tests.zig)

@@ -787,11 +787,11 @@ NO CHANGE
 								(value
 									(e-lookup-local
 										(p-assign (ident "a")))))))))))
-	(s-import (mod "I1")
+	(s-import (mod "I1") (alias "I1")
 		(exposes
 			(exposed (name "I11") (wildcard false))
 			(exposed (name "I12") (wildcard false))))
-	(s-import (mod "I2")
+	(s-import (mod "I2") (alias "I2")
 		(exposes
 			(exposed (name "I21") (alias "Ias1") (wildcard false))
 			(exposed (name "I22") (alias "Ias2") (wildcard false))))

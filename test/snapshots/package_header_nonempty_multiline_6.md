@@ -90,7 +90,7 @@ package # Comment after keyword
 # CANONICALIZE
 ~~~clojure
 (can-ir
-	(s-import (mod "SomeType")
+	(s-import (mod "SomeType") (alias "SomeType")
 		(exposes)))
 ~~~
 # TYPES

@@ -2246,22 +2246,22 @@ expect {
 		(e-runtime-error (tag "erroneous_value_expr"))
 		(annotation
 			(ty-malformed)))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "write!") (wildcard false))))
-	(s-import (mod "pf.StdoutMultiline")
+	(s-import (mod "pf.StdoutMultiline") (alias "StdoutMultiline")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "write!") (wildcard false))))
-	(s-import (mod "pkg.Something")
+	(s-import (mod "pkg.Something") (alias "Something")
 		(exposes
 			(exposed (name "func") (alias "function") (wildcard false))
 			(exposed (name "Type") (alias "ValueCategory") (wildcard false))
 			(exposed (name "Custom") (wildcard true))))
-	(s-import (mod "BadName")
+	(s-import (mod "BadName") (alias "GoodName")
 		(exposes))
-	(s-import (mod "BadNameMultiline")
+	(s-import (mod "BadNameMultiline") (alias "GoodNameMultiline")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Map")

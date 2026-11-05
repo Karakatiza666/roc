@@ -967,15 +967,17 @@ pub const ReifyOnlyText = extern struct {
     len: u32,
 };
 
-/// One frame of an exported reify-only chain: its text, and the path, line
-/// and column (1-based) of its place. An importer reports each frame as it
-/// is, so the chain is complete when the importer sees no module of it but
-/// the one it imports.
+/// One frame of an exported reify-only chain: its text, and the path and
+/// 1-based span of its place (the end column is one past the last byte). An
+/// importer reports each frame as it is, so the chain is complete when the
+/// importer sees no module of it but the one it imports.
 pub const ReifyOnlyFrame = extern struct {
     text: ReifyOnlyText,
     path: ReifyOnlyText,
     line: u32,
     column: u32,
+    end_line: u32,
+    end_column: u32,
 
     pub const SafeList = collections.SafeList(@This());
 };
@@ -2536,7 +2538,7 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addReflowingText("But ");
             try report.document.addType(owned_type_name);
             try report.document.addReflowingText(" was already declared in ");
-            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, original_region_info), "The type was first declared here.");
             try report.document.addReflowingText(".");
             try report.document.addLineBreak();
             try self.addSourceRegionTo(&report.document, original_region_info, .dimmed, owned_filename);
@@ -2561,7 +2563,7 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addReflowingText("But ");
             try report.document.addType(owned_type_name);
             try report.document.addReflowingText(" was already declared in ");
-            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, original_region_info), "The type alias was first declared here.");
             try report.document.addReflowingText(".");
             try report.document.addLineBreak();
             try self.addSourceRegionTo(&report.document, original_region_info, .dimmed, owned_filename);
@@ -2586,7 +2588,7 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addReflowingText("But ");
             try report.document.addType(owned_type_name);
             try report.document.addReflowingText(" was already declared in ");
-            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, original_region_info), "The nominal type was first declared here.");
             try report.document.addReflowingText(".");
             try report.document.addLineBreak();
             try self.addSourceRegionTo(&report.document, original_region_info, .dimmed, owned_filename);
@@ -2691,7 +2693,7 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addReflowingText("The field ");
             try report.document.addRecordField(owned_field_name);
             try report.document.addReflowingText(" was first defined in ");
-            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, original_region_info), "The field was first defined here.");
             try report.document.addReflowingText(".");
             try report.document.addLineBreak();
             try self.addSourceRegionTo(&report.document, original_region_info, .dimmed, owned_filename);
@@ -2859,7 +2861,7 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addReflowingText("In this scope, ");
             try report.document.addUnqualifiedSymbol(owned_ident);
             try report.document.addReflowingText(" was already defined in ");
-            try report.document.addSourceLocation(original_region_info, owned_filename);
+            try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, original_region_info), "The name was first defined here.");
             try report.document.addReflowingText(".");
             try report.document.addLineBreak();
             try self.addSourceRegionTo(&report.document, original_region_info, .dimmed, owned_filename);
@@ -4050,7 +4052,7 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addLineBreak();
             try report.document.addUnqualifiedSymbol(owned_ident);
             try report.document.addReflowingText(" was declared in ");
-            try report.document.addSourceLocation(declaration_region_info, owned_filename);
+            try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, declaration_region_info), "The variable is declared here.");
             try report.document.addReflowingText(".");
             try report.document.addLineBreak();
             try self.addSourceRegionTo(&report.document, declaration_region_info, .dimmed, owned_filename);
@@ -4089,7 +4091,7 @@ pub fn diagnosticToReport(self: *Self, diagnostic: CIR.Diagnostic, allocator: st
             try report.document.addReflowingText(" references ");
             try report.document.addType(owned_other_name);
             try report.document.addReflowingText(", which is declared in ");
-            try report.document.addSourceLocation(other_region_info, owned_filename);
+            try report.addRelatedSourceLocation(.fromRegionInfo(owned_filename, other_region_info), "The other type alias is declared here.");
             try report.document.addReflowingText(".");
             try report.document.addLineBreak();
             try self.addSourceRegionTo(&report.document, other_region_info, .dimmed, owned_filename);

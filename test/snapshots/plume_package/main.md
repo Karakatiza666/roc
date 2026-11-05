@@ -52,7 +52,7 @@ package
 # CANONICALIZE
 ~~~clojure
 (can-ir
-	(s-import (mod "Color")
+	(s-import (mod "Color") (alias "Color")
 		(exposes)))
 ~~~
 # TYPES

@@ -440,7 +440,7 @@ pub const ModuleType = enum {
             },
             .compile => .{
                 .root = "src/compile/mod.zig",
-                .deps = &.{ .tracy, .build_options, .ctx, .builtins, .collections, .base, .types, .parse, .can, .check, .reporting, .layout, .static_data, .eval, .unbundle, .roc_target, .backend, .lir, .symbol, .sljmp, .reify },
+                .deps = &.{ .tracy, .build_options, .ctx, .builtins, .collections, .base, .types, .parse, .can, .check, .reporting, .layout, .static_data, .eval, .unbundle, .roc_target, .backend, .lir, .symbol, .sljmp, .reify, .echo_platform },
                 .extra_imports = &.{"compiler_platform_sources"},
                 .tests = .{ .unit = .{ .aggregators = &.{"compile tests"} } },
             },
@@ -457,7 +457,7 @@ pub const ModuleType = enum {
             },
             .lsp => .{
                 .root = "src/lsp/mod.zig",
-                .deps = &.{ .collections, .compile, .reporting, .build_options, .ctx, .base, .parse, .can, .types, .fmt, .eval, .roc_target },
+                .deps = &.{ .collections, .compile, .reporting, .build_options, .ctx, .base, .parse, .can, .check, .types, .fmt, .eval, .roc_target },
                 .tests = .{ .unit = .{} },
                 .available = .native,
             },

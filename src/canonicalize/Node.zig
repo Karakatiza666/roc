@@ -572,7 +572,8 @@ pub const Payload = extern union {
     /// expr_var: local variable lookup by pattern index
     pub const ExprVar = extern struct {
         pattern_idx: u32,
-        _padding: [12]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        member_region_plus_one: u32 = 0, // Index into span2_data plus one, or 0 for none
+        _padding: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     /// expr_external_lookup: lookup from another module
@@ -604,7 +605,7 @@ pub const Payload = extern union {
         type_node_idx: u32,
         type_ident: u32,
         item_ident: u32,
-        _reserved: [4]u8 = .{ 0, 0, 0, 0 },
+        member_region_plus_one: u32 = 0, // Index into span2_data plus one, or 0 for none
     };
 
     /// expr_associated_lookup: imported type declaration plus associated item.
@@ -1165,7 +1166,8 @@ pub const Payload = extern union {
         var_idx: u32,
         name: u32,
         anno: u32,
-        _reserved: [4]u8 = .{ 0, 0, 0, 0 },
+        /// Index into `span2_data` of the method name's (start, len).
+        name_region_span2_idx: u32,
     };
 
     pub const WhereMalformed = extern struct {
@@ -1340,9 +1342,11 @@ pub const Payload = extern union {
     pub const TyRecordField = extern struct {
         name: u32,
         ty: u32,
+        /// Index into `span2_data` of the label's (start, len).
+        label_region_span2_idx: u32,
         is_optional: bool = false,
         is_unnamed: bool = false,
-        _padding: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
+        _padding: [2]u8 = .{ 0, 0 },
     };
 
     /// A DEFAULTED record-annotation field (`a : U8 ?? 10`): never optional,
@@ -1352,7 +1356,8 @@ pub const Payload = extern union {
         name: u32,
         ty: u32,
         default_value: u32,
-        _reserved: [4]u8 = .{ 0, 0, 0, 0 },
+        /// Index into `span2_data` of the label's (start, len).
+        label_region_span2_idx: u32,
     };
 
     pub const ExposedItem = extern struct {
@@ -1441,7 +1446,7 @@ test "Payload: setPayload through a poisoned Node leaves no undefined byte" {
         }
     };
 
-    // A one-word variant: its 12 reserved bytes must be written too.
+    // A variant with unused words: its reserved bytes must be written too.
     node_ones.setPayload(.{ .expr_var = .{ .pattern_idx = 0x11223344 } });
     node_fives.setPayload(.{ .expr_var = .{ .pattern_idx = 0x11223344 } });
     try Compare.serializedPartsMatch(node_ones, node_fives);
@@ -1546,8 +1551,8 @@ test "Node.List: serialization round-trips full-width payloads and ignores alloc
     try std.testing.expectEqual(@as(u32, 0x55555555), var_node.getPayload().expr_var.pattern_idx);
     try std.testing.expectEqualSlices(u8, repeated: {
         const pattern = &[_]u8{0};
-        var result: [pattern.len * (12)]@TypeOf(pattern[0]) = undefined;
-        for (0..(12)) |i| @memcpy(result[i * pattern.len ..][0..pattern.len], pattern);
+        var result: [pattern.len * (8)]@TypeOf(pattern[0]) = undefined;
+        for (0..(8)) |i| @memcpy(result[i * pattern.len ..][0..pattern.len], pattern);
         break :repeated &result;
     }, &var_node.getPayload().expr_var._padding);
 

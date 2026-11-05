@@ -4252,7 +4252,7 @@ fn evalInterpreterProgramRoots(
                 break :blk stored;
             }
 
-            const eval_result = try evalCompileTimeRoot(interpreter, problem_store, owners, root.owner, module, program.imports, compile_time_root, &lowered.lir_result, program.slotEnvironment(), root.proc, root.ret_layout, options.retry);
+            const eval_result = try evalCompileTimeRoot(interpreter, problem_store, owners, root.owner, module, program.modules, compile_time_root, &lowered.lir_result, program.slotEnvironment(), root.proc, root.ret_layout, options.retry);
             switch (eval_result) {
                 .retry => continue,
                 .value => |value| {
@@ -5124,8 +5124,9 @@ const InterpreterProgram = struct {
     /// so published values may reference them for the whole finalization.
     static_strings: Interpreter.StaticStrings.Table,
     interpreter: Interpreter,
-    /// The modules a refusal's site may come from, besides the root (I9c).
-    imports: []const checked.ImportedModuleView,
+    /// The lowering's modules, any of which a refusal's site may come from
+    /// (I9c).
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     /// Owner named by the callable headers of every image this program's
     /// slot environment installs: its static callables run on `interpreter`.
     callable_owner: Interpreter.StaticCallableOwner = .unbound,
@@ -5147,7 +5148,7 @@ const InterpreterProgram = struct {
         self.allocator = allocator;
         self.timing_io = null;
         self.shared_slots = null;
-        self.imports = modules.imports;
+        self.modules = modules;
         self.callable_owner = .unbound;
         self.shared_callable_owner = null;
         self.callable_images = 0;
@@ -5196,7 +5197,7 @@ const InterpreterProgram = struct {
             .host = CompilerHost.init(allocator),
             .static_strings = undefined,
             .interpreter = undefined,
-            .imports = self.imports,
+            .modules = self.modules,
         };
         errdefer child.host.deinit();
         child.interpreter = try Interpreter.init(allocator, &lowered.lir_result.store, &lowered.lir_result.layouts, self.interpreter.static_strings, child.host.ops());
@@ -5735,8 +5736,9 @@ const DevProgram = struct {
     linked_images: ?*BoxyLinkedImages,
     /// The program's LIR, whose source file table locations index.
     lir_store: *const lir.LirStore,
-    /// The modules a refusal's site may come from, besides the root (I9c).
-    imports: []const checked.ImportedModuleView,
+    /// The lowering's modules, any of which a refusal's site may come from
+    /// (I9c).
+    modules: lir.CheckedPipeline.CheckedModuleSet,
 
     fn init(allocator: Allocator, modules: lir.CheckedPipeline.CheckedModuleSet, lowered: *lir.CheckedPipeline.LoweredProgram, options: Options) FinalizeError!DevProgram {
         const static_data_started_ns = if (options.timing) |timing| timing.start() else 0;
@@ -5877,7 +5879,7 @@ const DevProgram = struct {
             .composition = if (lowered.lir_result.store.runtime_contract == .boxy) try BoxyInProcessState.create(allocator) else null,
             .linked_images = options.boxy_linked_images,
             .lir_store = &lowered.lir_result.store,
-            .imports = modules.imports,
+            .modules = modules,
         };
     }
 
@@ -6244,7 +6246,7 @@ fn evalDevProgramRoots(
                 break :crashed try devCrashedRootPayload(
                     problem_store,
                     module,
-                    native.imports,
+                    native.modules,
                     job.compile_time_root,
                     job.root.request,
                     job.host.refusal,
@@ -6435,7 +6437,7 @@ fn devComptimeExhaustivenessRootPayload(
 fn devCrashedRootPayload(
     problem_store: ?*check.problem.Store,
     module: *checked.CheckedModuleArtifact,
-    imports: []const checked.ImportedModuleView,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     root: checked.CompileTimeRoot,
     request: checked.RootRequest,
     refusal: ?builtins.in_process_host.CodeRefusal,
@@ -6447,7 +6449,7 @@ fn devCrashedRootPayload(
 ) FinalizeError!checked.CompileTimeRootPayload {
     const lir_store = &lir_result.store;
     if (refusal) |refused| if (problem_store) |store| {
-        try reportRefusal(store, module, imports, devRootSourceRegion(module, root), refused, message);
+        try reportRefusal(store, module, modules, devRootSourceRegion(module, root), refused, message);
         had_problem.* = true;
         return try failedRootPayload(module, root, message, .crash);
     };
@@ -6488,13 +6490,13 @@ fn devCrashedRootPayload(
 fn reportRefusal(
     store: *check.problem.Store,
     module: *const checked.CheckedModuleArtifact,
-    imports: []const checked.ImportedModuleView,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     root_region: base.Region,
     refusal: builtins.in_process_host.CodeRefusal,
     message: []const u8,
 ) Allocator.Error!void {
     const message_idx = try store.putExtraString(message);
-    const found = refusalSite(module, imports, refusal.site) orelse
+    const found = refusalSite(module, modules, refusal.site) orelse
         finalizationInvariant("a refusal named a reification site that no module's provenance holds");
     const chains = found.table.origins(found.site, refusal.row, refusal.node) orelse {
         _ = try store.appendProblem(.{ .translation_refused = .{
@@ -6514,7 +6516,7 @@ fn reportRefusal(
     const intrinsics = try store.putExtraStrings(names);
     for (chains) |chain| {
         const links = found.table.links[chain.start..][0..chain.len];
-        const place = refusalPlace(module, imports, found, links[0]);
+        const place = refusalPlace(module, modules, found, links[0]);
         // A foreign source is shown here at the innermost call in this module
         // that reached it.
         var region = if (place.foreign) root_region else place.region;
@@ -6522,7 +6524,7 @@ fn reportRefusal(
         var path: std.ArrayList(check.problem.RefusalCall) = .empty;
         defer path.deinit(store.gpa);
         for (links[1..]) |link| {
-            const call = refusalPlace(module, imports, found, link);
+            const call = refusalPlace(module, modules, found, link);
             if (!placed and !call.foreign) {
                 region = call.region;
                 placed = true;
@@ -6533,6 +6535,8 @@ fn reportRefusal(
                     .path = try store.putExtraString(call.path),
                     .line = call.line,
                     .column = call.column,
+                    .end_line = call.end_line,
+                    .end_column = call.end_column,
                 } } else .{ .local = call.region },
             });
         }
@@ -6543,6 +6547,8 @@ fn reportRefusal(
                 .path = try store.putExtraString(place.path),
                 .line = place.line,
                 .column = place.column,
+                .end_line = place.end_line,
+                .end_column = place.end_column,
             } else null,
             .path = try store.putRefusalCalls(path.items),
             .intrinsics = intrinsics,
@@ -6555,15 +6561,21 @@ const RefusalSite = struct {
     site: checked.CodeProvenanceTable.Site,
 };
 
-/// The provenance of the site whose `Code` value carries `key`: the root
-/// module's, or an import's when an import made that value.
+/// The provenance of the site whose `Code` value carries `key`: the
+/// evaluated module's, or that of another module of the lowering when that
+/// module made the value. The evaluated module need not be the lowering's
+/// root, so the root and its relation modules are searched as well as its
+/// imports.
 fn refusalSite(
     module: *const checked.CheckedModuleArtifact,
-    imports: []const checked.ImportedModuleView,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     key: u64,
 ) ?RefusalSite {
     if (module.code_provenance.site(key)) |site| return .{ .table = &module.code_provenance, .site = site };
-    for (imports) |view| if (view.code_provenance.site(key)) |site| return .{ .table = view.code_provenance, .site = site };
+    if (modules.root.module.code_provenance.site(key)) |site| return .{ .table = &modules.root.module.code_provenance, .site = site };
+    for ([_][]const checked.ImportedModuleView{ modules.imports, modules.root.relation_modules }) |views| {
+        for (views) |view| if (view.code_provenance.site(key)) |site| return .{ .table = view.code_provenance, .site = site };
+    }
     return null;
 }
 
@@ -6576,12 +6588,14 @@ const RefusalPlace = struct {
     text: []const u8,
     line: u32,
     column: u32,
+    end_line: u32,
+    end_column: u32,
 };
 
 /// Where one source of a site is: its region, its module and its text.
 fn refusalPlace(
     module: *const checked.CheckedModuleArtifact,
-    imports: []const checked.ImportedModuleView,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     found: RefusalSite,
     link: u32,
 ) RefusalPlace {
@@ -6589,9 +6603,8 @@ fn refusalPlace(
     const key = found.table.modules[src.module];
     const region = base.Region.from_raw_offsets(src.region_start, src.region_end);
     const local = std.meta.eql(key, module.key);
-    const env = if (local) module.moduleEnvConst() else for (imports) |view| {
-        if (std.meta.eql(view.key, key)) break view.module_env;
-    } else finalizationInvariant("a reification source names a module that finalization does not see");
+    const env = if (local) module.moduleEnvConst() else (loweringModuleView(modules, key.digest()) orelse
+        finalizationInvariant("a reification source names a module that finalization does not see")).module_env;
     const info = env.calcRegionInfo(region);
     return .{
         .region = region,
@@ -6600,6 +6613,8 @@ fn refusalPlace(
         .text = env.getSource(region),
         .line = info.start_line_idx + 1,
         .column = info.start_col_idx + 1,
+        .end_line = info.end_line_idx + 1,
+        .end_column = info.end_col_idx + 1,
     };
 }
 
@@ -6813,7 +6828,7 @@ fn evalCompileTimeRoot(
     owners: *const ModuleOwners,
     root_owner: lir.LIR.LoweringModuleId,
     module: *checked.CheckedModuleArtifact,
-    imports: []const checked.ImportedModuleView,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     root: checked.CompileTimeRoot,
     lir_result: *const lir.Program.Result,
     slots: *const StaticSlotEnvironment,
@@ -6843,7 +6858,7 @@ fn evalCompileTimeRoot(
                     return .{ .failed = .{ .message = message, .payload = try reportCompileTimeExhaustiveness(problem_store, owners, root_owner, module, root, lir_result, failure, proc) } };
                 }
                 if (interpreter.getFailedRefusal()) |refused| if (problem_store) |store| {
-                    try reportRefusal(store, module, imports, devRootSourceRegion(module, root), refused, message);
+                    try reportRefusal(store, module, modules, devRootSourceRegion(module, root), refused, message);
                     return .{ .failed = .{ .message = message, .payload = try failedRootPayload(module, root, message, .crash) } };
                 };
                 return .{ .failed = .{ .message = message, .payload = try reportCompileTimeCrash(problem_store, module, root, failed_at, owners, lir_result, message) } };

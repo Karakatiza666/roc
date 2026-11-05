@@ -828,17 +828,17 @@ combineTrys = |jsonTry, httpStatus|
 				(ty-malformed)
 				(ty-malformed)
 				(ty-malformed))))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes
 			(exposed (name "Value") (wildcard false))
 			(exposed (name "Error") (wildcard false))
 			(exposed (name "Config") (wildcard false))))
-	(s-import (mod "http.Client")
+	(s-import (mod "http.Client") (alias "Http")
 		(exposes
 			(exposed (name "Request") (wildcard false))
 			(exposed (name "Response") (wildcard false))
 			(exposed (name "Status") (wildcard false))))
-	(s-import (mod "utils.Try")
+	(s-import (mod "utils.Try") (alias "Try")
 		(exposes
 			(exposed (name "Try") (wildcard false))))
 	(s-alias-decl

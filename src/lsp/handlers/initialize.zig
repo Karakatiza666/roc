@@ -37,6 +37,7 @@ pub fn handler(comptime ServerType: type) type {
 
             self.client.deinit(self.allocator);
             params.moveInto(&self.client);
+            self.syntax_checker.related_information = self.client.related_information;
             self.state = .waiting_for_initialized;
         }
     };

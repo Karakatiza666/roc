@@ -3362,11 +3362,11 @@ EndOfFile,
 		(e-runtime-error (tag "erroneous_value_expr"))
 		(annotation
 			(ty-malformed)))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "e!") (wildcard false))))
-	(s-import (mod "Stdot")
+	(s-import (mod "Stdot") (alias "Stdot")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Some")

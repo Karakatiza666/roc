@@ -606,6 +606,8 @@ pub const WhereClause = union(enum) {
     w_method: struct {
         var_: TypeAnno.Idx,
         method_name: base.Ident.Idx,
+        /// The method name token in source, without the `.` before it.
+        method_name_region: base.Region,
         anno: TypeAnno.Idx,
     },
     /// Applies every constraint named by a where alias to `var_`.

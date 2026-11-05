@@ -272,9 +272,9 @@ NO CHANGE
 	(d-let
 		(p-assign (ident "parser"))
 		(e-runtime-error (tag "qualified_ident_does_not_exist")))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes))
-	(s-import (mod "http.Client")
+	(s-import (mod "http.Client") (alias "Http")
 		(exposes)))
 ~~~
 # TYPES

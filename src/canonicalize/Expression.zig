@@ -173,6 +173,9 @@ pub const Expr = union(enum) {
     /// ```
     e_lookup_local: struct {
         pattern_idx: CIR.Pattern.Idx,
+        /// Where the member is written when the lookup has a qualifier, as `x`
+        /// in `Thing.x`. Null for an unqualified or compiler-written lookup.
+        member_region: ?Region = null,
     },
     /// Lookup defined in another module
     /// ```roc
@@ -206,6 +209,9 @@ pub const Expr = union(enum) {
         type_node_idx: u32,
         type_ident: Ident.Idx,
         item_ident: Ident.Idx,
+        /// Where the item is written, as `x` in `Alias.x`. Null for a
+        /// compiler-written lookup.
+        member_region: ?Region = null,
     },
     /// An associated value selected through an imported type declaration.
     /// Checking resolves transparent aliases and replaces this with

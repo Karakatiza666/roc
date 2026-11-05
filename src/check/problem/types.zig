@@ -599,11 +599,14 @@ pub const RefusalCall = struct {
 
 /// A place in another module's source, shown as `path:line:col`: the path of
 /// that module's file (`ModuleEnv.diagnosticSourceName`) and the 1-based line
-/// and column.
+/// and column. The end line and end column (one past the last byte) complete
+/// the span, which a report gives as a related location.
 pub const SourcePlace = struct {
     path: ExtraStringIdx,
     line: u32,
     column: u32,
+    end_line: u32,
+    end_column: u32,
 };
 
 /// A range of `RefusalCall`s in the store's `refusal_calls_backing`.

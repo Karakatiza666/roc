@@ -561,12 +561,12 @@ transform = |result|
 	(s-import (mod "Basics")
 		(exposes
 			(exposed (name "Try") (alias "Try") (wildcard false))))
-	(s-import (mod "Color")
+	(s-import (mod "Color") (alias "Color")
 		(exposes))
-	(s-import (mod "ModA/ModB")
+	(s-import (mod "ModA/ModB") (alias "ModB")
 		(exposes
 			(exposed (name "TypeC") (wildcard false))))
-	(s-import (mod "ExternalMod")
+	(s-import (mod "ExternalMod") (alias "ExtMod")
 		(exposes)))
 ~~~
 # TYPES

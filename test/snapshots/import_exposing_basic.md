@@ -127,7 +127,7 @@ main = {
 			(s-runtime-error (tag "erroneous_value_expr"))
 			(s-runtime-error (tag "erroneous_value_expr"))
 			(e-runtime-error (tag "erroneous_value_expr"))))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes
 			(exposed (name "decode") (wildcard false))
 			(exposed (name "to_str") (wildcard false)))))

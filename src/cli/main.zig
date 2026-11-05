@@ -150,7 +150,7 @@ const watch_mod = if (builtin.target.cpu.arch == .wasm32) struct {
 } else @import("watch");
 
 const cli_args = @import("cli_args.zig");
-const default_app = @import("default_app.zig");
+const default_app = compile.default_app;
 const install_store = @import("install.zig");
 const host_symbols = @import("host_symbols.zig");
 const link_artifacts = @import("link_artifacts.zig");
@@ -173,7 +173,6 @@ comptime {
     if (builtin.is_test) {
         std.testing.refAllDecls(cli_args);
         std.testing.refAllDecls(@import("loc.zig"));
-        std.testing.refAllDecls(default_app);
         std.testing.refAllDecls(progress);
         std.testing.refAllDecls(targets_validator);
         std.testing.refAllDecls(target_selection);
@@ -17123,20 +17122,8 @@ fn writeDefaultAppCheckSourceFiles(
     temp_dir: []const u8,
     original_path: []const u8,
     staged: *const default_app.Staged,
-) (Allocator.Error || std.Io.Dir.CreateDirPathError || std.Io.Dir.WriteFileError)![]const u8 {
-    const platform_dir = try std.fs.path.join(ctx.arena, &.{ temp_dir, default_app.platform_dir_name });
-    try std.Io.Dir.cwd().createDirPath(ctx.io.std_io, platform_dir);
-
-    const app_filename = std.fs.path.basename(original_path);
-    const app_path = try std.fs.path.join(ctx.arena, &.{ temp_dir, app_filename });
-    const platform_main_path = try std.fs.path.join(ctx.arena, &.{ platform_dir, "main.roc" });
-    const echo_module_path = try std.fs.path.join(ctx.arena, &.{ platform_dir, "Echo.roc" });
-
-    try std.Io.Dir.cwd().writeFile(ctx.io.std_io, .{ .sub_path = app_path, .data = staged.synthetic_source });
-    try std.Io.Dir.cwd().writeFile(ctx.io.std_io, .{ .sub_path = platform_main_path, .data = echo_platform.platform_main_source });
-    try std.Io.Dir.cwd().writeFile(ctx.io.std_io, .{ .sub_path = echo_module_path, .data = echo_platform.echo_module_source });
-
-    return app_path;
+) default_app.WriteError![]const u8 {
+    return default_app.writeCheckSources(ctx.arena, ctx.coreCtx(), temp_dir, original_path, staged);
 }
 
 fn rocCheckDefaultApp(

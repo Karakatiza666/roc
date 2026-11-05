@@ -99,7 +99,7 @@ Pair3(_, _) = Pair(0, 1)
 			(args
 				(e-num (value "0"))
 				(e-num (value "1")))))
-	(s-import (mod "Mod")
+	(s-import (mod "Mod") (alias "Mod")
 		(exposes
 			(exposed (name "Pair") (wildcard false)))))
 ~~~

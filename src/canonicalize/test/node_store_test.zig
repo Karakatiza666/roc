@@ -1553,18 +1553,21 @@ test "NodeStore round trip - annotation record field optionality" {
     const fields = [_]CIR.TypeAnno.RecordField{
         .{
             .name = @bitCast(@as(u32, 1)),
+            .label_region = from_raw_offsets(0, 1),
             .ty = @fromBackingInt(@intCast(2)),
             .is_optional = false,
             .is_unnamed = false,
         },
         .{
             .name = @bitCast(@as(u32, 3)),
+            .label_region = from_raw_offsets(1, 3),
             .ty = @fromBackingInt(@intCast(4)),
             .is_optional = true,
             .is_unnamed = false,
         },
         .{
             .name = @bitCast(@as(u32, 5)),
+            .label_region = from_raw_offsets(4, 6),
             .ty = @fromBackingInt(@intCast(6)),
             .is_optional = false,
             .is_unnamed = true,
@@ -1765,6 +1768,7 @@ test "where clause span records canonical rigid ownership by annotation scope" {
     const outer_method = try store.addWhereClause(.{ .w_method = .{
         .var_ = outer_ref,
         .method_name = method_name,
+        .method_name_region = base.Region.zero(),
         .anno = try store.addTypeAnno(.{ .@"fn" = .{
             .args = no_args,
             .ret = item,
@@ -1775,6 +1779,7 @@ test "where clause span records canonical rigid ownership by annotation scope" {
     const item_method = try store.addWhereClause(.{ .w_method = .{
         .var_ = item_ref,
         .method_name = method_name,
+        .method_name_region = base.Region.zero(),
         .anno = try store.addTypeAnno(.{ .@"fn" = .{
             .args = no_args,
             .ret = outer_ref,
@@ -1785,6 +1790,7 @@ test "where clause span records canonical rigid ownership by annotation scope" {
     const detached_method = try store.addWhereClause(.{ .w_method = .{
         .var_ = detached,
         .method_name = method_name,
+        .method_name_region = base.Region.zero(),
         .anno = try store.addTypeAnno(.{ .@"fn" = .{
             .args = no_args,
             .ret = detached_ref,
@@ -1795,6 +1801,7 @@ test "where clause span records canonical rigid ownership by annotation scope" {
     const enclosing_method = try store.addWhereClause(.{ .w_method = .{
         .var_ = enclosing_ref,
         .method_name = method_name,
+        .method_name_region = base.Region.zero(),
         .anno = try store.addTypeAnno(.{ .@"fn" = .{
             .args = no_args,
             .ret = outer_ref,

@@ -536,7 +536,9 @@ pub const Constants = struct {
     ///      (`description_only`); a module lists its Code templates
     ///      (`code_template_defs`); a Code instance table records the
     ///      template each table serves (`table_templates`).
-    pub const CACHE_VERSION = 231;
+    /// 233: a record field of a type annotation and a where-clause method
+    ///      record the region of their name in source.
+    pub const CACHE_VERSION = 234;
 };
 
 /// Configuration for the Roc cache system.

@@ -84,7 +84,7 @@ g : r -> R.a.E
 			(ty-fn (effectful false)
 				(ty-rigid-var (name "r"))
 				(ty-malformed))))
-	(s-import (mod "u.R")
+	(s-import (mod "u.R") (alias "R")
 		(exposes)))
 ~~~
 # TYPES

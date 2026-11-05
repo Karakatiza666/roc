@@ -8,6 +8,7 @@ const std = @import("std");
 const compile = @import("compile");
 const can = @import("can");
 const scope_map = @import("scope_map.zig");
+const StagedDocument = @import("staged_document.zig").StagedDocument;
 
 const Allocator = std.mem.Allocator;
 const BuildEnv = compile.BuildEnv;
@@ -28,6 +29,10 @@ pub const BuildEnvHandle = struct {
     /// CIR does not change once its build env holds it, so each map stays
     /// valid until the env is freed.
     scope_maps: std.ArrayList(ScopeMapEntry) = .empty,
+    /// The staged document this env compiled in place of the checked
+    /// document, when that document runs on the default platform. The env
+    /// borrows its source mapping, so it is freed after the env.
+    staged_document: ?*StagedDocument = null,
 
     const ScopeMapEntry = struct {
         module_env: *const ModuleEnv,
@@ -54,6 +59,13 @@ pub const BuildEnvHandle = struct {
     /// Get a stable pointer to the underlying BuildEnv.
     pub fn envPtr(self: *BuildEnvHandle) *BuildEnv {
         return &self.env;
+    }
+
+    /// The path this env knows the module at `path` by. A staged document's
+    /// module has the staged app's path.
+    pub fn modulePath(self: *const BuildEnvHandle, path: []const u8) []const u8 {
+        const staged = self.staged_document orelse return path;
+        return staged.modulePath(path);
     }
 
     /// Record the source document used for this build environment.
@@ -123,6 +135,7 @@ pub const BuildEnvHandle = struct {
             for (self.scope_maps.items) |*entry| entry.scope_map.deinit();
             self.scope_maps.deinit(self.allocator);
             self.env.deinit();
+            if (self.staged_document) |staged| staged.destroy();
             self.allocator.free(self.cwd);
             self.allocator.destroy(self);
         }

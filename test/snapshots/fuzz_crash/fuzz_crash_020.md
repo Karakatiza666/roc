@@ -1995,15 +1995,15 @@ expect {
 		(e-runtime-error (tag "erroneous_value_expr"))
 		(annotation
 			(ty-malformed)))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))))
-	(s-import (mod "Stdot")
+	(s-import (mod "Stdot") (alias "Stdot")
 		(exposes
 			(exposed (name "Cust") (wildcard false))))
-	(s-import (mod "Bae")
+	(s-import (mod "Bae") (alias "Gooe")
 		(exposes))
-	(s-import (mod "Ba")
+	(s-import (mod "Ba") (alias "Ba")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Map")

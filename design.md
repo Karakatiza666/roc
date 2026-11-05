@@ -133,6 +133,31 @@ no build, content hash, or diagnostics from it, and the document stays
 scheduled until the message that canceled it is handled. Cancellation is an
 explicit input from the embedder, never inferred from timing or progress.
 
+A document that runs on the default platform (a headerless file with a
+`main!`, or an `app` header that names no platform) is checked as `roc check`
+checks it. `compile.default_app` stages the document text, writes the staged
+app and the Echo platform into a scratch directory, and the build compiles the
+staged app with the same source mapping and import directory that `roc check`
+sets. The scratch directory and the staging live as long as the build. The
+document's module therefore holds the staged source, so every query converts
+document positions into it and converts its ranges back. A range in text that
+staging wrote, such as the `echo!` binding, is in no document: queries leave
+it out, and a rename that would have to edit it is refused.
+
+A `Report` gives its places as data, apart from its document. The primary
+location is the place a builder names with `setPrimary`, else the first
+highlighted source region. `related` lists each other place the report names,
+with a short message. `reached_from` is set when the primary location is in a
+file other than the file of the module that reports it: it is the place in that
+module's file that reaches the primary location. Builders fill these where they
+name the places in the document (`Report.addRelatedSourceLocation`), so the
+rendered text and the data stay the same places. The server publishes each
+report in the file of its module, at `reached_from` when it is set and at the
+primary location otherwise. When the client accepts related information, the
+diagnostic's `relatedInformation` holds the primary location (when the report
+is shown at `reached_from`) and then each related place. A place in no file of
+the build has no URI and is left out.
+
 ## Core Principles
 
 Compiler stages after parsing and error reporting must not use workarounds,

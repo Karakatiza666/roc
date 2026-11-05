@@ -98,7 +98,7 @@ NO CHANGE
 				(p-assign (ident "bad_function")))
 			(e-string
 				(e-literal (string "This should fail")))))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes)))
 ~~~
 # TYPES

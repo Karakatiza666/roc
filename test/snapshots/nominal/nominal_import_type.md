@@ -83,7 +83,7 @@ NO CHANGE
 		(e-runtime-error (tag "type_from_missing_mod"))
 		(annotation
 			(ty-malformed)))
-	(s-import (mod "Color")
+	(s-import (mod "Color") (alias "Color")
 		(exposes)))
 ~~~
 # TYPES

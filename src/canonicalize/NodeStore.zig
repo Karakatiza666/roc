@@ -366,8 +366,6 @@ const copied_statement_shapes = [_]CopiedShape{
 };
 
 const copied_expr_shapes = [_]CopiedShape{
-    .{ .cir = "e_lookup_local", .tag = .expr_var, .payload = "expr_var" },
-    .{ .cir = "e_lookup_associated_local", .tag = .expr_associated_lookup_local, .payload = "expr_associated_lookup_local" },
     .{ .cir = "e_lookup_associated", .tag = .expr_associated_lookup, .payload = "expr_associated_lookup" },
     .{ .cir = "e_lookup_associated_resolved", .tag = .expr_associated_lookup_resolved, .payload = "expr_associated_lookup_resolved" },
     .{ .cir = "e_lookup_required", .tag = .expr_required_lookup, .payload = "expr_required_lookup" },
@@ -2315,9 +2313,23 @@ fn exprFromNode(store: *const NodeStore, node_idx: Node.Idx, node: Node) CIR.Exp
                 .constraint_fn_var = @fromBackingInt(@intCast(p.constraint_fn_var)),
             } };
         },
-        inline .expr_var,
-        .expr_associated_lookup_local,
-        .expr_associated_lookup,
+        .expr_var => {
+            const p = payload.expr_var;
+            return CIR.Expr{ .e_lookup_local = .{
+                .pattern_idx = @fromBackingInt(@intCast(p.pattern_idx)),
+                .member_region = store.loadOptionalRegion(p.member_region_plus_one),
+            } };
+        },
+        .expr_associated_lookup_local => {
+            const p = payload.expr_associated_lookup_local;
+            return CIR.Expr{ .e_lookup_associated_local = .{
+                .type_node_idx = p.type_node_idx,
+                .type_ident = @bitCast(p.type_ident),
+                .item_ident = @bitCast(p.item_ident),
+                .member_region = store.loadOptionalRegion(p.member_region_plus_one),
+            } };
+        },
+        inline .expr_associated_lookup,
         .expr_associated_lookup_resolved,
         .expr_required_lookup,
         .expr_list,
@@ -2360,9 +2372,12 @@ pub fn replaceExprWithLocalLookup(
     pattern_idx: CIR.Pattern.Idx,
 ) void {
     const node_idx: Node.Idx = @fromBackingInt(@intCast(@backingInt(expr_idx)));
+    const replaced = store.nodes.get(node_idx);
+    std.debug.assert(replaced.tag == .expr_associated_lookup_local);
     var node = Node.init(.expr_var);
     node.setPayload(.{ .expr_var = .{
         .pattern_idx = @backingInt(pattern_idx),
+        .member_region_plus_one = replaced.getPayload().expr_associated_lookup_local.member_region_plus_one,
     } });
     store.nodes.set(node_idx, node);
 }
@@ -3000,6 +3015,7 @@ pub fn getWhereClause(store: *const NodeStore, whereClause: CIR.WhereClause.Idx)
             return CIR.WhereClause{ .w_method = .{
                 .var_ = @fromBackingInt(@intCast(p.var_idx)),
                 .method_name = @bitCast(p.name),
+                .method_name_region = store.loadRegion(p.name_region_span2_idx),
                 .anno = @fromBackingInt(@intCast(p.anno)),
             } };
         },
@@ -3289,6 +3305,7 @@ pub fn getAnnoRecordField(store: *const NodeStore, annoRecordField: CIR.TypeAnno
         const p = node.getPayload().ty_record_field;
         return .{
             .name = @bitCast(p.name),
+            .label_region = store.loadRegion(p.label_region_span2_idx),
             .ty = @fromBackingInt(@intCast(p.ty)),
             .is_optional = p.is_optional,
             .is_unnamed = p.is_unnamed,
@@ -3298,6 +3315,7 @@ pub fn getAnnoRecordField(store: *const NodeStore, annoRecordField: CIR.TypeAnno
     const p = node.getPayload().ty_record_field_defaulted;
     return .{
         .name = @bitCast(p.name),
+        .label_region = store.loadRegion(p.label_region_span2_idx),
         .ty = @fromBackingInt(@intCast(p.ty)),
         .is_optional = false,
         .is_unnamed = false,
@@ -3531,6 +3549,22 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
                 .module_idx = @backingInt(e.module_idx),
                 .target_node_idx = e.target_node_idx,
                 .ident_idx = @bitCast(e.ident_idx),
+            } });
+        },
+        .e_lookup_local => |e| {
+            node.tag = .expr_var;
+            node.setPayload(.{ .expr_var = .{
+                .pattern_idx = @backingInt(e.pattern_idx),
+                .member_region_plus_one = try store.storeOptionalRegion(e.member_region),
+            } });
+        },
+        .e_lookup_associated_local => |e| {
+            node.tag = .expr_associated_lookup_local;
+            node.setPayload(.{ .expr_associated_lookup_local = .{
+                .type_node_idx = e.type_node_idx,
+                .type_ident = @bitCast(e.type_ident),
+                .item_ident = @bitCast(e.item_ident),
+                .member_region_plus_one = try store.storeOptionalRegion(e.member_region),
             } });
         },
         .e_deferred_import_ref => |e| {
@@ -3822,8 +3856,6 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
         inline .e_frac_f32,
         .e_num_from_numeral,
         .e_typed_num_from_numeral,
-        .e_lookup_local,
-        .e_lookup_associated_local,
         .e_lookup_associated,
         .e_lookup_associated_resolved,
         .e_lookup_required,
@@ -3991,6 +4023,7 @@ pub fn addWhereClause(store: *NodeStore, whereClause: CIR.WhereClause, region: b
                 .var_idx = @backingInt(where_method.var_),
                 .name = @bitCast(where_method.method_name),
                 .anno = @backingInt(where_method.anno),
+                .name_region_span2_idx = try store.storeRegion(where_method.method_name_region),
             } });
         },
         .w_alias => |where_alias| {
@@ -4288,6 +4321,7 @@ pub fn addAnnoRecordField(store: *NodeStore, annoRecordField: CIR.TypeAnno.Recor
             .name = @bitCast(annoRecordField.name),
             .ty = @backingInt(annoRecordField.ty),
             .default_value = @backingInt(default_idx),
+            .label_region_span2_idx = try store.storeRegion(annoRecordField.label_region),
         } });
         break :blk defaulted_node;
     } else blk: {
@@ -4295,6 +4329,7 @@ pub fn addAnnoRecordField(store: *NodeStore, annoRecordField: CIR.TypeAnno.Recor
         plain_node.setPayload(.{ .ty_record_field = .{
             .name = @bitCast(annoRecordField.name),
             .ty = @backingInt(annoRecordField.ty),
+            .label_region_span2_idx = try store.storeRegion(annoRecordField.label_region),
             .is_optional = annoRecordField.is_optional,
             .is_unnamed = annoRecordField.is_unnamed,
         } });
@@ -4304,6 +4339,34 @@ pub fn addAnnoRecordField(store: *NodeStore, annoRecordField: CIR.TypeAnno.Recor
     const nid = try store.nodes.append(store.gpa, node);
     _ = try store.regions.append(store.gpa, region);
     return @fromBackingInt(@intCast(@backingInt(nid)));
+}
+
+/// Stores a source region in `span2_data` and returns its index.
+fn storeRegion(store: *NodeStore, region: base.Region) Allocator.Error!u32 {
+    const idx: u32 = @intCast(store.span2_data.len());
+    _ = try store.span2_data.append(store.gpa, .{
+        .start = region.start.offset,
+        .len = region.end.offset - region.start.offset,
+    });
+    return idx;
+}
+
+/// The region stored at `idx` by `storeRegion`.
+fn loadRegion(store: *const NodeStore, idx: u32) base.Region {
+    const span = store.span2_data.items.items[idx];
+    return base.Region.from_raw_offsets(span.start, span.start + span.len);
+}
+
+/// Stores an optional region as its `storeRegion` index plus one, or 0 for none.
+fn storeOptionalRegion(store: *NodeStore, region: ?base.Region) Allocator.Error!u32 {
+    const present = region orelse return 0;
+    return try store.storeRegion(present) + 1;
+}
+
+/// The region stored by `storeOptionalRegion`.
+fn loadOptionalRegion(store: *const NodeStore, plus_one: u32) ?base.Region {
+    if (plus_one == 0) return null;
+    return store.loadRegion(plus_one - 1);
 }
 
 /// Drop the `??` default from a defaulted annotation record field, degrading
@@ -4320,6 +4383,7 @@ pub fn dropAnnoRecordFieldDefault(store: *NodeStore, field_idx: CIR.TypeAnno.Rec
     node.setPayload(.{ .ty_record_field = .{
         .name = payload.name,
         .ty = payload.ty,
+        .label_region_span2_idx = payload.label_region_span2_idx,
         .is_optional = false,
         .is_unnamed = false,
     } });

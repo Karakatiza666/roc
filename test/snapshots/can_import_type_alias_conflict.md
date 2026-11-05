@@ -85,7 +85,7 @@ NO CHANGE
 	(d-let
 		(p-assign (ident "main"))
 		(e-num (value "42")))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes
 			(exposed (name "JsonValue") (wildcard false))))
 	(s-alias-decl

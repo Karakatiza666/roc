@@ -612,13 +612,13 @@ combineTrys = |result1, result2|
 				(ty-malformed)
 				(ty-malformed)
 				(ty-malformed))))
-	(s-import (mod "http.Client")
+	(s-import (mod "http.Client") (alias "Http")
 		(exposes
 			(exposed (name "Request") (wildcard false))
 			(exposed (name "Response") (wildcard false))))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes))
-	(s-import (mod "utils.Try")
+	(s-import (mod "utils.Try") (alias "Try")
 		(exposes
 			(exposed (name "Try") (wildcard false)))))
 ~~~

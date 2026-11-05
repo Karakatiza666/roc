@@ -13,6 +13,7 @@ Key responsibilities include:
 - **Module Caching**: Managing the cache of compiled modules to speed up subsequent builds
 - **Package Building**: Building complete packages
 - **Build Environment**: Managing build contexts and environments
+- **Default-App Staging**: Turning a headerless app, or an app header that names no platform, into an app on the Echo platform (`default_app.zig`). `roc check` and the language server both stage this way.
 
 The compile module serves as the orchestrator that coordinates between the different compiler stages and manages the build process efficiently.
 

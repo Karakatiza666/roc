@@ -279,13 +279,13 @@ main = {
 			(s-runtime-error (tag "qualified_ident_does_not_exist"))
 			(s-runtime-error (tag "qualified_ident_does_not_exist"))
 			(e-runtime-error (tag "erroneous_value_expr"))))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes))
-	(s-import (mod "http.Client")
+	(s-import (mod "http.Client") (alias "Http")
 		(exposes
 			(exposed (name "get") (wildcard false))
 			(exposed (name "post") (wildcard false))))
-	(s-import (mod "utils.String")
+	(s-import (mod "utils.String") (alias "Str")
 		(exposes)))
 ~~~
 # TYPES
