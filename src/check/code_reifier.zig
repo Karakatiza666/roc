@@ -34,6 +34,7 @@ const ModuleEnv = @import("can").ModuleEnv;
 const View = @import("can").NodeStore.CodeReificationSite.View;
 const canonical = @import("canonical_names.zig");
 const checked = @import("checked_artifact.zig");
+const artifact_serialize = @import("artifact_serialize.zig");
 const const_store = @import("const_store.zig");
 const code_emit = @import("code_emit.zig");
 const static_dispatch = @import("static_dispatch_registry.zig");
@@ -111,6 +112,11 @@ pub const Rejection = struct {
         /// `to_inspect`, `is_eq`, `to_hash`, `encoder_for` or `parser_for`
         /// (D1, Q17). `detail` names the method.
         implicit_method_instance,
+        /// A platform requirement whose solution leaves a free type variable
+        /// with a constraint, at an app binding that holds an instance site
+        /// (design.md "Code Instance Tables"): lowering seals the variable
+        /// and ignores the constraint, so no closing use describes it.
+        requirement_constrained_variable,
         /// A `Code` value, or a value computed from one, inside the walked
         /// body: a lambda at a `Code` position, or a `Code.type_id` or
         /// `Code.prim` call. A description has no form for a description
@@ -3483,6 +3489,13 @@ pub const Reifier = struct {
         const record = self.bodies.patternBinder(binder);
         if (record.reassignable) return self.rejectError(.input_not_bound, region, "a `var`, whose value at the call is not always the value the description reads");
         if (self.walk.rows.items.len != 1) return self.rejectError(.input_not_bound, region, "a value that a function inside the description reads from around the lambda");
+        if (std.debug.runtime_safety) {
+            if (inputs.call_leaves) |call_leaves| {
+                for (call_leaves) |leaf_binder| {
+                    if (leaf_binder == binder) break;
+                } else invariant("an input slot reads a binder that is not a leaf of its bound call");
+            }
+        }
         const pattern = self.bodies.pattern(record.pattern);
         const ty = try self.tyOf(pattern.ty, pattern.source_region);
         const leaf: u32 = for (inputs.leaves.items, 0..) |known, i| {
@@ -6906,8 +6919,8 @@ pub const Reifier = struct {
 
     /// Whether `type_id` mentions a variable of `vars`: a variable is a
     /// flex or rigid type id, and it is read where it stands, through
-    /// records, tag unions, tuples, functions, aliases and a nominal's
-    /// arguments.
+    /// records (with the kind variable of an undetermined field), tag unions,
+    /// tuples, functions, aliases and a nominal's arguments.
     fn mentionsAny(self: *Reifier, type_id: CheckedTypeId, vars: *const RowVars) Allocator.Error!bool {
         if (vars.count() == 0) return false;
         var seen: RowVars = .empty;
@@ -6939,7 +6952,10 @@ pub const Reifier = struct {
                 .nominal => |nominal| try work.appendSlice(self.gpa, nominal.args),
                 .tuple => |parts| try work.appendSlice(self.gpa, parts),
                 .record => |record| {
-                    for (record.fields) |field| try work.append(self.gpa, field.ty);
+                    for (record.fields) |field| {
+                        if (field.kind.undeterminedVariable()) |kind| try work.append(self.gpa, kind);
+                        try work.append(self.gpa, field.ty);
+                    }
                     try work.append(self.gpa, record.ext);
                 },
                 .tag_union => |union_ty| {
@@ -6952,39 +6968,7 @@ pub const Reifier = struct {
     }
 
     fn mentionsIn(self: *Reifier, id: CheckedTypeId, vars: *const RowVars, seen: *RowVars) Allocator.Error!bool {
-        if ((try seen.getOrPut(self.gpa, id)).found_existing) return false;
-        switch (self.types.payload(id)) {
-            .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
-            .flex, .rigid => |variable| {
-                if (vars.contains(id)) return true;
-                for (variable.constraints) |constraint| if (try self.mentionsIn(constraint.fn_ty, vars, seen)) return true;
-                return false;
-            },
-            .alias => |alias| return self.mentionsIn(alias.backing, vars, seen),
-            .function => |fn_ty| {
-                for (fn_ty.args) |arg| if (try self.mentionsIn(arg, vars, seen)) return true;
-                return self.mentionsIn(fn_ty.ret, vars, seen);
-            },
-            .nominal => |nominal| {
-                for (nominal.args) |arg| if (try self.mentionsIn(arg, vars, seen)) return true;
-                return false;
-            },
-            .tuple => |parts| {
-                for (parts) |part| if (try self.mentionsIn(part, vars, seen)) return true;
-                return false;
-            },
-            .record => |record| {
-                for (record.fields) |field| if (try self.mentionsIn(field.ty, vars, seen)) return true;
-                return self.mentionsIn(record.ext, vars, seen);
-            },
-            .tag_union => |union_ty| {
-                for (union_ty.tags) |variant| {
-                    for (variant.argsSlice(self.types)) |arg| if (try self.mentionsIn(arg, vars, seen)) return true;
-                }
-                return self.mentionsIn(union_ty.ext, vars, seen);
-            },
-            .empty_record, .empty_tag_union, .pending, .err => return false,
-        }
+        return typeMentionsIn(self.gpa, self.types, id, vars, seen);
     }
 
     /// A lambda the block bound, lifted into a row of its own (N8b), or the
@@ -7996,6 +7980,62 @@ pub const Reifier = struct {
     /// variables of the procedure the alias ends at to. The use recorded what
     /// it copied the alias's own variables to, and the lookups of the chain
     /// compose the rest, as a method alias is composed (`aliasInstantiation`).
+    /// The app binding of a platform requirement at the requirement's sealed
+    /// solution: a closing use with no use expression (design.md "Code
+    /// Instance Tables").
+    fn requirementTarget(self: *Reifier, use: *const RequirementUse, region: base.Region) Error!CalleeTarget {
+        const reached = try self.reachedProcedure(.{ .top_level = use.binding }, use.binder, region);
+        const reader = reached.reader;
+        const fixed = use.sealed orelse invariant("a refused platform requirement reached a table");
+        var instance = if (reached.alias) |hop|
+            try self.requirementThroughAlias(use, reader, reached.template, hop, fixed)
+        else
+            try reader.instantiationOf(reader.templateScheme(reached.template), self, fixed, null, region, .call);
+        errdefer if (instance) |*found| found.substitution.deinit(self.gpa);
+        var target: CalleeTarget = .{
+            .key = .{
+                .artifact = reader.artifact.bytes,
+                .body = reached.body,
+                .instantiation = if (instance) |found| found.key else @as([32]u8, @splat(0)),
+            },
+            .reader = reader,
+            .instantiation = instance,
+            .signature = if (instance == null) null else self.resolvedType(fixed),
+        };
+        const supplied = self.plans.evidence_refs[use.evidence.start..][0..use.evidence.len];
+        if (supplied.len != 0) target.evidence = try self.supply(supplied, self.evidence);
+        return target;
+    }
+
+    /// What a platform requirement's sealed solution fixes the variables of
+    /// the procedure an exact alias binding forwards to: the alias's own
+    /// scheme (its entry wrapper's) matched against the solution, carried
+    /// through the alias chain.
+    fn requirementThroughAlias(
+        self: *Reifier,
+        use: *const RequirementUse,
+        reader: *Reifier,
+        template: checked.CheckedProcedureTemplate,
+        hop: AliasHop,
+        fixed: CheckedTypeId,
+    ) Error!?Instantiation {
+        const target_vars = reader.schemeVars(template);
+        if (target_vars.len == 0) return null;
+        const alias_root = switch (self.procedure_bindings.get(use.binding.binding).body) {
+            .callable_eval_template => |id| blk: {
+                const alias = self.callable_eval_templates.templates[@backingInt(id)];
+                const wrapper = self.entry_wrappers.lookupByRoot(alias.root) orelse
+                    invariant("a procedure alias binding has no entry wrapper");
+                break :blk self.procedure_templates.templates.items[@backingInt(wrapper.template.template)].checked_fn_root;
+            },
+            .direct_template, .checked_error => invariant("a platform requirement reached an alias through no alias binding"),
+        };
+        var scope: Substitution = .empty;
+        defer scope.deinit(self.gpa);
+        try self.matchType(&scope, hop.scope_vars, alias_root, self.resolvedType(fixed));
+        return self.composedThroughHops(hop, scope, target_vars);
+    }
+
     fn instantiationThroughAlias(
         self: *Reifier,
         reader: *Reifier,
@@ -8775,9 +8815,10 @@ pub const Reifier = struct {
                 // seals it to (design.md "Row Coercion Primitive": a value
                 // keeps its own row, so a tag built before its widening holds
                 // the variable in its own type).
-                if (payload == .flex and payload.variableSealsToRowDefault()) break :blk switch (variable.row_default.?) {
+                if (payload == .flex and payload.variableSealsToRowDefault()) break :blk switch (checked.sealedVariable(variable)) {
                     .empty_record => types.recordTy(&.{}),
                     .empty_tag_union => types.tagUnionTy(&.{}),
+                    .dec, .str => unreachable, // a variable that seals to its row default has no numeric default
                 };
                 break :blk self.rejectOpen(type_id, region);
             },
@@ -10172,7 +10213,7 @@ pub const Reifier = struct {
         return found;
     }
 
-    const RowVars = collections.DenseMapUnmanaged(CheckedTypeId, void);
+    const RowVars = MentionVars;
 
     fn collectRowVars(self: *Reifier, found: *RowVars, seen: *RowVars, id: CheckedTypeId) Allocator.Error!void {
         if ((try seen.getOrPut(self.gpa, id)).found_existing) return;
@@ -11448,6 +11489,9 @@ pub const SiteOutcome = struct {
     /// The call that binds the site's input slots, as the checker recorded
     /// it, or null.
     bound_call: ?u32 = null,
+    /// What stopped the calls that carry the site, as the checker recorded
+    /// it, when no call binds its run-time reads.
+    chain_stop: CodeSiteRecord.ChainStop = .none,
     /// The conversion roots of the custom literals the walk met, which
     /// lowering reads where the site stands. Owned.
     reads: []checked.CheckedCodeRead = &.{},
@@ -11568,6 +11612,44 @@ fn captureReads(gpa: Allocator, bodies: *const checked.CheckedBodyStore, site: C
 fn freeCaptureReads(gpa: Allocator, reads: []CaptureRead) void {
     for (reads) |read| gpa.free(read.steps);
     gpa.free(reads);
+}
+
+/// The published form of one slot step.
+fn slotStepRecord(step: SlotStep) checked.CheckedCodeSlotStep {
+    return switch (step) {
+        .field => |label| .{ .kind = .field, .value = @backingInt(label) },
+        .index => |index| .{ .kind = .index, .value = index },
+        .unwrap => .{ .kind = .unwrap, .value = 0 },
+    };
+}
+
+/// The slot step a published step records.
+fn slotStepOf(record: checked.CheckedCodeSlotStep) SlotStep {
+    return switch (record.kind) {
+        .field => .{ .field = @fromBackingInt(record.value) },
+        .index => .{ .index = record.value },
+        .unwrap => .unwrap,
+    };
+}
+
+/// The capture reads the recipe of a bound instance site recorded, as the
+/// walk takes them. Owned.
+fn recipeCaptureReads(gpa: Allocator, table: *const Instances, recipe: Instances.Recipe) Allocator.Error![]CaptureRead {
+    const records = table.recipeCaptures(recipe);
+    const out = try gpa.alloc(CaptureRead, records.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |read| gpa.free(read.steps);
+        gpa.free(out);
+    }
+    for (records, out) |record, *read| {
+        const recorded = table.captureSteps(record);
+        const steps = try gpa.alloc(SlotStep, recorded.len);
+        for (recorded, steps) |step, *into| into.* = slotStepOf(step);
+        read.* = .{ .leaf = record.leaf, .steps = steps, .encoder = record.encoder };
+        made += 1;
+    }
+    return out;
 }
 
 /// Whether a slot type holds an opaque type anywhere, so that the program
@@ -12107,6 +12189,10 @@ pub const Walk = struct {
     /// prints the size of the site's `outline` view at this K and emits
     /// nothing.
     measure_k: ?u32 = null,
+    /// The index of the site's first input slot among the slots of the call
+    /// that binds it: the slots of the call's earlier sites, in site order.
+    /// Zero for a site no call binds.
+    first_slot: u64 = 0,
     /// Per view, digest of the rows a site's walk built, and digest of
     /// their nodes' origins: the `Graph` their normal form wrote in that
     /// view, and the origins of its nodes (P1). The walk is deterministic,
@@ -12148,6 +12234,10 @@ pub const Walk = struct {
         /// The capture reads of a lambda at a `Code.Binds` position, with the
         /// encoder the checker required for each (`captureReads`). Owned.
         captures: []CaptureRead = &.{},
+        /// For a site of a generic bound call, the call's leaves
+        /// (`checked.appendBoundSiteLeaves`): every name the walk makes a
+        /// slot of is one of them.
+        call_leaves: ?[]const PatternBinderId = null,
     };
 
     /// One nominal `tyOf` is building: the name its `Recursive` carries, in
@@ -12261,6 +12351,7 @@ pub const Walk = struct {
         self.freeSlots();
         self.reads.clearRetainingCapacity();
         self.body = site_reader;
+        self.first_slot = 0;
         if (binds_inputs) self.inputs = .{ .reader = site_reader };
     }
 
@@ -12470,8 +12561,8 @@ pub const Walk = struct {
             try self.publish(site_key, &memo.origins);
             var emitter = try code_emit.Emitter.init(self.gpa, self.store, &site.store, &site.types);
             defer emitter.deinit();
-            if (memo.digests) |digests| return emitter.inlinedOf(memo.graph, digests, site_key);
-            return emitter.siteOf(memo.graph, site_key);
+            if (memo.digests) |digests| return emitter.inlinedOf(memo.graph, digests, self.first_slot, site_key);
+            return emitter.siteOf(memo.graph, self.first_slot, site_key);
         }
         try self.normalize(root, region);
         self.normalizations += 1;
@@ -12491,8 +12582,8 @@ pub const Walk = struct {
         errdefer self.gpa.free(slot_order);
         try self.publish(site_key, &origins);
         try self.normalized.put(self.gpa, memo_key, .{ .graph = graph, .digests = digests, .origins = origins, .slot_order = slot_order });
-        if (digests) |d| return emitter.inlinedOf(graph, d, site_key);
-        return emitter.siteOf(graph, site_key);
+        if (digests) |d| return emitter.inlinedOf(graph, d, self.first_slot, site_key);
+        return emitter.siteOf(graph, self.first_slot, site_key);
     }
 
     /// The `Code.Ty` value of `ty`, a type of the site being walked,
@@ -12654,6 +12745,14 @@ pub const LocalSources = struct {
     /// This module's methods, which name the templates the compiler calls
     /// with no written use (Q17).
     method_registry: *const static_dispatch.MethodRegistry,
+    /// This module's compile-time roots: a closing use attaches its bound
+    /// entries to the `literal_argument` roots of generic bound calls whose
+    /// edge it is (design.md "Bound Instance Roots").
+    compile_time_roots: []const checked.CompileTimeRoot = &.{},
+    /// Each successful function requirement of the platform this app
+    /// module satisfies: a closing use of its app binding (design.md "Code
+    /// Instance Tables").
+    requirement_uses: []const RequirementUse = &.{},
 
     fn views(self: LocalSources) Reifier.Sources {
         return .{
@@ -13002,6 +13101,11 @@ pub fn reifyModuleSites(
     defer plan.deinit(gpa);
     reifier.code_instances = &plan.table;
 
+    // The slots of each binding call's sites walked so far, which give the
+    // next site of that call its first slot (site order).
+    var call_slots = std.AutoHashMapUnmanaged(u32, u64).empty;
+    defer call_slots.deinit(gpa);
+
     for (sites) |site| {
         // A template and the name a template call calls both stand for a
         // description built elsewhere, so nothing is walked for either: the
@@ -13034,12 +13138,18 @@ pub fn reifyModuleSites(
         walk.beginSite(site.view, bound_call != null, reifier);
         try useSiteCut(&walk, reifier, local, site);
         if (bound_call != null) walk.useCaptureReads(try captureReads(gpa, local.bodies, site_expr));
+        const earlier_slots = if (bound_call) |call| try call_slots.getOrPut(gpa, call) else null;
+        if (earlier_slots) |entry| {
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            walk.first_slot = entry.value_ptr.*;
+        }
         const outcome = try walkSite(gpa, &walk, reifier, module, local, site, site_expr, region, &call_args, &call_values);
         const slots = walk.takeSlots();
         errdefer freeSlotSources(gpa, slots);
+        if (earlier_slots) |entry| entry.value_ptr.* += slots.len;
         const reads = try walk.takeReads();
         errdefer gpa.free(reads);
-        try results.append(gpa, .{ .expr = site_expr, .region = region, .outcome = outcome, .slots = slots, .bound_call = bound_call, .reads = reads });
+        try results.append(gpa, .{ .expr = site_expr, .region = region, .outcome = outcome, .slots = slots, .bound_call = bound_call, .chain_stop = site.chain_stop, .reads = reads });
     }
 
     var tables = TableBuilder{ .gpa = gpa, .walk = &walk, .reifier = reifier };
@@ -13048,7 +13158,22 @@ pub fn reifyModuleSites(
     defer refused.deinit(gpa);
     var uses = std.ArrayList(checked.CodeInstanceTable.Indexed).empty;
     defer uses.deinit(gpa);
-    try closeUses(&tables, &plan, &uses, &refused);
+    try closeUses(&tables, &plan, local.compile_time_roots, &uses, &refused);
+    var requirement_tables = std.ArrayList(checked.CodeInstanceTable.RequirementUse).empty;
+    defer requirement_tables.deinit(gpa);
+    try closeRequirements(&tables, local.requirement_uses, local.compile_time_roots, &requirement_tables, &refused);
+    // Each root of a generic bound call has its closing use, a written use
+    // or a platform requirement, which either binds the call's inputs or is
+    // refused, so checking fails.
+    if (std.debug.runtime_safety and refused.items.len == 0) {
+        for (local.compile_time_roots) |root| {
+            const argument = root.literal_argument orelse continue;
+            if (argument.site.kind != .bound_call) continue;
+            for (tables.root_bounds.items) |bound| {
+                if (bound.root == root.id) break;
+            } else invariant("a generic bound call's root has no closing use that binds its inputs");
+        }
+    }
 
     const outcomes = try results.toOwnedSlice(gpa);
     errdefer gpa.free(outcomes);
@@ -13057,7 +13182,7 @@ pub fn reifyModuleSites(
         for (provenance) |*p| p.deinit(gpa);
         gpa.free(provenance);
     }
-    var instances = try plan.finish(gpa, &tables, uses.items);
+    var instances = try plan.finish(gpa, &tables, uses.items, requirement_tables.items);
     errdefer instances.deinit(gpa);
     const instance_sites = try plan.instance_sites.toOwnedSlice(gpa);
     errdefer gpa.free(instance_sites);
@@ -13073,8 +13198,77 @@ pub fn reifyModuleSites(
     };
 }
 
+/// Whether `id` mentions a variable of `vars`, read as `Reifier.mentionsAny`
+/// reads it: an undetermined field kind is a variable it mentions. Publication
+/// reads it too, to find the generic bound calls (design.md "Bound Instance
+/// Roots"), so the two cannot disagree.
+pub fn typeMentionsIn(gpa: Allocator, types: checked.CheckedTypeStoreView, id: CheckedTypeId, vars: *const MentionVars, seen: *MentionVars) Allocator.Error!bool {
+    if ((try seen.getOrPut(gpa, id)).found_existing) return false;
+    switch (types.payload(id)) {
+        .field_kind => invariant("a field kind is a substitution entry, never part of a type"),
+        .flex, .rigid => |variable| {
+            if (vars.contains(id)) return true;
+            for (variable.constraints) |constraint| if (try typeMentionsIn(gpa, types, constraint.fn_ty, vars, seen)) return true;
+            return false;
+        },
+        .alias => |alias| return typeMentionsIn(gpa, types, alias.backing, vars, seen),
+        .function => |fn_ty| {
+            for (fn_ty.args) |arg| if (try typeMentionsIn(gpa, types, arg, vars, seen)) return true;
+            return typeMentionsIn(gpa, types, fn_ty.ret, vars, seen);
+        },
+        .nominal => |nominal| {
+            for (nominal.args) |arg| if (try typeMentionsIn(gpa, types, arg, vars, seen)) return true;
+            return false;
+        },
+        .tuple => |parts| {
+            for (parts) |part| if (try typeMentionsIn(gpa, types, part, vars, seen)) return true;
+            return false;
+        },
+        .record => |record| {
+            for (record.fields) |field| {
+                // A kind a substitution committed (a type that
+                // `cloneCheckedTypeRootSubstituting` built) mentions nothing.
+                if (field.kind.undeterminedVariable()) |kind| if (types.payload(kind) != .field_kind) {
+                    if (try typeMentionsIn(gpa, types, kind, vars, seen)) return true;
+                };
+                if (try typeMentionsIn(gpa, types, field.ty, vars, seen)) return true;
+            }
+            return typeMentionsIn(gpa, types, record.ext, vars, seen);
+        },
+        .tag_union => |union_ty| {
+            for (union_ty.tags) |variant| {
+                for (variant.argsSlice(types)) |arg| if (try typeMentionsIn(gpa, types, arg, vars, seen)) return true;
+            }
+            return typeMentionsIn(gpa, types, union_ty.ext, vars, seen);
+        },
+        .empty_record, .empty_tag_union, .pending, .err => return false,
+    }
+}
+
+/// A set of type variables, as `typeMentionsIn` reads it.
+pub const MentionVars = collections.DenseMapUnmanaged(CheckedTypeId, void);
+
 const CodeSiteRecord = @import("can").NodeStore.CodeReificationSite;
 const Instances = checked.CodeInstanceTable;
+
+/// A platform requirement of an app module as a closing use of its app
+/// binding (design.md "Code Instance Tables"): the binding instantiated at
+/// the requirement's solution with each free variable sealed as lowering
+/// seals it.
+pub const RequirementUse = struct {
+    requires_idx: u32,
+    binding: checked.ArtifactTopLevelProcedureBindingRef,
+    binder: PatternBinderId,
+    /// The binding's definition: a refused use makes it a runtime error,
+    /// and its report stands there.
+    body: CheckedExprId,
+    /// The sealed solution, or null where a free variable of the solution
+    /// has a constraint that sealing would ignore: the use is refused.
+    sealed: ?CheckedTypeId,
+    /// The requirement's root-call dispatch evidence, a span of this
+    /// module's `evidence_refs`.
+    evidence: artifact_serialize.Span,
+};
 
 /// A closing use refused (D1): the expression publication makes a runtime
 /// error, the use's region, where the report stands, and the refusal.
@@ -13112,6 +13306,20 @@ const Occurrence = struct {
     shown: ?CheckedExprId = null,
 };
 
+/// One site of a generic bound call while its template's inventory is
+/// built: the site's node, its inventory index, and its recipe.
+const BoundMember = struct {
+    raw_call: u32,
+    node_idx: u32,
+    index: u32,
+    recipe: u32,
+
+    fn lessThan(_: void, a: BoundMember, b: BoundMember) bool {
+        if (a.raw_call != b.raw_call) return a.raw_call < b.raw_call;
+        return a.node_idx < b.node_idx;
+    }
+};
+
 /// What publication of a module plans for its own instance sites (D1).
 const InstancePlan = struct {
     table: Instances = .{},
@@ -13139,7 +13347,7 @@ const InstancePlan = struct {
 
     /// The published table: the inventories, and the tables and closing
     /// uses `tables` built. Takes the plan's table.
-    fn finish(self: *InstancePlan, gpa: Allocator, tables: *TableBuilder, uses: []Instances.Indexed) Allocator.Error!Instances {
+    fn finish(self: *InstancePlan, gpa: Allocator, tables: *TableBuilder, uses: []Instances.Indexed, requirement_uses: []const Instances.RequirementUse) Allocator.Error!Instances {
         std.mem.sort(Instances.Indexed, uses, {}, indexedLessThan);
         var table = self.table;
         self.table = .{};
@@ -13149,9 +13357,28 @@ const InstancePlan = struct {
         table.table_entries = try tables.entries.toOwnedSlice(gpa);
         table.reads = try tables.reads.toOwnedSlice(gpa);
         table.uses = try gpa.dupe(Instances.Indexed, uses);
+        table.table_bounds = try tables.table_bounds.toOwnedSlice(gpa);
+        table.bound_entries = try tables.bound_entries.toOwnedSlice(gpa);
+        table.slots = try tables.slots.toOwnedSlice(gpa);
+        table.slot_steps = try tables.slot_steps.toOwnedSlice(gpa);
+        table.slot_shapes = try tables.slot_shapes.toOwnedSlice(gpa);
+        table.first_slots = try tables.first_slots.toOwnedSlice(gpa);
+        std.mem.sort(Instances.RootBound, tables.root_bounds.items, {}, rootBoundLessThan);
+        table.root_bounds = try tables.root_bounds.toOwnedSlice(gpa);
+        const sorted_uses = try gpa.dupe(Instances.RequirementUse, requirement_uses);
+        std.mem.sort(Instances.RequirementUse, sorted_uses, {}, requirementUseLessThan);
+        table.requirement_uses = sorted_uses;
         return table;
     }
 };
+
+fn requirementUseLessThan(_: void, a: Instances.RequirementUse, b: Instances.RequirementUse) bool {
+    return a.requires_idx < b.requires_idx;
+}
+
+fn rootBoundLessThan(_: void, a: Instances.RootBound, b: Instances.RootBound) bool {
+    return @backingInt(a.root) < @backingInt(b.root);
+}
 
 fn indexedLessThan(_: void, a: Instances.Indexed, b: Instances.Indexed) bool {
     return @backingInt(a.expr) < @backingInt(b.expr);
@@ -13284,6 +13511,38 @@ fn planInstances(
     }
     try dedupeOccurrences(gpa, &plan.occurrences);
 
+    // A generic bound call binds its inputs at each closing use, so each of
+    // its sites is described there too, as an instance site is, whatever its
+    // own type. Publication decided which calls are generic: each is an own
+    // bound requirement of the scheme around it (design.md "Bound Instance
+    // Roots").
+    var generic_bound: collections.DenseMapUnmanaged(u32, void) = .empty;
+    defer generic_bound.deinit(gpa);
+    {
+        var own_calls: collections.DenseMapUnmanaged(CheckedExprId, void) = .empty;
+        defer own_calls.deinit(gpa);
+        const templates = reifier.procedure_templates;
+        for (templates.templates.items) |*template| {
+            for (templates.templateLiteralRequirements(template)) |requirement| {
+                if (requirement.edge == .literal and requirement.site.kind == .bound_call) try own_calls.put(gpa, requirement.site.expr, {});
+            }
+        }
+        for (templates.dispatch_scopes) |*scope| {
+            for (templates.scopeLiteralRequirements(scope)) |requirement| {
+                if (requirement.edge == .literal and requirement.site.kind == .bound_call) try own_calls.put(gpa, requirement.site.expr, {});
+            }
+        }
+        for (sites) |site| {
+            if (site.bound_call == CodeSiteRecord.no_bound_call) continue;
+            const call = local.bodies.exprIdAtRawNode(site.bound_call) orelse continue;
+            if (own_calls.contains(call)) try generic_bound.put(gpa, site.bound_call, {});
+        }
+    }
+    for (plan.occurrences.items) |*occurrence| {
+        if (occurrence.kind != .site) continue;
+        if (generic_bound.contains(site_map.get(occurrence.expr).?.record.bound_call)) occurrence.template_vars = true;
+    }
+
     try implicitMethods(gpa, local, &plan.implicit_methods);
 
     // A template has an inventory when it holds an instance site, or a use
@@ -13341,6 +13600,19 @@ fn planInstances(
     defer forwards.deinit(gpa);
     var recipes = RecipeBuilder{ .gpa = gpa };
     defer recipes.deinit();
+    var bound_call_records = std.ArrayList(Instances.BoundCall).empty;
+    defer bound_call_records.deinit(gpa);
+    var bound_sites = std.ArrayList(u32).empty;
+    defer bound_sites.deinit(gpa);
+    var bound_leaves: std.ArrayListUnmanaged(checked.PatternBinderId) = .empty;
+    defer bound_leaves.deinit(gpa);
+    var call_leaves: std.ArrayListUnmanaged(checked.PatternBinderId) = .empty;
+    defer call_leaves.deinit(gpa);
+    var members = std.ArrayList(BoundMember).empty;
+    defer members.deinit(gpa);
+    // The generic bound calls one of whose sites has no recipe.
+    var unrecipied: collections.DenseMapUnmanaged(u32, void) = .empty;
+    defer unrecipied.deinit(gpa);
 
     // One inventory per holder, its entries in body order.
     var ordered = std.ArrayList(canonical.CheckedProcedureTemplateId).empty;
@@ -13350,6 +13622,8 @@ fn planInstances(
     std.mem.sort(canonical.CheckedProcedureTemplateId, ordered.items, {}, templateIdLessThan);
     for (ordered.items) |template_id| {
         const start: u32 = @intCast(entries.items.len);
+        members.clearRetainingCapacity();
+        unrecipied.clearRetainingCapacity();
         for (plan.occurrences.items) |occurrence| {
             if (occurrence.template == null or occurrence.template.? != template_id) continue;
             if (!occurrence.template_vars) continue;
@@ -13359,9 +13633,13 @@ fn planInstances(
                     const info = site_map.get(occurrence.expr).?;
                     try plan.handled.put(gpa, occurrence.expr, {});
                     const region = reifier.env.store.getRegionAt(@fromBackingInt(@intCast(info.record.node_idx)));
-                    // A site whose translator binds its inputs has one slot
-                    // order at its call, which no instance shares (Q4).
-                    if (info.record.bound_call != CodeSiteRecord.no_bound_call) {
+                    // A generic bound call binds its sites' inputs at each
+                    // closing use (R7). Any other call that binds a site
+                    // here reads a run-time value outside its sites, so no
+                    // closing use can make it a root.
+                    const bound_raw = info.record.bound_call;
+                    const generic_bound_site = bound_raw != CodeSiteRecord.no_bound_call and generic_bound.contains(bound_raw);
+                    if (bound_raw != CodeSiteRecord.no_bound_call and !generic_bound_site) {
                         try results.append(gpa, .{ .expr = occurrence.expr, .region = region, .outcome = .{ .rejected = .{
                             .kind = .bound_instance,
                             .region = region,
@@ -13373,10 +13651,15 @@ fn planInstances(
                     const recipe = switch (try recipes.resolve(walk, reifier, module, local, info, occurrence.expr, region, call_args)) {
                         .recipe => |recipe| recipe,
                         .rejected => |rejection| {
+                            if (generic_bound_site) try unrecipied.put(gpa, bound_raw, {});
                             try results.append(gpa, .{ .expr = occurrence.expr, .region = region, .outcome = .{ .rejected = rejection } });
                             continue;
                         },
                     };
+                    if (generic_bound_site) {
+                        try recipes.recordCaptures(local.bodies, recipe, occurrence.expr);
+                        try members.append(gpa, .{ .raw_call = bound_raw, .node_idx = info.record.node_idx, .index = index, .recipe = recipe });
+                    }
                     try indexed_sites.append(gpa, .{ .expr = occurrence.expr, .index = index });
                     try plan.instance_sites.append(gpa, occurrence.expr);
                     try entries.append(gpa, .{ .kind = .site, .expr = occurrence.expr, .recipe = recipe });
@@ -13416,7 +13699,39 @@ fn planInstances(
                 },
             }
         }
-        try inventories.append(gpa, .{ .template = template_id, .entries = .{ .start = start, .len = @as(u32, @intCast(entries.items.len)) - start } });
+        // The template's generic bound calls, each with its sites in site
+        // order (node order, as the site loop counts first slots).
+        const calls_start: u32 = @intCast(bound_call_records.items.len);
+        std.mem.sort(BoundMember, members.items, {}, BoundMember.lessThan);
+        var at: usize = 0;
+        while (at < members.items.len) {
+            const raw_call = members.items[at].raw_call;
+            var end = at;
+            while (end < members.items.len and members.items[end].raw_call == raw_call) end += 1;
+            defer at = end;
+            // A call one of whose sites has no recipe has no inputs to bind.
+            if (unrecipied.contains(raw_call)) continue;
+            const sites_start: u32 = @intCast(bound_sites.items.len);
+            const call_index: u32 = @intCast(bound_call_records.items.len);
+            call_leaves.clearRetainingCapacity();
+            for (members.items[at..end]) |member| {
+                try bound_sites.append(gpa, member.index);
+                recipes.recipes.items[member.recipe].bound = call_index;
+                try checked.appendBoundSiteLeaves(gpa, .{ .bodies = local.bodies, .plans = local.plans, .types = local.types, .value_refs = local.value_refs }, entries.items[start + member.index].expr, &call_leaves, null);
+            }
+            const leaves_start: u32 = @intCast(bound_leaves.items.len);
+            try bound_leaves.appendSlice(gpa, call_leaves.items);
+            try bound_call_records.append(gpa, .{
+                .call = local.bodies.exprIdAtRawNode(raw_call) orelse invariant("a bound call with published sites is published"),
+                .sites = .{ .start = sites_start, .len = @intCast(end - at) },
+                .leaves = .{ .start = leaves_start, .len = @intCast(call_leaves.items.len) },
+            });
+        }
+        try inventories.append(gpa, .{
+            .template = template_id,
+            .entries = .{ .start = start, .len = @as(u32, @intCast(entries.items.len)) - start },
+            .bound_calls = .{ .start = calls_start, .len = @as(u32, @intCast(bound_call_records.items.len)) - calls_start },
+        });
     }
     std.mem.sort(Instances.Indexed, indexed_sites.items, {}, indexedLessThan);
     std.mem.sort(Instances.Indexed, forwards.items, {}, indexedLessThan);
@@ -13430,6 +13745,11 @@ fn planInstances(
         .scheme_vars = try recipes.scheme_vars.toOwnedSlice(gpa),
         .exprs = try recipes.exprs.toOwnedSlice(gpa),
         .modules = try recipes.modules.toOwnedSlice(gpa),
+        .bound_calls = try bound_call_records.toOwnedSlice(gpa),
+        .bound_sites = try bound_sites.toOwnedSlice(gpa),
+        .bound_leaves = try bound_leaves.toOwnedSlice(gpa),
+        .captures = try recipes.captures.toOwnedSlice(gpa),
+        .capture_steps = try recipes.capture_steps.toOwnedSlice(gpa),
     };
     return plan;
 }
@@ -13488,12 +13808,34 @@ const RecipeBuilder = struct {
     scheme_vars: std.ArrayList(CheckedTypeId) = .empty,
     exprs: std.ArrayList(CheckedExprId) = .empty,
     modules: std.ArrayList(checked.CheckedModuleArtifactKey) = .empty,
+    captures: std.ArrayList(Instances.CaptureRead) = .empty,
+    capture_steps: std.ArrayList(checked.CheckedCodeSlotStep) = .empty,
 
     fn deinit(self: *RecipeBuilder) void {
         self.recipes.deinit(self.gpa);
         self.scheme_vars.deinit(self.gpa);
         self.exprs.deinit(self.gpa);
         self.modules.deinit(self.gpa);
+        self.captures.deinit(self.gpa);
+        self.capture_steps.deinit(self.gpa);
+    }
+
+    /// Record the capture reads of the bound site `site` on its recipe, so a
+    /// walk in any module can read them (`recipeCaptureReads`).
+    fn recordCaptures(self: *RecipeBuilder, bodies: *const checked.CheckedBodyStore, recipe: u32, site: CheckedExprId) Allocator.Error!void {
+        const reads = try captureReads(self.gpa, bodies, site);
+        defer freeCaptureReads(self.gpa, reads);
+        const start: u32 = @intCast(self.captures.items.len);
+        for (reads) |read| {
+            const steps_start: u32 = @intCast(self.capture_steps.items.len);
+            for (read.steps) |step| try self.capture_steps.append(self.gpa, slotStepRecord(step));
+            try self.captures.append(self.gpa, .{
+                .leaf = read.leaf,
+                .steps = .{ .start = steps_start, .len = @intCast(read.steps.len) },
+                .encoder = read.encoder,
+            });
+        }
+        self.recipes.items[recipe].captures = .{ .start = start, .len = @intCast(reads.len) };
     }
 
     /// The `modules` index of `reader`'s module, or `none` for the site's
@@ -13663,6 +14005,8 @@ const OccurrenceScan = struct {
         var template_vars = false;
         var local_vars = false;
         for (types) |ty| {
+            // A substitution entry that fixes a kind variable is no type.
+            if (s.r.types.payload(ty) == .field_kind) continue;
             const found = try s.mentions(ty);
             template_vars = template_vars or found.template;
             local_vars = local_vars or found.local;
@@ -13895,6 +14239,7 @@ const OccurrenceScan = struct {
 fn closeUses(
     tables: *TableBuilder,
     plan: *const InstancePlan,
+    roots: []const checked.CompileTimeRoot,
     uses: *std.ArrayList(Instances.Indexed),
     refused: *std.ArrayList(RefusedUse),
 ) Allocator.Error!void {
@@ -13947,6 +14292,45 @@ fn closeUses(
             continue;
         }
         try uses.append(gpa, .{ .expr = occurrence.expr, .index = table });
+        try tables.attachRoots(roots, .{ .use = occurrence.expr }, table);
+        if (base.dev_diagnostics.isSet(.reify_instances)) tables.printTable(region, table, 0);
+    }
+}
+
+/// Build the table of each platform requirement's closing use (design.md
+/// "Code Instance Tables"), where the app binding's template has an
+/// inventory. A requirement whose solution leaves a free variable with a
+/// constraint is refused there: lowering seals the variable and ignores the
+/// constraint.
+fn closeRequirements(
+    tables: *TableBuilder,
+    requirements: []const RequirementUse,
+    roots: []const checked.CompileTimeRoot,
+    out: *std.ArrayList(Instances.RequirementUse),
+    refused: *std.ArrayList(RefusedUse),
+) Allocator.Error!void {
+    const reifier = tables.reifier;
+    const gpa = tables.gpa;
+    for (requirements) |*requirement| {
+        const region = reifier.bodies.expr(requirement.body).source_region;
+        if (!try tables.requirementHasInventory(requirement, region)) continue;
+        if (requirement.sealed == null) {
+            try refused.append(gpa, .{ .expr = requirement.body, .region = region, .rejection = .{
+                .kind = .requirement_constrained_variable,
+                .region = region,
+                .module = reifier.rejectionModule(),
+                .detail = "",
+            } });
+            continue;
+        }
+        const steps = [_]ChainStep{.{ .reader = reifier, .use = requirement.body, .requirement = requirement }};
+        const table = try tables.build(&steps);
+        if (try tables.firstRejection(table)) |rejection| {
+            try refused.append(gpa, .{ .expr = requirement.body, .region = region, .rejection = rejection });
+            continue;
+        }
+        try out.append(gpa, .{ .requires_idx = requirement.requires_idx, .table = table });
+        try tables.attachRoots(roots, .{ .requirement = requirement.requires_idx }, table);
         if (base.dev_diagnostics.isSet(.reify_instances)) tables.printTable(region, table, 0);
     }
 }
@@ -14071,11 +14455,28 @@ fn evidenceEntriesReach(reifier: *Reifier, entries: []const static_dispatch.Chec
     return false;
 }
 
+/// The generalized local function scope an edge of a requirement chain
+/// enters: a use of the local function, or its construction.
+fn localScopeOfEdge(reader: *Reifier, expr: CheckedExprId) ?*const checked.DispatchRefScope {
+    const templates = reader.procedure_templates;
+    if (reader.value_refs.lookupIdByCheckedExpr(expr)) |id| switch (reader.value_refs.records[@backingInt(id)].ref) {
+        .local_proc => |local| if (local.dispatch_scope) |scope| return &templates.dispatch_scopes[@backingInt(scope)],
+        .local_param, .local_value, .local_mutable_version, .pattern_binder, .selected_hoisted_const, .top_level_const, .imported_const, .top_level_proc, .imported_proc, .hosted_proc, .platform_required_declaration, .platform_required_const, .platform_required_proc, .platform_required_checked_error, .promoted_top_level_proc => {},
+    };
+    for (templates.dispatch_scopes) |*scope| {
+        if (scope.checked_expr == expr) return scope;
+    }
+    return null;
+}
+
 /// One use on the way from a closing use to a table's template: the reader
 /// of the module that holds the use, and the use.
 const ChainStep = struct {
     reader: *Reifier,
     use: CheckedExprId,
+    /// For the first step of a platform requirement's closing use, the
+    /// requirement; `use` is then its binding's definition.
+    requirement: ?*const RequirementUse = null,
 };
 
 /// The instance a chain of uses reaches: the template, read by its module's
@@ -14136,6 +14537,17 @@ const TableBuilder = struct {
     /// The refusal of each table, or null.
     rejections: std.ArrayList(?Rejection) = .empty,
     memo: std.AutoHashMapUnmanaged(MemoKey, u32) = .empty,
+    /// Each table's span of `bound_entries`, parallel to `tables`.
+    table_bounds: std.ArrayList(Instances.Span) = .empty,
+    bound_entries: std.ArrayList(Instances.BoundEntry) = .empty,
+    /// The reader of each table's template's module, parallel to `tables`;
+    /// null for a refused table.
+    readers: std.ArrayList(?*Reifier) = .empty,
+    root_bounds: std.ArrayList(Instances.RootBound) = .empty,
+    slots: std.ArrayList(checked.CheckedCodeSlot) = .empty,
+    slot_steps: std.ArrayList(checked.CheckedCodeSlotStep) = .empty,
+    slot_shapes: std.ArrayList(u32) = .empty,
+    first_slots: std.ArrayList(u32) = .empty,
 
     const MemoKey = struct {
         module: [32]u8,
@@ -14158,6 +14570,13 @@ const TableBuilder = struct {
                 },
             }
         }
+        const bounds = self.table_bounds.items[table];
+        for (self.bound_entries.items[bounds.start..][0..bounds.len]) |bound| {
+            for (0..depth + 1) |_| std.debug.print("  ", .{});
+            std.debug.print("bound call {d}: {d} slots, first slots", .{ bound.call, bound.slots.len });
+            for (self.first_slots.items[bound.first_slots.start..][0..bound.first_slots.len]) |first| std.debug.print(" {d}", .{first});
+            std.debug.print("\n", .{});
+        }
     }
 
     fn deinit(self: *TableBuilder) void {
@@ -14167,6 +14586,35 @@ const TableBuilder = struct {
         self.reads.deinit(self.gpa);
         self.rejections.deinit(self.gpa);
         self.memo.deinit(self.gpa);
+        self.table_bounds.deinit(self.gpa);
+        self.bound_entries.deinit(self.gpa);
+        self.readers.deinit(self.gpa);
+        self.root_bounds.deinit(self.gpa);
+        self.slots.deinit(self.gpa);
+        self.slot_steps.deinit(self.gpa);
+        self.slot_shapes.deinit(self.gpa);
+        self.first_slots.deinit(self.gpa);
+    }
+
+    /// Append `sources` to the slot pools, in slot order, and return their
+    /// span of `slots`.
+    fn appendSlots(self: *TableBuilder, sources: []const SlotSource) Allocator.Error!Instances.Span {
+        const start: u32 = @intCast(self.slots.items.len);
+        for (sources) |slot| {
+            const steps_start: u32 = @intCast(self.slot_steps.items.len);
+            for (slot.steps) |step| try self.slot_steps.append(self.gpa, slotStepRecord(step));
+            const shape_start: u32 = @intCast(self.slot_shapes.items.len);
+            try self.slot_shapes.appendSlice(self.gpa, slot.shape);
+            try self.slots.append(self.gpa, .{
+                .leaf = slot.leaf,
+                .steps_start = steps_start,
+                .steps_len = @intCast(slot.steps.len),
+                .shape_start = shape_start,
+                .shape_len = @intCast(slot.shape.len),
+                .encoder = if (slot.encoder) |encoder| .some(encoder) else .none,
+            });
+        }
+        return .{ .start = start, .len = @intCast(sources.len) };
     }
 
     /// Fix the instance `chain` reaches in a walk begun by the caller.
@@ -14180,8 +14628,11 @@ const TableBuilder = struct {
             if (index != 0) try saved.set(step.reader, frame, evidence, key);
             self.walk.body = step.reader;
             const region = step.reader.bodies.expr(step.use).source_region;
-            var target = (try step.reader.useTarget(step.use, region)) orelse
-                invariant("a use an inventory or a closing use names reaches no template");
+            var target = if (step.requirement) |requirement|
+                try step.reader.requirementTarget(requirement, region)
+            else
+                (try step.reader.useTarget(step.use, region)) orelse
+                    invariant("a use an inventory or a closing use names reaches no template");
             defer step.reader.releaseBound(target.bound);
             defer if (target.instantiation) |*fixed| fixed.substitution.deinit(self.gpa);
             frame = try target.reader.instanceFrame(target.instantiation, target.signature, target.key.body, target.key.curried);
@@ -14218,7 +14669,9 @@ const TableBuilder = struct {
         const index: u32 = @intCast(self.tables.items.len);
         try self.tables.append(self.gpa, .{});
         try self.templates.append(self.gpa, .{ .module = est.reader.artifact, .template = @backingInt(est.template) });
+        try self.readers.append(self.gpa, est.reader);
         try self.rejections.append(self.gpa, null);
+        try self.table_bounds.append(self.gpa, .{});
         try self.memo.put(self.gpa, memo_key, index);
 
         const holder = est.reader;
@@ -14229,7 +14682,13 @@ const TableBuilder = struct {
         for (inventory) |entry| switch (entry.kind) {
             .site => {
                 const recipe = holder.code_instances.recipes[entry.recipe];
-                const outcome = try self.describe(chain, holder, recipe);
+                // A site of a bound call is described below, with the
+                // call's other sites, in site order.
+                if (recipe.bound != Instances.none) {
+                    try entries.append(self.gpa, .{ .kind = .node, .value = 0, .reads = .{} });
+                    continue;
+                }
+                const outcome = try self.describe(chain, holder, recipe, null);
                 const reads = try self.walk.takeReads();
                 defer self.gpa.free(reads);
                 switch (outcome) {
@@ -14257,6 +14716,7 @@ const TableBuilder = struct {
                 try entries.append(self.gpa, .{ .kind = .table, .value = child, .reads = .{} });
             },
         };
+        if (self.rejections.items[index] == null) try self.bindInstance(chain, holder, est.template, index, entries.items);
         const start: u32 = @intCast(self.entries.items.len);
         try self.entries.appendSlice(self.gpa, entries.items);
         self.tables.items[index] = .{ .start = start, .len = @intCast(entries.items.len) };
@@ -14266,9 +14726,87 @@ const TableBuilder = struct {
     fn refusedTable(self: *TableBuilder, rejection: Rejection) Allocator.Error!u32 {
         const index: u32 = @intCast(self.tables.items.len);
         try self.tables.append(self.gpa, .{});
+        try self.table_bounds.append(self.gpa, .{});
         try self.templates.append(self.gpa, .{ .module = .{}, .template = Instances.none });
+        try self.readers.append(self.gpa, null);
         try self.rejections.append(self.gpa, rejection);
         return index;
+    }
+
+    /// Whether the template a platform requirement's app binding reaches has
+    /// an inventory, so its closing use needs a table.
+    fn requirementHasInventory(self: *TableBuilder, requirement: *const RequirementUse, region: base.Region) Allocator.Error!bool {
+        self.walk.beginSite(.graph, false, self.reifier);
+        try self.walk.startSite();
+        const reached = self.reifier.reachedProcedure(.{ .top_level = requirement.binding }, requirement.binder, region) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            // A binding the walk cannot follow has no inventory to read.
+            error.Rejected, error.Diverged => return false,
+        };
+        return reached.reader.code_instances.inventoryOf(reached.template.template_id) != null;
+    }
+
+    /// Attach to each `literal_argument` root of a generic bound call whose
+    /// edge is the closing use `edge` the bound entry it reads in the tables
+    /// `table` reaches (design.md "Bound Instance Roots").
+    fn attachRoots(self: *TableBuilder, roots: []const checked.CompileTimeRoot, edge: checked.LiteralEdge, table: u32) Allocator.Error!void {
+        for (roots) |root| {
+            const argument = root.literal_argument orelse continue;
+            if (argument.site.kind != .bound_call) continue;
+            // A written use's roots are those its expression holds: the
+            // use's own edge, or the dispatch edge of a method call.
+            const at_edge = switch (edge) {
+                .use => |use| argument.edge != .requirement and root.expr == use,
+                .requirement => std.meta.eql(argument.edge, edge),
+                .literal, .node => invariant("a closing use is a use expression or a platform requirement"),
+            };
+            if (!at_edge) continue;
+            try self.root_bounds.append(self.gpa, .{ .root = root.id, .entry = try self.requirementEntry(table, argument.callee_requirement) });
+        }
+    }
+
+    /// The bound entry that requirement `first` of table `first_table`'s
+    /// template reads: the chain of forwarded requirements, through the
+    /// forward entries of the tables and the local scopes of their
+    /// templates, ends at a generic bound call's own requirement.
+    fn requirementEntry(self: *TableBuilder, first_table: u32, first: u32) Allocator.Error!u32 {
+        var table = first_table;
+        var reader = self.readers.items[table] orelse invariant("a closing use with a table names a refused table");
+        const templates = reader.procedure_templates;
+        var requirements = templates.templateLiteralRequirements(&templates.templates.items[self.templates.items[table].template]);
+        var index = first;
+        while (true) {
+            if (index >= requirements.len) invariant("a bound requirement chain names a requirement its scheme does not have");
+            const requirement = requirements[index];
+            index = requirement.callee_requirement;
+            const edge_expr = switch (requirement.edge) {
+                .literal => {
+                    const instances = reader.code_instances;
+                    const span = self.table_bounds.items[table];
+                    for (self.bound_entries.items[span.start..][0..span.len], span.start..) |entry, at| {
+                        if (instances.bound_calls[entry.call].call == requirement.site.expr) return @intCast(at);
+                    }
+                    invariant("a table has no bound entry for a generic bound call of its template");
+                },
+                .use => |expr| expr,
+                .node => requirement.dispatch_use orelse invariant("a bound requirement's dispatch edge is no method call's target"),
+                .requirement => invariant("a scheme's requirement forwards through a platform requirement"),
+            };
+            if (reader.code_instances.forwardIndex(edge_expr)) |forward| {
+                const entry = self.entries.items[self.tables.items[table].start + forward];
+                if (entry.kind != .table) invariant("a forward entry of a table holds no table");
+                table = entry.value;
+                reader = self.readers.items[table] orelse invariant("a forward entry of a closed table names a refused table");
+                const callee = reader.procedure_templates;
+                requirements = callee.templateLiteralRequirements(&callee.templates.items[self.templates.items[table].template]);
+                continue;
+            }
+            // An edge to a generalized local function stays in the table of
+            // the template whose body holds the function.
+            const scope = localScopeOfEdge(reader, edge_expr) orelse
+                invariant("a bound requirement's edge is neither a forward entry nor a local function's");
+            requirements = reader.procedure_templates.scopeLiteralRequirements(scope);
+        }
     }
 
     /// The first refusal among the tables `root` reaches, or null.
@@ -14289,11 +14827,87 @@ const TableBuilder = struct {
         return null;
     }
 
+    /// Describe the sites of each generic bound call of `template` at the
+    /// instance `chain` reaches, in site order, into their `entries`, and
+    /// record the call's input slots at that instance on table `table`
+    /// (R7). Each site's first slot counts the slots of the call's earlier
+    /// sites at this instance.
+    fn bindInstance(
+        self: *TableBuilder,
+        chain: []const ChainStep,
+        holder: *Reifier,
+        template: canonical.CheckedProcedureTemplateId,
+        table: u32,
+        entries: []Instances.TableEntry,
+    ) Allocator.Error!void {
+        const instances = holder.code_instances;
+        const inventory = for (instances.inventories) |inventory| {
+            if (inventory.template == template) break inventory;
+        } else invariant("a table names a template with no inventory");
+        const inventory_entries = instances.entries[inventory.entries.start..][0..inventory.entries.len];
+        var made = std.ArrayList(Instances.BoundEntry).empty;
+        defer made.deinit(self.gpa);
+        var call_slots = std.ArrayList(SlotSource).empty;
+        defer call_slots.deinit(self.gpa);
+        var owned = std.ArrayList([]SlotSource).empty;
+        defer {
+            for (owned.items) |slots| freeSlotSources(self.gpa, slots);
+            owned.deinit(self.gpa);
+        }
+        for (instances.bound_calls[inventory.bound_calls.start..][0..inventory.bound_calls.len], 0..) |call, offset| {
+            call_slots.clearRetainingCapacity();
+            const first_start: u32 = @intCast(self.first_slots.items.len);
+            var first: u64 = 0;
+            for (instances.boundCallSites(call)) |site_index| {
+                const recipe = instances.recipes[inventory_entries[site_index].recipe];
+                const outcome = try self.describe(chain, holder, recipe, first);
+                const reads = try self.walk.takeReads();
+                defer self.gpa.free(reads);
+                const slots = self.walk.takeSlots();
+                try owned.append(self.gpa, slots);
+                switch (outcome) {
+                    .reified => |node| {
+                        const reads_start: u32 = @intCast(self.reads.items.len);
+                        try self.reads.appendSlice(self.gpa, reads);
+                        entries[site_index] = .{
+                            .kind = .node,
+                            .value = @backingInt(node),
+                            .reads = .{ .start = reads_start, .len = @intCast(reads.len) },
+                        };
+                    },
+                    .rejected => |rejection| {
+                        self.rejections.items[table] = rejection;
+                        return;
+                    },
+                }
+                try self.first_slots.append(self.gpa, @intCast(first));
+                first += slots.len;
+                try call_slots.appendSlice(self.gpa, slots);
+            }
+            try made.append(self.gpa, .{
+                .call = inventory.bound_calls.start + @as(u32, @intCast(offset)),
+                .slots = try self.appendSlots(call_slots.items),
+                .first_slots = .{ .start = first_start, .len = @as(u32, @intCast(self.first_slots.items.len)) - first_start },
+            });
+        }
+        const start: u32 = @intCast(self.bound_entries.items.len);
+        try self.bound_entries.appendSlice(self.gpa, made.items);
+        self.table_bounds.items[table] = .{ .start = start, .len = @intCast(made.items.len) };
+    }
+
     /// Describe one instance site of `holder` at the instance `chain`
-    /// reaches, in this module's store.
-    fn describe(self: *TableBuilder, chain: []const ChainStep, holder: *Reifier, recipe: Instances.Recipe) Allocator.Error!Outcome {
+    /// reaches, in this module's store. `first_slot` is set for a site of a
+    /// generic bound call: what the site reads at run time becomes input
+    /// slots from that slot on.
+    fn describe(self: *TableBuilder, chain: []const ChainStep, holder: *Reifier, recipe: Instances.Recipe, first_slot: ?u64) Allocator.Error!Outcome {
         const walk = self.walk;
         walk.beginSite(@fromBackingInt(@intCast(recipe.view)), false, self.reifier);
+        if (first_slot) |first| {
+            // Only the holder's run-time names are the call's inputs.
+            walk.inputs = .{ .reader = holder, .call_leaves = holder.code_instances.boundCallLeaves(recipe.bound) };
+            walk.useCaptureReads(try recipeCaptureReads(self.gpa, holder.code_instances, recipe));
+            walk.first_slot = first;
+        }
         try walk.startSite();
         var saved = SavedStates{ .gpa = self.gpa };
         defer saved.restore();

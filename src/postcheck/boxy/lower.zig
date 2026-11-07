@@ -271,6 +271,11 @@ pub const WorkerKey = union(enum) {
     /// the entry's node of `module`'s constant store at the closed
     /// representation of the site's type.
     code_description: struct { module: ModuleIndex, table: u32, entry: u32 },
+    /// The hidden argument of a bound requirement of `module`'s
+    /// `literal_argument` root `root` (design.md "Bound Instance Roots"): an
+    /// erased worker whose one argument is the tuple of the call's leaf
+    /// values and whose result is the call's `Code.Bound` with its inputs.
+    code_bound: struct { module: ModuleIndex, root: checked.ComptimeRootId },
 };
 
 /// The template whose inventory a worker's instance table serves (design.md
@@ -670,7 +675,7 @@ pub const Program = struct {
                 hasher.update(&self.modules.linkName(instances.module));
                 hasher.update(std.mem.asBytes(&instances.table));
             },
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_description => invariant("a worker no module's object exports has no content identity"),
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_description => invariant("a worker no module's object exports has no content identity"),
         }
         return .{ .bytes = hasher.finalResult() };
     }
@@ -689,7 +694,7 @@ pub const Program = struct {
     pub fn exportableKind(key: WorkerKey) bool {
         return switch (key) {
             .template, .lambda, .method_entry, .default, .code_instances => true,
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_description => false,
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_description => false,
         };
     }
 
@@ -1667,7 +1672,7 @@ pub const Program = struct {
         if (requirements.len == 0) return .{ .bound = bound, .requirements = requirements };
         const key = switch (target_worker.key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("a worker with dictionary parameters is not a template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => invariant("a worker with dictionary parameters is not a template's"),
         };
         const templates = self.module(key.module).view.checked_procedure_templates;
         const params = poolSlice(static_dispatch.EvidenceParamRecord, templates.evidence_params_pool, templates.templates.items[@backingInt(key.template)].evidence_params);
@@ -1823,7 +1828,7 @@ pub const Program = struct {
         if (target_worker.dictionary_params.len == 0) return;
         const key = switch (target_worker.key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("a worker with dictionary parameters is not a template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => invariant("a worker with dictionary parameters is not a template's"),
         };
         const templates = self.module(key.module).view.checked_procedure_templates;
         const all_params = poolSlice(static_dispatch.EvidenceParamRecord, templates.evidence_params_pool, templates.templates.items[@backingInt(key.template)].evidence_params);
@@ -2204,7 +2209,7 @@ pub const Program = struct {
             const scoped = self.worker(current).*;
             const outer: ?WorkerId = switch (scoped.key) {
                 .lambda => |lambda| lambda.outer,
-                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => null,
+                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => null,
             };
             const own = if (outer) |o| scoped.literal_scopes.len != self.worker(o).literal_scopes.len else scoped.literal_scopes.len != 0;
             if (own) try owners.append(allocator, current);
@@ -2336,6 +2341,32 @@ pub const Program = struct {
         const key: WorkerKey = .{ .root_slot = .{ .module = module_index, .root = root } };
         if (self.worker_ids.get(key)) |existing| return existing;
         return try self.addErasedWorker(key, module_index, &.{}, &.{}, ty, "boxy.root_slot");
+    }
+
+    /// The hidden argument of the bound requirement that `module_index`'s
+    /// `literal_argument` root `root` satisfies (`WorkerKey.code_bound`).
+    pub fn codeBoundWorker(self: *Program, module_index: ModuleIndex, root: checked.ComptimeRootId) Allocator.Error!WorkerId {
+        const key: WorkerKey = .{ .code_bound = .{ .module = module_index, .root = root } };
+        if (self.worker_ids.get(key)) |existing| return existing;
+        const view = self.module(module_index);
+        const argument = view.view.compile_time_roots.root(root).literal_argument orelse invariant("a bound root records no literal argument");
+        if (argument.site.kind != .bound_call) invariant("a code_bound worker names a root that is no bound call's");
+        const requirement_ty = argument.requirement_ty;
+        const env: types.Env = .{ .module = module_index, .vars = &.{}, .bound = &.{} };
+        const parts = switch (view.types().payload(requirement_ty)) {
+            .tuple => |parts| parts,
+            .pending, .field_kind, .err, .flex, .rigid, .alias, .function, .nominal, .record, .tag_union, .empty_record, .empty_tag_union => invariant("a bound requirement's type is not a tuple"),
+        };
+        // The tuple is the call's type, the leaves' types, and the holder's
+        // function type; the argument is the leaves' part.
+        if (parts.len < 2) invariant("a bound requirement's type has no call or holder part");
+        const leaves = try self.allocator.alloc(TypeId, parts.len - 2);
+        defer self.allocator.free(leaves);
+        for (leaves, parts[1 .. parts.len - 1]) |*leaf, part| leaf.* = try self.converter().convert(module_index, part, env);
+        const arg = try self.store.intern(.{ .tuple = leaves });
+        const params = try self.arena.allocator().dupe(TypeId, &.{arg});
+        const ret = try self.converter().convert(module_index, argument.ty, env);
+        return try self.addErasedWorker(key, module_index, &.{}, params, ret, "boxy.code_bound");
     }
 
     /// The worker of Code instance table `table` of `module_index` (see
@@ -2843,7 +2874,7 @@ pub fn run(allocator: Allocator, input: Input) Allocator.Error!Output {
                     const export_name = names.procBase(template.proc_base).export_name orelse break :blk "boxy.template";
                     break :blk names.exportNameText(export_name);
                 },
-                inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => |_, kind| "boxy." ++ @tagName(kind),
+                inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => |_, kind| "boxy." ++ @tagName(kind),
             };
             try program.result.store.setProcDebugName(worker.proc, name);
         }

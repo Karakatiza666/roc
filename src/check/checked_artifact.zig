@@ -8,6 +8,7 @@ const TypeDigestHasher = @import("base").TypeDigestHasher;
 const builtin = @import("builtin");
 const base = @import("base");
 const can = @import("can");
+const code_roots = @import("code_roots.zig");
 const collections = @import("collections");
 const types = @import("types");
 const TypedCIR = @import("typed_cir.zig");
@@ -855,6 +856,9 @@ pub const RootRequest = struct {
     procedure_binding: ?TopLevelProcedureBindingRef = null,
     procedure_use: ?ProcedureUseTemplate = null,
     root_evidence: ?CheckedEvidenceSpan = null,
+    /// The Code instance table of a platform requirement's closing use
+    /// (design.md "Code Instance Tables"), or null.
+    instances: ?CheckedInstanceTableRef = null,
 };
 
 /// Public `RootRequestTable` declaration.
@@ -951,6 +955,7 @@ pub const RootRequestTable = struct {
                     .exposure = .platform_required,
                     .procedure_use = procedure_use.procedure,
                     .root_evidence = procedure_use.root_evidence,
+                    .instances = procedure_use.instances,
                 }),
                 .const_value => {},
             }
@@ -1388,6 +1393,11 @@ const CompileTimeRequestScheduler = struct {
                 const ref_id = self.resolved_value_refs.by_checked_expr[raw].get() orelse return;
                 const template_ref = (try self.collectResolvedRefDependency(self.resolved_value_refs.records[@backingInt(ref_id)].ref)) orelse return;
                 try self.collectTemplateDependencies(template_ref);
+            },
+            .requirement => |requires_idx| {
+                const requirement = self.procedure_templates.literalRequirementEdge(requires_idx) orelse
+                    checkedArtifactInvariant("a literal argument root's requirement edge is not recorded", .{});
+                try self.collectTemplateDependencies(requirement.template);
             },
         }
     }
@@ -2320,6 +2330,9 @@ const RootRequestWithoutOrder = struct {
     procedure_binding: ?TopLevelProcedureBindingRef = null,
     procedure_use: ?ProcedureUseTemplate = null,
     root_evidence: ?CheckedEvidenceSpan = null,
+    /// The Code instance table of a platform requirement's closing use
+    /// (design.md "Code Instance Tables"), or null.
+    instances: ?CheckedInstanceTableRef = null,
 };
 
 fn appendRoot(
@@ -2342,6 +2355,7 @@ fn appendRoot(
         .procedure_binding = request.procedure_binding,
         .procedure_use = request.procedure_use,
         .root_evidence = request.root_evidence,
+        .instances = request.instances,
     });
 }
 
@@ -2503,6 +2517,30 @@ pub const CheckedStaticDispatchConstraint = struct {
 /// The defaulting oracle (src/types/literal_defaulting.zig), re-exported for
 /// consumers reached through the checked artifact (monotype solving/lowering).
 pub const literal_defaulting = types.literal_defaulting;
+
+/// What lowering gives a type variable that no scope binds (a free variable
+/// of the program): its numeric default, else its row default, else the
+/// empty tag union, which has no values. Monotype, Boxy and the reifier's
+/// platform requirement uses all read this one rule (design.md "Code
+/// Instance Tables").
+pub const SealedVariable = enum { dec, str, empty_record, empty_tag_union };
+
+/// The type lowering seals `variable` to (`SealedVariable`).
+pub fn sealedVariable(variable: CheckedTypeVariable) SealedVariable {
+    if (variable.numeric_default_phase) |phase| {
+        const target = literal_defaulting.defaultTargetForPhase(phase) orelse
+            base.invariant("a checking-finalized numeric variable reached lowering unresolved", .{});
+        return switch (target) {
+            .dec => .dec,
+            .str => .str,
+        };
+    }
+    if (variable.row_default) |row_default| return switch (row_default) {
+        .empty_record => .empty_record,
+        .empty_tag_union => .empty_tag_union,
+    };
+    return .empty_tag_union;
+}
 
 /// The exact-numeral value authority (src/types/numeral.zig), re-exported for
 /// consumers reached through the checked artifact (monotype lowering).
@@ -17471,6 +17509,20 @@ pub const CheckedEvidenceSpan = struct {
     span: artifact_serialize.Span,
 };
 
+/// One Code instance table (D1): the module whose closing use built it, and
+/// its index in that module's `CodeInstanceTable.tables`.
+pub const CheckedInstanceTableRef = struct {
+    checked_module: CheckedModuleDigest,
+    table: u32,
+};
+
+/// The literal requirement edge (`LiteralRequirementEdge`) of platform
+/// requirement `requires_idx` in its app module.
+pub const CheckedLiteralRequirementEdgeRef = struct {
+    checked_module: CheckedModuleDigest,
+    requires_idx: u32,
+};
+
 /// Public `LocalProcedureBinding` declaration.
 pub const LocalProcedureBinding = struct {
     /// An alias owns an instantiation scope, but forwards an existing callable
@@ -17519,6 +17571,13 @@ pub const PlatformRequiredProcedureResolvedRef = struct {
     binding: PlatformRequiredBindingId,
     procedure: ProcedureUseTemplate,
     root_evidence: ?CheckedEvidenceSpan = null,
+    /// The table of the requirement's closing use in the app, where the app
+    /// binding's template has a Code instance inventory (design.md "Code
+    /// Instance Tables").
+    instances: ?CheckedInstanceTableRef = null,
+    /// The requirement's literal argument edge in the app, where the
+    /// requirement's solution was sealed (design.md "Literal Arguments").
+    literal_edge: ?CheckedLiteralRequirementEdgeRef = null,
 };
 
 /// Public `SelectedHoistedConstUse` declaration.
@@ -18569,6 +18628,8 @@ fn categorizeRequiredValueRef(
             .binding = binding.id,
             .procedure = procedure_use.procedure,
             .root_evidence = procedure_use.root_evidence,
+            .instances = procedure_use.instances,
+            .literal_edge = procedure_use.literal_edge,
         } },
     };
 }
@@ -18939,8 +19000,17 @@ const TemplateIteratorRefs = struct {
     /// Refs collected from the body of each lambda written at a `Code`
     /// position (see `StagedLambdaRefs`).
     staged: []StagedLambdaRefs = &.{},
+    /// Each call a template body holds that binds the run-time reads of its
+    /// sites and reads nothing else at run time, grouped per template, with
+    /// the scope that holds it (design.md "Bound Instance Roots").
+    bound_call_spans: []artifact_serialize.Span = &.{},
+    bound_calls: []CheckedExprId = &.{},
+    bound_call_scopes: []DispatchScope = &.{},
 
     fn deinit(self: *TemplateIteratorRefs, allocator: Allocator) void {
+        allocator.free(self.bound_call_spans);
+        allocator.free(self.bound_calls);
+        allocator.free(self.bound_call_scopes);
         allocator.free(self.staged);
         allocator.free(self.spans);
         allocator.free(self.pool);
@@ -19125,6 +19195,13 @@ fn sealCheckedProcedureTemplateRefs(
         const checked_expr = checked_bodies.exprIdForSource(@fromBackingInt(@intCast(site.node_idx))) orelse continue;
         try staged_lambdas.put(@backingInt(checked_expr), {});
     }
+    var bound_call_set = collections.DenseMap(u32, void).init(allocator);
+    defer bound_call_set.deinit();
+    for (module.moduleEnvConst().store.codeReificationSites()) |site| {
+        if (site.bound_call == can.NodeStore.CodeReificationSite.no_bound_call or site.bound_reads != .sites_only) continue;
+        const call = checked_bodies.exprIdAtRawNode(site.bound_call) orelse continue;
+        try bound_call_set.put(@backingInt(call), {});
+    }
     {
         const types_store = module.typeStoreConst();
 
@@ -19195,6 +19272,7 @@ fn sealCheckedProcedureTemplateRefs(
         &nested_function_uses,
         &callable_derived_schemes,
         &staged_lambdas,
+        &bound_call_set,
     );
     defer collector.deinit();
 
@@ -19232,6 +19310,12 @@ fn sealCheckedProcedureTemplateRefs(
     errdefer allocator.free(scheme_use_spans);
     const scope_site_spans = try allocator.alloc(artifact_serialize.Span, templates.templates.items.len);
     errdefer allocator.free(scope_site_spans);
+    const bound_call_spans = try allocator.alloc(artifact_serialize.Span, templates.templates.items.len);
+    errdefer allocator.free(bound_call_spans);
+    var bound_call_pool = std.ArrayList(CheckedExprId).empty;
+    errdefer bound_call_pool.deinit(allocator);
+    var bound_call_scope_pool = std.ArrayList(DispatchScope).empty;
+    errdefer bound_call_scope_pool.deinit(allocator);
 
     var staged_pool = std.ArrayList(StagedLambdaRefs).empty;
     errdefer staged_pool.deinit(allocator);
@@ -19380,6 +19464,11 @@ fn sealCheckedProcedureTemplateRefs(
         try dispatch_ref_scope_pool.appendSlice(allocator, collector.dispatch_ref_scopes.items);
         try iterator_scope_pool.appendSlice(allocator, collector.iterator_ref_scopes.items);
         try scheme_use_scope_pool.appendSlice(allocator, collector.scheme_use_scopes.items);
+        bound_call_spans[template_index] = .{ .start = @intCast(bound_call_pool.items.len), .len = @intCast(collector.bound_hits.items.len) };
+        for (collector.bound_hits.items) |hit| {
+            try bound_call_pool.append(allocator, hit.expr);
+            try bound_call_scope_pool.append(allocator, if (hit.scope) |id| .{ .generalized = id } else .root);
+        }
 
         // Each lambda at a `Code` position that this body holds, and each
         // one that such a lambda holds, is collected in the scope that holds
@@ -19487,6 +19576,9 @@ fn sealCheckedProcedureTemplateRefs(
         .default_scheme_uses = default_scheme_uses,
         .default_scope_sites = default_scope_sites,
         .staged = try staged_pool.toOwnedSlice(allocator),
+        .bound_call_spans = bound_call_spans,
+        .bound_calls = try bound_call_pool.toOwnedSlice(allocator),
+        .bound_call_scopes = try bound_call_scope_pool.toOwnedSlice(allocator),
     };
 }
 
@@ -23003,6 +23095,11 @@ const CheckedTemplateRefCollector = struct {
     /// Each lambda at a `Code` position that this collection reached, with
     /// the scope that holds it. The collection does not enter such a lambda.
     staged_hits: std.ArrayList(StagedHit) = .empty,
+    /// The calls that bind the run-time reads of their sites and read
+    /// nothing else at run time (`CodeReificationSite.BoundReads.sites_only`).
+    bound_calls: *const collections.DenseMap(u32, void),
+    /// Each such call this collection reached, with the scope that holds it.
+    bound_hits: std.ArrayList(StagedHit) = .empty,
     value_refs: std.ArrayList(ResolvedValueRefId),
     dispatch_refs: std.ArrayList(static_dispatch.StaticDispatchPlanId),
     iterator_refs: std.ArrayList(static_dispatch.IteratorForPlanId),
@@ -23035,6 +23132,7 @@ const CheckedTemplateRefCollector = struct {
         nested_function_uses: *const collections.DenseMap(u32, u32),
         callable_derived_schemes: *const collections.DenseMap(u32, Var),
         staged_lambdas: *const collections.DenseMap(u32, void),
+        bound_calls: *const collections.DenseMap(u32, void),
     ) CheckedTemplateRefCollector {
         return .{
             .allocator = allocator,
@@ -23046,6 +23144,7 @@ const CheckedTemplateRefCollector = struct {
             .nested_function_uses = nested_function_uses,
             .callable_derived_schemes = callable_derived_schemes,
             .staged_lambdas = staged_lambdas,
+            .bound_calls = bound_calls,
             .value_refs = .empty,
             .dispatch_refs = .empty,
             .iterator_refs = .empty,
@@ -23075,6 +23174,7 @@ const CheckedTemplateRefCollector = struct {
     };
 
     fn deinit(self: *CheckedTemplateRefCollector) void {
+        self.bound_hits.deinit(self.allocator);
         self.staged_hits.deinit(self.allocator);
         self.work.deinit(self.allocator);
         self.visited_statements.deinit();
@@ -23097,6 +23197,7 @@ const CheckedTemplateRefCollector = struct {
     }
 
     fn clear(self: *CheckedTemplateRefCollector) void {
+        self.bound_hits.clearRetainingCapacity();
         self.staged_hits.clearRetainingCapacity();
         self.value_refs.clearRetainingCapacity();
         self.dispatch_refs.clearRetainingCapacity();
@@ -23318,6 +23419,9 @@ const CheckedTemplateRefCollector = struct {
         if (entry.found_existing) return;
 
         const raw_expr = @backingInt(expr_id);
+        if (self.bound_calls.contains(raw_expr)) {
+            try self.bound_hits.append(self.allocator, .{ .expr = expr_id, .scope = self.currentScopeId() });
+        }
         if (self.staged_lambdas.contains(raw_expr)) {
             try self.staged_hits.append(self.allocator, .{ .expr = expr_id, .scope = self.currentScopeId() });
             // The encoders of a `Code.Binds` site's capture reads run where
@@ -24147,6 +24251,11 @@ pub const CheckedProcedureTemplateTable = struct {
     /// The literal arguments of each procedure or local-function use, by
     /// use expression, ascending.
     literal_use_edges: []LiteralEdgeEntry = &.{},
+    /// The edge of each platform requirement with a sealed solution, by
+    /// requires index, ascending.
+    literal_requirement_edges: []LiteralRequirementEdge = &.{},
+    /// The substitutions of `literal_requirement_edges`, pooled.
+    literal_requirement_subst_pool: []CheckedTypeId = &.{},
     /// Relation semantics of each
     /// `StaticDispatchPlanTable.dispatch_relation_refs` entry.
     dispatch_relation_kinds: []DispatchRelationKind = &.{},
@@ -24180,6 +24289,8 @@ pub const CheckedProcedureTemplateTable = struct {
         literal_edge_args_pool: SerializedSlice(LiteralArgSource) = .{},
         literal_node_edges: SerializedSlice(LiteralEdgeEntry) = .{},
         literal_use_edges: SerializedSlice(LiteralEdgeEntry) = .{},
+        literal_requirement_edges: SerializedSlice(LiteralRequirementEdge) = .{},
+        literal_requirement_subst_pool: SerializedSlice(CheckedTypeId) = .{},
         dispatch_relation_kinds: SerializedSlice(DispatchRelationKind) = .{},
         dispatch_scopes: SerializedSlice(DispatchRefScope) = .{},
         specialization_interface_relations: SerializedSlice(SpecializationInterfaceRelation) = .{},
@@ -24519,10 +24630,26 @@ pub const CheckedProcedureTemplateTable = struct {
         const entries: []const LiteralEdgeEntry, const key: u32 = switch (edge) {
             .node => |id| .{ self.literal_node_edges, @backingInt(id) },
             .use => |expr| .{ self.literal_use_edges, @backingInt(expr) },
+            .requirement => |requires_idx| {
+                const found = self.literalRequirementEdge(requires_idx) orelse return &.{};
+                return self.literal_edge_args_pool[found.args.start .. found.args.start + found.args.len];
+            },
             .literal => return &.{},
         };
         const found = artifact_serialize.binarySearchByKey(LiteralEdgeEntry, u32, entries, key, literalEdgeEntryOrder) orelse return &.{};
         return self.literal_edge_args_pool[found.args.start .. found.args.start + found.args.len];
+    }
+
+    /// The edge of platform requirement `requires_idx`, or null where its
+    /// solution was not sealed.
+    pub fn literalRequirementEdge(self: *const CheckedProcedureTemplateTable, requires_idx: u32) ?LiteralRequirementEdge {
+        const found = artifact_serialize.binarySearchByKey(LiteralRequirementEdge, u32, self.literal_requirement_edges, requires_idx, literalRequirementEdgeOrder) orelse return null;
+        return found.*;
+    }
+
+    /// The types a platform requirement's edge fixes its scheme's variables to.
+    pub fn literalRequirementSubst(self: *const CheckedProcedureTemplateTable, edge: LiteralRequirementEdge) []const CheckedTypeId {
+        return self.literal_requirement_subst_pool[edge.subst.start..][0..edge.subst.len];
     }
 
     /// The template's evidence params, in the scheme's requirement order.
@@ -25665,6 +25792,9 @@ fn hashRequiredTypeForClauseAliases(
 pub const PlatformRequiredProcedureUse = struct {
     procedure: ProcedureUseTemplate,
     root_evidence: ?CheckedEvidenceSpan = null,
+    /// See `PlatformRequiredProcedureResolvedRef.instances`.
+    instances: ?CheckedInstanceTableRef = null,
+    literal_edge: ?CheckedLiteralRequirementEdgeRef = null,
     relation_template_closure: ImportedTemplateClosureView = .{},
 };
 
@@ -25694,6 +25824,8 @@ pub const PlatformRequiredValueUseKind = enum { const_value, procedure_value };
 pub const StoredPlatformRequiredProcedureUse = struct {
     procedure: ProcedureUseTemplate,
     root_evidence: ?CheckedEvidenceSpan = null,
+    instances: ?CheckedInstanceTableRef = null,
+    literal_edge: ?CheckedLiteralRequirementEdgeRef = null,
     relation_template_closure: StoredImportedTemplateClosure = .{},
 };
 
@@ -27415,6 +27547,273 @@ fn literalRequirementTypeIdentity(
     return hasher.finalResult();
 }
 
+/// The checked tables `appendBoundSiteLeaves` reads, all of the module that
+/// holds the call.
+pub const BoundLeafSources = struct {
+    bodies: *const CheckedBodyStore,
+    plans: *const static_dispatch.StaticDispatchPlanTable,
+    types: *const CheckedTypeStore,
+    value_refs: *const ResolvedValueRefTable,
+};
+
+/// Append the leaves of one site of a generic bound call to `leaves`: the
+/// binders around the site that the site's walk reads as input slots, each
+/// once, in the order the rule below meets them. With `leaf_types`, also
+/// append each new leaf's type. Publication of the requirement type and the
+/// reifier's `BoundCall.leaves`, which Boxy binds, read this one rule
+/// (design.md "Bound Instance Roots").
+///
+/// The rule follows the walk's reads of a name (`Reifier.lookupRef`): a name
+/// a `decl` statement defines is replayed, so it gives the names its value
+/// reads, again by this rule. A promoted local function resolves to its
+/// procedure, and a read the checker resolved to a constant or at a
+/// function type folds (`Reifier.unboundRef`), so neither is a leaf. Any
+/// other name is a leaf. The rule reads the template only, so it gives the
+/// same leaves at every instance.
+pub fn appendBoundSiteLeaves(
+    allocator: Allocator,
+    sources: BoundLeafSources,
+    site: CheckedExprId,
+    leaves: *std.ArrayListUnmanaged(PatternBinderId),
+    leaf_types: ?*std.ArrayListUnmanaged(CheckedTypeId),
+) Allocator.Error!void {
+    const bodies = sources.bodies;
+    // A site that is no closure reads nothing around it.
+    const closure = switch (bodies.expr(site).data) {
+        .closure => |closure| closure,
+        .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .lambda, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return,
+    };
+    const lambda = switch (bodies.expr(closure.lambda).data) {
+        .lambda => |lambda| lambda,
+        .pending, .numeral, .str_from_quote, .code_from_lambda, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .binop, .unary_minus, .unary_not, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => checkedArtifactInvariant("a closure names no lambda", .{}),
+    };
+    // A stack of reads still to follow, popped in the order they were met.
+    var reads: std.ArrayListUnmanaged(BoundSiteRead) = .empty;
+    defer reads.deinit(allocator);
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(allocator, bodies.pattern_binders.items.len);
+    defer seen.deinit(allocator);
+    try appendOuterReads(allocator, sources, lambda.args, lambda.body, &reads);
+    std.mem.reverse(BoundSiteRead, reads.items);
+    while (reads.pop()) |read| {
+        if (seen.isSet(@backingInt(read.binder))) continue;
+        seen.set(@backingInt(read.binder));
+        const record = bodies.patternBinder(read.binder);
+        if (record.defining_statement) |statement_id| switch (bodies.statement(statement_id).data) {
+            .decl => |decl| {
+                const start = reads.items.len;
+                try appendOuterReads(allocator, sources, &.{decl.pattern}, decl.expr, &reads);
+                std.mem.reverse(BoundSiteRead, reads.items[start..]);
+                continue;
+            },
+            .promoted_proc => continue,
+            .pending, .var_, .var_uninitialized, .reassign, .crash, .dbg, .expr, .expect, .for_, .while_, .infinite_loop, .breakable_loop, .break_, .return_, .import_, .alias_decl, .where_alias_decl, .nominal_decl, .type_anno, .type_var_alias, .runtime_error => {},
+        };
+        if (read.folds) continue;
+        if (sliceContains(PatternBinderId, leaves.items, read.binder)) continue;
+        try leaves.append(allocator, read.binder);
+        if (leaf_types) |types_out| try types_out.append(allocator, bodies.pattern(record.pattern).ty);
+    }
+}
+
+/// A name an expression reads, and whether the read folds where no scope
+/// binds the name (`Reifier.unboundRef`): the checker resolved it to a
+/// constant, or to anything at a function type. A capture of a closure
+/// inside is a read that does not fold.
+const BoundSiteRead = struct {
+    binder: PatternBinderId,
+    folds: bool,
+};
+
+fn boundSiteReadFolds(sources: BoundLeafSources, lookup_ty: CheckedTypeId, resolved: ?ResolvedValueRefId) bool {
+    const id = resolved orelse return false;
+    switch (sources.value_refs.callableTarget(id).ref) {
+        .top_level_const, .imported_const, .selected_hoisted_const => return true,
+        .local_param, .local_value, .local_mutable_version, .pattern_binder, .local_proc, .top_level_proc, .imported_proc, .hosted_proc, .platform_required_declaration, .platform_required_checked_error, .platform_required_const, .platform_required_proc, .promoted_top_level_proc => {},
+    }
+    var ty = lookup_ty;
+    while (true) switch (sources.types.payload(ty)) {
+        .function => return true,
+        .alias => |alias| ty = alias.backing,
+        .field_kind => checkedArtifactInvariant("a field kind is a substitution entry, never part of a type", .{}),
+        .pending, .err, .flex, .rigid, .record, .tuple, .nominal, .empty_record, .tag_union, .empty_tag_union => return false,
+    };
+}
+
+/// Append the names `value` reads that neither `patterns` nor `value` binds,
+/// in source order. A closure inside reads its captures, and the walk does
+/// not enter its body.
+fn appendOuterReads(
+    allocator: Allocator,
+    sources: BoundLeafSources,
+    patterns: []const CheckedPatternId,
+    value: CheckedExprId,
+    out: *std.ArrayListUnmanaged(BoundSiteRead),
+) Allocator.Error!void {
+    const bodies = sources.bodies;
+    const plans = sources.plans;
+    const Work = union(enum) {
+        expr: CheckedExprId,
+        statement: CheckedStatementId,
+        pattern: CheckedPatternId,
+        interpolation_parts: CheckedExprId,
+    };
+    var work: std.ArrayListUnmanaged(Work) = .empty;
+    defer work.deinit(allocator);
+    var found: std.ArrayListUnmanaged(BoundSiteRead) = .empty;
+    defer found.deinit(allocator);
+    var bound = try std.DynamicBitSetUnmanaged.initEmpty(allocator, bodies.pattern_binders.items.len);
+    defer bound.deinit(allocator);
+    try work.append(allocator, .{ .expr = value });
+    for (patterns) |pattern| try work.append(allocator, .{ .pattern = pattern });
+    while (work.pop()) |item| {
+        // Children are pushed in reverse, so they pop in source order.
+        const children = work.items.len;
+        defer std.mem.reverse(Work, work.items[children..]);
+        switch (item) {
+            .pattern => |id| {
+                if (bodies.patternBinderForCheckedPattern(id)) |binder| bound.set(@backingInt(binder));
+                switch (bodies.pattern(id).data) {
+                    .assign => |binder| bound.set(@backingInt(binder)),
+                    .as => |as| {
+                        bound.set(@backingInt(as.binder));
+                        try work.append(allocator, .{ .pattern = as.pattern });
+                    },
+                    .applied_tag => |tag| for (tag.args) |arg| try work.append(allocator, .{ .pattern = arg }),
+                    .nominal => |nominal| try work.append(allocator, .{ .pattern = nominal.backing_pattern }),
+                    .record_destructure => |destructs| for (destructs) |destruct| switch (destruct.kind) {
+                        inline .required, .sub_pattern, .rest => |child| try work.append(allocator, .{ .pattern = child }),
+                    },
+                    .list => |list| {
+                        for (list.patterns) |child| try work.append(allocator, .{ .pattern = child });
+                        if (list.rest) |rest| if (rest.pattern) |child| try work.append(allocator, .{ .pattern = child });
+                    },
+                    .tuple => |items| for (items) |child| try work.append(allocator, .{ .pattern = child }),
+                    .str_interpolation => |str| for (str.steps) |step| {
+                        if (step.capture) |capture| try work.append(allocator, .{ .pattern = capture });
+                    },
+                    .numeral_literal => |literal| if (literal.guard) |guard| try work.append(allocator, .{ .expr = guard }),
+                    .str_literal => |literal| if (literal.guard) |guard| try work.append(allocator, .{ .expr = guard }),
+                    .pending, .underscore, .runtime_error => {},
+                }
+            },
+            .statement => |id| switch (bodies.statement(id).data) {
+                inline .decl, .var_ => |decl| {
+                    try work.append(allocator, .{ .pattern = decl.pattern });
+                    try work.append(allocator, .{ .expr = decl.expr });
+                },
+                .promoted_proc => |proc| try work.append(allocator, .{ .pattern = proc.pattern }),
+                .var_uninitialized => |var_| try work.append(allocator, .{ .pattern = var_.pattern }),
+                .reassign => |reassign| try work.append(allocator, .{ .expr = reassign.expr }),
+                inline .dbg, .expr, .expect => |child| try work.append(allocator, .{ .expr = child }),
+                .return_ => |ret| try work.append(allocator, .{ .expr = ret.expr }),
+                .for_ => |for_| {
+                    try work.append(allocator, .{ .pattern = for_.pattern });
+                    try work.append(allocator, .{ .expr = for_.expr });
+                    try work.append(allocator, .{ .expr = for_.body });
+                },
+                inline .while_, .infinite_loop, .breakable_loop => |loop| {
+                    try work.append(allocator, .{ .expr = loop.cond });
+                    try work.append(allocator, .{ .expr = loop.body });
+                },
+                .pending, .crash, .break_, .import_, .alias_decl, .where_alias_decl, .nominal_decl, .type_anno, .type_var_alias, .runtime_error => {},
+            },
+            .interpolation_parts => |id| {
+                const interpolation = bodies.expr(id).data.interpolation;
+                for (interpolation.segments) |segment| try work.append(allocator, .{ .expr = segment });
+                for (interpolation.values) |part| try work.append(allocator, .{ .expr = part });
+            },
+            .expr => |id| switch (bodies.expr(id).data) {
+                .lookup_local => |lookup| {
+                    const binder = bodies.patternBinderForCheckedPattern(lookup.pattern) orelse
+                        checkedArtifactInvariant("a local lookup names a pattern with no binder", .{});
+                    try found.append(allocator, .{ .binder = binder, .folds = boundSiteReadFolds(sources, bodies.expr(id).ty, lookup.resolved) });
+                },
+                .closure => |closure| for (closure.captures) |capture| {
+                    const binder = bodies.patternBinderForCheckedPattern(capture.pattern) orelse
+                        checkedArtifactInvariant("a capture names a pattern with no binder", .{});
+                    try found.append(allocator, .{ .binder = binder, .folds = false });
+                },
+                .str, .list, .tuple => |items| for (items) |child| try work.append(allocator, .{ .expr = child }),
+                .match_ => |match| {
+                    try work.append(allocator, .{ .expr = match.cond });
+                    for (match.branches) |branch| {
+                        for (branch.patternsSlice(bodies)) |branch_pattern| try work.append(allocator, .{ .pattern = branch_pattern.pattern });
+                        if (branch.guard) |guard| try work.append(allocator, .{ .expr = guard });
+                        try work.append(allocator, .{ .expr = branch.value });
+                    }
+                },
+                .if_ => |if_| {
+                    for (if_.branches) |branch| {
+                        try work.append(allocator, .{ .expr = branch.cond });
+                        try work.append(allocator, .{ .expr = branch.body });
+                    }
+                    try work.append(allocator, .{ .expr = if_.final_else });
+                },
+                .call => |call| {
+                    try work.append(allocator, .{ .expr = call.func });
+                    for (call.args) |arg| try work.append(allocator, .{ .expr = arg });
+                },
+                .record => |record| {
+                    if (record.ext) |ext| try work.append(allocator, .{ .expr = ext });
+                    for (record.fields) |field| try work.append(allocator, .{ .expr = field.value });
+                },
+                .block => |block| {
+                    for (block.statements) |statement| try work.append(allocator, .{ .statement = statement });
+                    try work.append(allocator, .{ .expr = block.final_expr });
+                },
+                .tag => |tag| for (tag.args) |arg| try work.append(allocator, .{ .expr = arg }),
+                .nominal => |nominal| try work.append(allocator, .{ .expr = nominal.backing_expr }),
+                .row_coerce => |coerce| try work.append(allocator, .{ .expr = coerce.value }),
+                .binop => |binop| {
+                    try work.append(allocator, .{ .expr = binop.lhs });
+                    try work.append(allocator, .{ .expr = binop.rhs });
+                },
+                .unary_minus, .unary_not, .dbg, .expect => |child| try work.append(allocator, .{ .expr = child }),
+                .expect_err => |expect_err| try work.append(allocator, .{ .expr = expect_err.expr }),
+                .field_access => |field| try work.append(allocator, .{ .expr = field.receiver }),
+                .structural_eq => |eq| {
+                    try work.append(allocator, .{ .expr = eq.lhs });
+                    try work.append(allocator, .{ .expr = eq.rhs });
+                },
+                .structural_hash => |hash| {
+                    try work.append(allocator, .{ .expr = hash.value });
+                    try work.append(allocator, .{ .expr = hash.hasher });
+                },
+                .tuple_access => |access| try work.append(allocator, .{ .expr = access.tuple }),
+                .return_ => |ret| try work.append(allocator, .{ .expr = ret.expr }),
+                .for_ => |for_| {
+                    try work.append(allocator, .{ .pattern = for_.pattern });
+                    try work.append(allocator, .{ .expr = for_.expr });
+                    try work.append(allocator, .{ .expr = for_.body });
+                },
+                .run_low_level => |run| for (run.args) |arg| try work.append(allocator, .{ .expr = arg }),
+                .interpolation => try work.append(allocator, .{ .interpolation_parts = id }),
+                inline .numeral, .str_from_quote => |literal| if (literal.plan) |plan_id| {
+                    for (plans.plans[@backingInt(plan_id)].argsSlice(plans)) |operand| switch (operand) {
+                        .checked_expr => |child| try work.append(allocator, .{ .expr = child }),
+                        .generated_interpolation_segments => |child| try work.append(allocator, .{ .interpolation_parts = child }),
+                        .generated_numeral, .generated_quote => {},
+                    };
+                },
+                .dispatch_call, .method_eq, .type_dispatch_call => |plan| {
+                    const plan_id = plan orelse checkedArtifactInvariant("a published dispatch expression has no plan", .{});
+                    for (plans.plans[@backingInt(plan_id)].argsSlice(plans)) |operand| switch (operand) {
+                        .checked_expr => |child| try work.append(allocator, .{ .expr = child }),
+                        .generated_interpolation_segments => |child| try work.append(allocator, .{ .interpolation_parts = child }),
+                        .generated_numeral, .generated_quote => {},
+                    };
+                },
+                // A lambda with no captures reads nothing around it.
+                .lambda, .hosted_lambda, .code_from_lambda, .str_segment, .bytes_literal, .lookup_external, .lookup_required, .empty_list, .empty_record, .zero_argument_tag, .runtime_error, .crash, .ellipsis, .anno_only, .break_, .pending => {},
+            },
+        }
+    }
+    for (found.items) |read| {
+        if (bound.isSet(@backingInt(read.binder))) continue;
+        try out.append(allocator, read);
+    }
+}
+
 /// Publish each scheme's literal requirements, the literal arguments of every
 /// edge, and the `literal_argument` roots this module's instantiations fix
 /// (design.md "Literal Arguments").
@@ -27444,6 +27843,7 @@ fn publishLiteralArgumentRoots(
     import_views: CheckedImportViews,
     top_level_procedure_bindings: *const TopLevelProcedureBindingTable,
     callable_eval_templates: *const CallableEvalTemplateTable,
+    requirement_uses: []const code_reifier.RequirementUse,
 ) Allocator.Error!void {
     const store = &checked_types.store;
     const template_count = templates.templates.items.len;
@@ -27536,6 +27936,79 @@ fn publishLiteralArgumentRoots(
             try entry.value_ptr.list.append(allocator, .{ .site = site, .ty = ty, .edge = .literal, .callee_requirement = 0 });
         }
     }
+    // Own bound requirements: a generic bound call is a requirement of the
+    // innermost scheme around it, as a literal is (design.md "Bound Instance
+    // Roots").
+    {
+        var template_vars: code_reifier.MentionVars = .empty;
+        defer template_vars.deinit(allocator);
+        var scope_vars: code_reifier.MentionVars = .empty;
+        defer scope_vars.deinit(allocator);
+        var seen: code_reifier.MentionVars = .empty;
+        defer seen.deinit(allocator);
+        var site_nodes = std.ArrayListUnmanaged(u32).empty;
+        defer site_nodes.deinit(allocator);
+        var leaves = std.ArrayListUnmanaged(PatternBinderId).empty;
+        defer leaves.deinit(allocator);
+        var elems = std.ArrayListUnmanaged(CheckedTypeId).empty;
+        defer elems.deinit(allocator);
+        const code_sites = module.moduleEnvConst().store.codeReificationSites();
+        for (template_iterator_refs.bound_call_spans, 0..) |span, template_index| {
+            if (span.len == 0) continue;
+            const template = templates.templates.items[template_index];
+            template_vars.clearRetainingCapacity();
+            for (templates.scheme_vars_pool[template.scheme_vars.start..][0..template.scheme_vars.len]) |variable| try template_vars.put(allocator, variable, {});
+            const calls = template_iterator_refs.bound_calls[span.start..][0..span.len];
+            const call_scopes = template_iterator_refs.bound_call_scopes[span.start..][0..span.len];
+            for (calls, call_scopes) |call, scope| {
+                const call_ty = bodies.expr(call).ty;
+                seen.clearRetainingCapacity();
+                if (!try code_reifier.typeMentionsIn(allocator, store.view(), call_ty, &template_vars, &seen)) continue;
+                // A call at the variables of a generalized local function has
+                // no closing use (`instance_in_local_generic`).
+                scope_vars.clearRetainingCapacity();
+                var current: ?DispatchScopeId = switch (scope) {
+                    .root => null,
+                    .generalized => |id| id,
+                };
+                while (current) |id| {
+                    const local_scope = &scopes[@backingInt(id)];
+                    for (templates.scopeSchemeVars(local_scope)) |variable| try scope_vars.put(allocator, variable, {});
+                    current = local_scope.parent;
+                }
+                seen.clearRetainingCapacity();
+                if (try code_reifier.typeMentionsIn(allocator, store.view(), call_ty, &scope_vars, &seen)) continue;
+
+                // The requirement's type: the call's, each leaf's, and the
+                // template's function type.
+                site_nodes.clearRetainingCapacity();
+                for (code_sites) |code_site| {
+                    if (code_site.bound_call == can.NodeStore.CodeReificationSite.no_bound_call) continue;
+                    if (bodies.exprIdAtRawNode(code_site.bound_call) != call) continue;
+                    try site_nodes.append(allocator, code_site.node_idx);
+                }
+                std.mem.sort(u32, site_nodes.items, {}, std.sort.asc(u32));
+                leaves.clearRetainingCapacity();
+                elems.clearRetainingCapacity();
+                try elems.append(allocator, call_ty);
+                for (site_nodes.items) |node_idx| {
+                    const site_expr = bodies.exprIdAtRawNode(node_idx) orelse continue;
+                    try appendBoundSiteLeaves(allocator, .{ .bodies = bodies, .plans = plans, .types = store, .value_refs = resolved_value_refs }, site_expr, &leaves, &elems);
+                }
+                try elems.append(allocator, template.checked_fn_root);
+                const ty = try appendExplicitCheckedTypePayload(allocator, names, store, .{ .tuple = try allocator.dupe(CheckedTypeId, elems.items) });
+
+                const key = scopeKeyOf(@intCast(template_index), scope);
+                const entry = try scope_states.getOrPut(allocator, key);
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                const site: LiteralSite = .{ .module = owner_artifact, .expr = call, .kind = .bound_call };
+                const slot = try entry.value_ptr.index.getOrPut(allocator, .{ .site = site, .ty = try literalRequirementTypeIdentity(store, &identity_orderer, ty) });
+                if (slot.found_existing) continue;
+                slot.value_ptr.* = @intCast(entry.value_ptr.list.items.len);
+                try entry.value_ptr.list.append(allocator, .{ .site = site, .ty = ty, .edge = .literal, .callee_requirement = 0 });
+            }
+        }
+    }
     {
         const span = template_iterator_refs.default_plan_refs;
         for (plans.template_refs[span.start..][0..span.len]) |plan_id| {
@@ -27558,6 +28031,8 @@ fn publishLiteralArgumentRoots(
         /// The scope the edge is in; null inside a defaulted field expression.
         scope: ?ScopeKey,
         owner_expr: CheckedExprId,
+        /// See `LiteralRequirement.dispatch_use`.
+        dispatch_use: ?CheckedExprId = null,
     };
     var edges = std.ArrayListUnmanaged(EdgeRec).empty;
     defer edges.deinit(allocator);
@@ -27597,6 +28072,10 @@ fn publishLiteralArgumentRoots(
                 seen.value_ptr.* = @intCast(self.edges.items.len);
                 try self.edges.append(self.allocator, edge);
                 try self.edge_templates.append(self.allocator, .empty);
+            } else if (edge.dispatch_use) |use| {
+                // A node reached first through evidence is a method call's
+                // own target too.
+                self.edges.items[seen.value_ptr.*].dispatch_use = use;
             }
             const template = (edge.scope orelse return).template orelse return;
             const list = &self.edge_templates.items[seen.value_ptr.*];
@@ -27606,9 +28085,16 @@ fn publishLiteralArgumentRoots(
         /// The dispatch edges of `node_id` and of every node its evidence
         /// reaches.
         fn nodes(self: *@This(), node_id: static_dispatch.EvidenceNodeId, scope: ?ScopeKey, owner_expr: CheckedExprId) Allocator.Error!void {
+            try self.nodesOf(node_id, scope, owner_expr, false);
+        }
+
+        /// `nodes`, where `dispatch` marks `node_id` as the direct target of
+        /// the method call `owner_expr`.
+        fn nodesOf(self: *@This(), node_id: static_dispatch.EvidenceNodeId, scope: ?ScopeKey, owner_expr: CheckedExprId, dispatch: bool) Allocator.Error!void {
             try self.stack.append(self.allocator, node_id);
             while (self.stack.pop()) |id| {
                 const node = self.plans.evidenceNode(id);
+                const dispatch_use: ?CheckedExprId = if (dispatch and id == node_id) owner_expr else null;
                 switch (node.target.kind) {
                     .procedure => |procedure| if (node.instantiation == .alias) {
                         // The method is bound to an exact procedure alias:
@@ -27621,6 +28107,7 @@ fn publishLiteralArgumentRoots(
                             .subst = subst,
                             .scope = scope,
                             .owner_expr = owner_expr,
+                            .dispatch_use = dispatch_use,
                         });
                     } else try self.add(.{
                         .key = .{ .node = id },
@@ -27628,6 +28115,7 @@ fn publishLiteralArgumentRoots(
                         .subst = self.plans.site_substitutions[node.subst.start..][0..node.subst.len],
                         .scope = scope,
                         .owner_expr = owner_expr,
+                        .dispatch_use = dispatch_use,
                     }),
                     // A method declared in a function body is called through
                     // its function value, whose scheme its construction or
@@ -27849,6 +28337,12 @@ fn publishLiteralArgumentRoots(
                 },
                 .hosted, .platform_required => return null,
             };
+            return self.templateOfBody(alias_view, body);
+        }
+
+        /// The template whose scheme a use of a binding with body `body`
+        /// instantiates, as `templateOfValueRef` reads it.
+        fn templateOfBody(self: *@This(), alias_view: ?ImportedModuleView, body: ProcedureBindingBody) ?canonical.ProcedureTemplateRef {
             return switch (body) {
                 .direct_template => |direct| switch (direct.template) {
                     .checked => |template| template,
@@ -27933,7 +28427,7 @@ fn publishLiteralArgumentRoots(
             const plan = plans.plans[@backingInt(plan_id)];
             const scope = scopeKeyOf(t, if (sealed) template_iterator_refs.plan_scopes[plan_start + i] else .root);
             switch (plan.resolution) {
-                .direct_closed, .direct_parametric => |direct| try collector.nodes(direct.evidence, scope, plan.expr),
+                .direct_closed, .direct_parametric => |direct| try collector.nodesOf(direct.evidence, scope, plan.expr, true),
                 // A generated codec's calls are edges of the scope that
                 // reaches the codec.
                 .structural => if (plan.generated_codec_derivation) |id| {
@@ -27960,7 +28454,7 @@ fn publishLiteralArgumentRoots(
         for (plans.template_refs[span.start..][0..span.len]) |plan_id| {
             const plan = plans.plans[@backingInt(plan_id)];
             switch (plan.resolution) {
-                .direct_closed, .direct_parametric => |direct| try collector.nodes(direct.evidence, null, plan.expr),
+                .direct_closed, .direct_parametric => |direct| try collector.nodesOf(direct.evidence, null, plan.expr, true),
                 .evidence_dependent, .checked_error, .@"unreachable", .structural, .direct_pending => {},
             }
         }
@@ -27974,6 +28468,27 @@ fn publishLiteralArgumentRoots(
             try collector.scopeSite(site, if (parent) |p| .{ .template = null, .scope = @backingInt(p) } else null);
         }
     }
+    // Each platform requirement with a sealed solution is a closing use of
+    // its app binding (design.md "Code Instance Tables"): an edge at the
+    // types the solution fixes, in no scheme of this module.
+    for (requirement_uses) |use| {
+        const sealed = use.sealed orelse continue;
+        const template_ref = collector.templateOfBody(null, top_level_procedure_bindings.get(use.binding.binding).body) orelse continue;
+        const template = templates.get(template_ref.template);
+        const vars = templates.scheme_vars_pool[template.scheme_vars.start..][0..template.scheme_vars.len];
+        const subst = try requirementSubstitution(allocator, names, store, vars, template.checked_fn_root, sealed);
+        collector.composed_substs.append(allocator, subst) catch |err| {
+            allocator.free(subst);
+            return err;
+        };
+        try collector.add(.{
+            .key = .{ .requirement = use.requires_idx },
+            .callee = .{ .template = template_ref },
+            .subst = subst,
+            .scope = null,
+            .owner_expr = use.body,
+        });
+    }
 
     // Instantiation of each edge's callee literal requirements, to a fixpoint.
     const ArgBuild = union(enum) { root: u32, forwarded: u32 };
@@ -27984,7 +28499,7 @@ fn publishLiteralArgumentRoots(
     }
     try edge_args.resize(allocator, edges.items.len);
     for (edge_args.items) |*list| list.* = .empty;
-    const NewRoot = struct { site: LiteralSite, ty: CheckedTypeId, edge: LiteralEdge, callee_requirement: u32, validate_only: bool, owner_expr: CheckedExprId };
+    const NewRoot = struct { site: LiteralSite, ty: CheckedTypeId, requirement_ty: CheckedTypeId, edge: LiteralEdge, callee_requirement: u32, validate_only: bool, owner_expr: CheckedExprId, dispatch_use: ?CheckedExprId };
     var new_roots = std.ArrayListUnmanaged(NewRoot).empty;
     defer new_roots.deinit(allocator);
     var root_index = std.AutoHashMapUnmanaged(ObligationKey, u32).empty;
@@ -28083,23 +28598,42 @@ fn publishLiteralArgumentRoots(
                 const projected = if (projector) |p| try p.project(obligation.ty) else obligation.ty;
                 const ty = if (substitution) |*s| try store.cloneCheckedTypeRootSubstituting(allocator, projected, s) else projected;
                 const key: ObligationKey = .{ .site = obligation.site, .ty = try literalRequirementTypeIdentity(store, &identity_orderer, ty) };
-                if (!store.rootContainsIdentityVariables(ty)) {
+                // A bound requirement is closed where it mentions no variable
+                // the edge's scheme quantifies, which is where the reifier
+                // closes a use: a variable no scheme quantifies is sealed
+                // where the program is lowered.
+                // A platform requirement's edge fixes every variable of its
+                // scheme: one its solution does not reach is sealed where
+                // the program is lowered.
+                const closed = edge.key == .requirement or switch (obligation.site.kind) {
+                    .numeral, .quote, .interpolation => !store.rootContainsIdentityVariables(ty),
+                    .bound_call => !try mentionsQuantifiedVars(allocator, store.view(), templates, edge.scope, ty),
+                };
+                if (closed) {
                     const slot = try root_index.getOrPut(allocator, key);
                     if (!slot.found_existing) {
                         slot.value_ptr.* = @intCast(new_roots.items.len);
+                        // A bound requirement's root holds the call's value.
+                        const value_ty = switch (obligation.site.kind) {
+                            .numeral, .quote, .interpolation => ty,
+                            .bound_call => boundRequirementCallType(store.view(), ty),
+                        };
                         try new_roots.append(allocator, .{
                             .site = obligation.site,
-                            .ty = ty,
+                            .ty = value_ty,
+                            .requirement_ty = ty,
                             .edge = edge.key,
                             .callee_requirement = j,
-                            .validate_only = !obligation.site.carriesValue() or try checkedTypeHoldsFunction(allocator, store.view(), owner_artifact, import_views, ty),
+                            .validate_only = !obligation.site.carriesValue() or try checkedTypeHoldsFunction(allocator, store.view(), owner_artifact, import_views, value_ty),
                             .owner_expr = edge.owner_expr,
+                            .dispatch_use = edge.dispatch_use,
                         });
                         if (base.dev_diagnostics.isSet(.trace_boxy_work)) {
                             const edge_id: u32 = switch (edge.key) {
                                 .literal => 0,
                                 .node => |id| @backingInt(id),
                                 .use => |use_expr| @backingInt(use_expr),
+                                .requirement => |requires_idx| requires_idx,
                             };
                             std.debug.print("literal-args: root {d}: literal expr {d} ({s}) at type root {d}, edge {s} {d} (owner expr {d}), callee obligation {d}\n", .{ new_roots.items.len - 1, @backingInt(obligation.site.expr), @tagName(obligation.site.kind), @backingInt(ty), @tagName(edge.key), edge_id, @backingInt(edge.owner_expr), j });
                         }
@@ -28112,7 +28646,7 @@ fn publishLiteralArgumentRoots(
                     const slot = try state.value_ptr.index.getOrPut(allocator, key);
                     if (!slot.found_existing) {
                         slot.value_ptr.* = @intCast(state.value_ptr.list.items.len);
-                        try state.value_ptr.list.append(allocator, .{ .site = obligation.site, .ty = ty, .edge = edge.key, .callee_requirement = j });
+                        try state.value_ptr.list.append(allocator, .{ .site = obligation.site, .ty = ty, .edge = edge.key, .callee_requirement = j, .dispatch_use = edge.dispatch_use });
                     }
                     try args.append(allocator, .{ .forwarded = slot.value_ptr.* });
                 }
@@ -28145,6 +28679,7 @@ fn publishLiteralArgumentRoots(
                         .literal => 0,
                         .node => |id| @backingInt(id),
                         .use => |use_expr| @backingInt(use_expr),
+                        .requirement => |requires_idx| requires_idx,
                     };
                     std.debug.print("literal-args: template {d} obligation {d}: literal expr {d} ({s}) at type root {d}, edge {s} {d}, callee obligation {d}\n", .{ template_index, index, @backingInt(obligation.site.expr), @tagName(obligation.site.kind), @backingInt(obligation.ty), @tagName(obligation.edge), edge_id, obligation.callee_requirement });
                 }
@@ -28181,8 +28716,10 @@ fn publishLiteralArgumentRoots(
                 .literal_argument = .{
                     .site = new_root.site,
                     .ty = new_root.ty,
+                    .requirement_ty = new_root.requirement_ty,
                     .edge = new_root.edge,
                     .callee_requirement = new_root.callee_requirement,
+                    .dispatch_use = new_root.dispatch_use,
                     .validate_only = new_root.validate_only,
                 },
             });
@@ -28230,8 +28767,14 @@ fn publishLiteralArgumentRoots(
             allocator.free(demand);
         }
         @memset(demand, .empty);
+        var requirement_edges = std.ArrayListUnmanaged(LiteralRequirementEdge).empty;
+        errdefer requirement_edges.deinit(allocator);
+        var requirement_subst_pool = std.ArrayListUnmanaged(CheckedTypeId).empty;
+        errdefer requirement_subst_pool.deinit(allocator);
         for (edges.items, edge_args.items, edge_templates.items) |edge, args, holders| {
-            if (args.items.len == 0) continue;
+            // A requirement's edge is recorded with no arguments too: its
+            // presence says the solution was sealed.
+            if (args.items.len == 0 and edge.key != .requirement) continue;
             const start: u32 = @intCast(pool.items.len);
             for (args.items) |arg| {
                 try pool.append(allocator, switch (arg) {
@@ -28246,22 +28789,38 @@ fn publishLiteralArgumentRoots(
                     }
                 }
             }
-            const entry: LiteralEdgeEntry = .{
-                .key = switch (edge.key) {
-                    .node => |id| @backingInt(id),
-                    .use => |expr| @backingInt(expr),
-                    .literal => checkedArtifactInvariant("a literal obligation's own literal is no edge", .{}),
-                },
-                .args = .{ .start = start, .len = @intCast(pool.items.len - start) },
-            };
+            const arg_span: artifact_serialize.Span = .{ .start = start, .len = @intCast(pool.items.len - start) };
             switch (edge.key) {
-                .node => try node_edges.append(allocator, entry),
-                .use => try use_edges.append(allocator, entry),
-                .literal => unreachable, // the entry's key switch above rejects literal keys
+                .node => |id| try node_edges.append(allocator, .{ .key = @backingInt(id), .args = arg_span }),
+                .use => |expr| try use_edges.append(allocator, .{ .key = @backingInt(expr), .args = arg_span }),
+                .requirement => |requires_idx| {
+                    const use = for (requirement_uses) |candidate| {
+                        if (candidate.requires_idx == requires_idx) break candidate;
+                    } else checkedArtifactInvariant("a requirement edge has no platform requirement use", .{});
+                    const subst_start: u32 = @intCast(requirement_subst_pool.items.len);
+                    try requirement_subst_pool.appendSlice(allocator, edge.subst);
+                    try requirement_edges.append(allocator, .{
+                        .requires_idx = requires_idx,
+                        .binding = use.binding.binding,
+                        .template = switch (edge.callee) {
+                            .template => |template_ref| template_ref,
+                            .scope => checkedArtifactInvariant("a requirement edge instantiates a local scope", .{}),
+                        },
+                        .subst = .{ .start = subst_start, .len = @intCast(edge.subst.len) },
+                        .evidence = use.evidence,
+                        .args = arg_span,
+                    });
+                },
+                .literal => checkedArtifactInvariant("a literal obligation's own literal is no edge", .{}),
             }
         }
         std.sort.pdq(LiteralEdgeEntry, node_edges.items, {}, literalEdgeEntryLessThan);
         std.sort.pdq(LiteralEdgeEntry, use_edges.items, {}, literalEdgeEntryLessThan);
+        std.sort.pdq(LiteralRequirementEdge, requirement_edges.items, {}, literalRequirementEdgeLessThan);
+        allocator.free(templates.literal_requirement_edges);
+        templates.literal_requirement_edges = try requirement_edges.toOwnedSlice(allocator);
+        allocator.free(templates.literal_requirement_subst_pool);
+        templates.literal_requirement_subst_pool = try requirement_subst_pool.toOwnedSlice(allocator);
         allocator.free(templates.literal_edge_args_pool);
         templates.literal_edge_args_pool = try pool.toOwnedSlice(allocator);
         allocator.free(templates.literal_node_edges);
@@ -28282,6 +28841,44 @@ fn publishLiteralArgumentRoots(
     }
 }
 
+/// The call's type in the type of a bound requirement: the tuple's first
+/// part (design.md "Bound Instance Roots").
+fn boundRequirementCallType(type_view: CheckedTypeStoreView, requirement_ty: CheckedTypeId) CheckedTypeId {
+    return switch (type_view.payload(requirement_ty)) {
+        .tuple => |parts| parts[0],
+        .pending, .field_kind, .err, .flex, .rigid, .alias, .function, .nominal, .record, .tag_union, .empty_record, .empty_tag_union => checkedArtifactInvariant("a bound requirement's type is not a tuple", .{}),
+    };
+}
+
+/// Whether `ty` mentions a variable the scheme `scope` of this module
+/// quantifies, or one of the generalized local scopes around it, read as
+/// `code_reifier.typeMentionsIn` reads it.
+fn mentionsQuantifiedVars(
+    allocator: Allocator,
+    type_view: CheckedTypeStoreView,
+    templates: *const CheckedProcedureTemplateTable,
+    scope: anytype,
+    ty: CheckedTypeId,
+) Allocator.Error!bool {
+    const key = scope orelse return false;
+    var vars: code_reifier.MentionVars = .empty;
+    defer vars.deinit(allocator);
+    if (key.template) |template_index| {
+        const template = templates.templates.items[template_index];
+        for (templates.scheme_vars_pool[template.scheme_vars.start..][0..template.scheme_vars.len]) |variable| try vars.put(allocator, variable, {});
+    }
+    var current: ?u32 = key.scope;
+    while (current) |id| {
+        const local_scope = &templates.dispatch_scopes[id];
+        for (templates.scopeSchemeVars(local_scope)) |variable| try vars.put(allocator, variable, {});
+        current = if (local_scope.parent) |parent| @backingInt(parent) else null;
+    }
+    if (vars.count() == 0) return false;
+    var seen: code_reifier.MentionVars = .empty;
+    defer seen.deinit(allocator);
+    return code_reifier.typeMentionsIn(allocator, type_view, ty, &vars, &seen);
+}
+
 /// Whether `items` holds `value`.
 fn sliceContains(comptime T: type, items: []const T, value: T) bool {
     for (items) |item| {
@@ -28300,6 +28897,14 @@ fn comptimeRootIdLessThan(_: void, a: ComptimeRootId, b: ComptimeRootId) bool {
 
 fn literalEdgeEntryOrder(entry: LiteralEdgeEntry, key: u32) std.math.Order {
     return std.math.order(entry.key, key);
+}
+
+fn literalRequirementEdgeLessThan(_: void, a: LiteralRequirementEdge, b: LiteralRequirementEdge) bool {
+    return a.requires_idx < b.requires_idx;
+}
+
+fn literalRequirementEdgeOrder(entry: LiteralRequirementEdge, key: u32) std.math.Order {
+    return std.math.order(entry.requires_idx, key);
 }
 
 /// Whether a value of the closed type `ty` holds a function: a function
@@ -28366,13 +28971,17 @@ fn checkedTypeHoldsFunction(
                         try pending.append(allocator, .{ .key = item.key, .types = item.types, .ty = declaration.backing });
                     },
                     .imported_box_payload_capability => |imported| {
-                        const declaring: CheckedTypeStoreView = if (imported.artifact.eql(own_key))
-                            own_types
-                        else
-                            (import_views.viewForKey(imported.artifact) orelse checkedArtifactInvariant("a nominal type's declaring module is not available", .{})).checked_types;
-                        const declaration = declaring.nominalDeclarationForPayload(nominal) orelse
-                            checkedArtifactInvariant("a box payload capability names a nominal its module does not declare", .{});
-                        try pending.append(allocator, .{ .key = imported.artifact.bytes, .types = declaring, .ty = declaration.backing });
+                        if (imported.artifact.eql(own_key)) {
+                            const declaration = own_types.nominalDeclarationForPayload(nominal) orelse
+                                checkedArtifactInvariant("a box payload capability names a nominal its module does not declare", .{});
+                            try pending.append(allocator, .{ .key = imported.artifact.bytes, .types = own_types, .ty = declaration.backing });
+                        } else {
+                            // The capability names its nominal by the
+                            // declaring module's key.
+                            const owner = ownerViewAndDeclForImportedNominal(import_views, imported.artifact, nominal.representation) orelse
+                                checkedArtifactInvariant("a nominal type's declaring module is not available", .{});
+                            try pending.append(allocator, .{ .key = imported.artifact.bytes, .types = owner.view.checked_types, .ty = owner.decl.backing });
+                        }
                     },
                     .opaque_without_backing => {},
                 }
@@ -29011,6 +29620,8 @@ fn platformRequiredValueUseWithRelation(
                 .checked_module = relation.app_value.artifact,
                 .span = relation.root_evidence,
             },
+            .instances = proc_use.instances,
+            .literal_edge = proc_use.literal_edge,
             .relation_template_closure = proc_use.relation_template_closure,
         } },
     };
@@ -29033,6 +29644,8 @@ fn copyPlatformRequiredValueUse(
             .procedure_value = .{
                 .procedure = proc_use.procedure,
                 .root_evidence = proc_use.root_evidence,
+                .instances = proc_use.instances,
+                .literal_edge = proc_use.literal_edge,
                 .relation_template_closure = try pool.appendBorrowed(allocator, proc_use.relation_template_closure),
             },
         },
@@ -29132,6 +29745,14 @@ fn buildPlatformAppRelationFromDeclarations(
                         .checked_module = app_artifact.key.digest(),
                         .span = solution.root_evidence,
                     },
+                    .instances = if (app_artifact.code_instances.requirementTable(solution.requires_idx)) |table| .{
+                        .checked_module = app_artifact.key.digest(),
+                        .table = table,
+                    } else null,
+                    .literal_edge = if (app_artifact.checked_procedure_templates.literalRequirementEdge(solution.requires_idx) != null) .{
+                        .checked_module = app_artifact.key.digest(),
+                        .requires_idx = solution.requires_idx,
+                    } else null,
                     .relation_template_closure = template_closure,
                 } };
             } else blk: {
@@ -29628,6 +30249,7 @@ pub fn pairCheckedPlatform(
             .exposure = .platform_required,
             .procedure_use = procedure.procedure,
             .root_evidence = procedure.root_evidence,
+            .instances = procedure.instances,
         }),
         .const_value => {},
     };
@@ -30561,17 +31183,20 @@ pub const LiteralSite = struct {
     /// body converts it through its dictionary.
     pub fn carriesValue(self: LiteralSite) bool {
         return switch (self.kind) {
-            .numeral, .quote => true,
+            .numeral, .quote, .bound_call => true,
             .interpolation => false,
         };
     }
 };
 
-/// The conversion a literal argument's literal dispatches.
+/// The conversion a literal argument's literal dispatches, or `bound_call`
+/// for a generic `Code.Bound` call (design.md "Bound Instance Roots"),
+/// which converts nothing: its root's value is the call's.
 pub const LiteralArgumentKind = enum(u8) {
     numeral,
     quote,
     interpolation,
+    bound_call,
 };
 
 /// One instantiation edge of a scheme inside a body: a dispatch edge (the
@@ -30579,11 +31204,33 @@ pub const LiteralArgumentKind = enum(u8) {
 /// or of a generalized local function (the use expression; for a local
 /// function whose scheme its construction fixes, the function expression).
 /// `literal` marks an literal requirement's own literal: no edge, the literal is in
-/// the scope's body.
+/// the scope's body. `requirement` is the closing use a platform requirement
+/// makes of its app binding, by requires index (an app module's
+/// `LiteralRequirementEdge`).
 pub const LiteralEdge = union(enum(u8)) {
     literal,
     node: static_dispatch.EvidenceNodeId,
     use: CheckedExprId,
+    requirement: u32,
+};
+
+/// The edge of a platform requirement in its app module: the app binding
+/// instantiated at the requirement's sealed solution (design.md "Code
+/// Instance Tables"). Only a requirement with a sealed solution has one.
+pub const LiteralRequirementEdge = struct {
+    requires_idx: u32,
+    binding: TopLevelProcedureBindingId,
+    /// The scheme the edge instantiates: the binding's template, or the
+    /// entry wrapper template of an exact alias binding.
+    template: canonical.ProcedureTemplateRef,
+    /// One type per scheme variable of `template`, in scheme order: a range
+    /// into `CheckedProcedureTemplateTable.literal_requirement_subst_pool`.
+    subst: artifact_serialize.Span,
+    /// The requirement's root evidence, a range of this module's
+    /// `evidence_refs`.
+    evidence: artifact_serialize.Span,
+    /// The literal arguments, a range into `literal_edge_args_pool`.
+    args: artifact_serialize.Span,
 };
 
 /// One literal a scheme's instantiation must convert: a literal of the
@@ -30601,6 +31248,10 @@ pub const LiteralRequirement = struct {
     ty: CheckedTypeId,
     edge: LiteralEdge,
     callee_requirement: u32,
+    /// For a dispatch edge that is a method call's own target, the call
+    /// expression: the use whose Code instance table the callee reads
+    /// (design.md "Bound Instance Roots"). Null for any other edge.
+    dispatch_use: ?CheckedExprId = null,
 };
 
 /// Where an edge's hidden literal argument comes from: a `literal_argument`
@@ -30628,9 +31279,16 @@ pub const LiteralEdgeEntry = struct {
 pub const LiteralArgumentRoot = struct {
     site: LiteralSite,
     ty: CheckedTypeId,
+    /// The requirement's closed type: `ty` for a literal; for a generic bound
+    /// call, the tuple of the call's type, its leaves' types and its
+    /// template's function type, whose first part is `ty` (design.md "Bound
+    /// Instance Roots").
+    requirement_ty: CheckedTypeId,
     edge: LiteralEdge,
     callee_requirement: u32,
     validate_only: bool,
+    /// See `LiteralRequirement.dispatch_use`.
+    dispatch_use: ?CheckedExprId = null,
 };
 
 /// The two literal-conversion root kinds, as a payload-free classification
@@ -31009,7 +31667,12 @@ fn publishCompileTimeRootRequestEligibility(
                 .def => |def_idx| module.def(def_idx).data.annotation != null,
                 .expr, .statement, .hoisted, .required_binding => false,
             },
-            .hoisted_constant,
+            .hoisted_constant => switch (root.source) {
+                .hoisted => |hoisted| root.source_pattern == null and
+                    code_roots.exprBindsInputs(module.moduleEnvConst(), hoisted.expr) and
+                    try boundCaptureEncodersAreConcrete(allocator, module, checked_types, hoisted.expr),
+                .def, .expr, .statement, .required_binding => false,
+            },
             .hoisted_validation,
             .expect,
             .numeral_conversion,
@@ -31027,6 +31690,28 @@ fn publishCompileTimeRootRequestEligibility(
         );
         root.request_eligibility = if (context_free) .eligible else .ineligible;
     }
+}
+
+/// Whether each `Code.Binds` encoder of the sites a call binds has a concrete
+/// type. An encoder whose type an enclosing generic function fixes needs that
+/// function's evidence, so the call's root is not context-free (the walk
+/// refuses such a site as `bound_instance`).
+fn boundCaptureEncodersAreConcrete(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    checked_types: *const CheckedTypePublication,
+    call: CIR.Expr.Idx,
+) Allocator.Error!bool {
+    const module_env = module.moduleEnvConst();
+    for (module_env.bound_capture_encodings.items.items) |encoding| {
+        const site = module_env.codeReificationSiteForNode(@fromBackingInt(encoding.site_node)) orelse
+            checkedArtifactInvariant("a bound capture encoding names no code reification site", .{});
+        if (site.bound_call != @backingInt(ModuleEnv.nodeIdxFrom(call))) continue;
+        const encoder = checked_types.rootForSourceVar(module, @fromBackingInt(encoding.encoder_var)) orelse
+            checkedArtifactInvariant("a bound capture's encoder type was not published", .{});
+        if (!try checkedTypeIsConcreteCompileTimeRoot(allocator, &checked_types.store, encoder)) return false;
+    }
+    return true;
 }
 
 /// Finds the procedure templates whose every call, in every program, comes
@@ -36622,6 +37307,14 @@ pub const CodeCutTable = struct {
 /// | `table_entries` | inventory entry of a table's template | a description node, or a nested table |
 /// | `reads` | literal root a description's walk met | `CheckedCodeRead` |
 /// | `uses` | closing use of this module, by expression | its table |
+/// | `bound_calls` | generic bound call of this module (R7), by inventory | the call and its span of `bound_sites` |
+/// | `bound_sites` | site of a bound call, in site order | its index in the template's inventory |
+/// | `bound_leaves` | leaf of a bound call, in leaf order | the binder of this module |
+/// | `captures` | capture read of a bound site at `Code.Binds` | binder, `capture_steps` span, encoder |
+/// | `table_bounds` | table, parallel to `tables` | its span of `bound_entries` |
+/// | `bound_entries` | bound call of a table's template, at the table's instance | its slots and each site's first slot |
+/// | `slots`, `slot_steps`, `slot_shapes` | input slot of a bound entry | `CheckedCodeSlot` and its pools |
+/// | `first_slots` | site of a bound entry, in site order | the number of slots of the earlier sites |
 pub const CodeInstanceTable = struct {
     pub const Span = extern struct { start: u32 = 0, len: u32 = 0 };
     pub const none: u32 = std.math.maxInt(u32);
@@ -36629,6 +37322,56 @@ pub const CodeInstanceTable = struct {
     pub const Inventory = extern struct {
         template: canonical.CheckedProcedureTemplateId,
         entries: Span,
+        /// The template's generic bound calls, a span of `bound_calls`.
+        bound_calls: Span = .{},
+    };
+    /// A call in a template whose result is a `Code.Bound`, whose type
+    /// mentions a variable of the template, and which reads nothing at run
+    /// time but through its sites (`CodeReificationSite.BoundReads`). Each
+    /// closing use binds its inputs at the use's instance (R7, design.md
+    /// "Bound Instance Roots").
+    pub const BoundCall = extern struct {
+        /// The call, in the template's module.
+        call: CheckedExprId,
+        /// The inventory index of each of its sites, in site order: a span
+        /// of `bound_sites`.
+        sites: Span,
+        /// The call's leaves (`appendBoundSiteLeaves`), a span of
+        /// `bound_leaves`: the order of the leaf parts of its requirement
+        /// type, and of the tuple its bound requirement takes.
+        leaves: Span = .{},
+    };
+    /// One capture read of a bound site at a `Code.Binds` position, which a
+    /// walk in any module reads to bind a slot whose type holds an opaque
+    /// type: the captured binder, its path (a span of `capture_steps`), and
+    /// the encoder the checker planned (rule "Bound Capture Encoding").
+    pub const CaptureRead = extern struct {
+        leaf: PatternBinderId,
+        steps: Span,
+        encoder: CheckedExprId,
+    };
+    /// A bound call of a table's template at the table's instance.
+    pub const BoundEntry = extern struct {
+        /// The call's index in the template module's `bound_calls`.
+        call: u32,
+        /// The call's input slots, in slot order: a span of `slots`.
+        slots: Span,
+        /// The first slot of each of its sites, in site order: a span of
+        /// `first_slots`.
+        first_slots: Span,
+    };
+    /// The bound entry a `literal_argument` root of a generic bound call
+    /// reads at its closing use: an index of `bound_entries` (design.md
+    /// "Bound Instance Roots").
+    pub const RootBound = extern struct {
+        root: ComptimeRootId,
+        entry: u32,
+    };
+    /// The closing use of a platform requirement: the requires index and its
+    /// table.
+    pub const RequirementUse = extern struct {
+        requires_idx: u32,
+        table: u32,
     };
     pub const EntryKind = enum(u32) { site, forward };
     pub const Entry = extern struct {
@@ -36677,6 +37420,11 @@ pub const CodeInstanceTable = struct {
         translator: u32,
         /// A template call's arguments, a span of `exprs`.
         args: Span,
+        /// The bound call (`bound_calls` index) whose inputs a closing use
+        /// binds at this site, or `none`.
+        bound: u32 = none,
+        /// The capture reads of a bound site, a span of `captures`.
+        captures: Span = .{},
     };
     /// The template a table serves: its module's key, and its id there,
     /// or `none` for a table whose use is refused.
@@ -36706,6 +37454,22 @@ pub const CodeInstanceTable = struct {
     table_entries: []const TableEntry = &.{},
     reads: []const CheckedCodeRead = &.{},
     uses: []const Indexed = &.{},
+    bound_calls: []const BoundCall = &.{},
+    bound_sites: []const u32 = &.{},
+    bound_leaves: []const PatternBinderId = &.{},
+    captures: []const CaptureRead = &.{},
+    capture_steps: []const CheckedCodeSlotStep = &.{},
+    table_bounds: []const Span = &.{},
+    bound_entries: []const BoundEntry = &.{},
+    slots: []const CheckedCodeSlot = &.{},
+    slot_steps: []const CheckedCodeSlotStep = &.{},
+    slot_shapes: []const u32 = &.{},
+    first_slots: []const u32 = &.{},
+    /// Sorted by root.
+    root_bounds: []const RootBound = &.{},
+    /// The table of each platform requirement's closing use, by requires
+    /// index, sorted (design.md "Code Instance Tables").
+    requirement_uses: []const RequirementUse = &.{},
 
     pub const Serialized = extern struct {
         inventories: SerializedSlice(Inventory) = .{},
@@ -36721,6 +37485,19 @@ pub const CodeInstanceTable = struct {
         table_entries: SerializedSlice(TableEntry) = .{},
         reads: SerializedSlice(CheckedCodeRead) = .{},
         uses: SerializedSlice(Indexed) = .{},
+        bound_calls: SerializedSlice(BoundCall) = .{},
+        bound_sites: SerializedSlice(u32) = .{},
+        bound_leaves: SerializedSlice(PatternBinderId) = .{},
+        captures: SerializedSlice(CaptureRead) = .{},
+        capture_steps: SerializedSlice(CheckedCodeSlotStep) = .{},
+        table_bounds: SerializedSlice(Span) = .{},
+        bound_entries: SerializedSlice(BoundEntry) = .{},
+        slots: SerializedSlice(CheckedCodeSlot) = .{},
+        slot_steps: SerializedSlice(CheckedCodeSlotStep) = .{},
+        slot_shapes: SerializedSlice(u32) = .{},
+        first_slots: SerializedSlice(u32) = .{},
+        root_bounds: SerializedSlice(RootBound) = .{},
+        requirement_uses: SerializedSlice(RequirementUse) = .{},
         const Serde = artifact_serialize.SliceStoreSerde(CodeInstanceTable, @This());
         pub const serialize = Serde.serialize;
         pub const deserialize = Serde.deserialize;
@@ -36771,6 +37548,78 @@ pub const CodeInstanceTable = struct {
         return self.table_entries[span.start..][0..span.len];
     }
 
+    /// The generic bound calls of the inventory of `template`.
+    pub fn boundCallsOf(self: *const CodeInstanceTable, template: canonical.CheckedProcedureTemplateId) []const BoundCall {
+        for (self.inventories) |inventory| {
+            if (inventory.template != template) continue;
+            return self.bound_calls[inventory.bound_calls.start..][0..inventory.bound_calls.len];
+        }
+        return &.{};
+    }
+
+    /// The index in `bound_calls` of the generic bound call at `expr`, or
+    /// null where `expr` is none.
+    pub fn boundCallIndex(self: *const CodeInstanceTable, expr: CheckedExprId) ?u32 {
+        for (self.bound_calls, 0..) |call, index| {
+            if (call.call == expr) return @intCast(index);
+        }
+        return null;
+    }
+
+    /// The inventory indices of the sites of `call`, in site order.
+    pub fn boundCallSites(self: *const CodeInstanceTable, call: BoundCall) []const u32 {
+        return self.bound_sites[call.sites.start..][0..call.sites.len];
+    }
+
+    /// The leaves of generic bound call `call_index` (`BoundCall.leaves`).
+    pub fn boundCallLeaves(self: *const CodeInstanceTable, call_index: u32) []const PatternBinderId {
+        const leaves = self.bound_calls[call_index].leaves;
+        return self.bound_leaves[leaves.start..][0..leaves.len];
+    }
+
+    /// The capture reads of a bound site's recipe.
+    pub fn recipeCaptures(self: *const CodeInstanceTable, recipe: Recipe) []const CaptureRead {
+        return self.captures[recipe.captures.start..][0..recipe.captures.len];
+    }
+
+    /// The path of one capture read.
+    pub fn captureSteps(self: *const CodeInstanceTable, read: CaptureRead) []const CheckedCodeSlotStep {
+        return self.capture_steps[read.steps.start..][0..read.steps.len];
+    }
+
+    /// The bound calls of table `table` at its instance.
+    pub fn tableBoundEntries(self: *const CodeInstanceTable, table: u32) []const BoundEntry {
+        const span = self.table_bounds[table];
+        return self.bound_entries[span.start..][0..span.len];
+    }
+
+    /// The input slots of one bound entry, in slot order.
+    pub fn boundEntrySlots(self: *const CodeInstanceTable, entry: BoundEntry) []const CheckedCodeSlot {
+        return self.slots[entry.slots.start..][0..entry.slots.len];
+    }
+
+    /// The bound entry the `literal_argument` root `root` of a generic bound
+    /// call reads, or null for a root with none.
+    pub fn rootBoundEntry(self: *const CodeInstanceTable, root: ComptimeRootId) ?BoundEntry {
+        const found = artifact_serialize.binarySearchByKey(RootBound, u32, self.root_bounds, @backingInt(root), rootBoundOrder) orelse return null;
+        return self.bound_entries[found.entry];
+    }
+
+    fn rootBoundOrder(item: RootBound, key: u32) std.math.Order {
+        return std.math.order(@backingInt(item.root), key);
+    }
+
+    /// The table of the closing use of platform requirement `requires_idx`,
+    /// or null where the app binding has no inventory.
+    pub fn requirementTable(self: *const CodeInstanceTable, requires_idx: u32) ?u32 {
+        const found = artifact_serialize.binarySearchByKey(RequirementUse, u32, self.requirement_uses, requires_idx, requirementUseOrder) orelse return null;
+        return found.table;
+    }
+
+    fn requirementUseOrder(item: RequirementUse, key: u32) std.math.Order {
+        return std.math.order(item.requires_idx, key);
+    }
+
     /// The literal roots of one table entry.
     pub fn entryReads(self: *const CodeInstanceTable, entry: TableEntry) []const CheckedCodeRead {
         return self.reads[entry.reads.start..][0..entry.reads.len];
@@ -36793,6 +37642,34 @@ pub const CodeInstanceTable = struct {
             if (entry.kind == .table and entry.value >= self.tables.len) return error.CorruptArtifact;
         }
         for (self.uses) |use| if (use.index >= self.tables.len) return error.CorruptArtifact;
+        for (self.inventories) |inventory| try checkSpan(inventory.bound_calls, self.bound_calls.len);
+        for (self.bound_calls) |call| {
+            try checkSpan(call.sites, self.bound_sites.len);
+            try checkSpan(call.leaves, self.bound_leaves.len);
+        }
+        for (self.recipes) |recipe| {
+            try checkSpan(recipe.captures, self.captures.len);
+            if (recipe.bound != none and recipe.bound >= self.bound_calls.len) return error.CorruptArtifact;
+        }
+        for (self.captures) |read| try checkSpan(read.steps, self.capture_steps.len);
+        if (self.table_bounds.len != self.tables.len) return error.CorruptArtifact;
+        for (self.table_bounds) |span| try checkSpan(span, self.bound_entries.len);
+        for (self.bound_entries) |entry| {
+            try checkSpan(entry.slots, self.slots.len);
+            try checkSpan(entry.first_slots, self.first_slots.len);
+        }
+        for (self.slots) |slot| {
+            try checkSpan(.{ .start = slot.steps_start, .len = slot.steps_len }, self.slot_steps.len);
+            try checkSpan(.{ .start = slot.shape_start, .len = slot.shape_len }, self.slot_shapes.len);
+        }
+        for (self.root_bounds, 0..) |bound, index| {
+            if (bound.entry >= self.bound_entries.len) return error.CorruptArtifact;
+            if (index != 0 and @backingInt(self.root_bounds[index - 1].root) >= @backingInt(bound.root)) return error.CorruptArtifact;
+        }
+        for (self.requirement_uses, 0..) |use, index| {
+            if (use.table >= self.tables.len) return error.CorruptArtifact;
+            if (index != 0 and self.requirement_uses[index - 1].requires_idx >= use.requires_idx) return error.CorruptArtifact;
+        }
     }
 
     fn checkSpan(span: Span, len: usize) error{CorruptArtifact}!void {
@@ -36813,6 +37690,19 @@ pub const CodeInstanceTable = struct {
         allocator.free(self.table_entries);
         allocator.free(self.reads);
         allocator.free(self.uses);
+        allocator.free(self.bound_calls);
+        allocator.free(self.bound_sites);
+        allocator.free(self.bound_leaves);
+        allocator.free(self.captures);
+        allocator.free(self.capture_steps);
+        allocator.free(self.table_bounds);
+        allocator.free(self.bound_entries);
+        allocator.free(self.slots);
+        allocator.free(self.slot_steps);
+        allocator.free(self.slot_shapes);
+        allocator.free(self.first_slots);
+        allocator.free(self.root_bounds);
+        allocator.free(self.requirement_uses);
         self.* = .{};
     }
 };
@@ -37347,8 +38237,8 @@ pub const CheckedModuleArtifact = struct {
             // code provenance table adds its ten slices, and the calls that
             // bind input slots four in the body store, and the roots a Code site
             // reads one. The code cut table adds its two slices, and the code
-            // instance table (D1) its thirteen.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 288);
+            // instance table (D1) its thirteen, and twelve for generic bound calls (R7), and one for platform requirement uses.
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 303);
         }
 
         /// Every field but the inline POD `key`, `source_hash`, and
@@ -41063,6 +41953,8 @@ fn reifyStagedCode(
     problem_store: ?*problem.Store,
     code_cuts: *CodeCutTable,
     code_instances: *CodeInstanceTable,
+    compile_time_roots: *const CompileTimeRootTable,
+    requirement_uses: []const code_reifier.RequirementUse,
 ) Allocator.Error!CodeProvenanceTable {
     var foreign = ForeignStagedLookup{
         .module = module,
@@ -41126,6 +42018,8 @@ fn reifyStagedCode(
         .site_types = type_publication,
         .code_cuts = code_cuts,
         .method_registry = method_registry,
+        .compile_time_roots = compile_time_roots.roots,
+        .requirement_uses = requirement_uses,
     }, module, module_env, foreign.lookup());
     defer sites.deinit(allocator);
 
@@ -41158,7 +42052,7 @@ fn reifyStagedCode(
             .rejected => |rejection| {
                 checked_bodies.refuseCodeReification(identity.call);
                 const problems = problem_store orelse continue;
-                try appendStagedCodeRefusal(allocator, problems, artifact_key, identity.region, rejection);
+                try appendStagedCodeRefusal(allocator, problems, artifact_key, identity.region, rejection, .none);
             },
             .not_a_definition, .not_nominal => {
                 checked_bodies.refuseCodeReification(identity.call);
@@ -41186,24 +42080,12 @@ fn reifyStagedCode(
         checked_bodies.refuseCodeReification(expr);
     }
 
-    for (sites.outcomes) |site| {
-        if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
-        switch (site.outcome) {
-            .reified => |node| try checked_bodies.attachCodeReification(allocator, site.expr, node, site.reads),
-            .rejected => |rejection| {
-                checked_bodies.refuseCodeReification(site.expr);
-                // The site is a runtime error either way. Only the report
-                // depends on the caller asking for compile-time problems.
-                const problems = problem_store orelse continue;
-                try appendStagedCodeRefusal(allocator, problems, artifact_key, site.region, rejection);
-            },
-        }
-    }
-
     // D1: an instance site has no description of its own; each closing use
     // describes it, and lowering reads the table in force. A closing use no
     // table serves is reported at the use and becomes a runtime error, so
-    // lowering never reaches its template without a table.
+    // lowering never reaches its template without a table. This comes
+    // before the outcomes: a site of a generic bound call is still refused
+    // there, and its recipe keeps the lambda all the same (R7).
     const recipes = @constCast(sites.instances.recipes);
     for (sites.instance_sites) |expr| {
         if (checked_bodies.codeSiteWasPoisoned(expr)) continue;
@@ -41213,12 +42095,26 @@ fn reifyStagedCode(
             if (recipe.kind == .inline_lambda and recipe.root_module == CodeInstanceTable.none and recipe.root_body == expr) recipe.root_body = lambda;
         }
     }
+    for (sites.outcomes) |site| {
+        if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
+        switch (site.outcome) {
+            .reified => |node| try checked_bodies.attachCodeReification(allocator, site.expr, node, site.reads),
+            .rejected => |rejection| {
+                checked_bodies.refuseCodeReification(site.expr);
+                // The site is a runtime error either way. Only the report
+                // depends on the caller asking for compile-time problems.
+                const problems = problem_store orelse continue;
+                try appendStagedCodeRefusal(allocator, problems, artifact_key, site.region, rejection, site.chain_stop);
+            },
+        }
+    }
+
     for (sites.refused_uses) |refused| {
         if (refused.statement) |statement_id| {
             try checked_bodies.refuseInstanceLoop(allocator, statement_id, refused.expr);
         } else checked_bodies.refuseInstanceUse(refused.expr);
         const problems = problem_store orelse continue;
-        try appendStagedCodeRefusal(allocator, problems, artifact_key, refused.region, refused.rejection);
+        try appendStagedCodeRefusal(allocator, problems, artifact_key, refused.region, refused.rejection, .none);
     }
     code_instances.* = sites.instances;
     sites.instances = .{};
@@ -41231,12 +42127,14 @@ fn reifyStagedCode(
 /// (D1). A refusal outside that region's own source (another module's, or a
 /// callee or constant this module defines elsewhere) is shown where it is,
 /// and the site or use is where the walk reached it from (F4, D9).
+/// `chain_stop` is what stopped the calls that carry a site no call binds.
 fn appendStagedCodeRefusal(
     allocator: Allocator,
     problems: *problem.Store,
     artifact_key: CheckedModuleArtifactKey,
     site_region: base.Region,
     rejection: code_reifier.Rejection,
+    chain_stop: can.NodeStore.CodeReificationSite.ChainStop,
 ) Allocator.Error!void {
     // The checker reported the error that stopped the walk.
     if (rejection.kind == .checking_error) return;
@@ -41248,6 +42146,7 @@ fn appendStagedCodeRefusal(
     const reached_place = foreign_place or !regionWithin(rejection.region, site_region);
     _ = try problems.appendProblem(.{ .staged_code = .{
         .reason = stagedCodeReason(rejection.kind),
+        .chain_stop = if (rejection.kind == .capture) chain_stop else .none,
         .region = if (reached_place) site_region else rejection.region,
         .foreign = if (reached_place) try foreignRefusalPlace(problems, rejection.module.env, rejection.region) else null,
         .detail = detail,
@@ -41321,13 +42220,13 @@ fn appendBoundCaptureExprs(
 }
 
 /// Record, on each call whose result is a `Code.Bound`, the input slots of
-/// the one site it holds (roc-reify-proposal.md section 10.1), and refuse a
+/// the sites it binds (roc-reify-proposal.md section 10.1), and refuse each
 /// site whose slots the call cannot supply.
 ///
 /// The program reads the call's compile-time value with the slot values
 /// added, so the call has to be a compile-time root of its own whose type
-/// the call fixes, and it has to hold one site, because two sites have no
-/// one slot order.
+/// the call fixes. The call's slots are the slots of its sites in site
+/// order, so a refused site refuses the call.
 fn bindCodeInputs(
     allocator: Allocator,
     type_publication: *const CheckedTypePublication,
@@ -41337,35 +42236,95 @@ fn bindCodeInputs(
     problem_store: ?*problem.Store,
 ) Allocator.Error!void {
     defer checked_bodies.sortCodeBindings();
-    for (outcomes) |site| {
-        const call_node = site.bound_call orelse continue;
-        if (site.slots.len == 0) continue;
-        if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
+    // The slots of one call are the slots of its sites, concatenated in site
+    // order (the order of the site table, which the walk uses too).
+    var slots = std.ArrayList(code_reifier.SlotSource).empty;
+    defer slots.deinit(allocator);
+    for (outcomes, 0..) |first, first_index| {
+        const call_node = first.bound_call orelse continue;
+        // The first site of a call binds the whole group.
+        const group_start = for (outcomes[0..first_index]) |earlier| {
+            if (earlier.bound_call == call_node) break false;
+        } else true;
+        if (!group_start) continue;
+        slots.clearRetainingCapacity();
+        var any_refused = false;
+        for (outcomes[first_index..]) |site| {
+            if (site.bound_call != call_node) continue;
+            if (checked_bodies.codeSiteWasPoisoned(site.expr)) any_refused = true;
+            try slots.appendSlice(allocator, site.slots);
+        }
+        if (slots.items.len == 0) continue;
         const detail: []const u8 = refused: {
-            var sharing: usize = 0;
-            for (outcomes) |other| {
-                if (other.bound_call == call_node) sharing += 1;
-            }
-            if (sharing != 1) break :refused "a call that binds the inputs of two sites";
+            if (any_refused) break :refused "the call also binds the inputs of a site that was refused";
             const call = checked_bodies.exprIdAtRawNode(call_node) orelse
                 checkedArtifactInvariant("a call that binds input slots has no checked expression", .{});
             const entry = hoisted_constants.lookupByExpr(call) orelse
-                break :refused "a translator that receives captured inputs runs while the compiler runs, so the other arguments of its call must be fixed then";
+                break :refused "a translator that receives captured inputs runs while the compiler runs, and so does each call of its chain, so each argument of those calls outside a lambda must be fixed then. Read a value known only when the program runs in a lambda at a `Code` place instead, such as `|_| n`: the value is then an input slot";
             std.debug.assert(entry.pattern == null);
-            if (type_publication.store.rootContainsIdentityVariables(checked_bodies.expr(call).ty))
-                break :refused "a translator result whose type the call does not fix";
-            try checked_bodies.attachCodeBinding(allocator, call, site.slots);
+            if (builtin.mode == .debug) std.debug.assert(try boundRootTypeIsFixed(allocator, &type_publication.store, checked_bodies.expr(call).ty));
+            try checked_bodies.attachCodeBinding(allocator, call, slots.items);
             continue;
         };
-        checked_bodies.refuseCodeReification(site.expr);
-        const problems = problem_store orelse continue;
-        _ = try problems.appendProblem(.{ .staged_code = .{
-            .reason = .input_not_bound,
-            .region = checked_bodies.expr(site.expr).source_region,
-            .detail = try problems.putExtraString(detail),
-            .open = null,
-        } });
+        // Each site of the call that reads a slot is refused.
+        for (outcomes[first_index..]) |site| {
+            if (site.bound_call != call_node or site.slots.len == 0) continue;
+            if (checked_bodies.codeSiteWasPoisoned(site.expr)) continue;
+            checked_bodies.refuseCodeReification(site.expr);
+            const problems = problem_store orelse continue;
+            _ = try problems.appendProblem(.{ .staged_code = .{
+                .reason = .input_not_bound,
+                .region = checked_bodies.expr(site.expr).source_region,
+                .detail = try problems.putExtraString(detail),
+                .open = null,
+            } });
+        }
     }
+}
+
+/// Whether the type of a call that binds input slots holds no type variable.
+/// Hoisting keeps only a root whose type is concrete, so this is a debug
+/// check. The kind variable of an undetermined record field is no type
+/// variable here: the walk refuses a site whose type mentions a kind
+/// variable of its template (an instance site), and any other undetermined
+/// kind is `required` where the root is evaluated and where the program
+/// reads it, as Monotype's relation freeze commits it.
+fn boundRootTypeIsFixed(allocator: Allocator, store: *const CheckedTypeStore, root: CheckedTypeId) Allocator.Error!bool {
+    var visited = collections.DenseMap(CheckedTypeId, void).init(allocator);
+    defer visited.deinit();
+    var work = std.ArrayList(CheckedTypeId).empty;
+    defer work.deinit(allocator);
+    try work.append(allocator, root);
+    while (work.pop()) |id| {
+        if (!store.rootContainsIdentityVariables(id)) continue;
+        if ((try visited.getOrPut(id)).found_existing) continue;
+        switch (store.payload(id)) {
+            .pending, .flex, .rigid => return false,
+            .field_kind, .err, .empty_record, .empty_tag_union => {},
+            .alias => |alias| {
+                try work.append(allocator, alias.backing);
+                try work.appendSlice(allocator, alias.args);
+            },
+            .record => |record| {
+                for (record.fields) |field| try work.append(allocator, field.ty);
+                try work.append(allocator, record.ext);
+            },
+            .tuple => |items| try work.appendSlice(allocator, items),
+            .nominal => |nominal| {
+                try work.appendSlice(allocator, nominal.args);
+                try work.appendSlice(allocator, nominal.padding_field_types);
+            },
+            .function => |function| {
+                try work.appendSlice(allocator, function.args);
+                try work.append(allocator, function.ret);
+            },
+            .tag_union => |tag_union| {
+                for (tag_union.tags) |tag| try work.appendSlice(allocator, tag.argsSlice(store));
+                try work.append(allocator, tag_union.ext);
+            },
+        }
+    }
+    return true;
 }
 
 /// What a refusal at a type variable names: the variable, as its annotation
@@ -41397,6 +42356,221 @@ fn openVariableDetail(
     return problems.putExtraString(text.items);
 }
 
+/// Each successful function requirement of the platform this app module
+/// satisfies, as a closing use of its app binding: the requirement's solution
+/// with each free variable sealed as lowering seals it (design.md "Code
+/// Instance Tables").
+fn platformRequirementClosingUses(
+    allocator: Allocator,
+    module: TypedCIR.Module,
+    names: *canonical.CanonicalNameStore,
+    import_views: CheckedImportViews,
+    store: *CheckedTypeStore,
+    bodies: *const CheckedBodyStore,
+    top_level_values: *const TopLevelValueTable,
+    inputs: []const requirement_solution.SolutionInput,
+    root_evidence: []const artifact_serialize.Span,
+) Allocator.Error![]code_reifier.RequirementUse {
+    var uses = std.ArrayList(code_reifier.RequirementUse).empty;
+    errdefer uses.deinit(allocator);
+    if (inputs.len == 0) return uses.toOwnedSlice(allocator);
+    var active = try CheckedSourceTypeRoots.init(allocator, module);
+    defer active.deinit();
+    const env = module.moduleEnvConst();
+    for (inputs, root_evidence) |input, evidence| {
+        if (input.outcome != .success or !input.is_function) continue;
+        const top_level = top_level_values.lookupByDef(input.def) orelse
+            checkedArtifactInvariant("platform requirement solution references a def with no published top-level value", .{});
+        const binding = switch (top_level.value) {
+            .procedure_binding => |binding| binding,
+            .const_ref => checkedArtifactInvariant("a function requirement's app value is a constant", .{}),
+        };
+        const binder = bodies.patternBinderForCheckedPattern(top_level.pattern) orelse
+            checkedArtifactInvariant("a platform requirement's app binding binds no name", .{});
+        const body = bodies.exprIdForSource(env.store.getDef(input.def).expr) orelse
+            checkedArtifactInvariant("a platform requirement's app binding has no checked definition", .{});
+        const solved = try appendCheckedTypeRoot(allocator, module, names, import_views, store, &active, input.solved_var);
+        try uses.append(allocator, .{
+            .requires_idx = input.requires_idx,
+            .binding = .{ .artifact = import_views.current_owner, .binding = binding },
+            .binder = binder,
+            .body = body,
+            .sealed = try sealFreeVariables(allocator, names, store, solved),
+            .evidence = evidence,
+        });
+    }
+    return uses.toOwnedSlice(allocator);
+}
+
+/// `ty` with each free variable replaced by the type lowering seals it to
+/// (`sealedVariable`), or null where a free variable has a constraint that
+/// sealing would ignore.
+fn sealFreeVariables(
+    allocator: Allocator,
+    names: *canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    ty: CheckedTypeId,
+) Allocator.Error!?CheckedTypeId {
+    var seen: code_reifier.MentionVars = .empty;
+    defer seen.deinit(allocator);
+    var work = std.ArrayListUnmanaged(CheckedTypeId).empty;
+    defer work.deinit(allocator);
+    var formals = std.ArrayListUnmanaged(CheckedTypeId).empty;
+    defer formals.deinit(allocator);
+    var actuals = std.ArrayListUnmanaged(CheckedTypeId).empty;
+    defer actuals.deinit(allocator);
+    try work.append(allocator, ty);
+    while (work.pop()) |id| {
+        if ((try seen.getOrPut(allocator, id)).found_existing) continue;
+        switch (store.view().payload(id)) {
+            .flex, .rigid => |variable| {
+                if (variable.constraints.len != 0 and !variable.row_default_discharges_constraints) return null;
+                try formals.append(allocator, id);
+                try actuals.append(allocator, switch (sealedVariable(variable)) {
+                    .empty_record => try store.ensureEmptyRecordRoot(allocator, names),
+                    .empty_tag_union => try appendExplicitCheckedTypePayload(allocator, names, store, .empty_tag_union),
+                    .dec, .str => checkedArtifactInvariant("a platform requirement's solution has a free numeric variable", .{}),
+                });
+            },
+            .alias => |alias| try work.append(allocator, alias.backing),
+            .function => |fn_ty| {
+                try work.appendSlice(allocator, fn_ty.args);
+                try work.append(allocator, fn_ty.ret);
+            },
+            .nominal => |nominal| try work.appendSlice(allocator, nominal.args),
+            .tuple => |parts| try work.appendSlice(allocator, parts),
+            .record => |record| {
+                for (record.fields) |field| try work.append(allocator, field.ty);
+                try work.append(allocator, record.ext);
+            },
+            .tag_union => |tag_union| {
+                for (tag_union.tags) |tag| try work.appendSlice(allocator, tag.argsSlice(store.view()));
+                try work.append(allocator, tag_union.ext);
+            },
+            .empty_record, .empty_tag_union, .pending, .err, .field_kind => {},
+        }
+    }
+    if (formals.items.len == 0) return ty;
+    var substitution = CheckedTypeSubstitution.init(allocator, names, store, formals.items, actuals.items);
+    defer substitution.deinit();
+    return try store.cloneCheckedTypeRootSubstituting(allocator, ty, &substitution);
+}
+
+/// The types a platform requirement's sealed solution `actual` fixes the
+/// variables `vars` of a scheme whose function type is `pattern` to, one per
+/// variable in order (design.md "Code Instance Tables"). A row variable
+/// takes the rest of the row it stands for. A variable the solution does not
+/// reach (one only a `where` clause names) stays itself, and lowering seals
+/// it as it seals every variable of the use.
+fn requirementSubstitution(
+    allocator: Allocator,
+    names: *canonical.CanonicalNameStore,
+    store: *CheckedTypeStore,
+    vars: []const CheckedTypeId,
+    pattern: CheckedTypeId,
+    actual: CheckedTypeId,
+) Allocator.Error![]CheckedTypeId {
+    const found = try allocator.alloc(?CheckedTypeId, vars.len);
+    defer allocator.free(found);
+    @memset(found, null);
+    const Pair = struct { pattern: CheckedTypeId, actual: CheckedTypeId };
+    var work = std.ArrayListUnmanaged(Pair).empty;
+    defer work.deinit(allocator);
+    try work.append(allocator, .{ .pattern = pattern, .actual = actual });
+    while (work.pop()) |pair| {
+        const var_index: ?usize = for (vars, 0..) |candidate, i| {
+            if (candidate == pair.pattern) break i;
+        } else null;
+        if (var_index) |index| {
+            if (found[index] == null) found[index] = pair.actual;
+            continue;
+        }
+        const actual_payload = store.view().payload(pair.actual);
+        if (actual_payload == .alias) {
+            try work.append(allocator, .{ .pattern = pair.pattern, .actual = actual_payload.alias.backing });
+            continue;
+        }
+        switch (store.view().payload(pair.pattern)) {
+            .alias => |alias| try work.append(allocator, .{ .pattern = alias.backing, .actual = pair.actual }),
+            .function => |fn_ty| switch (actual_payload) {
+                .function => |actual_fn| {
+                    if (actual_fn.args.len != fn_ty.args.len) continue;
+                    for (fn_ty.args, actual_fn.args) |a, b| try work.append(allocator, .{ .pattern = a, .actual = b });
+                    try work.append(allocator, .{ .pattern = fn_ty.ret, .actual = actual_fn.ret });
+                },
+                .pending, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .empty_record, .tag_union, .empty_tag_union, .field_kind => {},
+            },
+            .nominal => |nominal| switch (actual_payload) {
+                .nominal => |actual_nominal| {
+                    if (actual_nominal.args.len != nominal.args.len) continue;
+                    for (nominal.args, actual_nominal.args) |a, b| try work.append(allocator, .{ .pattern = a, .actual = b });
+                },
+                .pending, .err, .flex, .rigid, .alias, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union, .field_kind => {},
+            },
+            .tuple => |parts| switch (actual_payload) {
+                .tuple => |actual_parts| {
+                    if (actual_parts.len != parts.len) continue;
+                    for (parts, actual_parts) |a, b| try work.append(allocator, .{ .pattern = a, .actual = b });
+                },
+                .pending, .err, .flex, .rigid, .alias, .record, .nominal, .function, .empty_record, .tag_union, .empty_tag_union, .field_kind => {},
+            },
+            .record => |record| {
+                const actual_fields: []const CheckedRecordField, const actual_ext: CheckedTypeId = switch (actual_payload) {
+                    .record => |actual_record| .{ actual_record.fields, actual_record.ext },
+                    .empty_record => .{ &.{}, pair.actual },
+                    .pending, .err, .flex, .rigid, .alias, .tuple, .nominal, .function, .tag_union, .empty_tag_union, .field_kind => continue,
+                };
+                var rest = std.ArrayListUnmanaged(CheckedRecordField).empty;
+                defer rest.deinit(allocator);
+                for (actual_fields) |field| {
+                    for (record.fields) |own| {
+                        if (own.name == field.name) {
+                            try work.append(allocator, .{ .pattern = own.ty, .actual = field.ty });
+                            break;
+                        }
+                    } else try rest.append(allocator, field);
+                }
+                const tail = if (rest.items.len == 0) actual_ext else try appendExplicitCheckedTypePayload(allocator, names, store, .{ .record = .{
+                    .fields = try allocator.dupe(CheckedRecordField, rest.items),
+                    .ext = actual_ext,
+                } });
+                try work.append(allocator, .{ .pattern = record.ext, .actual = tail });
+            },
+            .tag_union => |tag_union| {
+                const actual_tags: []const CheckedTag, const actual_ext: CheckedTypeId = switch (actual_payload) {
+                    .tag_union => |actual_union| .{ actual_union.tags, actual_union.ext },
+                    .empty_tag_union => .{ &.{}, pair.actual },
+                    .pending, .err, .flex, .rigid, .alias, .tuple, .nominal, .function, .record, .empty_record, .field_kind => continue,
+                };
+                var rest = std.ArrayListUnmanaged(CheckedTagBuild).empty;
+                defer rest.deinit(allocator);
+                errdefer for (rest.items) |tag| allocator.free(tag.args);
+                for (actual_tags) |tag| {
+                    const actual_args = tag.argsSlice(store.view());
+                    for (tag_union.tags) |own| {
+                        if (own.name == tag.name) {
+                            const own_args = own.argsSlice(store.view());
+                            if (own_args.len == actual_args.len) {
+                                for (own_args, actual_args) |a, b| try work.append(allocator, .{ .pattern = a, .actual = b });
+                            }
+                            break;
+                        }
+                    } else try rest.append(allocator, .{ .name = tag.name, .args = try allocator.dupe(CheckedTypeId, actual_args) });
+                }
+                const tail = if (rest.items.len == 0) actual_ext else try appendExplicitCheckedTypePayload(allocator, names, store, .{ .tag_union = .{
+                    .tags = try rest.toOwnedSlice(allocator),
+                    .ext = actual_ext,
+                } });
+                try work.append(allocator, .{ .pattern = tag_union.ext, .actual = tail });
+            },
+            .flex, .rigid, .empty_record, .empty_tag_union, .pending, .err, .field_kind => {},
+        }
+    }
+    const subst = try allocator.alloc(CheckedTypeId, vars.len);
+    for (subst, found, vars) |*out, maybe, variable| out.* = maybe orelse variable;
+    return subst;
+}
+
 /// The reported reason for a walk that stopped.
 fn stagedCodeReason(kind: code_reifier.Rejection.Kind) problem.StagedCode.Reason {
     return switch (kind) {
@@ -41414,6 +42588,7 @@ fn stagedCodeReason(kind: code_reifier.Rejection.Kind) problem.StagedCode.Reason
         .instance_through_evidence => .instance_through_evidence,
         .instance_in_local_generic => .instance_in_local_generic,
         .implicit_method_instance => .instance_in_implicit_method,
+        .requirement_constrained_variable => .requirement_constrained_variable,
         .type_id_not_nominal => .type_id_not_nominal,
         .ty_of_not_closed => .ty_of_not_closed,
         .checking_error => unreachable, // appendStagedCodeRefusal reports no checking error
@@ -41812,6 +42987,20 @@ pub fn publishFromTypedModule(
         &entry_wrappers,
         &checked_procedure_templates,
     );
+    // Each successful function requirement of the platform is a closing use
+    // of its app binding (design.md "Code Instance Tables").
+    const requirement_uses = try platformRequirementClosingUses(
+        allocator,
+        module,
+        &canonical_names,
+        .{ .current_owner = artifact_key.digest(), .direct = inputs.imports, .available = inputs.available_artifacts, .relations = inputs.relation_artifacts },
+        &checked_type_publication.store,
+        checked_bodies,
+        &top_level_values,
+        inputs.platform_requirement_solutions,
+        platform_requirement_root_evidence,
+    );
+    defer allocator.free(requirement_uses);
     try publishLiteralArgumentRoots(
         allocator,
         module,
@@ -41828,6 +43017,7 @@ pub fn publishFromTypedModule(
         .{ .current_owner = artifact_key.digest(), .direct = inputs.imports, .available = inputs.available_artifacts, .relations = inputs.relation_artifacts },
         &top_level_procedure_bindings,
         &callable_eval_templates,
+        requirement_uses,
     );
     try classifyTemplateDispatchPlanRefs(
         allocator,
@@ -42027,6 +43217,8 @@ pub fn publishFromTypedModule(
         inputs.problem_store,
         &code_cuts,
         &code_instances,
+        &compile_time_roots,
+        requirement_uses,
     );
     errdefer code_provenance.deinit(allocator);
 
@@ -43283,6 +44475,7 @@ fn isSliceField(comptime FT: type) bool {
 /// every field is byte-identical (incl. padding) after relocation. Validates the
 /// per-field serialize/deserialize wiring for any POD element shape.
 fn expectAllSliceStoreRoundTrips(comptime Store: type) artifact_serialize.TestError!void {
+    @setEvalBranchQuota(4000);
     const gpa = std.testing.allocator;
     var store: Store = .{};
     inline for (@typeInfo(Store).@"struct".field_names) |field_name| {
@@ -44552,8 +45745,8 @@ test "SERIALIZED_VERSION_HASH golden value" {
     // `serialized_layout_version` only for semantic changes the structural hash
     // cannot observe, as documented at that discriminant.
     const golden: [32]u8 = .{
-        0x5C, 0x7C, 0xAC, 0x02, 0x4C, 0xDF, 0xB9, 0x7C, 0x05, 0x37, 0x3E, 0x8D, 0x5B, 0xB2, 0x9C, 0x8B,
-        0x48, 0x88, 0x03, 0xE2, 0x0E, 0x69, 0x95, 0xCD, 0x04, 0x79, 0x6C, 0x60, 0xB3, 0x29, 0xFF, 0x9A,
+        0x37, 0xB8, 0x88, 0xBC, 0x74, 0xF1, 0xFD, 0x6D, 0x9F, 0x5D, 0x43, 0xAF, 0x5D, 0xA5, 0xC4, 0x3A,
+        0xF1, 0x26, 0xA3, 0x62, 0xAC, 0x05, 0x24, 0x53, 0xDF, 0xF0, 0x0F, 0xC4, 0xCF, 0x1E, 0x3E, 0x09,
     };
     try std.testing.expectEqualSlices(u8, &golden, &CheckedModuleArtifact.SERIALIZED_VERSION_HASH);
 }

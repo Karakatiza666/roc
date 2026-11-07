@@ -1388,7 +1388,7 @@ pub fn parseProgram(
             // only through its root.
             for (selected_hoisted_roots) |root| {
                 if (main_checked.checker.selectedHoistedRootIsTopLevel(root) or
-                    main_checked.checker.selectedHoistedRootBindsCodeInputs(root))
+                    check.CodeRoots.rootBindsInputs(main_checked.checker.cir, root))
                 {
                     try top_level_hoisted_roots.append(allocator, root);
                 }

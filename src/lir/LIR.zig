@@ -459,6 +459,10 @@ pub const LiteralRejectionKind = enum(u8) {
     /// An interpolated string literal, whose conversion sees only the
     /// literal's segments.
     interpolation,
+    /// No literal: a generic bound call, which a specialization makes a
+    /// compile-time root of its program (design.md "Bound Instance Roots").
+    /// No conversion rejects it.
+    bound_call,
 };
 
 /// The source literal a literal-rejection crash reports: the checked

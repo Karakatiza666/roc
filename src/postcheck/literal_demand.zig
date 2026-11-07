@@ -29,7 +29,8 @@
 //!   evaluation of this compilation requests and whose payload is not stored,
 //!   each of which registers a literal root whatever the instance; or a body
 //!   no checked data bounds, such as a read of a constant whose computation
-//!   lowers in place;
+//!   lowers in place; or a generic bound call, which registers a root of the
+//!   program at each specialization;
 //! - *dependent numeral* (*quote*): a numeral (quote) whose conversion depends
 //!   on its instance, which registers a literal root only at a custom numeral
 //!   (quote) type;
@@ -448,6 +449,9 @@ const Builder = struct {
     fn addTemplate(self: *Builder, view: checked.ImportedModuleView, node: NodeId, template: checked.CheckedProcedureTemplate) Allocator.Error!void {
         if (template.target == .hosted) return;
         try self.addTypeEdge(node, view, template.checked_fn_root);
+        // A generic bound call is a compile-time root of the program at each
+        // specialization (design.md "Bound Instance Roots").
+        if (view.code_instances.boundCallsOf(template.template_id).len != 0) self.markOwn(node, .{ .strict = true });
 
         const refs = view.resolved_value_refs;
         for (refs.template_refs[template.resolved_value_refs.start..][0..template.resolved_value_refs.len]) |ref_id| {

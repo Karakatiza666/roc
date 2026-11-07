@@ -56,13 +56,13 @@ EndOfFile,
 		(e-lambda
 			(args
 				(p-assign (ident "l")))
-			(e-call (constraint-fn-var 467)
+			(e-call (constraint-fn-var 471)
 				(e-lookup-external
 					(builtin))
 				(e-lookup-local
 					(p-assign (ident "l")))
 				(e-num (value "42")))))
-	(e-call (constraint-fn-var 492)
+	(e-call (constraint-fn-var 496)
 		(e-lookup-local
 			(p-assign (ident "add_one")))
 		(e-list

@@ -312,6 +312,26 @@ const Staged = struct {
         main_statement: []const u8,
         lib_source: ?[]const u8,
     ) StagedError!*Staged {
+        return createCheckedReports(gpa, wobble_source, main_statement, lib_source, false);
+    }
+
+    /// `createChecked` for a fixture that checking reports on, such as a
+    /// site it refuses: the checked module is still published.
+    fn createCheckedRefused(
+        gpa: Allocator,
+        wobble_source: []const u8,
+        main_statement: []const u8,
+    ) StagedError!*Staged {
+        return createCheckedReports(gpa, wobble_source, main_statement, null, true);
+    }
+
+    fn createCheckedReports(
+        gpa: Allocator,
+        wobble_source: []const u8,
+        main_statement: []const u8,
+        lib_source: ?[]const u8,
+        allow_reports: bool,
+    ) StagedError!*Staged {
         const self = try gpa.create(Staged);
         errdefer gpa.destroy(self);
 
@@ -375,7 +395,7 @@ const Staged = struct {
         try self.coord.start();
         try self.coord.discoverAppFromPath(arena, .{ .entry_path = app_path });
         try self.coord.coordinatorLoop();
-        if (self.coord.hasUserErrors()) {
+        if (!allow_reports and self.coord.hasUserErrors()) {
             var reports = self.coord.iterReports();
             while (reports.next()) |entry| {
                 std.debug.print("report: {s} in {s}\n", .{ entry.report.title, entry.module_name });
@@ -4831,6 +4851,73 @@ test "a call of a function parameter no call fixes refuses the site" {
     try staged.expectRejected("a call to a function value that no simplification resolves");
 }
 
+/// The query fixture of the R7 tests: `fetch` returns a `Code.Bound` whose
+/// error row its scheme quantifies, so each use fixes the row again.
+const generic_bound_query =
+    \\Q := [Q(Str)].{
+    \\    from : Str -> Q
+    \\    from = |name| Q(name)
+    \\
+    \\    filter : Q, Code(U16 -> Bool) -> Q
+    \\    filter = |Q(text), code| Q("${text} ${Code.graph(code).slots().len().to_str()}")
+    \\
+    \\    ready : Q -> Code.Bound(Try(Str, [NotFound, ..e]))
+    \\    ready = |Q(text)| Code.Bound.of(Ok(text))
+    \\}
+    \\
+;
+
+test "R7: each closing use of a generic Code.Bound call records the call's input slots at its instance" {
+    const gpa = std.testing.allocator;
+    const self = try Staged.createCheckedRefused(gpa, generic_bound_query ++
+        \\fetch = |least, most| Q.from("meds").filter(|m| m > least).filter(|m| m < most).ready()
+    , "_a : Code.Bound(Try(Str, [NotFound, Other]))\n_a = fetch(1, 9)\n_b : Code.Bound(Try(Str, [NotFound]))\n_b = fetch(2, 8)");
+    self.store = ConstStore.init(gpa);
+    const artifact = self.coord.appRootCheckedArtifact();
+    self.foreign = .{ .artifact = artifact, .builtins = &(try sharedBuiltinModules()).checked_artifact };
+    self.walk = CodeReifier.Walk.init(gpa, &self.store, self.foreign.lookup());
+    defer self.destroy();
+
+    const instances = &artifact.code_instances;
+    // One generic bound call, whose two sites are instance sites though
+    // their own types are concrete: the call's type is not.
+    try std.testing.expectEqual(@as(usize, 1), instances.bound_calls.len);
+    try std.testing.expectEqual(@as(usize, 2), instances.boundCallSites(instances.bound_calls[0]).len);
+    // Each use fixes the error row its own way, so each has a table, and
+    // each table binds the call: two slots, the second site from slot 1.
+    try std.testing.expectEqual(@as(usize, 2), instances.uses.len);
+    const least = binderNamed(artifact, self.env, "least") orelse return error.StagedLambdaNotFound;
+    const most = binderNamed(artifact, self.env, "most") orelse return error.StagedLambdaNotFound;
+    for (instances.uses) |use| {
+        const bound = instances.tableBoundEntries(use.index);
+        try std.testing.expectEqual(@as(usize, 1), bound.len);
+        try std.testing.expectEqual(@as(u32, 0), bound[0].call);
+        const slots = instances.boundEntrySlots(bound[0]);
+        try std.testing.expectEqual(@as(usize, 2), slots.len);
+        try std.testing.expectEqual(least, slots[0].leaf);
+        try std.testing.expectEqual(most, slots[1].leaf);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, instances.first_slots[bound[0].first_slots.start..][0..bound[0].first_slots.len]);
+    }
+}
+
+test "R7: a Code.Bound call in a generic function that reads a run-time value outside its sites binds at no closing use" {
+    const gpa = std.testing.allocator;
+    const self = try Staged.createCheckedRefused(gpa, generic_bound_query ++
+        \\with : Q, U16 -> Q
+        \\with = |q, _| q
+        \\
+        \\fetch = |least, n| with(Q.from("meds").filter(|m| m > least), n).ready()
+    , "_a : Code.Bound(Try(Str, [NotFound, Other]))\n_a = fetch(1, 9)");
+    self.store = ConstStore.init(gpa);
+    const artifact = self.coord.appRootCheckedArtifact();
+    self.foreign = .{ .artifact = artifact, .builtins = &(try sharedBuiltinModules()).checked_artifact };
+    self.walk = CodeReifier.Walk.init(gpa, &self.store, self.foreign.lookup());
+    defer self.destroy();
+
+    try std.testing.expectEqual(@as(usize, 0), artifact.code_instances.bound_calls.len);
+    try std.testing.expectEqual(@as(usize, 0), artifact.code_instances.bound_entries.len);
+}
+
 test "P1: a template is normalized once per argument digest, however many calls it has" {
     const gpa = std.testing.allocator;
     const self = try Staged.createChecked(gpa,
@@ -4863,7 +4950,8 @@ test "P1: a template is normalized once per argument digest, however many calls 
             .use = null,
         }, values.items, .zero());
         if (outcome != .reified) return error.TestUnexpectedResult;
-        graph.* = self.store.get(outcome.reified).record[0];
+        // `Code := { first_slot, graph, site, version }`, in label order.
+        graph.* = self.store.get(outcome.reified).record[1];
     }
     try std.testing.expectEqual(@as(u32, 2), self.walk.normalizations);
     try std.testing.expectEqual(graphs[0], graphs[2]);
@@ -5807,7 +5895,7 @@ fn inlineDigests(gpa: Allocator, source: []const u8) (StagedError || error{ Test
         try staged.expectDump("");
         return error.TestUnexpectedResult;
     }
-    // `Inlined := { digests, graph, site, version }`, in label order.
+    // `Inlined := { digests, first_slot, graph, site, version }`, in label order.
     const rows = staged.store.get(staged.store.get(staged.outcome.reified).record[0]).list.nodes;
     var out: std.ArrayList(u128) = .empty;
     errdefer out.deinit(gpa);

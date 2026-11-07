@@ -5085,8 +5085,13 @@ pub fn recordCodeReificationSite(
 
 /// Record that the call at `call_idx` binds the run-time reads of the lambda
 /// site at `node_idx` as input slots.
-pub fn markCodeSiteBound(self: *Self, node_idx: Node.Idx, call_idx: Node.Idx) void {
-    self.store.markCodeSiteBound(node_idx, call_idx);
+pub fn markCodeSiteBound(self: *Self, node_idx: Node.Idx, call_idx: Node.Idx, reads: NodeStore.CodeReificationSite.BoundReads) void {
+    self.store.markCodeSiteBound(node_idx, call_idx, reads);
+}
+
+/// Record what stopped the calls that carry a lambda site with run-time reads.
+pub fn markCodeSiteStopped(self: *Self, node_idx: Node.Idx, stop: NodeStore.CodeReificationSite.ChainStop) void {
+    self.store.markCodeSiteStopped(node_idx, stop);
 }
 
 /// Whether the call at `call_idx` binds the run-time reads of a lambda site

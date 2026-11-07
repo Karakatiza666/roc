@@ -1314,6 +1314,8 @@ it replays every binding of the block around the site, so `k` is not a slot.
 | Equality and hash | `slots` is part of the description, so `==`, `to_hash` and the cache key read it. The values never enter them. |
 | The translator | Builds its result with `Code.bound : Code(f), a -> Code.Bound(a)` (or `Code.Inlined.bound`). The result holds no inputs while the compiler runs, because the values do not exist then. The translator emits one placeholder for each slot it reads, for example `?` in SQL. |
 | The site | The call of the translator is a compile-time root. The lambda is a description, so the root does not depend on what the lambda reads at run time. The program reads that root's value, and the site sets `inputs` to one `Code.Value` for each slot, in slot order. |
+| The chain | The root is the first call whose result is a `Code.Bound`, walking out from the lambda through each call that takes it, or a call that passed it on, as an argument or as the receiver. So a builder keeps its plain type: in `Q.from(t).filter(\|m\| m < limit).ready()`, `filter` returns a `Q`, and `ready`, which returns a `Code.Bound`, is the root. A binding, an `if`, a `match`, a record or a block stops the walk. |
+| Many sites | One root binds every lambda its chain holds. Its slots are the slots of each site, in site order (the order of the module's site table, which is node order), and in slot order for each site. One captured name read in two sites is two slots. `Code.first_slot : Code(f) -> U64` gives the index of a site's first slot among the slots of its root, so a translator numbers its placeholders across the chain. `==` and `to_hash` skip it, as they skip the site key. |
 | The program | Reads `bound.value()` and `bound.inputs()`. A SQL binder maps each `Code.Value` to a driver value with one `match`. |
 
 #### `Code.Bound` and `Code.Value`
@@ -1373,7 +1375,7 @@ slot type. In release builds a mismatch is unreachable.
 | A `var` | "a `var`, whose value at the call is not always the value the description reads" |
 | A function value with no definition | as before: "a function value that names no definition" |
 | A call whose other arguments are not fixed at build time | "a translator that receives captured inputs runs while the compiler runs, so the other arguments of its call must be fixed then" |
-| A call that holds two sites with captured inputs | "a call that binds the inputs of two sites" |
+| A call that also binds a site that was refused | "the call also binds the inputs of a site that was refused" |
 | A call whose result type it does not fix | "a translator result whose type the call does not fix" |
 | A translator result that holds a function, such as a query builder that keeps its clauses as closures | The call cannot be a compile-time root of its own, because a stored value holds no function, so the reason line is the one for a call whose arguments are not fixed. Return data, such as the rendered text, from a translator that receives captured inputs. |
 

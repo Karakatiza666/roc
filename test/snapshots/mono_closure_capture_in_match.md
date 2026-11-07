@@ -136,14 +136,14 @@ EndOfFile,
 													(e-lambda
 														(args
 															(p-assign (ident "y")))
-														(e-dispatch-call (method "plus") (constraint-fn-var 489)
+														(e-dispatch-call (method "plus") (constraint-fn-var 493)
 															(receiver
 																(e-lookup-local
 																	(p-assign (ident "x"))))
 															(args
 																(e-lookup-local
 																	(p-assign (ident "y"))))))))
-											(e-call (constraint-fn-var 501)
+											(e-call (constraint-fn-var 505)
 												(e-lookup-local
 													(p-assign (ident "add_x")))
 												(e-num (value "10"))))))
@@ -157,7 +157,7 @@ EndOfFile,
 					(p-assign (ident "result"))))))
 	(d-let
 		(p-assign (ident "answer"))
-		(e-call (constraint-fn-var 530)
+		(e-call (constraint-fn-var 534)
 			(e-lookup-local
 				(p-assign (ident "func")))
 			(e-num (value "42")))))

@@ -23687,7 +23687,7 @@ Builtin :: [].{
 	##
 	## The type parameter records the function type the description came from.
 	## It never appears in the description itself, which is a [Code.Graph].
-	Code(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+	Code(_fn) :: { first_slot : U64, graph : Graph, site : U64, version : U32 }.{
 
 		## The type of a reified expression. Every [Code.Node] carries one.
 		##
@@ -24441,7 +24441,7 @@ Builtin :: [].{
 		## one is a `Lambda` region where it is built. Only recursive functions
 		## stay rows. A translator with no function form, such as one that emits
 		## one expression, reads this view.
-		Inlined(_fn) :: { digests : List(List(U128)), graph : Graph, site : U64, version : U32 }.{
+		Inlined(_fn) :: { digests : List(List(U128)), first_slot : U64, graph : Graph, site : U64, version : U32 }.{
 
 			## The rows the description reaches: the root, and the recursive
 			## rows it calls.
@@ -24451,6 +24451,11 @@ Builtin :: [].{
 			## The normal-form version the value was built under.
 			version : Inlined(_fn) -> U32
 			version = |Inlined.(inner)| inner.version
+
+			## The index of this description's first input slot among the
+			## slots of the call that binds it, as [Code.first_slot] gives it.
+			first_slot : Inlined(_fn) -> U64
+			first_slot = |Inlined.(inner)| inner.first_slot
 
 			## Two values are equal when their normal forms are, wherever each
 			## was described.
@@ -24508,7 +24513,7 @@ Builtin :: [].{
 		## output must not change when the author moves code into or out of a
 		## helper, reads this view. Recursive functions stay rows, as in
 		## `inline`.
-		Outlined(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+		Outlined(_fn) :: { first_slot : U64, graph : Graph, site : U64, version : U32 }.{
 
 			## The rows the description reaches: the root, the recursive rows,
 			## and the rows the view made.
@@ -24518,6 +24523,11 @@ Builtin :: [].{
 			## The normal-form version the value was built under.
 			version : Outlined(_fn) -> U32
 			version = |Outlined.(inner)| inner.version
+
+			## The index of this description's first input slot among the
+			## slots of the call that binds it, as [Code.first_slot] gives it.
+			first_slot : Outlined(_fn) -> U64
+			first_slot = |Outlined.(inner)| inner.first_slot
 
 			## Two values are equal when their normal forms are, wherever each
 			## was described.
@@ -24551,7 +24561,7 @@ Builtin :: [].{
 		## reads this view sees one form where the author writes either, and
 		## matches the form after the laws. A translator that wants the forms
 		## as written reads `Code(f)`.
-		Lawful(_fn) :: { graph : Graph, site : U64, version : U32 }.{
+		Lawful(_fn) :: { first_slot : U64, graph : Graph, site : U64, version : U32 }.{
 
 			## The rows the description reaches, as [Code.graph] gives them.
 			graph : Lawful(_fn) -> Graph
@@ -24560,6 +24570,11 @@ Builtin :: [].{
 			## The normal-form version the value was built under.
 			version : Lawful(_fn) -> U32
 			version = |Lawful.(inner)| inner.version
+
+			## The index of this description's first input slot among the
+			## slots of the call that binds it, as [Code.first_slot] gives it.
+			first_slot : Lawful(_fn) -> U64
+			first_slot = |Lawful.(inner)| inner.first_slot
 
 			## Two values are equal when their normal forms are, wherever each
 			## was described.
@@ -24635,6 +24650,15 @@ Builtin :: [].{
 			## The run-time value of each input slot, in slot order.
 			inputs : Bound(_result) -> List(Value)
 			inputs = |Bound.(inner)| inner.inputs
+
+			## A translator's result, which the site completes with the values
+			## of its input slots. Use it in a call that has no `Code` of its
+			## own, such as the last call of a chain whose lambdas earlier calls
+			## take: `Q.from(t).filter(|m| m < a).ready()`, where `ready`
+			## returns `Code.Bound.of(statement)`. Like [Code.bound], it
+			## gives no inputs when the program builds the value at run time.
+			of : a -> Bound(a)
+			of = |result| Bound.({ value: result, inputs: [] })
 		}
 
 		## The rows the site's description reaches.
@@ -24647,9 +24671,20 @@ Builtin :: [].{
 		version : Code(_fn) -> U32
 		version = |Code.(inner)| inner.version
 
+		## The index of this description's first input slot among the slots
+		## of the call that binds it. One call can bind the lambdas of a whole
+		## chain of calls, such as `Q.from(t).filter(|m| m < a).select(|m| m + b)`
+		## up to its first call that returns a [Code.Bound]. Its inputs are the
+		## slots of each lambda in turn, in the order of the lambdas, so a
+		## translator that numbers its placeholders across the chain adds this
+		## index to a slot's own index. It is 0 for the first lambda, and for a
+		## lambda no call binds.
+		first_slot : Code(_fn) -> U64
+		first_slot = |Code.(inner)| inner.first_slot
+
 		## Two values are equal when their normal forms are, wherever each was
-		## described. The value also carries the key of the site that built it,
-		## which equality ignores.
+		## described. The value also carries the key of the site that built it
+		## and its first slot, which equality ignores.
 		is_eq : Code(fn), Code(fn) -> Bool
 		is_eq = |Code.(a), Code.(b)| a.version == b.version and a.graph == b.graph
 

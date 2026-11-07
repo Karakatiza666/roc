@@ -359,6 +359,11 @@ const Walker = struct {
                 const ref_id = artifact.resolved_value_refs.by_checked_expr[raw].get() orelse return;
                 try self.walkRef(artifact.resolved_value_refs.records[@backingInt(ref_id)].ref);
             },
+            .requirement => |requires_idx| {
+                const requirement = artifact.checked_procedure_templates.literalRequirementEdge(requires_idx) orelse
+                    base.invariant("compile-time finalization invariant violated: a literal argument root's requirement edge is not recorded", .{});
+                try self.pushTemplate(requirement.template);
+            },
         }
     }
 

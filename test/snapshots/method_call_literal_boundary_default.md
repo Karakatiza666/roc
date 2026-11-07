@@ -133,7 +133,7 @@ NO CHANGE
 						(e-lambda
 							(args
 								(p-assign (ident "a")))
-							(e-dispatch-call (method "plus") (constraint-fn-var 475)
+							(e-dispatch-call (method "plus") (constraint-fn-var 479)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "a"))))
@@ -148,27 +148,27 @@ NO CHANGE
 						(e-lambda
 							(args
 								(p-assign (ident "b")))
-							(e-dispatch-call (method "plus") (constraint-fn-var 477)
+							(e-dispatch-call (method "plus") (constraint-fn-var 481)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "b"))))
 								(args
 									(e-lookup-local
 										(p-assign (ident "y"))))))))
-				(e-dispatch-call (method "plus") (constraint-fn-var 503)
+				(e-dispatch-call (method "plus") (constraint-fn-var 507)
 					(receiver
-						(e-call (constraint-fn-var 490)
+						(e-call (constraint-fn-var 494)
 							(e-lookup-local
 								(p-assign (ident "add_x")))
 							(e-num (value "5"))))
 					(args
-						(e-call (constraint-fn-var 502)
+						(e-call (constraint-fn-var 506)
 							(e-lookup-local
 								(p-assign (ident "add_y")))
 							(e-num (value "5"))))))))
 	(d-let
 		(p-assign (ident "result"))
-		(e-call (constraint-fn-var 535)
+		(e-call (constraint-fn-var 539)
 			(e-lookup-local
 				(p-assign (ident "func")))
 			(e-num (value "10"))

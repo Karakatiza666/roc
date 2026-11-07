@@ -94,7 +94,7 @@ NO CHANGE
 				(ty-lookup (name "Str") (builtin)))))
 	(d-let
 		(p-assign (ident "for_code"))
-		(e-call (constraint-fn-var 488)
+		(e-call (constraint-fn-var 492)
 			(e-lookup-local
 				(p-assign (ident "describe")))
 			(e-runtime-error (tag "erroneous_value_expr")))))

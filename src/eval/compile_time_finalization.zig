@@ -3328,7 +3328,7 @@ fn Evaluation(comptime ProgramPtr: type) type {
                 switch (entry) {
                     .own => |own| {
                         const lowered = program orelse finalizationInvariant("a literal root failed without running");
-                        try reportLiteralRootFailure(&self.owners, lowered, lowered.lir_result.literal_roots.items[self.literalPlanIn(lowered, index)], own.borrow(self.literal_failures.messages.items));
+                        try reportLiteralRootFailure(&self.owners, self.program.modules, lowered, lowered.lir_result.literal_roots.items[self.literalPlanIn(lowered, index)], own.borrow(self.literal_failures.messages.items));
                     },
                     .literal, .checked => {},
                 }
@@ -3905,6 +3905,11 @@ const RootCompletionState = struct {
                     }
                 }
             },
+            .requirement => |requires_idx| {
+                const requirement = self.module.checked_procedure_templates.literalRequirementEdge(requires_idx) orelse
+                    finalizationInvariant("a literal argument root's requirement edge is not recorded");
+                try self.pending_templates.append(self.allocator, requirement.template);
+            },
         };
         while (self.pending_templates.pop()) |next| {
             if (!try self.templateDependenciesComplete(next)) return false;
@@ -4326,6 +4331,7 @@ const LiteralRootFailures = struct {
         meaning: ?lir.LIR.FailureMeaning,
         region: ?base.Region,
         loc: ?base.SourceLoc,
+        refusal: ?builtins.in_process_host.CodeRefusal,
 
         fn borrow(self: OwnedFailure, messages: []const u8) LiteralRootFailure {
             return .{
@@ -4333,6 +4339,7 @@ const LiteralRootFailures = struct {
                 .meaning = self.meaning,
                 .region = self.region,
                 .loc = self.loc,
+                .refusal = self.refusal,
             };
         }
     };
@@ -4379,6 +4386,7 @@ const LiteralRootFailures = struct {
                     .meaning = failure.meaning,
                     .region = failure.region,
                     .loc = failure.loc,
+                    .refusal = failure.refusal,
                 } };
             },
         };
@@ -4579,6 +4587,7 @@ fn reportEmbeddedFailure(
             .numeral => _ = try store.appendProblem(.{ .comptime_invalid_numeral = .{ .message = message_idx, .region = site.region, .origin = origin } }),
             .quote => _ = try store.appendProblem(.{ .comptime_invalid_quote = .{ .message = message_idx, .region = site.region, .origin = origin } }),
             .interpolation => _ = try store.appendProblem(.{ .comptime_invalid_interpolation = .{ .message = message_idx, .region = site.region, .origin = origin } }),
+            .bound_call => unreachable, // no conversion rejects a bound call's root (`LiteralRejectionKind.bound_call`)
         }
     } else {
         const message_idx = try store.putExtraString(embedded.message);
@@ -4598,6 +4607,9 @@ const LiteralRootFailure = struct {
     meaning: ?lir.LIR.FailureMeaning,
     region: ?base.Region,
     loc: ?base.SourceLoc,
+    /// The node a translator refused, where the root is a generic bound
+    /// call's (design.md "Bound Instance Roots") and its translator refused.
+    refusal: ?builtins.in_process_host.CodeRefusal = null,
 };
 
 /// Where a compile-time evaluation failed: the statement it stopped at, as
@@ -4654,12 +4666,19 @@ fn evalInterpreterLiteralRoot(
                 error.InvalidHostedFunctionSignature => finalizationInvariant("literal root reached an invalid hosted function signature"),
                 error.ExpectErr => unreachable, // expect_err statements occur only in top-level expect test roots, not literal roots
             };
+            // Only a crash can be a translator's refusal.
+            const refusal = switch (err) {
+                error.Crash => interpreter.getFailedRefusal(),
+                error.RuntimeError, error.DivisionByZero => null,
+                error.OutOfMemory, error.UnsupportedHostedFunction, error.InvalidHostedFunctionSignature, error.ExpectErr => unreachable, // the switch above returned or stopped
+            };
             const failed_at = interpreterFailedAt(&lowered.lir_result, interpreter, program.slotEnvironment());
             break :evaluated .{
                 .message = message,
                 .meaning = failed_at.meaning,
                 .region = failed_at.region,
                 .loc = failed_at.loc,
+                .refusal = refusal,
             };
         };
         defer interpreter.dropValue(result.value, plan.ret_layout);
@@ -4728,7 +4747,7 @@ fn evalDevLiteralRoot(
         .returned => null,
         .crashed => crashed: {
             const failed_at = native.failedAt(host.failure);
-            break :crashed .{ .message = host.crashMessage() orelse "Roc crashed", .meaning = failed_at.meaning, .region = failed_at.region, .loc = failed_at.loc };
+            break :crashed .{ .message = host.crashMessage() orelse "Roc crashed", .meaning = failed_at.meaning, .region = failed_at.region, .loc = failed_at.loc, .refusal = host.refusal };
         },
         .host_oom => return error.OutOfMemory,
     };
@@ -4786,6 +4805,7 @@ fn recordLiteralRootFailure(
 /// a crash of the conversion, reported at the literal.
 fn reportLiteralRootFailure(
     owners: *const ModuleOwners,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     plan: LirProgram.LiteralRootPlan,
     failure: LiteralRootFailure,
@@ -4798,6 +4818,11 @@ fn reportLiteralRootFailure(
     while (targets.nextTarget()) |owner| {
         const store = owner.problem_store orelse continue;
         const literal_region = owner.module.checked_bodies.expr(@fromBackingInt(@intCast(plan.site.checked_expr))).source_region;
+        // A translator's refusal is reported at the node it refused.
+        if (failure.refusal) |refused| {
+            try reportRefusal(store, owner.module, modules, literal_region, refused, failure.message);
+            continue;
+        }
         const site = comptimeFailureSiteFromLoc(owner.module, &lowered.lir_result.store, literal_region, failure.region, failure.loc);
         const message_idx = try store.putExtraString(failure.message);
         _ = try store.appendProblem(.{ .comptime_crash = .{
@@ -6734,6 +6759,7 @@ fn reportLiteralRejection(
                 .region = failure_site.region,
                 .origin = try comptimeFailureOrigin(store, failure_site),
             } }),
+            .bound_call => unreachable, // no conversion rejects a bound call's root (`LiteralRejectionKind.bound_call`)
         }
     }
 }
@@ -6745,6 +6771,7 @@ fn literalRejectionReported(store: *const check.problem.Store, kind: lir.LIR.Lit
             .numeral => if (problem == .comptime_invalid_numeral) problem.comptime_invalid_numeral.region else continue,
             .quote => if (problem == .comptime_invalid_quote) problem.comptime_invalid_quote.region else continue,
             .interpolation => if (problem == .comptime_invalid_interpolation) problem.comptime_invalid_interpolation.region else continue,
+            .bound_call => unreachable, // no conversion rejects a bound call's root (`LiteralRejectionKind.bound_call`)
         };
         if (regionsEqual(reported_region, region)) return true;
     }

@@ -70,7 +70,7 @@ NO CHANGE
 			(args
 				(p-assign (ident "a"))
 				(p-assign (ident "b")))
-			(e-dispatch-call (method "plus") (constraint-fn-var 474)
+			(e-dispatch-call (method "plus") (constraint-fn-var 478)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "a"))))
@@ -85,7 +85,7 @@ NO CHANGE
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-call (constraint-fn-var 482)
+				(e-call (constraint-fn-var 486)
 					(e-lookup-local
 						(p-assign (ident "addU8")))
 					(e-num (value "1"))
@@ -95,7 +95,7 @@ NO CHANGE
 	(s-expect
 		(e-method-eq (negated "false")
 			(lhs
-				(e-call (constraint-fn-var 502)
+				(e-call (constraint-fn-var 506)
 					(e-lookup-local
 						(p-assign (ident "addU8")))
 					(e-num (value "0"))

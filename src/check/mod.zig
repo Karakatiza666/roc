@@ -38,6 +38,8 @@ pub const InferenceOutput = @import("inference_output.zig");
 /// **Staging reifier**: a checked function body as a `Code.Ir` const tree.
 pub const CodeReifier = @import("code_reifier.zig");
 pub const CodeEmit = @import("code_emit.zig");
+/// Compile-time roots of code reification sites that read run-time values.
+pub const CodeRoots = @import("code_roots.zig");
 /// Comptime layout fingerprint for a registered serialization root (recurses into
 /// nested aggregates and `SerializedElement`s), so every admitted blob invalidates on
 /// any layout change, not just a top-level one.
@@ -64,6 +66,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("problem.zig"));
     std.testing.refAllDecls(@import("problem/context.zig"));
     std.testing.refAllDecls(@import("reify_only.zig"));
+    std.testing.refAllDecls(@import("code_roots.zig"));
     std.testing.refAllDecls(@import("problem/store.zig"));
     std.testing.refAllDecls(@import("problem/types.zig"));
     std.testing.refAllDecls(@import("report.zig"));

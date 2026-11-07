@@ -1171,21 +1171,12 @@ pub const Converter = struct {
     /// A variable the converting scope does not bind: it seals to its row
     /// default or its numeric default (`CheckedTypePayload.variableSealsToRowDefault`).
     fn sealVariable(self: Converter, variable: checked.CheckedTypeVariable) Allocator.Error!TypeId {
-        if (variable.numeric_default_phase) |phase| {
-            const target = checked.literal_defaulting.defaultTargetForPhase(phase) orelse
-                invariant("a checking-finalized numeric variable reached Boxy lowering unresolved");
-            return switch (target) {
-                .dec => try self.store.primitive(.dec),
-                .str => try self.store.primitive(.str),
-            };
-        }
-        if (variable.row_default) |row_default| return switch (row_default) {
+        return switch (checked.sealedVariable(variable)) {
+            .dec => try self.store.primitive(.dec),
+            .str => try self.store.primitive(.str),
             .empty_record => try self.store.emptyRecord(),
             .empty_tag_union => try self.store.emptyTagUnion(),
         };
-        // An unconstrained variable no scope binds has no values reachable at
-        // it; its type is the empty tag union, as every other strategy gives it.
-        return try self.store.emptyTagUnion();
     }
 
     fn pushFrame(self: Converter, frames: *std.ArrayList(Frame), pending: *std.ArrayList(Child), results_start: usize, module: ModuleIndex, ty: checked.CheckedTypeId) Allocator.Error!void {

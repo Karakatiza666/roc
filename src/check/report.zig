@@ -6386,6 +6386,12 @@ pub const ReportBuilder = struct {
                 "This use is inside a function that a block made generic, and the function it uses holds a Code site at its own type variables.",
                 .runtime_error,
             ),
+            .requirement_constrained_variable => try Report.init(
+                self.gpa,
+                "Cannot Reify At An Open Platform Requirement",
+                "The platform requires this function at a type that leaves a type variable open with a constraint, and the function holds a Code site at its own type variables.",
+                .runtime_error,
+            ),
             .instance_in_implicit_method => try Report.init(
                 self.gpa,
                 "Cannot Reify In A Method The Compiler Calls",
@@ -6493,7 +6499,11 @@ pub const ReportBuilder = struct {
                 D.bytes("this value out of the reified function."),
             }, self, &report),
             .unresolved_type => try self.renderOpenTypeHint(data.open, &report),
-            .captures_a_binding => try D.renderSlice(&.{
+            // A recorded chain stop says how a `Code.Bound` receives the value.
+            .captures_a_binding => if (data.chain_stop != .none) try D.renderSlice(&.{
+                D.bytes("A translator receives the description on its own, without the scope the"),
+                D.bytes("function was written in. Pass this value as a parameter instead."),
+            }, self, &report) else try D.renderSlice(&.{
                 D.bytes("A translator receives the description on its own, without the scope the"),
                 D.bytes("function was written in. Pass this value as a parameter instead."),
                 D.bytes("A translator whose result is a"),
@@ -6508,10 +6518,12 @@ pub const ReportBuilder = struct {
                 D.bytes("or build the value without one, such as a handle that holds only a name."),
             }, self, &report),
             .bound_instance => try D.renderSlice(&.{
-                D.bytes("The compiler describes this site again at each use of the function,"),
-                D.bytes("at the types that use fixes. A site that binds inputs has one slot"),
-                D.bytes("order at its one call. Move the site into a function whose"),
-                D.bytes("annotation names concrete types."),
+                D.bytes("Each use of the function runs the call that binds the inputs while"),
+                D.bytes("the compiler runs, at the types that use fixes. So the call and each"),
+                D.bytes("call of its chain can read a value known only when the program runs"),
+                D.bytes("only in a lambda at a `Code` place, such as `|_| n`. Read such a value"),
+                D.bytes("there, or move the call into a function whose annotation names"),
+                D.bytes("concrete types."),
             }, self, &report),
             .instance_through_evidence => try D.renderSlice(&.{
                 D.bytes("The compiler describes a Code site in a generic function at each use"),
@@ -6526,6 +6538,14 @@ pub const ReportBuilder = struct {
                 D.bytes("that fixes the function's types, and a use inside a generic local"),
                 D.bytes("function does not fix them. Give the local function an annotation"),
                 D.bytes("with concrete types, or move it to the top level."),
+            }, self, &report),
+            .requirement_constrained_variable => try D.renderSlice(&.{
+                D.bytes("The compiler describes a Code site in a generic function at each use"),
+                D.bytes("that fixes the function's types. The platform's use fixes each type"),
+                D.bytes("its requirement leaves open to a type with no values, which does not"),
+                D.bytes("meet a constraint. Give the function an annotation that closes the"),
+                D.bytes("constrained type, or move the site into a function the program calls"),
+                D.bytes("at concrete types."),
             }, self, &report),
             .instance_in_implicit_method => try D.renderSlice(&.{
                 D.bytes("The compiler describes a Code site in a generic function at each"),
@@ -6636,6 +6656,12 @@ pub const ReportBuilder = struct {
             }, self, &report),
         }
 
+        if (data.chain_stop != .none) {
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+            try self.renderChainStop(data.chain_stop, &report);
+        }
+
         // The walk names what stopped it, which the region alone does not: a
         // rejected expression is often one operator inside a longer line.
         const detail = self.problems.getExtraString(data.detail);
@@ -6652,6 +6678,50 @@ pub const ReportBuilder = struct {
         }
 
         return report;
+    }
+
+    /// Why no call binds a lambda's run-time reads: what stopped the chain of
+    /// calls that carries it, and what to write instead.
+    fn renderChainStop(self: *Self, stop: StagedCode.ChainStop, report: *Report) Allocator.Error!void {
+        try D.renderSlice(&.{
+            D.bytes("A call whose result is a"),
+            D.bytes("Code.Bound").withAnnotation(.emphasized),
+            D.bytes("binds such a value when a chain of calls carries the lambda to it:"),
+            D.bytes("each call takes the lambda, or the call before it, as an argument or"),
+            D.bytes("as its receiver."),
+        }, self, report);
+        try report.document.addReflowingText(" ");
+        switch (stop) {
+            .none => unreachable, // the caller renders a stop only when one is recorded
+            .branch => try D.renderSlice(&.{
+                D.bytes("Here an"),
+                D.bytes("if").withAnnotation(.inline_code),
+                D.bytes("or a"),
+                D.bytes("match").withAnnotation(.inline_code),
+                D.bytes("holds the chain, and a branch stops it. If a call that returns a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes("reads the value of the branches, write the whole chain, up to that"),
+                D.bytes("call, in each branch."),
+            }, self, report),
+            .binding => try D.renderSlice(&.{
+                D.bytes("Here a name holds the result of the chain, and a name stops it. If a"),
+                D.bytes("call that returns a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes("reads the name, write the chain as one expression, up to that call."),
+            }, self, report),
+            .value => try D.renderSlice(&.{
+                D.bytes("Here a record, a tuple, a list or a tag holds the chain, and that"),
+                D.bytes("value stops it. If a call that returns a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes("reads that value, give the chain to the call directly, as an"),
+                D.bytes("argument or as its receiver."),
+            }, self, report),
+            .end => try D.renderSlice(&.{
+                D.bytes("Here the chain ends, and no call in it returns a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes(". End the chain with such a call.").withNoPrecedingSpace(),
+            }, self, report),
+        }
     }
 
     /// The fix a report of an open type variable gives, picked by why the
@@ -6722,7 +6792,7 @@ pub const ReportBuilder = struct {
             .input_not_bound => "The site cannot bind:",
             .reads_a_code_value => "It reads the constant:",
             .instance_in_implicit_method => "The method is:",
-            .bound_instance, .instance_through_evidence, .instance_in_local_generic => null,
+            .bound_instance, .instance_through_evidence, .instance_in_local_generic, .requirement_constrained_variable => null,
             .not_a_named_function, .outside_staged_position, .argument_not_constant, .primitive_not_a_function, .primitives_not_a_list, .primitive_listed_twice, .primitive_already_primitive, .prim_not_a_definition, .identity_not_called, .type_id_not_nominal, .ty_of_not_closed => null,
         };
     }

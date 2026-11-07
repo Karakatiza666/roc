@@ -140,6 +140,10 @@ pub const Task = union(enum) {
     /// slots, and push it with `inputs` set to the slots' values
     /// (`bindCodeInputs`).
     bind_code_inputs: CheckedExprId,
+    /// Pop the `Code.Bound` value of the generic bound call that `module`'s
+    /// root `root` binds, of type `ty`, and push it with `inputs` set to the
+    /// values of the slots its closing use recorded (`bindRootInputs`).
+    bind_root_inputs: struct { module: ModuleIndex, root: checked.ComptimeRootId, ty: TypeId },
     /// Restore stored constant `node` at `ty`. `root` is the compile-time
     /// root whose own value the node is, when the restore reads one: a read
     /// of a failed root's value then fails as that root did, reported once
@@ -247,6 +251,15 @@ const AliasScope = struct {
     /// entered bind: each read composes the one it names.
     deferred_dicts: ?DeferredDictionaries = null,
     saved_env: types.Env,
+    /// A literal chain frame's Code instance table, where its scheme has an
+    /// inventory (design.md "Bound Instance Roots").
+    instances: ?Builder.InstanceTable = null,
+    /// Set on a literal chain's frame of an exact procedure alias: the
+    /// instance table word of the use that entered the alias, which the
+    /// alias's forwarded lookup passes on where checking keyed no table of
+    /// its own there (design.md "Code Instance Tables"). The word is null
+    /// where the alias's target has no inventory.
+    alias_instances: ?struct { word: ?LocalId } = null,
 };
 
 /// Where a literal chain frame's dictionaries come from: the evidence of the
@@ -382,6 +395,9 @@ pub const Builder = struct {
     /// the hidden parameter of a template with an inventory, or a lambda's
     /// capture of it; empty or one word.
     instance_words: []LocalId = &.{},
+    /// The generic bound call a literal chain lowers as an ordinary call:
+    /// the root's own evaluation, not a read of its requirement.
+    bound_call_lowering: ?CheckedExprId = null,
     /// The thunk composed for each `literal_argument` root this body reads.
     /// Set while `enterEdge` builds a frame's call instance, whose
     /// dictionaries the frame composes as it reads them, and whose
@@ -1300,6 +1316,7 @@ pub const Builder = struct {
             .code_value => |key| return try self.lowerCodeValueBody(key.ty, key.value),
             .literal_thunk => |key| return try self.lowerLiteralThunkBody(key),
             .root_slot => |key| return try self.lowerRootSlotThunkBody(key),
+            .code_bound => |key| return try self.lowerCodeBoundBody(key),
             .code_instances => |key| return try self.lowerCodeInstancesBody(key),
             .code_description => |key| return try self.lowerCodeDescriptionBody(key),
         };
@@ -2717,6 +2734,7 @@ pub const Builder = struct {
             },
             .push_value => |local| try self.pushValue(local),
             .bind_code_inputs => |expr| try self.bindCodeInputs(expr),
+            .bind_root_inputs => |key| try self.bindRootInputs(key.module, key.root, key.ty),
             .unreachable_value => |ty| try self.pushValue(try self.localOf(ty, .frame)),
             .unreachable_or_unit => try self.pushValue(try self.unitValue()),
             .segments_arg => |arg| {
@@ -2991,6 +3009,13 @@ pub const Builder = struct {
 
     // -- Expressions --
 
+    /// Whether `expr_id` is the expression of the root this body evaluates.
+    fn evaluatesOwnRoot(self: *Builder, expr_id: CheckedExprId) bool {
+        const own = self.own_root orelse return false;
+        const entry = self.view.view.hoisted_constants.lookupByExpr(expr_id) orelse return false;
+        return entry.root == own;
+    }
+
     /// The stored value of the hoisted root `expr_id` is, when this body
     /// reads it instead of computing it: not the root this body computes,
     /// not a root whose evaluation failed (it runs in place), and not a
@@ -3076,8 +3101,17 @@ pub const Builder = struct {
         }
         // A call that binds input slots is read, from its stored value or
         // where it runs in place, with the slots' values as its `inputs`
-        // (design.md, the section on `Code` descriptions).
-        if (self.bodies().codeBinding(expr_id) != null) try self.push(.{ .bind_code_inputs = expr_id });
+        // (design.md, the section on `Code` descriptions). The body that
+        // evaluates the call's own root gives the translator's result: the
+        // program adds the inputs where it reads that result.
+        if (self.bodies().codeBinding(expr_id) != null and !self.evaluatesOwnRoot(expr_id)) try self.push(.{ .bind_code_inputs = expr_id });
+        // A generic bound call reads its bound requirement, unless a literal
+        // chain lowers it as its root's own evaluation.
+        if (self.view.view.code_instances.boundCallIndex(expr_id)) |call_index| {
+            if (self.bound_call_lowering != null and self.bound_call_lowering.? == expr_id) {
+                self.bound_call_lowering = null;
+            } else return try self.lowerInstanceBound(expr_id, call_index);
+        }
         // An expression compile-time evaluation hoisted and stored is read
         // (design.md "Runtime Programs Read Stored Values").
         if (self.storedHoisted(expr_id)) |read| switch (read) {
@@ -3681,6 +3715,20 @@ pub const Builder = struct {
         for (args, out) |source, *word| word.* = try self.literalArg(source);
     }
 
+    /// `fillLiteralArgs` for the edge `edge` of the module `owner`, whose
+    /// roots the arguments read.
+    fn fillLiteralArgsOf(self: *Builder, owner: *const types.ModuleView, callee: ?WorkerId, edge: checked.LiteralEdge, out: []LocalId) Allocator.Error!void {
+        const saved_module = self.module;
+        const saved_view = self.view;
+        defer {
+            self.module = saved_module;
+            self.view = saved_view;
+        }
+        self.module = owner.index;
+        self.view = owner;
+        try self.fillLiteralArgs(callee, edge, out);
+    }
+
     /// The source name of a template worker's procedure, for diagnostics.
     pub fn workerName(self: *Builder, id: WorkerId) []const u8 {
         return switch (self.program.worker(id).key) {
@@ -3690,7 +3738,7 @@ pub const Builder = struct {
                 const export_name = view.nameStore().procBase(template.proc_base).export_name orelse break :blk "a template";
                 break :blk view.nameStore().exportNameText(export_name);
             },
-            inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => |_, kind| @tagName(kind),
+            inline .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => |_, kind| @tagName(kind),
         };
     }
 
@@ -3717,6 +3765,8 @@ pub const Builder = struct {
     fn composeRootThunk(self: *Builder, root: checked.ComptimeRootId) Allocator.Error!LocalId {
         const compile_time_root = self.view.view.compile_time_roots.root(root);
         const argument = compile_time_root.literal_argument orelse invariant("a literal argument root records no literal argument");
+        // A bound requirement's argument takes the call's leaves.
+        if (argument.site.kind == .bound_call) return try self.composeDictionary(try self.program.codeBoundWorker(self.module, root), &.{});
         // In the compile-time program evaluating the root, a reader reads
         // its value from its slot once it completes; its wrapper converts
         // the literal only as the root's own evaluation. A validate-only
@@ -3797,7 +3847,7 @@ pub const Builder = struct {
             inline .fn_value, .expect, .runtime => |_, tag| invariantFmt("a literal argument root holding {s} reached lowering", .{@tagName(tag)}),
         }
         try self.beginLiteralChain();
-        const literal_requirements = try self.enterEdge(argument.edge);
+        const literal_requirements = try self.enterEdge(argument.edge, argument.dispatch_use);
         try self.lowerLiteralChain(literal_requirements, argument.callee_requirement, worker.ret);
     }
 
@@ -3898,6 +3948,14 @@ pub const Builder = struct {
                 .literal => {
                     if (!literal_requirement.site.module.eql(self.view.key)) invariant("a literal literal_requirement's literal is in another module than its scheme");
                     const expr = literal_requirement.site.expr;
+                    // A generic bound call's root is the call, lowered as an
+                    // ordinary call in its holder's frame (design.md "Bound
+                    // Instance Roots").
+                    if (literal_requirement.site.kind == .bound_call) {
+                        if (std.debug.runtime_safety and try self.exprType(expr) != result_ty) invariant("a bound root's call has another type in its holder's frame than the root");
+                        self.bound_call_lowering = expr;
+                        return try self.push(.{ .expr = expr });
+                    }
                     return switch (self.bodies().expr(expr).data) {
                         .numeral => |numeral| try self.lowerLiteralConversion(expr, .numeral, numeral.plan orelse invariant("a literal literal_requirement's numeral has no conversion plan"), result_ty),
                         .str_from_quote => |quote| try self.lowerLiteralConversion(expr, .quote, quote.plan orelse invariant("a literal literal_requirement's quote has no conversion plan"), result_ty),
@@ -3906,9 +3964,10 @@ pub const Builder = struct {
                     };
                 },
                 .node, .use => {
-                    literal_requirements = try self.enterEdge(literal_requirement.edge);
+                    literal_requirements = try self.enterEdge(literal_requirement.edge, literal_requirement.dispatch_use);
                     index = literal_requirement.callee_requirement;
                 },
+                .requirement => invariant("a scheme's literal requirement forwards through a platform requirement"),
             }
         }
     }
@@ -3916,8 +3975,10 @@ pub const Builder = struct {
     /// Enter the frame of the scheme the edge `edge` of this body's module
     /// instantiates, at the edge's instantiation: the scheme's module,
     /// variables, dictionaries, and literal arguments become this body's
-    /// innermost scope. Returns the scheme's literal requirements.
-    fn enterEdge(self: *Builder, edge: checked.LiteralEdge) Allocator.Error![]const checked.LiteralRequirement {
+    /// innermost scope. Returns the scheme's literal requirements. A dispatch
+    /// edge that is a method call's own target passes the Code instance
+    /// table of that call, `dispatch_use`.
+    fn enterEdge(self: *Builder, edge: checked.LiteralEdge, dispatch_use: ?CheckedExprId) Allocator.Error![]const checked.LiteralRequirement {
         switch (edge) {
             .literal => invariant("a literal literal_requirement's own literal is no edge"),
             .node => |node_id| {
@@ -3933,11 +3994,11 @@ pub const Builder = struct {
                 self.chain_frame = true;
                 defer self.chain_frame = false;
                 const instance = switch (node.instantiation) {
-                    .alias => try self.aliasTargetInstance(node, callee, edge, null),
+                    .alias => try self.aliasTargetInstance(node, callee, edge, dispatch_use),
                     .monomorphic, .callable, .derived_from_callable => switch (node.nested) {
                         .resolved => blk: {
                             deferred = true;
-                            break :blk try self.callInstanceAt(callee, subst, table.nestedEvidence(node), try self.instantiationCallable(node.instantiation), edge, null);
+                            break :blk try self.callInstanceAt(callee, subst, table.nestedEvidence(node), try self.instantiationCallable(node.instantiation), edge, dispatch_use);
                         },
                         .from_callable => invariant("callable-derived evidence carries no substitution, so checking records no literal edge for it"),
                         .through_alias => invariant("alias-scope evidence accompanies only an alias instantiation"),
@@ -3945,6 +4006,34 @@ pub const Builder = struct {
                 };
                 defer self.allocator.free(instance.hidden);
                 return try self.enterWorkerFrame(callee, instance, if (deferred) edge else null);
+            },
+            .requirement => |requires_idx| {
+                // A platform requirement's closing use of its app binding,
+                // at the types its sealed solution fixes (design.md "Code
+                // Instance Tables").
+                const templates = self.view.view.checked_procedure_templates;
+                const requirement = templates.literalRequirementEdge(requires_idx) orelse
+                    invariant("a literal argument's requirement edge is not recorded");
+                const subst = templates.literalRequirementSubst(requirement);
+                const evidence = self.view.view.static_dispatch_plans.evidence_refs[requirement.evidence.start..][0..requirement.evidence.len];
+                switch (try self.bindingCallee(.{ .top_level = .{ .artifact = self.view.key, .binding = requirement.binding } })) {
+                    .worker => |callee| {
+                        const owned = try self.boundTypesAt(callee, subst, null);
+                        defer self.allocator.free(owned);
+                        const bound = try self.program.arena.allocator().dupe(TypeId, owned);
+                        const instances = try self.ownRequirementInstanceWord(requires_idx);
+                        self.chain_frame = true;
+                        defer self.chain_frame = false;
+                        const instance = try self.callInstanceFrom(callee, bound, evidence, null, edge, null, null, instances);
+                        defer self.allocator.free(instance.hidden);
+                        return try self.enterWorkerFrame(callee, instance, edge);
+                    },
+                    .alias => |alias| {
+                        const word = if (self.program.worker(alias.target).instances != null) try self.ownRequirementInstanceWord(requires_idx) else null;
+                        return try self.enterAliasFrameAt(alias, subst, null, evidence, edge, word);
+                    },
+                    .callable_eval => invariant("a requirement edge instantiates a computed callable"),
+                }
             },
             .use => |expr| {
                 if (self.view.view.resolved_value_refs.by_checked_expr[@backingInt(expr)].get()) |ref_id| {
@@ -3965,12 +4054,17 @@ pub const Builder = struct {
                                 .callable_eval => invariant("a literal argument's edge uses a computed callable"),
                             };
                             const use_ty = try self.convert(self.bodies().expr(expr).ty);
+                            const instances = if (tag != .platform_required_proc and self.program.worker(callee).instances != null) try self.chainUseInstanceWord(expr) else null;
                             self.chain_frame = true;
                             defer self.chain_frame = false;
                             const instance = if (tag == .platform_required_proc)
                                 try self.requiredInstanceAt(callee, ref, self.siteSubstitution(expr), use_ty, edge)
-                            else
-                                try self.callInstanceAt(callee, self.siteSubstitution(expr), self.view.view.static_dispatch_plans.siteEvidence(expr) orelse &.{}, use_ty, edge, null);
+                            else instance: {
+                                const owned = try self.boundTypesAt(callee, self.siteSubstitution(expr), use_ty);
+                                defer self.allocator.free(owned);
+                                const bound = try self.program.arena.allocator().dupe(TypeId, owned);
+                                break :instance try self.callInstanceFrom(callee, bound, self.view.view.static_dispatch_plans.siteEvidence(expr) orelse &.{}, null, edge, null, expr, instances);
+                            };
                             defer self.allocator.free(instance.hidden);
                             return try self.enterWorkerFrame(callee, instance, edge);
                         },
@@ -4011,6 +4105,7 @@ pub const Builder = struct {
             .deferred = deferred,
             .deferred_dicts = instance.deferred_dicts,
             .saved_env = self.env,
+            .instances = if (target.instances) |inventory| .{ .word = instance.hidden[instance.hidden.len - 1], .entries = inventory.entries } else null,
         });
         return literal_requirements;
     }
@@ -4019,12 +4114,33 @@ pub const Builder = struct {
     /// of this body's module instantiates it. Its literal requirements are
     /// those its forwarded lookup's scheme gives it.
     fn enterAliasFrame(self: *Builder, alias: AliasCallee, site: CheckedExprId) Allocator.Error![]const checked.LiteralRequirement {
+        const word = if (self.program.worker(alias.target).instances != null) try self.chainUseInstanceWord(site) else null;
+        return try self.enterAliasFrameAt(alias, self.siteSubstitution(site), try self.exprType(site), self.view.view.static_dispatch_plans.siteEvidence(site) orelse &.{}, .{ .use = site }, word);
+    }
+
+    /// The instance table word a use `use` in the innermost frame of a
+    /// literal chain passes a template with an inventory: the use's own
+    /// (a closing use, or a forward use of the frame's table), else, in the
+    /// frame of an exact procedure alias, the word of the use that entered
+    /// the alias. This is the rule `aliasChainInstance` applies to a
+    /// forwarded lookup outside a chain.
+    fn chainUseInstanceWord(self: *Builder, use: CheckedExprId) Allocator.Error!?LocalId {
+        if (try self.instanceWordForUse(use, self.ownInstanceTable())) |word| return word;
+        const first = self.thunk_frames orelse return null;
+        if (self.alias_scopes.items.len <= first) return null;
+        const frame = self.alias_scopes.items[self.alias_scopes.items.len - 1].alias_instances orelse return null;
+        return frame.word;
+    }
+
+    /// `enterAliasFrame` for the edge `edge`, which fixes the alias scope's
+    /// variables to `subst` (related through `call_fn` where it records
+    /// none) and fills its requirements from `evidence`.
+    fn enterAliasFrameAt(self: *Builder, alias: AliasCallee, subst: []const checked.CheckedTypeId, call_fn: ?TypeId, evidence: []const static_dispatch.CheckedEvidence, edge: checked.LiteralEdge, instances: ?LocalId) Allocator.Error![]const checked.LiteralRequirement {
         const alias_step = self.callableEvalAliasStep(alias.module, alias.template);
-        const bound = try self.aliasScopeBound(alias_step, self.siteSubstitution(site), try self.exprType(site));
-        const evidence = self.view.view.static_dispatch_plans.siteEvidence(site) orelse &.{};
+        const bound = try self.aliasScopeBound(alias_step, subst, call_fn);
         const env: types.Env = .{ .module = alias_step.module, .vars = alias_step.vars, .bound = bound };
         const deferred_dicts = try self.deferredDictionaries(evidence, .{ .module = alias_step.module, .params = alias_step.params, .env = env }, alias_step.params.len);
-        const args = self.view.view.checked_procedure_templates.literalEdgeArgs(.{ .use = site });
+        const args = self.view.view.checked_procedure_templates.literalEdgeArgs(edge);
         if (args.len != alias_step.literal_requirements.len) invariant("an alias's use has no literal arguments for its literal_requirements");
         const deferred: DeferredLiterals = .{ .edge = .{ .args = args, .module = self.module, .view = self.view, .env = self.env } };
         self.module = alias_step.module;
@@ -4037,6 +4153,7 @@ pub const Builder = struct {
             .deferred = deferred,
             .deferred_dicts = deferred_dicts,
             .saved_env = self.env,
+            .alias_instances = .{ .word = instances },
         });
         return alias_step.literal_requirements;
     }
@@ -4061,6 +4178,9 @@ pub const Builder = struct {
         const args = self.view.view.checked_procedure_templates.literalEdgeArgs(.{ .use = site });
         if (args.len != scheme.literal_requirements.len) invariant("a local scope's site has no literal arguments for its literal_requirements");
         const deferred: DeferredLiterals = .{ .edge = .{ .args = args, .module = self.module, .view = self.view, .env = self.env } };
+        // A generalized local function is in the table of the template
+        // whose body holds it.
+        const instances = self.ownInstanceTable();
         self.env = context.env;
         try self.alias_scopes.append(self.allocator, .{
             .params = scheme.dictionaries,
@@ -4069,6 +4189,7 @@ pub const Builder = struct {
             .deferred = deferred,
             .deferred_dicts = deferred_dicts,
             .saved_env = self.env,
+            .instances = instances,
         });
         return scheme.literal_requirements;
     }
@@ -4133,6 +4254,8 @@ pub const Builder = struct {
 
     /// The instance table this body's worker takes or captures, or null.
     pub fn ownInstanceTable(self: *Builder) ?InstanceTable {
+        // In a literal chain, the table is the innermost entered frame's.
+        if (self.thunk_frames) |first| if (self.alias_scopes.items.len > first) return self.alias_scopes.items[self.alias_scopes.items.len - 1].instances;
         if (self.instance_words.len == 0) return null;
         const inventory = self.currentWorker().instances orelse invariant("a body holds an instance table its worker has no inventory for");
         return .{ .word = self.instance_words[0], .entries = inventory.entries };
@@ -4169,8 +4292,12 @@ pub const Builder = struct {
     /// Set the instance table word of a call of `callee` (the last word of
     /// `hidden`) from the use `use` of this body, which a template with an
     /// inventory always has (a refused use is a runtime error).
-    fn fillInstanceWord(self: *Builder, callee: WorkerId, use: ?CheckedExprId, hidden: []LocalId) Allocator.Error!void {
+    fn fillInstanceWord(self: *Builder, callee: WorkerId, use: ?CheckedExprId, given: ?LocalId, hidden: []LocalId) Allocator.Error!void {
         if (self.program.worker(callee).instances == null) return;
+        if (given) |word| {
+            hidden[hidden.len - 1] = word;
+            return;
+        }
         const at = use orelse invariant("a template with an inventory was reached by no use that passes an instance table");
         hidden[hidden.len - 1] = (try self.instanceWordForUse(at, self.ownInstanceTable())) orelse
             invariant("a use of a template with an inventory has no instance table");
@@ -4241,14 +4368,120 @@ pub const Builder = struct {
     // (`WorkerKey.code_value`), which calls the worker of each component's
     // type, so a recursive type reaches its own worker again.
 
+    /// A generic bound call read in its body: the call's bound requirement
+    /// in scope, called with the tuple of the call's leaf values (design.md
+    /// "Bound Instance Roots").
+    fn lowerInstanceBound(self: *Builder, expr: CheckedExprId, call_index: u32) Allocator.Error!void {
+        const index = self.ownLiteralRequirementIndex(expr) orelse invariant("a generic bound call has no bound requirement in its scope");
+        const callable = try self.scopeLiteral(.{ .depth = 0, .index = index });
+        const leaves = self.view.view.code_instances.boundCallLeaves(call_index);
+        const values = try self.allocator.alloc(LocalId, leaves.len);
+        defer self.allocator.free(values);
+        const leaf_types = try self.allocator.alloc(TypeId, leaves.len);
+        defer self.allocator.free(leaf_types);
+        for (leaves, values, leaf_types) |leaf, *value, *leaf_ty| {
+            value.* = self.binders.get(leaf) orelse invariant("a generic bound call's leaf is not bound in its body");
+            leaf_ty.* = try self.patternType(self.bodies().patternBinder(leaf).pattern);
+        }
+        const store = &self.program.store;
+        const tuple_ty = try store.intern(.{ .tuple = leaf_types });
+        const tuple = try self.buildStruct(tuple_ty, values);
+        const call_ty = try self.exprType(expr);
+        const fn_ty = try store.intern(.{ .function = .{ .args = &.{tuple_ty}, .ret = call_ty, .effectful = false } });
+        try self.pushValue(try self.emitErasedCall(callable, fn_ty, &.{tuple}, call_ty));
+    }
+
+    /// The body of a bound requirement's argument (`WorkerKey.code_bound`):
+    /// the root's edge chain entered as its wrapper enters it, the call's
+    /// leaves bound from the argument, the root's value (restored, read from
+    /// its slot while it is pending, or the call lowered there), and the
+    /// inputs of the root's closing use (design.md "Bound Instance Roots").
+    pub fn lowerCodeBoundBody(self: *Builder, key: @FieldType(lower.WorkerKey, "code_bound")) Allocator.Error!void {
+        const worker = self.currentWorker().*;
+        const start = try self.beginErasedWorker(&.{});
+        defer self.allocator.free(start.captures);
+        self.var_descs = &.{};
+        self.dict_locals = &.{};
+        self.literal_locals = &.{};
+        const record = try self.erasedParamLocal(worker.params);
+        const ret_layout = try self.program.layouts.layoutOf(worker.ret);
+        const body_start = try self.newHole();
+        self.hole = body_start;
+        const tuple = try self.erasedParamValue(record, worker.params, 0);
+        const leaf_types = switch (self.program.store.get(worker.params[0])) {
+            .tuple => |items| try self.allocator.dupe(TypeId, self.program.store.span(items)),
+            .primitive, .empty_record, .record, .tag_union, .list, .box, .nominal, .function, .variable => invariant("a bound requirement's argument is not a tuple"),
+        };
+        defer self.allocator.free(leaf_types);
+        const root = self.view.view.compile_time_roots.root(key.root);
+        const argument = root.literal_argument orelse invariant("a bound root records no literal argument");
+        try self.tasks.append(self.allocator, .ret);
+        try self.beginLiteralChain();
+        var requirements = try self.enterEdge(argument.edge, argument.dispatch_use);
+        var index = argument.callee_requirement;
+        while (true) {
+            if (index >= requirements.len) invariant("a bound root names a requirement its scheme does not have");
+            switch (requirements[index].edge) {
+                .literal => break,
+                .node, .use => {
+                    const edge = requirements[index].edge;
+                    const dispatch_use = requirements[index].dispatch_use;
+                    index = requirements[index].callee_requirement;
+                    requirements = try self.enterEdge(edge, dispatch_use);
+                },
+                .requirement => invariant("a scheme's literal requirement forwards through a platform requirement"),
+            }
+        }
+        const site = requirements[index].site;
+        if (site.kind != .bound_call or !site.module.eql(self.view.key)) invariant("a bound root's chain does not end at its call");
+        const call_index = self.view.view.code_instances.boundCallIndex(site.expr) orelse invariant("a bound root's call is no generic bound call of its holder");
+        const leaves = self.view.view.code_instances.boundCallLeaves(call_index);
+        if (leaves.len != leaf_types.len) invariant("a bound requirement's argument differs from its call's leaves");
+        for (leaves, leaf_types, 0..) |leaf, leaf_ty, position| {
+            try self.binders.put(self.allocator, leaf, try self.readField(worker.params[0], tuple, @intCast(position), leaf_ty));
+        }
+        try self.push(.{ .bind_root_inputs = .{ .module = key.module, .root = key.root, .ty = worker.ret } });
+        switch (root.payload) {
+            .const_node => |node| try self.push(.{ .restore = .{ .source = .{ .module = key.module }, .node = node, .ty = worker.ret, .root = key.root } }),
+            .pending, .unevaluated, .discarded => if (root.payload == .pending and !argument.validate_only and self.program.evaluatesRoot(key.module, key.root)) {
+                try self.pendingValueRead(key.module, key.root, worker.ret);
+            } else {
+                self.bound_call_lowering = site.expr;
+                try self.push(.{ .expr = site.expr });
+            },
+            inline .fn_value, .expect, .runtime => |_, tag| invariantFmt("a bound root holding {s} reached lowering", .{@tagName(tag)}),
+        }
+        try self.run();
+        try self.finishProc(start.entry, body_start, &.{ record, start.capture_ptr }, ret_layout);
+        const proc = self.store.getProcSpecPtr(worker.proc);
+        proc.erased_capture_arg = start.capture_ptr;
+        proc.abi = .erased_record;
+    }
+
     /// The `Code.Bound` value of `expr` rebuilt with the values of the
     /// input slots it binds (`Task.bind_code_inputs`).
     pub fn bindCodeInputs(self: *Builder, expr: CheckedExprId) Allocator.Error!void {
+        const slots = self.bodies().codeBinding(expr) orelse invariant("a code binding task names a call that binds no input slots");
+        try self.bindInputSlots(try self.exprType(expr), slots, null);
+    }
+
+    /// The `Code.Bound` value of the generic bound call that root `root` of
+    /// `module_index` binds, rebuilt with the values of the input slots its
+    /// closing use recorded (`Task.bind_root_inputs`, design.md "Bound
+    /// Instance Roots").
+    fn bindRootInputs(self: *Builder, module_index: ModuleIndex, root: checked.ComptimeRootId, bound_ty: TypeId) Allocator.Error!void {
+        const table = self.program.module(module_index).view.code_instances;
+        const entry = table.rootBoundEntry(root) orelse invariant("a generic bound call's root has no bound entry");
+        try self.bindInputSlots(bound_ty, table.boundEntrySlots(entry), table);
+    }
+
+    /// Pop a `Code.Bound` value of `bound_ty` and push it with `inputs` set
+    /// to the values of `slots`, whose steps and shapes are in `table`'s
+    /// pools, or in the body store's where `table` is null.
+    fn bindInputSlots(self: *Builder, bound_ty: TypeId, slots: []const checked.CheckedCodeSlot, table: ?*const checked.CodeInstanceTable) Allocator.Error!void {
         const raw = self.popValue();
-        const bound_ty = try self.exprType(expr);
         // A value no execution produces is not rebuilt.
         if (self.hole == null) return try self.pushValue(raw);
-        const slots = self.bodies().codeBinding(expr) orelse invariant("a code binding task names a call that binds no input slots");
         const store = &self.program.store;
         if (!store.isClosed(bound_ty)) invariant("a call that binds input slots has an open type");
         const bound_nominal = switch (store.get(bound_ty)) {
@@ -4282,7 +4515,7 @@ pub const Builder = struct {
         const value = try self.readField(backing, raw, @intCast(value_index.?), value_field.ty);
         const values = try self.allocator.alloc(LocalId, slots.len);
         defer self.allocator.free(values);
-        for (slots, values) |slot, *out| out.* = try self.boundSlotValue(slot, code_value_ty);
+        for (slots, values) |slot, *out| out.* = try self.boundSlotValue(slot, table, code_value_ty);
         const inputs = try self.buildList(inputs_field.ty, values);
         const components = try self.allocator.alloc(LocalId, fields.len);
         defer self.allocator.free(components);
@@ -4295,13 +4528,15 @@ pub const Builder = struct {
     /// its path steps, then built by the worker of its type, or, for a slot
     /// whose type holds an opaque type, the bytes its recorded encoder
     /// writes.
-    fn boundSlotValue(self: *Builder, slot: checked.CheckedCodeSlot, code_value_ty: TypeId) Allocator.Error!LocalId {
+    fn boundSlotValue(self: *Builder, slot: checked.CheckedCodeSlot, table: ?*const checked.CodeInstanceTable, code_value_ty: TypeId) Allocator.Error!LocalId {
         const store = &self.program.store;
         const binder = self.bodies().patternBinder(slot.leaf);
         var ty = try self.patternType(binder.pattern);
         if (!store.isClosed(ty)) invariant("an input slot's binder has an open type");
         var value = self.binders.get(slot.leaf) orelse invariant("an input slot reads a binder the body has not bound");
-        for (self.bodies().codeSlotSteps(slot)) |path_step| switch (path_step.kind) {
+        const slot_steps = if (table) |pools| pools.slot_steps[slot.steps_start..][0..slot.steps_len] else self.bodies().codeSlotSteps(slot);
+        const slot_shape = if (table) |pools| pools.slot_shapes[slot.shape_start..][0..slot.shape_len] else self.bodies().codeSlotShape(slot);
+        for (slot_steps) |path_step| switch (path_step.kind) {
             .field => {
                 const text = self.view.nameStore().recordFieldLabelText(@fromBackingInt(path_step.value));
                 const record = switch (store.get(ty)) {
@@ -4339,13 +4574,13 @@ pub const Builder = struct {
         };
         if (slot.encoder.get()) |encoder| {
             if (std.debug.runtime_safety) {
-                const shape = self.bodies().codeSlotShape(slot);
+                const shape = slot_shape;
                 if (shape.len != 1 or shape[0] != @backingInt(checked.CodeValueShape.encoded)) invariant("an input slot with an encoder was not recorded as encoded");
             }
             return try self.encodedSlotValue(encoder, value, ty, code_value_ty);
         }
         if (std.debug.runtime_safety) {
-            if (!try self.codeValueShapeMatches(ty, self.bodies().codeSlotShape(slot))) invariant("an input slot's type differs from the shape of its slot type");
+            if (!try self.codeValueShapeMatches(ty, slot_shape)) invariant("an input slot's type differs from the shape of its slot type");
         }
         return try self.codeValueCall(value, ty, code_value_ty);
     }
@@ -5121,7 +5356,7 @@ pub const Builder = struct {
             if (self.program.worker_ids.get(.{ .lambda = .{ .module = self.module, .expr = lambda_expr, .outer = scope_worker } })) |id| return .{ scope_worker, id };
             switch (self.program.worker(scope_worker).key) {
                 .lambda => |key| scope_worker = key.outer,
-                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => break,
+                .template, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => break,
             }
         }
         // No body of the chain declared it: the chain is a stored closure
@@ -5886,7 +6121,7 @@ pub const Builder = struct {
         if (decoded.rebuilt) {
             const target = switch (self.program.worker(decoded.worker).key) {
                 .method_entry => |target| target,
-                .template, .adapter, .default, .lambda, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("a rebuilt stored dictionary is not a method entry's"),
+                .template, .adapter, .default, .lambda, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => invariant("a rebuilt stored dictionary is not a method entry's"),
             };
             const instance = try self.program.targetRequirements(target, decoded.bound);
             return try self.pushValue(try self.dictionaryOfTree(.{ .target = .{ .target = target, .instance = instance } }));
@@ -6024,7 +6259,7 @@ pub const Builder = struct {
     pub fn templateEvidenceParams(self: *Builder, worker_id: WorkerId) []const static_dispatch.EvidenceParamRecord {
         const key = switch (self.program.worker(worker_id).key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("evidence parameters of a worker that is not a procedure template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => invariant("evidence parameters of a worker that is not a procedure template's"),
         };
         const view = self.program.module(key.module).view;
         const template = view.checked_procedure_templates.templates.items[@backingInt(key.template)];
@@ -6369,7 +6604,7 @@ pub const Builder = struct {
     /// (design.md "Literal Arguments"), and its instance table from the use
     /// `use` (design.md "Code Instance Tables").
     pub fn callInstanceBound(self: *Builder, callee: WorkerId, bound: []const TypeId, evidence: []const static_dispatch.CheckedEvidence, edge: checked.LiteralEdge, use: ?CheckedExprId) Allocator.Error!CallInstance {
-        return try self.callInstanceFrom(callee, bound, evidence, null, edge, use);
+        return try self.callInstanceFrom(callee, bound, evidence, null, edge, null, use, null);
     }
 
     /// The call instance of a use of platform requirement `required`, whose
@@ -6382,16 +6617,42 @@ pub const Builder = struct {
         const owned = try self.boundTypesAt(callee, subst, call_fn);
         defer self.allocator.free(owned);
         const bound = try self.program.arena.allocator().dupe(TypeId, owned);
-        const span = required.root_evidence orelse return try self.callInstanceFrom(callee, bound, &.{}, null, edge, null);
+        const instances = try self.requirementInstanceWord(required);
+        // The app's edge for the requirement gives the literal arguments
+        // where the requirement's solution was sealed (design.md "Literal
+        // Arguments").
+        const literal_edge: checked.LiteralEdge, const edge_owner: ?*const types.ModuleView = if (required.literal_edge) |ref|
+            .{ .{ .requirement = ref.requires_idx }, self.program.moduleByKey(ref.checked_module) }
+        else
+            .{ edge, null };
+        const span = required.root_evidence orelse return try self.callInstanceFrom(callee, bound, &.{}, null, literal_edge, edge_owner, null, instances);
         const owner = self.program.moduleByKey(span.checked_module);
         const evidence = owner.view.static_dispatch_plans.evidence_refs[span.span.start..][0..span.span.len];
-        return try self.callInstanceFrom(callee, bound, evidence, owner, edge, null);
+        return try self.callInstanceFrom(callee, bound, evidence, owner, literal_edge, edge_owner, null, instances);
+    }
+
+    /// The instance table word of platform requirement `requires_idx`'s
+    /// closing use in this body's module, the app, or null where the app
+    /// binding has no inventory.
+    fn ownRequirementInstanceWord(self: *Builder, requires_idx: u32) Allocator.Error!?LocalId {
+        const table = self.view.view.code_instances.requirementTable(requires_idx) orelse return null;
+        return try self.composeDictionary(try self.program.codeInstancesWorker(self.module, table), &.{});
+    }
+
+    /// The instance table word of a platform requirement's closing use in
+    /// the app (design.md "Code Instance Tables"), or null where the app
+    /// binding has no inventory.
+    fn requirementInstanceWord(self: *Builder, required: checked.PlatformRequiredProcedureResolvedRef) Allocator.Error!?LocalId {
+        const table = required.instances orelse return null;
+        const owner = self.program.moduleByKey(table.checked_module);
+        return try self.composeDictionary(try self.program.codeInstancesWorker(owner.index, table.table), &.{});
     }
 
     /// `callInstanceBound` with evidence read from `evidence_owner`'s table
     /// when it is not this body's module's, resolved in that module at the
-    /// instance's bindings of the callee's scheme.
-    fn callInstanceFrom(self: *Builder, callee: WorkerId, bound: []const TypeId, evidence: []const static_dispatch.CheckedEvidence, evidence_owner: ?*const types.ModuleView, edge: checked.LiteralEdge, use: ?CheckedExprId) Allocator.Error!CallInstance {
+    /// instance's bindings of the callee's scheme, and `edge` an edge of
+    /// `edge_owner` when it is not this body's module's.
+    fn callInstanceFrom(self: *Builder, callee: WorkerId, bound: []const TypeId, evidence: []const static_dispatch.CheckedEvidence, evidence_owner: ?*const types.ModuleView, edge: checked.LiteralEdge, edge_owner: ?*const types.ModuleView, use: ?CheckedExprId, instances: ?LocalId) Allocator.Error!CallInstance {
         // Only this instance's frame reads as it goes, not the instances its
         // dictionaries are built from.
         const chain_frame = self.chain_frame;
@@ -6401,6 +6662,9 @@ pub const Builder = struct {
         errdefer self.allocator.free(hidden);
         if (chain_frame) {
             const ret = try self.program.substitute(self.allocator, target.ret, bound);
+            // A frame's Code sites read the use's table (design.md "Bound
+            // Instance Roots").
+            try self.fillInstanceWord(callee, use, instances, hidden);
             if (target.dictionary_params.len == 0) return .{ .hidden = hidden, .bound = bound, .ret = ret };
             const context = self.templateParamContext(callee, bound);
             var deferred = try self.deferredDictionaries(evidence, context, target.dictionary_params.len);
@@ -6438,14 +6702,16 @@ pub const Builder = struct {
         }
         const literals = hidden[bound.len + target.dictionary_params.len ..][0..target.literal_params];
         if (edge == .literal) {
-            // A call checking recorded no edge for (a platform requirement's
-            // call of the app's binding) derives its literal arguments from
-            // its instantiation, as it does its dictionaries.
+            // A call checking recorded no edge for (a platform requirement
+            // whose solution was not sealed) derives its literal arguments
+            // from its instantiation, as it does its dictionaries.
             try self.derivedLiteralArgs(callee, bound, literals);
+        } else if (edge_owner) |owner| {
+            try self.fillLiteralArgsOf(owner, callee, edge, literals);
         } else {
             try self.fillLiteralArgs(callee, edge, literals);
         }
-        try self.fillInstanceWord(callee, use, hidden);
+        try self.fillInstanceWord(callee, use, instances, hidden);
         return .{ .hidden = hidden, .bound = bound, .ret = try self.program.substitute(self.allocator, target.ret, bound) };
     }
 
@@ -6659,7 +6925,7 @@ pub const Builder = struct {
         const target = self.program.worker(callee).*;
         const key = switch (target.key) {
             .template => |key| key,
-            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_instances, .code_description => invariant("a worker with dictionary parameters is not a template's"),
+            .adapter, .default, .lambda, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .code_bound, .code_instances, .code_description => invariant("a worker with dictionary parameters is not a template's"),
         };
         const templates = self.program.module(key.module).view.checked_procedure_templates;
         return .{
@@ -6952,7 +7218,7 @@ pub const Builder = struct {
             .literal_source = literal_source,
             .chain_frame = chain_frame,
             .call_fn = null,
-            .instances = if (chain_frame) null else try self.useInstanceWord(use),
+            .instances = try self.useInstanceWord(use),
         });
     }
 
@@ -6993,17 +7259,30 @@ pub const Builder = struct {
     fn requiredAliasInstance(self: *Builder, alias: AliasCallee, required: checked.PlatformRequiredProcedureResolvedRef, call_fn: TypeId) Allocator.Error!CallInstance {
         const first = self.callableEvalAliasStep(alias.module, alias.template);
         const scope = try self.requiredAliasScope(first, required, call_fn);
+        const literals = try self.requiredAliasLiterals(first, required);
         return try self.aliasChainInstance(.{
             .callee = alias.target,
             .first = first,
             .bound = scope.bound,
             .dicts = scope.dicts,
-            .literals = &.{},
+            .literals = literals.args,
             .evidence = &.{},
-            .literal_source = .derived,
+            .literal_source = literals.source,
             .chain_frame = false,
             .call_fn = call_fn,
+            .instances = try self.requirementInstanceWord(required),
         });
+    }
+
+    /// The literal arguments of the scope of alias `alias_step` that platform
+    /// requirement `required` enters: the app's edge for the requirement
+    /// where its solution was sealed, which the chain's lookups then carry,
+    /// else derived from the target's instantiation.
+    fn requiredAliasLiterals(self: *Builder, alias_step: AliasStep, required: checked.PlatformRequiredProcedureResolvedRef) Allocator.Error!struct { args: []const LocalId, source: AliasLiterals } {
+        const ref = required.literal_edge orelse return .{ .args = &.{}, .source = .derived };
+        const args = try self.program.arena.allocator().alloc(LocalId, alias_step.literal_requirements.len);
+        try self.fillLiteralArgsOf(self.program.moduleByKey(ref.checked_module), null, .{ .requirement = ref.requires_idx }, args);
+        return .{ .args = args, .source = .scopes };
     }
 
     /// The instantiation and dictionaries of the scope of alias `alias_step`
@@ -7034,7 +7313,7 @@ pub const Builder = struct {
     /// of the use's substitution `subst`, where an entry it left erroneous or
     /// did not record takes what the use's function type relates it to, or
     /// seals.
-    fn aliasScopeBound(self: *Builder, alias_step: AliasStep, subst: []const checked.CheckedTypeId, call_fn: TypeId) Allocator.Error![]const TypeId {
+    fn aliasScopeBound(self: *Builder, alias_step: AliasStep, subst: []const checked.CheckedTypeId, call_fn: ?TypeId) Allocator.Error![]const TypeId {
         if (subst.len != 0 and subst.len != alias_step.vars.len) invariant("a use's substitution differs from its alias's scope");
         const bound = try self.program.arena.allocator().alloc(TypeId, alias_step.vars.len);
         var unrecorded = subst.len != alias_step.vars.len;
@@ -7048,7 +7327,7 @@ pub const Builder = struct {
         for (generic, 0..) |*slot, index| slot.* = try self.program.store.variable(@intCast(index));
         const alias_fn = alias_step.fn_ty orelse invariant("an alias with an unrecorded use has no function type");
         const generic_fn = try self.program.converter().convert(alias_step.module, alias_fn, .{ .module = alias_step.module, .vars = alias_step.vars, .bound = generic });
-        const related = try self.relateVariablesPartial(&.{.{ generic_fn, call_fn }}, alias_step.vars.len);
+        const related = try self.relateVariablesPartial(&.{.{ generic_fn, call_fn orelse invariant("an alias scope with an unrecorded instantiation has no use type") }}, alias_step.vars.len);
         defer self.allocator.free(related);
         for (bound, related, alias_step.vars, 0..) |*slot, ty, variable, index| {
             slot.* = if (index < subst.len and self.view.types().payload(subst[index]) != .err)
@@ -7119,11 +7398,9 @@ pub const Builder = struct {
             // read in this alias's scope (design.md "Code Instance Tables").
             // A lookup closed in the alias's own body (an alias at a fixed
             // type), or a local alias's forward use, has its own table;
-            // otherwise the use's table reaches the procedure.
-            const lookup_instances: ?LocalId = if (chain_frame)
-                null
-            else
-                (try self.instanceWordForUse(alias_step.lookup, if (alias_step.local) own_instances else null)) orelse carried;
+            // otherwise the use's table reaches the procedure. A literal
+            // chain's frame of the procedure reads the same table.
+            const lookup_instances: ?LocalId = (try self.instanceWordForUse(alias_step.lookup, if (alias_step.local) own_instances else null)) orelse carried;
             const ref_id = self.view.view.resolved_value_refs.by_checked_expr[@backingInt(alias_step.lookup)].get() orelse
                 invariant("a forwarded procedure alias lookup has no resolved reference");
             const lookup_ref = self.view.view.resolved_value_refs.records[@backingInt(ref_id)].ref;
@@ -7160,9 +7437,9 @@ pub const Builder = struct {
                     errdefer self.allocator.free(hidden);
                     if (!chain_frame) {
                         for (target_bound, hidden[0..target_bound.len]) |ty, *desc| desc.* = try self.descOf(ty);
-                        if (target.instances != null) hidden[hidden.len - 1] = lookup_instances orelse
-                            invariant("an alias's forwarded lookup of a template with an inventory has no instance table");
                     }
+                    if (target.instances != null) hidden[hidden.len - 1] = lookup_instances orelse
+                        invariant("an alias's forwarded lookup of a template with an inventory has no instance table");
                     const target_literals = hidden[target_bound.len + target.dictionary_params.len ..][0..target.literal_params];
                     switch (literal_source) {
                         .edge => |literal_args| @memcpy(target_literals, literal_args),
@@ -7187,10 +7464,11 @@ pub const Builder = struct {
             // alias's scope as a use with no recorded instantiation.
             if (lookup_ref == .platform_required_proc) if (chain.call_fn) |call_fn| {
                 const scope = try self.requiredAliasScope(next, lookup_ref.platform_required_proc, call_fn);
+                const required_literals = try self.requiredAliasLiterals(next, lookup_ref.platform_required_proc);
                 bound = scope.bound;
                 dicts = scope.dicts;
-                literals = &.{};
-                literal_source = .derived;
+                literals = required_literals.args;
+                literal_source = required_literals.source;
                 alias_step = next;
                 continue;
             };

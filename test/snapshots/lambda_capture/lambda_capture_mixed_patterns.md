@@ -57,7 +57,7 @@ EndOfFile,
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-call (constraint-fn-var 490)
+(e-call (constraint-fn-var 494)
 	(e-lambda
 		(args
 			(p-assign (ident "base")))
@@ -70,9 +70,9 @@ EndOfFile,
 					(e-lambda
 						(args
 							(p-assign (ident "x")))
-						(e-dispatch-call (method "plus") (constraint-fn-var 466)
+						(e-dispatch-call (method "plus") (constraint-fn-var 470)
 							(receiver
-								(e-dispatch-call (method "plus") (constraint-fn-var 457)
+								(e-dispatch-call (method "plus") (constraint-fn-var 461)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "base"))))
@@ -81,7 +81,7 @@ EndOfFile,
 											(p-assign (ident "x"))))))
 							(args
 								(e-num (value "1")))))))
-			(e-call (constraint-fn-var 482)
+			(e-call (constraint-fn-var 486)
 				(e-lookup-local
 					(p-assign (ident "simple")))
 				(e-num (value "1")))))

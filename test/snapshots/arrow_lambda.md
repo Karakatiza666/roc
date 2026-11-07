@@ -84,11 +84,11 @@ test3 = "" |> (|s| if (s.is_empty()) "empty" else "not empty")
 (can-ir
 	(d-let
 		(p-assign (ident "test1"))
-		(e-call (constraint-fn-var 487)
+		(e-call (constraint-fn-var 491)
 			(e-lambda
 				(args
 					(p-assign (ident "x")))
-				(e-dispatch-call (method "plus") (constraint-fn-var 478)
+				(e-dispatch-call (method "plus") (constraint-fn-var 482)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "x"))))
@@ -97,7 +97,7 @@ test3 = "" |> (|s| if (s.is_empty()) "empty" else "not empty")
 			(e-num (value "10"))))
 	(d-let
 		(p-assign (ident "test2"))
-		(e-call (constraint-fn-var 504)
+		(e-call (constraint-fn-var 508)
 			(e-lambda
 				(args
 					(p-underscore))
@@ -107,14 +107,14 @@ test3 = "" |> (|s| if (s.is_empty()) "empty" else "not empty")
 				(e-literal (string "hello")))))
 	(d-let
 		(p-assign (ident "test3"))
-		(e-call (constraint-fn-var 532)
+		(e-call (constraint-fn-var 536)
 			(e-lambda
 				(args
 					(p-assign (ident "s")))
 				(e-if
 					(if-branches
 						(if-branch
-							(e-dispatch-call (method "is_empty") (constraint-fn-var 505)
+							(e-dispatch-call (method "is_empty") (constraint-fn-var 509)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "s"))))

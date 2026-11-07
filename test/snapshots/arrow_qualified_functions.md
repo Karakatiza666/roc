@@ -117,21 +117,21 @@ test7 = 42 |> Ok
 (can-ir
 	(d-let
 		(p-assign (ident "test1"))
-		(e-call (constraint-fn-var 495)
+		(e-call (constraint-fn-var 499)
 			(e-lookup-external
 				(builtin))
 			(e-string
 				(e-literal (string "hello")))))
 	(d-let
 		(p-assign (ident "test2"))
-		(e-call (constraint-fn-var 507)
+		(e-call (constraint-fn-var 511)
 			(e-lookup-external
 				(builtin))
 			(e-string
 				(e-literal (string "hello")))))
 	(d-let
 		(p-assign (ident "test3"))
-		(e-call (constraint-fn-var 528)
+		(e-call (constraint-fn-var 532)
 			(e-lookup-external
 				(builtin))
 			(e-string
@@ -147,13 +147,13 @@ test7 = 42 |> Ok
 				(p-assign (ident "a")))))
 	(d-let
 		(p-assign (ident "test4"))
-		(e-call (constraint-fn-var 538)
+		(e-call (constraint-fn-var 542)
 			(e-lookup-local
 				(p-assign (ident "fn0")))
 			(e-num (value "10"))))
 	(d-let
 		(p-assign (ident "test5"))
-		(e-call (constraint-fn-var 548)
+		(e-call (constraint-fn-var 552)
 			(e-lookup-local
 				(p-assign (ident "fn0")))
 			(e-num (value "10"))))

@@ -8080,7 +8080,7 @@ const Builder = struct {
                     procedure.source_fn_ty_template,
                     root_node,
                     edge,
-                    null,
+                    self.requirementInstances(request.instances),
                     false,
                 );
                 const callee_fn_node = try ctx.draftFnSlotTypeNode(selected, root_node);
@@ -11832,21 +11832,12 @@ const Builder = struct {
     }
 
     fn lowerCheckedTypeVariable(variable: checked.CheckedTypeVariable) Type.Content {
-        if (variable.numeric_default_phase) |phase| {
-            const target = checked.literal_defaulting.defaultTargetForPhase(phase) orelse
-                Common.invariant("checking-finalized numeric variable reached Monotype unresolved");
-            return switch (target) {
-                .dec => .{ .primitive = .dec },
-                .str => .{ .primitive = .str },
-            };
-        }
-        if (variable.row_default) |row_default| {
-            return switch (row_default) {
-                .empty_record => .{ .record = .empty() },
-                .empty_tag_union => .{ .tag_union = .empty() },
-            };
-        }
-        return .{ .tag_union = .empty() };
+        return switch (checked.sealedVariable(variable)) {
+            .dec => .{ .primitive = .dec },
+            .str => .{ .primitive = .str },
+            .empty_record => .{ .record = .empty() },
+            .empty_tag_union => .{ .tag_union = .empty() },
+        };
     }
 
     fn lowerNominalBackingType(
@@ -13259,6 +13250,13 @@ const Builder = struct {
     /// The evidence a producer-authored root edge supplies to a template: the
     /// template's own quantified variables, unpinned by any caller, with the
     /// root's recorded entries as contract provenance.
+    /// The table of a platform requirement's closing use in the app
+    /// (design.md "Code Instance Tables"), or null.
+    fn requirementInstances(self: *Builder, ref: ?checked.CheckedInstanceTableRef) ?InstanceTableId {
+        const table = ref orelse return null;
+        return .{ .view = self.moduleForId(table.checked_module), .table = table.table };
+    }
+
     fn materializeCheckedProcedureEvidence(
         self: *Builder,
         template_ref: names.ProcTemplate,
@@ -22713,6 +22711,10 @@ const BodyContext = struct {
     /// stored at its own type variables keeps no table, and an exact alias's
     /// lookup is at those variables, so each takes the use's.
     binding_instances: ?BindingInstances = null,
+    /// The generic bound call whose own lowering `stepBoundInstance`
+    /// requested, which the next lowering step of that call takes as an
+    /// ordinary call (design.md "Bound Instance Roots").
+    bound_call_lowering: ?checked.CheckedExprId = null,
     /// While restoring a static-data candidate's runtime expression along its
     /// constructor spine, that candidate. Each non-empty list or box on the
     /// spine restores as its own nested candidate (`restoredStaticDataPart`),
@@ -32219,6 +32221,8 @@ const BodyContext = struct {
         expr: struct { expr: checked.CheckedExprId },
         /// `lowerExprInner`
         expr_inner: struct { expr: checked.CheckedExprId, saved: ?SavedSourceLocation = null },
+        /// A generic bound call at the instance table in force.
+        bound_instance: struct { expr: checked.CheckedExprId },
         /// An expression lowered at a sealed type.
         with_type: WithTypeTask,
         /// `lowerRecordExpr` at a sealed record type.
@@ -35009,6 +35013,7 @@ const BodyContext = struct {
             .call_expr_at_node,
             .call_expr,
             .interpolation,
+            .bound_instance,
             => {},
         }
     }
@@ -35020,6 +35025,7 @@ const BodyContext = struct {
             .type_inner => |*task| return self.stepTypeInner(frame, task, input),
             .expr => |*task| return self.stepLowerExpr(frame, task, input),
             .expr_inner => |*task| return self.stepExprInner(frame, task, input),
+            .bound_instance => |*task| return self.stepBoundInstance(frame, task, input),
             .with_type => |*task| return self.stepWithType(frame, task, input),
             .record_at_type => |*task| return self.stepRecordAtType(task, input),
             .dispatch => |*task| return self.stepDispatchLower(frame, task, input),
@@ -35233,6 +35239,7 @@ const BodyContext = struct {
             .sealed => Common.invariant("sealed expression reached graph-cell lowering"),
             .graph_node => {},
         }
+        if (try self.boundInstanceStep(frame, checked_expr, 4)) |step| return step;
         if (try self.restoredHoistedExprAtNode(checked_expr, expected_node)) |restored| {
             return loweredExprStep(restored);
         }
@@ -35392,7 +35399,8 @@ const BodyContext = struct {
                 } else DraftTypeCell.fromGraphNode(try self.relateCheckedNodeToProducedValue(expected_node, ret_node));
                 return loweredExprStep(try self.addExprWithTypeCell(result_cell, lowered.data));
             },
-            // A dispatch lowered at the context type.
+            // A dispatch, or a generic bound call, lowered at the context
+            // type.
             3 => return .{ .ret = input.? },
             // An expression lowered with the context type.
             else => {
@@ -35407,6 +35415,7 @@ const BodyContext = struct {
                 return loweredExprStep(lowered);
             },
         }
+        if (try self.boundInstanceStep(frame, checked_expr, 3)) |step| return step;
         switch (expr.data) {
             .call => |call| if (try self.inspectOnlyCallStep(
                 expr.ty,
@@ -35504,6 +35513,7 @@ const BodyContext = struct {
             frame.cursor = 1;
             return step;
         }
+        if (try self.boundInstanceStep(frame, expr_id, 1)) |step| return step;
         switch (expr.data) {
             .call => |call| if (try self.inspectOnlyCallStep(
                 expr.ty,
@@ -37376,8 +37386,12 @@ const BodyContext = struct {
     fn boundCodeType(self: *BodyContext, entry: checked.HoistedConstEntry) Allocator.Error!Type.TypeId {
         return switch (self.view.const_templates.get(entry.const_ref).state) {
             .stored_const => |stored| try self.storedConstRootMonoType(self.view, stored, entry.checked_type),
-            // Publication refused a call whose type it does not fix.
-            .eval_template => try self.lowerType(entry.checked_type),
+            // Publication refused a call whose type holds a type variable.
+            // An undetermined field kind takes its relation-freeze default
+            // (`required`) in this view, as for a selected hoisted const use
+            // (`selectedHoistedConstMonoType`), and the caller relates that
+            // type to the live request.
+            .eval_template => try self.graph.specializationTypeViewForNode(try self.instNode(entry.checked_type)),
             .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
             .unimplemented => Common.invariant("declaration with no implementation reached hoisted const restoration"),
         };
@@ -37417,6 +37431,96 @@ const BodyContext = struct {
         bound_ty: Type.TypeId,
     ) Allocator.Error!DraftExprId {
         const slots = self.view.bodies.codeBinding(call) orelse return restored;
+        return try self.boundCodeValueWith(restored, bound_ty, .{ .slots = slots, .table = null });
+    }
+
+    /// Lower a generic bound call through `stepBoundInstance` when `expr` is
+    /// one: the call itself, then its value read with the inputs of the
+    /// instance table in force. `resume_cursor` is where `frame` takes the
+    /// result.
+    fn boundInstanceStep(self: *BodyContext, frame: *LowerFrame, expr: checked.CheckedExprId, resume_cursor: u8) Allocator.Error!?LowerStep {
+        if (self.bound_call_lowering) |lowering| if (lowering == expr) {
+            self.bound_call_lowering = null;
+            return null;
+        };
+        if (self.view.code_instances.boundCallIndex(expr) == null) return null;
+        frame.cursor = resume_cursor;
+        return requestLowerTask(self, .{ .bound_instance = .{ .expr = expr } });
+    }
+
+    fn stepBoundInstance(self: *BodyContext, frame: *LowerFrame, task: anytype, input: ?LowerResult) Allocator.Error!LowerStep {
+        if (frame.cursor == 0) {
+            frame.cursor = 1;
+            self.bound_call_lowering = task.expr;
+            // The call and its chain run while the compiler runs.
+            self.draft.evaluation_depth += 1;
+            return requestLowerTask(self, .{ .expr_inner = .{ .expr = task.expr } });
+        }
+        self.draft.evaluation_depth -= 1;
+        return loweredExprStep(try self.boundInstanceValue(task.expr, input.?.exprValue()));
+    }
+
+    /// The value of the generic bound call `call`, lowered as `value` in
+    /// this specialization: a compile-time root of this program where the
+    /// program evaluates its roots, read with the input slots the table in
+    /// force recorded for the call (design.md "Bound Instance Roots").
+    fn boundInstanceValue(self: *BodyContext, call: checked.CheckedExprId, value: DraftExprId) Allocator.Error!DraftExprId {
+        const index = self.view.code_instances.boundCallIndex(call) orelse
+            Common.invariant("a bound instance task names no generic bound call");
+        const table = self.evidence.instanceTable() orelse
+            Common.invariant("a generic bound call was lowered with no instance table in force");
+        const instances = table.view.code_instances;
+        const entry = for (instances.tableBoundEntries(table.table)) |entry| {
+            if (entry.call == index) break entry;
+        } else Common.invariant("an instance table has no entry for a generic bound call of its template");
+        const bound_ty = try self.graph.specializationTypeViewForNode(try self.instNode(self.view.bodies.expr(call).ty));
+        const bound_node = try self.graph.importMono(bound_ty);
+        try relateRequestComponent(self.graph, try self.exprTypeCell(value).toGraphNode(self.graph), bound_node);
+        const read = if (self.builder.literal_roots) try self.literalRootRead(call, .{
+            .owner = self.builder.loweringModuleId(self.view.key),
+            .checked_expr = @backingInt(call),
+            .kind = .bound_call,
+        }, value, bound_node) else value;
+        return try self.boundCodeValueWith(read, bound_ty, .{ .slots = instances.boundEntrySlots(entry), .table = instances });
+    }
+
+    /// The input slots a bound call's value is read with: those publication
+    /// recorded on the call, or those the table of a closing use recorded
+    /// for a generic bound call (design.md "Bound Instance Roots").
+    const BoundSlots = struct {
+        slots: []const checked.CheckedCodeSlot,
+        /// The table whose pools hold `slots`, or null for the body store's.
+        table: ?*const checked.CodeInstanceTable,
+    };
+
+    fn boundSlotSteps(self: *BodyContext, slots: BoundSlots, slot: checked.CheckedCodeSlot) []const checked.CheckedCodeSlotStep {
+        const table = slots.table orelse return self.view.bodies.codeSlotSteps(slot);
+        return table.slot_steps[slot.steps_start..][0..slot.steps_len];
+    }
+
+    fn boundSlotShape(self: *BodyContext, slots: BoundSlots, slot: checked.CheckedCodeSlot) []const u32 {
+        const table = slots.table orelse return self.view.bodies.codeSlotShape(slot);
+        return table.slot_shapes[slot.shape_start..][0..slot.shape_len];
+    }
+
+    /// The Monotype type of a checked type a bound call's inputs read: a
+    /// closed type, or, in a generic bound call, the type this
+    /// specialization gives it.
+    fn boundSlotType(self: *BodyContext, slots: BoundSlots, checked_ty: checked.CheckedTypeId) Allocator.Error!Type.TypeId {
+        if (slots.table == null) {
+            std.debug.assert(self.checkedTypeIsClosed(checked_ty));
+            return try self.lowerType(checked_ty);
+        }
+        return try self.graph.specializationTypeViewForNode(try self.instNode(checked_ty));
+    }
+
+    fn boundCodeValueWith(
+        self: *BodyContext,
+        restored: DraftExprId,
+        bound_ty: Type.TypeId,
+        bound_slots: BoundSlots,
+    ) Allocator.Error!DraftExprId {
+        const slots = bound_slots.slots;
         const bound_backing = nominalExprBackingType(self.typeStore(), bound_ty) orelse
             Common.invariant("a call that binds input slots did not return a nominal Code.Bound");
         const inputs_field = self.boundCodeField(bound_backing, "inputs");
@@ -37447,7 +37551,7 @@ const BodyContext = struct {
 
         const values = try self.allocator.alloc(DraftExprId, slots.len);
         defer self.allocator.free(values);
-        for (slots, values) |slot, *out| out.* = try self.boundSlotValue(slot, v, &pending);
+        for (slots, values) |slot, *out| out.* = try self.boundSlotValue(bound_slots, slot, v, &pending);
         while (pending.pop()) |def| try self.buildCodeValueDef(def, v, &pending);
 
         const inputs = try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(values) } });
@@ -37479,20 +37583,19 @@ const BodyContext = struct {
     /// its projections, an unwrap binding the backing of a nominal value.
     fn boundSlotValue(
         self: *BodyContext,
+        bound_slots: BoundSlots,
         slot: checked.CheckedCodeSlot,
         v: CodeValueTypes,
         pending: *std.ArrayList(PendingCodeValueDef),
     ) Allocator.Error!DraftExprId {
-        const binder_ty = checkedBinderType(self.view, slot.leaf);
-        std.debug.assert(self.checkedTypeIsClosed(binder_ty));
-        var ty = try self.lowerType(binder_ty);
+        var ty = try self.boundSlotType(bound_slots, checkedBinderType(self.view, slot.leaf));
         const local = self.binders.get(slot.leaf) orelse
             Common.invariant("an input slot read a name the body has not bound");
         var value = try self.lowerLocalAtRequestedNode(local, self.localTypeCell(local), try self.graph.importMono(ty));
         const Unwrap = struct { pat: DraftPatId, value: DraftExprId };
         var unwraps = std.ArrayList(Unwrap).empty;
         defer unwraps.deinit(self.allocator);
-        for (self.view.bodies.codeSlotSteps(slot)) |step| {
+        for (self.boundSlotSteps(bound_slots, slot)) |step| {
             const shape_ty = self.codeValueShapeType(ty);
             switch (step.kind) {
                 .field => {
@@ -37525,15 +37628,15 @@ const BodyContext = struct {
         }
         var out = if (slot.encoder.get()) |encoder| blk: {
             if (std.debug.runtime_safety) {
-                const shape = self.view.bodies.codeSlotShape(slot);
+                const shape = self.boundSlotShape(bound_slots, slot);
                 if (shape.len != 1 or shape[0] != @backingInt(checked.CodeValueShape.encoded)) {
                     Common.invariant("an input slot with an encoder was not recorded as encoded");
                 }
             }
-            break :blk try self.encodedSlotValue(encoder, value, ty, v);
+            break :blk try self.encodedSlotValue(bound_slots, encoder, value, ty, v);
         } else blk: {
             if (std.debug.runtime_safety) {
-                if (!try self.codeValueShapeMatches(ty, self.view.bodies.codeSlotShape(slot))) {
+                if (!try self.codeValueShapeMatches(ty, self.boundSlotShape(bound_slots, slot))) {
                     Common.invariant("an input slot's Monotype type differs from the shape of its slot type");
                 }
             }
@@ -37552,14 +37655,13 @@ const BodyContext = struct {
     /// the only result.
     fn encodedSlotValue(
         self: *BodyContext,
+        bound_slots: BoundSlots,
         encoder: checked.CheckedExprId,
         value: DraftExprId,
         ty: Type.TypeId,
         v: CodeValueTypes,
     ) Allocator.Error!DraftExprId {
-        const encoder_checked_ty = self.view.bodies.expr(encoder).ty;
-        std.debug.assert(self.checkedTypeIsClosed(encoder_checked_ty));
-        const encoder_ty = try self.lowerType(encoder_checked_ty);
+        const encoder_ty = try self.boundSlotType(bound_slots, self.view.bodies.expr(encoder).ty);
         const function = functionShape(self.typeStore(), encoder_ty, "a bound capture's encoder was not a function");
         if (function.args.len != 2) Common.invariant("a bound capture's encoder did not take a value and its bytes");
         if (std.debug.runtime_safety) self.assertSameType(self.spanTypeAt(function.args, 0), ty, "a bound capture's encoder took a type other than its slot's");
@@ -48212,6 +48314,13 @@ const BodyContext = struct {
     /// its holder's inventory names. Null for any other use.
     fn instancesForUse(self: *BodyContext, use: checked.CheckedExprId) ?InstanceTableId {
         if (self.view.code_instances.useTable(use)) |table| return .{ .view = self.view, .table = table };
+        // A platform's use of a function it requires reads the table of the
+        // requirement's closing use in the app (design.md "Code Instance
+        // Tables").
+        if (self.view.resolved_refs.lookupIdByCheckedExpr(use)) |id| switch (self.view.resolved_refs.records[@backingInt(id)].ref) {
+            .platform_required_proc => |required| if (required.instances) |table| return self.builder.requirementInstances(table),
+            .local_param, .local_value, .local_mutable_version, .pattern_binder, .local_proc, .selected_hoisted_const, .top_level_const, .imported_const, .top_level_proc, .imported_proc, .hosted_proc, .platform_required_declaration, .platform_required_checked_error, .platform_required_const, .promoted_top_level_proc => {},
+        };
         if (self.binding_instances) |binding| if (binding.forwarded_lookup) |lookup| if (lookup == use) return binding.table;
         const index = self.view.code_instances.forwardIndex(use) orelse return null;
         const in_force = self.evidence.instanceTable() orelse

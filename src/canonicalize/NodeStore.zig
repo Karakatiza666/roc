@@ -916,9 +916,13 @@ pub const CodeReificationSite = extern struct {
     kind: Kind,
     /// Which view of the normal form the site's declared type asks for.
     view: View = .graph,
-    /// Written so the record's tail bytes are the same on every build: this
-    /// list is serialized into the module cache.
-    kind_padding: [2]u8 = .{ 0, 0 },
+    /// Where the calls that carry this lambda's run-time reads stopped with
+    /// no call that binds them, or `none`. The checker sets it when the
+    /// holder that stops them finishes checking (`code_roots.zig`).
+    chain_stop: ChainStop = .none,
+    /// What the call `bound_call` reads other than through its sites. The
+    /// checker sets it with `bound_call`.
+    bound_reads: BoundReads = .other,
     /// The node of the call that binds what this lambda reads at run time as
     /// input slots (the call's result is a `Code.Bound`), or `no_bound_call`.
     /// The checker sets it when the call finishes checking.
@@ -935,6 +939,36 @@ pub const CodeReificationSite = extern struct {
 
     /// `translator` of a site that is no argument of a call.
     pub const no_translator: u32 = std.math.maxInt(u32);
+
+    /// What holds a lambda with run-time reads, or the last call that
+    /// carried it, when no call whose result is a `Code.Bound` binds it.
+    /// The report of the refused read says it.
+    pub const ChainStop = enum(u8) {
+        /// No holder stopped the lambda: a call binds it, or it reads no
+        /// run-time value.
+        none,
+        /// An `if` or a `match`.
+        branch,
+        /// The right side of a binding: a name holds the call's result.
+        binding,
+        /// A record, a tuple, a list or a tag.
+        value,
+        /// Any other expression, or nothing: the chain ends with no call
+        /// whose result is a `Code.Bound`.
+        end,
+    };
+
+    /// What a call that binds a lambda's run-time reads reads besides them.
+    pub const BoundReads = enum(u8) {
+        /// A run-time value outside its sites, a local binding, a value of
+        /// the enclosing function, or a `Code.Bound` call no frame can root.
+        other,
+        /// Nothing at run time but through its sites, and no binding of the
+        /// enclosing function. Only its type can tie it to that function,
+        /// so a call in a generic function has one compile-time root per
+        /// closing use (design.md "Bound Instance Roots").
+        sites_only,
+    };
 
     /// The view a site's declared type selects (plan 1.5): `Code(f)` holds
     /// the `graph` view, `Code.Inlined(f)` the `inline` view,
@@ -1529,6 +1563,8 @@ pub fn recordCodeReificationSite(
         items[at].kind = kind;
         items[at].view = view;
         items[at].bound_call = CodeReificationSite.no_bound_call;
+        items[at].bound_reads = .other;
+        items[at].chain_stop = .none;
         items[at].translator = translator_raw;
         return;
     }
@@ -1545,7 +1581,7 @@ pub fn recordCodeReificationSite(
 
 /// Record that the call at `call_idx` binds what the lambda site at
 /// `node_idx` reads at run time as input slots.
-pub fn markCodeSiteBound(store: *NodeStore, node_idx: Node.Idx, call_idx: Node.Idx) void {
+pub fn markCodeSiteBound(store: *NodeStore, node_idx: Node.Idx, call_idx: Node.Idx, reads: CodeReificationSite.BoundReads) void {
     const raw = @backingInt(node_idx);
     const items = store.code_reification_sites.items.items;
     const at = codeReificationSiteLowerBound(items, raw);
@@ -1553,6 +1589,18 @@ pub fn markCodeSiteBound(store: *NodeStore, node_idx: Node.Idx, call_idx: Node.I
     // call that holds it finishes.
     std.debug.assert(at < items.len and items[at].node_idx == raw);
     items[at].bound_call = @backingInt(call_idx);
+    items[at].bound_reads = reads;
+}
+
+/// Record what stopped the calls that carry the lambda site at `node_idx`
+/// before a call that binds its run-time reads.
+pub fn markCodeSiteStopped(store: *NodeStore, node_idx: Node.Idx, stop: CodeReificationSite.ChainStop) void {
+    const raw = @backingInt(node_idx);
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    std.debug.assert(at < items.len and items[at].node_idx == raw);
+    std.debug.assert(items[at].bound_call == CodeReificationSite.no_bound_call);
+    items[at].chain_stop = stop;
 }
 
 /// Whether the call at `call_idx` binds the run-time reads of a lambda site

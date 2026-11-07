@@ -78,23 +78,24 @@ pub const Emitter = struct {
         self.region_nodes.clearRetainingCapacity();
     }
 
-    /// The `Code` backing for the site whose root is `root`: the rows it
-    /// reaches, the site's key, and the version.
-    pub fn site(self: *Emitter, root: RowId, site_key: u64) Allocator.Error!ConstNodeId {
-        return self.siteOf(try self.graph(root), site_key);
+    /// The `Code` backing for the site whose root is `root`: its first input
+    /// slot, the rows it reaches, the site's key, and the version.
+    pub fn site(self: *Emitter, root: RowId, first_slot: u64, site_key: u64) Allocator.Error!ConstNodeId {
+        return self.siteOf(try self.graph(root), first_slot, site_key);
     }
 
     /// The `Code` backing over a graph already written, for another site
-    /// with the same normal form (P1).
-    pub fn siteOf(self: *Emitter, graph_node: ConstNodeId, site_key: u64) Allocator.Error!ConstNodeId {
-        return self.record(&.{ graph_node, try self.scalar(.{ .u64 = site_key }), try self.u32Node(version) });
+    /// with the same normal form (P1): `{ first_slot, graph, site, version }`,
+    /// in label order.
+    pub fn siteOf(self: *Emitter, graph_node: ConstNodeId, first_slot: u64, site_key: u64) Allocator.Error!ConstNodeId {
+        return self.record(&.{ try self.scalar(.{ .u64 = first_slot }), graph_node, try self.scalar(.{ .u64 = site_key }), try self.u32Node(version) });
     }
 
     /// The `Code.Inlined` backing over a graph already written and its
-    /// digests (`digests`): `{ digests, graph, site, version }`, in label
-    /// order.
-    pub fn inlinedOf(self: *Emitter, graph_node: ConstNodeId, digests_node: ConstNodeId, site_key: u64) Allocator.Error!ConstNodeId {
-        return self.record(&.{ digests_node, graph_node, try self.scalar(.{ .u64 = site_key }), try self.u32Node(version) });
+    /// digests (`digests`): `{ digests, first_slot, graph, site, version }`,
+    /// in label order.
+    pub fn inlinedOf(self: *Emitter, graph_node: ConstNodeId, digests_node: ConstNodeId, first_slot: u64, site_key: u64) Allocator.Error!ConstNodeId {
+        return self.record(&.{ digests_node, try self.scalar(.{ .u64 = first_slot }), graph_node, try self.scalar(.{ .u64 = site_key }), try self.u32Node(version) });
     }
 
     /// The content digest of every node of the rows the site of `root`
@@ -589,12 +590,14 @@ test "a site's value holds its reached rows root first, with the nodes it reache
     defer out.deinit();
     var emitter = try Emitter.init(testing.allocator, &out, &store, &types);
     defer emitter.deinit();
-    const code = try emitter.site(root, 7);
+    const code = try emitter.site(root, 3, 7);
 
+    // `{ first_slot, graph, site, version }`, in label order.
     const backing = out.get(code).record;
-    try testing.expectEqual(@as(u64, 7), out.get(backing[1]).scalar.u64);
-    try testing.expectEqual(version, out.get(backing[2]).scalar.u32);
-    const rows = out.get(out.get(backing[0]).record[1]).list.nodes;
+    try testing.expectEqual(@as(u64, 3), out.get(backing[0]).scalar.u64);
+    try testing.expectEqual(@as(u64, 7), out.get(backing[2]).scalar.u64);
+    try testing.expectEqual(version, out.get(backing[3]).scalar.u32);
+    const rows = out.get(out.get(backing[1]).record[1]).list.nodes;
     try testing.expectEqual(@as(usize, 2), rows.len);
     // The root is row 0; its nodes are the call in the switch's arm and then
     // the switch, and the dead `plus` is not among them.
@@ -653,8 +656,8 @@ test "D7: a Prim's evidence is a list of { method, target, ty }, and a row it na
     defer out.deinit();
     var emitter = try Emitter.init(testing.allocator, &out, &store, &types);
     defer emitter.deinit();
-    const code = try emitter.site(root, 7);
-    const rows = out.get(out.get(out.get(code).record[0]).record[1]).list.nodes;
+    const code = try emitter.site(root, 0, 7);
+    const rows = out.get(out.get(out.get(code).record[1]).record[1]).list.nodes;
     // The root, then the row the evidence names, which nothing calls.
     try testing.expectEqual(@as(usize, 2), rows.len);
     const root_nodes = out.get(out.get(rows[0]).record[2]).list.nodes;

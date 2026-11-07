@@ -399,6 +399,11 @@ pub const StagedCode = struct {
     /// this module defines outside the site (D9). `region` is then the site.
     /// Null when the walk stopped inside the site.
     foreign: ?Foreign = null,
+    /// For `captures_a_binding` at a lambda whose run-time reads no call
+    /// binds: what stopped the calls that carry it. `none` otherwise.
+    chain_stop: ChainStop = .none,
+
+    pub const ChainStop = can.NodeStore.CodeReificationSite.ChainStop;
 
     /// A place outside the site's own source, as the report shows it: the
     /// path of its module's file, the text of the lines the place spans, and
@@ -492,6 +497,12 @@ pub const StagedCode = struct {
         /// derived method over a structure that holds the type calls. No
         /// written use fixes the method's types (D1, Q17).
         instance_in_implicit_method,
+        /// A platform requirement leaves a type variable open with a
+        /// constraint, at an app binding that holds a `Code` site at its own
+        /// type variables. The program gives the variable no type that meets
+        /// the constraint, so no use describes the site (design.md "Code
+        /// Instance Tables").
+        requirement_constrained_variable,
         /// An entry of a type's `code_primitives` item is no `Code.prim` of a
         /// top-level function defined as a lambda or of a top-level constant
         /// (I14).

@@ -157,47 +157,47 @@ EndOfFile,
 ~~~clojure
 (e-tuple
 	(elems
-		(e-dispatch-call (method "plus") (constraint-fn-var 519)
+		(e-dispatch-call (method "plus") (constraint-fn-var 523)
 			(receiver
 				(e-num (value "4")))
 			(args
 				(e-num (value "2"))))
-		(e-dispatch-call (method "minus") (constraint-fn-var 535)
+		(e-dispatch-call (method "minus") (constraint-fn-var 539)
 			(receiver
 				(e-num (value "4")))
 			(args
 				(e-num (value "2"))))
-		(e-dispatch-call (method "times") (constraint-fn-var 551)
+		(e-dispatch-call (method "times") (constraint-fn-var 555)
 			(receiver
 				(e-num (value "4")))
 			(args
 				(e-num (value "2"))))
-		(e-dispatch-call (method "div_by") (constraint-fn-var 567)
+		(e-dispatch-call (method "div_by") (constraint-fn-var 571)
 			(receiver
 				(e-num (value "4")))
 			(args
 				(e-num (value "2"))))
-		(e-dispatch-call (method "rem_by") (constraint-fn-var 583)
+		(e-dispatch-call (method "rem_by") (constraint-fn-var 587)
 			(receiver
 				(e-num (value "4")))
 			(args
 				(e-num (value "2"))))
-		(e-dispatch-call (method "is_lt") (constraint-fn-var 600)
+		(e-dispatch-call (method "is_lt") (constraint-fn-var 604)
 			(receiver
 				(e-num (value "4")))
 			(args
 				(e-num (value "2"))))
-		(e-dispatch-call (method "is_gt") (constraint-fn-var 617)
+		(e-dispatch-call (method "is_gt") (constraint-fn-var 621)
 			(receiver
 				(e-num (value "4")))
 			(args
 				(e-num (value "2"))))
-		(e-dispatch-call (method "is_lte") (constraint-fn-var 634)
+		(e-dispatch-call (method "is_lte") (constraint-fn-var 638)
 			(receiver
 				(e-num (value "4")))
 			(args
 				(e-num (value "2"))))
-		(e-dispatch-call (method "is_gte") (constraint-fn-var 651)
+		(e-dispatch-call (method "is_gte") (constraint-fn-var 655)
 			(receiver
 				(e-num (value "4")))
 			(args
@@ -212,7 +212,7 @@ EndOfFile,
 				(e-num (value "4")))
 			(rhs
 				(e-num (value "2"))))
-		(e-dispatch-call (method "div_trunc_by") (constraint-fn-var 707)
+		(e-dispatch-call (method "div_trunc_by") (constraint-fn-var 711)
 			(receiver
 				(e-num (value "4")))
 			(args

@@ -205,7 +205,7 @@ answer = composed([42])
 				(ty-lookup (name "Str") (builtin)))))
 	(d-let
 		(p-assign (ident "answer"))
-		(e-call (constraint-fn-var 570)
+		(e-call (constraint-fn-var 574)
 			(e-lookup-local
 				(p-assign (ident "composed")))
 			(e-list

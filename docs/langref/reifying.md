@@ -64,7 +64,7 @@ These forms are refused. Most of them are a function that is only known when the
 | A function read from a list | `cannot reify this expression` |
 | An [intrinsic](#intrinsics) used as a value, as in `xs.map(Text.is_email)`, or named as the function to describe | `cannot reify this expression` |
 | A function that performs an effect | `reified function performs an effect` |
-| A lambda that reads a parameter or a `var` of the function around it, at a translator that doesn't return a `Code.Bound` (see [Captured Values](#captured-values)) | `reified function captures a value` |
+| A lambda that reads a parameter or a `var` of the function around it, with no call that returns a `Code.Bound` in the chain of calls that holds it (see [Captured Values](#captured-values)) | `reified function captures a value` |
 
 A top-level value that computes a function, as in `doubler = make(2.0)`, isn't refused when a described function uses it. The description reads the definition where the name stands, so `doubler(x)` is a call of the lambda inside `make` with `2.0` as its captured value. Naming such a value as the function to describe, as in `Calc.to_expr(doubler)`, is refused. Write `|x| doubler(x)` there instead.
 
@@ -131,15 +131,24 @@ Stdout.line!(Frag.recent(pets).show())
 
 So `roc check` of the package alone doesn't give this report, unless one of the package's own `expect`s uses the fragment. `roc check` of an app that uses it does.
 
+A function that the platform requires can be a fragment. The platform calls it at the type its requirement names, and an open row in that type, as in `show : [A, ..] -> Str`, is closed as the program closes it when it is built. That call is a use of the app, so the app's `roc check` describes the function there. A `where` clause on such an open row can't be closed this way, and is refused with `cannot reify at an open platform requirement`.
+
 Three forms are refused:
 
 | Form | Report |
 | --- | --- |
-| A fragment whose translator binds captured values (it returns a `Code.Bound`) | `cannot bind inputs in a generic function` |
+| A fragment whose translator binds captured values (it returns a `Code.Bound`) and whose chain reads a run-time value outside a lambda, as in `pick = \|row, least\| Stage.render(\|x\| x.n > least, row)` | `cannot bind inputs in a generic function` |
 | A fragment that a `where` requirement selects, as in `tidy_twice : b -> b where [b.tidy : b -> b]` | `cannot reify through a where requirement` |
 | A `to_inspect`, `is_eq`, `to_hash`, `encoder_for` or `parser_for` method that is a fragment, or that uses one at its type's variables | `cannot reify in a method the compiler calls` |
 
-A translator that binds inputs gives each run-time value a slot, in one order for its one call, and a fragment would need a new order at each use. A `where` requirement picks its method only when the program is built for one type, after the descriptions exist. Call the method on its type directly instead, as in `Wrap.tidy(w)`.
+A translator that binds inputs can be in a generic function. When the type of the call that returns the `Code.Bound` names the function's type variables, each use that fixes them runs the chain at its own types and binds the inputs there, so each use has its own slots:
+
+```roc
+pick : I64 -> Code.Bound(Rendered({ n : I64, ..r }))
+pick = |least| Stage.render(|x| x.n > least)
+```
+
+Here `pick(1)` at `Rendered({ n : I64, m : I64 })` and `pick(2)` at `Rendered({ n : I64 })` each get one slot, which holds `least`. A use through a method call, a package's generic function used from the app, and a function the platform requires work the same way. The chain must read a run-time value only in a lambda at a `Code` place: a chain that takes `row` as an argument, as in the first row of the table, has no one value to run with while the compiler runs. A `where` requirement picks its method only when the program is built for one type, after the descriptions exist. Call the method on its type directly instead, as in `Wrap.tidy(w)`.
 
 The compiler calls the methods in the last row itself: `Str.inspect` calls `to_inspect`, and `==`, hashing, encoding and parsing of a record or a list that holds the type call the others. No use in the program fixes their types, so the compiler refuses the place at the method. Put it in a function that the program calls by name.
 
@@ -516,6 +525,25 @@ Here `[TimeSql.extension]` is an [extension](#extending-a-translator) that says 
 
 A translator that returns a `Code.Bound(result)` accepts such a lambda. The translator still runs once, while the compiler runs, and emits a placeholder for each value it can't know yet, such as a `?` in SQL. In the description, each such value is an `Input(k)` node, called an _input slot_. Each call of `before` then gives the program a `Code.Bound` whose `inputs()` holds one `Code.Value` per slot, in slot order. The translator writes `Code.bound(code, result)`, and the program adds the inputs.
 
+The call that takes the lambda doesn't have to return the `Code.Bound` itself. A builder can keep its own type and pass the lambda on, and the first call of the chain that returns a `Code.Bound` receives it:
+
+```roc
+cheaper_than = |limit| Query.from(meds).filter(|m| m.price < limit).ready()
+```
+
+Here `filter` returns a `Query`, and `ready` returns a `Code.Bound`. The whole chain, up to `ready`, runs once while the compiler runs, and each call of `cheaper_than` gives its own inputs. Because the chain runs in `roc check`, a translator's refusal in any call of it is a compile error at the node it refused, also when the chain is in a branch. So is a crash in a translator of the chain. A call passes the lambda on when it takes it, or a call that passed it on, as an argument or as the receiver. A name stops the chain (`q = base.filter(..)` and then `q.ready()`), and so do an `if`, a `match`, a record, a tuple, a list and a tag. The report of a lambda whose chain stops says which of these stopped it. To branch, write the whole chain, up to the call that returns the `Code.Bound`, in each branch. One chain can hold many lambdas that capture values. Their slots come one lambda after another, in the order the lambdas are written, and each lambda's own slots are in slot order. A name that two lambdas read is two slots. `code.first_slot()` tells a builder where its lambda's slots start, so a translator can number its placeholders across the whole chain. Two descriptions that differ only in `first_slot` are still equal.
+
+A call at the end of the chain often has no lambda of its own, so it has no `Code` to call `Code.bound` on. It writes `Code.Bound.of(result)` instead:
+
+```roc
+ready : Query(row) -> Code.Bound(Try(Prepared(row), Error))
+ready = |query| Code.Bound.of(query.prepare())
+```
+
+The two give the same value. What makes a call receive the inputs is the `Code.Bound` type it returns, not the function that builds the value. If the program builds a `Code.Bound` while it runs, outside such a chain, its `inputs()` is empty.
+
+The result can hold a function that the translator makes, such as a `read` function that decodes rows of the statement it emitted. The function can use the values the translator computed. It can't use a value that only exists when the program runs: an argument of the call that the program computes at run time stops the call from running while the compiler runs, so the compiler refuses to bind the lambda. The same is true for an argument of each call in the chain, such as `n` in `.limit(n)`. Read such a value in a lambda at a `Code` place instead, as in `.limit(|_| n)`, and it is an input slot. Because the result holds a function, the compiler doesn't reuse it after you edit the module, and runs the chain again.
+
 A slot is a value the description reads whole. A lambda that reads only fields of a captured record, as `|o| o.quantity >= limits.min and o.quantity <= limits.max` does, gets one slot per field it reads, here `limits.min` and `limits.max`. A lambda that reads the record whole also gets one slot for it, and reads its fields as `Field` of that slot's `Input`. `|c| c.address == place`, with `zip ?: Str` in the address, reads `place` whole, because the `Switch` on its optional field reads the whole record. It gets one slot, and the `city` comparison reads `Field(Input(0), "city")`. A list and a tag union are always read whole. A translator that binds a record input field by field, as the SQL translator does, writes a placeholder for each field. One that binds the record as one value, as the SurrealDB translator does, writes `$_1.city`.
 
 A `Code.Value` follows the slot's type: an integer is an `Int`, a `Str` is a `Str`, a record is a `Record` of its fields' values, and a nominal value is a `Wrap` of its backing's value.
@@ -766,18 +794,19 @@ These are all the reports that reifying gives. Each one is a compile error at th
 | `cannot reify a polymorphic function` | A function whose types the place doesn't fix. |
 | `cannot reify this function` | A function with no body behind its name, such as a parameter of the surrounding function named at the `Code` place. |
 | `cannot reach this definition` | A name whose body the compiler can't read where it stands. |
-| `reified function captures a value` | A lambda that reads a run-time value, at a translator that doesn't return a `Code.Bound`. |
-| `cannot bind this captured value` | A captured value that a translator returning a `Code.Bound` still can't receive: one of an opaque type with no `Code.Binds` format, or one read other than as a name or a field path. |
+| `reified function captures a value` | A lambda that reads a run-time value, with no call that returns a `Code.Bound` in the chain of calls that holds it. The report says what stopped the chain: an `if` or a `match`, a name, a record, a tuple, a list or a tag, or the end of the chain. |
+| `cannot bind this captured value` | A captured value that a translator returning a `Code.Bound` still can't receive: one of an opaque type with no `Code.Binds` format, one read other than as a name or a field path, or one whose chain takes a run-time value outside a lambda, as in `.limit(n)`. |
 | `cannot bind captured value` | A captured value at a `Code.Binds` place whose type the format can't encode. |
 | `reified function performs an effect` | A function, or a `Code.ty_of` type, with an effect. |
 | `cannot reify a code value` | A function that reads a value built from `Code`: a description, a value computed from one, an id, or a `Code.ty_of` type. |
 | `template needs a constant` | A template argument that's only known when the program runs. |
 | `cannot normalize this function` | A function whose normal form reaches a bound the language sets. |
 | `code is not allowed here` | A `Code` anywhere but a parameter of the outermost function of an annotation, or the result of a template. |
-| `cannot bind inputs in a generic function` | A [query fragment](#query-fragments) whose translator binds inputs. |
+| `cannot bind inputs in a generic function` | A [query fragment](#query-fragments) whose translator binds inputs and whose chain reads a run-time value outside a lambda at a `Code` place. |
 | `cannot reify through a where requirement` | A query fragment that a `where` requirement selects. |
 | `cannot reify in a local generic function` | A use of a query fragment inside a function that a block made generic. |
 | `cannot reify in a method the compiler calls` | A query fragment, `Code.ty_of` or `Code.type_id` at the type variables of `to_inspect`, `is_eq`, `to_hash`, `encoder_for` or `parser_for`. |
+| `cannot reify at an open platform requirement` | A function the platform requires, at a type that leaves a type variable open with a constraint, when the function holds a `Code` place at its own type variables. |
 | `not a primitive` | A `code_primitives` entry that isn't `Code.prim` of a top-level function or constant. |
 | `cannot read this cut` | A `code_primitives` item that isn't a list of `Code.prim` entries, or the name of a constant of the same module that is one. |
 | `primitive listed twice` | One function in a `code_primitives` list two times. |

@@ -1578,7 +1578,9 @@ const State = struct {
                     const argument = root.literal_argument orelse base.invariant("value identity invariant violated: a literal argument root names no literal", .{});
                     var class = Sha256.init(.{});
                     hashTag(&class, "literal-argument");
-                    if (self.inputs.test_dependencies) {
+                    // A generic bound call has no literal operand: it is named
+                    // by its module and expression.
+                    if (self.inputs.test_dependencies and argument.site.kind != .bound_call) {
                         const operand = if (std.meta.eql(argument.site.module.bytes, self.inputs.own_key.bytes))
                             literalIdentity(env, self.inputs.bodies.view(), argument.site.expr)
                         else imported: {

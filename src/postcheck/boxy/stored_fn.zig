@@ -74,7 +74,7 @@ pub fn captureShape(program: *Program, id: WorkerId) CaptureShape {
             };
         },
         .structural, .structural_map => .{ .values = &.{}, .descs = worker.structural_descs, .dicts = 0, .composed = true },
-        .crash_dictionary, .literal_thunk, .root_slot, .code_instances => .{ .values = &.{}, .descs = 0, .dicts = 0, .composed = true },
+        .crash_dictionary, .literal_thunk, .root_slot, .code_bound, .code_instances => .{ .values = &.{}, .descs = 0, .dicts = 0, .composed = true },
         .codec => |index| .{
             .values = worker.capture_types,
             .descs = @intCast(worker.scheme_vars.len),
@@ -174,7 +174,7 @@ pub const Retained = struct {
         // from the types rather than stored as a cycle.
         const rebuilt = switch (program.worker(worker_id).key) {
             .method_entry => |target| try program.dictionaryCapturesItself(target, bound),
-            .lambda, .adapter, .structural, .structural_map, .crash_dictionary, .literal_thunk, .root_slot, .codec, .template, .default, .root, .static_data, .convert, .code_value, .code_instances, .code_description => false,
+            .lambda, .adapter, .structural, .structural_map, .crash_dictionary, .literal_thunk, .root_slot, .code_bound, .codec, .template, .default, .root, .static_data, .convert, .code_value, .code_instances, .code_description => false,
         };
         try recipe.bytes.append(allocator, @intFromBool(rebuilt));
         if (rebuilt) return .{ .recipe = try recipe.finish(), .captures = &.{} };
@@ -273,6 +273,7 @@ const Tag = enum(u8) {
     crash_dictionary,
     codec,
     code_instances,
+    code_bound,
 };
 
 fn appendWord(allocator: Allocator, list: *std.ArrayList(u8), value: u32) Allocator.Error!void {
@@ -561,6 +562,11 @@ const Encoder = struct {
                 try self.module(key.module);
                 try self.word(key.table);
             },
+            .code_bound => |key| {
+                try self.tag(.code_bound);
+                try self.module(key.module);
+                try self.word(@backingInt(key.root));
+            },
             // Only a table's worker composes a description thunk, so no
             // function value captures one.
             .root, .static_data, .convert, .code_value, .code_description => invariant("a worker that is no function value reached a stored function"),
@@ -779,6 +785,10 @@ const Decoder = struct {
             .code_instances => {
                 const module_index = self.module();
                 return try program.codeInstancesWorker(module_index, self.word());
+            },
+            .code_bound => {
+                const module_index = self.module();
+                return try program.codeBoundWorker(module_index, @fromBackingInt(self.word()));
             },
         }
     }

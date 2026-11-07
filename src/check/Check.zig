@@ -30,6 +30,7 @@ const output_type_roots = @import("output_type_roots.zig");
 const dispatch_evidence = @import("dispatch_evidence.zig");
 const static_dispatch = @import("static_dispatch_registry.zig");
 const reify_only = @import("reify_only.zig");
+const code_roots = @import("code_roots.zig");
 
 const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
@@ -1023,9 +1024,9 @@ hoist_frames: std.ArrayListUnmanaged(HoistFrame) = .empty,
 hoist_expr_candidates: std.ArrayListUnmanaged(CIR.Expr.Idx) = .empty,
 /// The lambdas written at a `Code` position that read a value only the
 /// running program has, waiting for the call that holds them to decide
-/// whether it binds them as input slots (`Code.Bound`). Partitioned by hoist
-/// frame like `hoist_expr_candidates`.
-hoist_runtime_code_sites: std.ArrayListUnmanaged(CIR.Expr.Idx) = .empty,
+/// whether it binds them as input slots (`code_roots.zig`). Partitioned by
+/// hoist frame like `hoist_expr_candidates`.
+hoist_runtime_code_sites: code_roots.PendingSites = .empty,
 /// Last answer from `methodCallPreservesIteratorSourceInput`. The hoist flow
 /// asks the same question about one expression up to five times while
 /// deciding that expression's role (root, cover, binding root, and the two
@@ -1150,6 +1151,11 @@ last_hoist_result: ?CompletedHoistResult = null,
 /// is known at compile time by the design of the feature, so it draws no
 /// compile-time condition warning (see `warnIfComptimeConditionalExpr`).
 code_site_bindings: std.AutoHashMapUnmanaged(CIR.Pattern.Idx, void) = .empty,
+/// For each call that binds the run-time reads of lambda sites as inputs, the
+/// innermost scheme that was active when its hoist frame finished. Pruning
+/// follows `scheme_owner_parents` from it to find the schemes around the call
+/// (design.md "Bound Instance Roots").
+bound_call_scheme_owners: std.AutoHashMapUnmanaged(CIR.Expr.Idx, Var) = .empty,
 /// Sparse conjunctions of pending procedure-promotion facts. Children always
 /// precede parents, and summaries share IDs rather than copying dependency sets.
 hoist_promotion_dependencies: std.ArrayListUnmanaged(HoistPromotionDependency) = .empty,
@@ -1913,6 +1919,7 @@ pub const state_inventory = state_discipline.inventory(Self, .{
     .compile_time_executable_root_indices = .input,
     .last_hoist_result = .lexical,
     .code_site_bindings = .keyed,
+    .bound_call_scheme_owners = .keyed,
     .hoist_promotion_dependencies = .keyed,
     .hoist_promotion_conjunctions = .keyed,
     .pending_comptime_conditions = .settled,
@@ -3503,6 +3510,9 @@ const HoistSelectionAction = enum {
     suppress_children,
     cover_with_current_root,
     flush_child_candidates,
+    /// The frame passes code reification sites on (`code_roots.zig`), so the
+    /// root that binds them selects among its child candidates.
+    pass_child_candidates,
     drop_empty,
 };
 
@@ -5283,15 +5293,6 @@ pub fn selectedHoistedRootIsTopLevel(self: *const Self, root: hoist_roots.Select
     return self.patternIsTopLevelDef(pattern);
 }
 
-/// Whether a selected root is a call that binds the run-time reads of a lambda
-/// site as input slots. The program reads such a call only through its root
-/// (roc-reify-proposal.md section 10.1), so the root is part of what the
-/// program means, at any depth.
-pub fn selectedHoistedRootBindsCodeInputs(self: *const Self, root: hoist_roots.SelectedHoistedRoot) bool {
-    return root.body == .expr and root.pattern == null and
-        self.cir.codeSiteBindsCall(ModuleEnv.nodeIdxFrom(root.expr));
-}
-
 /// Record a top-level root that will be evaluated as a zero-arg executable
 /// thunk. This must be explicit producer metadata from canonicalization or the
 /// caller; the checker never recovers roots from names or source shape.
@@ -5378,28 +5379,24 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
     }
     if (does_fx) frame.has_observable_effect = true;
 
-    // Captured run-time inputs (roc-reify-proposal.md section 10.1). A lambda
-    // at a `Code` position is a description, which never holds a run-time
-    // value, so what it reads at run time does not make its value depend on
-    // run time. The call that holds it decides what that read becomes.
-    const reads_runtime_inputs = frame.has_runtime_dependency and self.isInlineCodeSite(expr);
-    if (reads_runtime_inputs) {
-        try self.hoist_runtime_code_sites.ensureUnusedCapacity(self.gpa, 1);
-        frame.has_runtime_dependency = false;
-    }
-    // A call whose result is a `Code.Bound` binds what its one site reads at
-    // run time as input slots: the call is a root of its own, evaluated while
-    // the compiler runs, and the value the program reads is that root's
-    // result with the run-time values the site lowering adds, so what holds
-    // the call depends on run time. Any other holder depends on run time as
-    // it always did, and the walk refuses the read.
-    // The sites are marked, and leave the list, once nothing below can fail.
-    const runtime_sites = self.hoist_runtime_code_sites.items[frame.runtime_code_site_start..];
-    const binds_inputs = runtime_sites.len != 0 and self.exprIsCodeBound(expr);
-    // Two sites of one call have no one slot order, so the call stays at run
-    // time and publication refuses both.
-    if (runtime_sites.len != 0 and (!binds_inputs or runtime_sites.len != 1)) frame.has_runtime_dependency = true;
-    const self_root_only = binds_inputs and !frame.has_runtime_dependency;
+    // Code reification sites with run-time reads (code_roots.zig). The sites
+    // are marked, and leave the list, once nothing below can fail.
+    const code_selection = try code_roots.selectFrame(
+        self.gpa,
+        self.cir,
+        self.types,
+        &self.hoist_runtime_code_sites,
+        frame.runtime_code_site_start,
+        expr,
+        frame.has_runtime_dependency,
+        frame.binding_rhs,
+        frame_index != 0,
+    );
+    frame.has_runtime_dependency = code_selection.has_runtime_dependency;
+    const self_root_only = code_selection.self_root_only;
+    // A call that passes sites on is no root: the root that binds them
+    // covers it, and its child candidates go to its parent.
+    const passes_sites = code_selection.passes_sites;
     // The call is an expression root even as the right side of a binding: a
     // binding root would let a read of the binder restore the root's value
     // without the inputs.
@@ -5420,9 +5417,12 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
     if (frame.reads_code_site and frame.binding_rhs) {
         if (frame.binding_pattern) |pattern| try self.code_site_bindings.put(self.gpa, pattern, {});
     }
+    if (code_selection.binds_inputs) {
+        if (self.active_scheme_root) |owner| try self.bound_call_scheme_owners.put(self.gpa, expr, owner);
+    }
     const top_level_equivalent = semantically_eligible and !frame.has_contextual_dependency;
     const selection_allowed = frame.hoist_position.allowsSelection();
-    const roles = if (top_level_equivalent)
+    const roles = if (top_level_equivalent and !passes_sites)
         self.exprHoistRoles(expr, frame.binding_rhs and selection_allowed)
     else
         HoistRoles.none;
@@ -5444,6 +5444,8 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         .suppress_children
     else if (current_covers_children)
         .cover_with_current_root
+    else if (passes_sites and semantically_eligible)
+        .pass_child_candidates
     else if (has_child_candidates)
         .flush_child_candidates
     else
@@ -5454,7 +5456,10 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
     if (should_bubble_to_parent) {
         try self.hoist_expr_candidates.ensureUnusedCapacity(self.gpa, 1);
     }
-    const records_guarded_expr = frame.hoist_position == .guarded and top_level_equivalent;
+    // A call that binds inputs is never a guarded root: the program reads it
+    // only through its stored value with the inputs added, so a failure is
+    // reported at the root, never left to run in place.
+    const records_guarded_expr = frame.hoist_position == .guarded and top_level_equivalent and !self_root_only;
     if (records_guarded_expr) {
         try self.hoist_guarded_exprs.ensureUnusedCapacity(self.gpa, 1);
     }
@@ -5491,23 +5496,25 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         try transaction.commit();
     }
 
-    if (binds_inputs) {
-        for (self.hoist_runtime_code_sites.items[frame.runtime_code_site_start..]) |site| {
-            self.cir.markCodeSiteBound(ModuleEnv.nodeIdxFrom(site), ModuleEnv.nodeIdxFrom(expr));
-        }
-    }
-    self.hoist_runtime_code_sites.shrinkRetainingCapacity(frame.runtime_code_site_start);
+    code_selection.commit(
+        self.cir,
+        &self.hoist_runtime_code_sites,
+        frame.runtime_code_site_start,
+        expr,
+        frame_index != 0 and can_be_root and selection_allowed and frame.promotion_dependency == null,
+    );
 
     if (builtin.mode == .debug and has_child_candidates) {
         switch (action) {
             .suppress_children,
             .cover_with_current_root,
             .flush_child_candidates,
+            .pass_child_candidates,
             => {},
             .drop_empty => hoistSelectionInvariant("hoist frame dropped child candidates without an explicit action"),
         }
     }
-    self.hoist_expr_candidates.shrinkRetainingCapacity(frame.candidate_start);
+    if (action != .pass_child_candidates) self.hoist_expr_candidates.shrinkRetainingCapacity(frame.candidate_start);
 
     if (!selection_allowed or should_flush_deferred_roots) {
         self.hoist_deferred_roots.shrinkRetainingCapacity(frame.deferred_dependency_start);
@@ -5539,7 +5546,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         .promotion_dependency = frame.promotion_dependency,
         .expr = expr,
         .eligible = semantically_eligible and !self_root_only,
-        .top_level_equivalent = top_level_equivalent and !self_root_only,
+        .top_level_equivalent = top_level_equivalent and !self_root_only and !passes_sites,
         .has_observable_effect = frame.has_observable_effect,
         .reads_code_site = frame.reads_code_site,
         .hoist_position = frame.hoist_position,
@@ -5559,43 +5566,8 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
             self.hoist_expr_candidates.appendAssumeCapacity(expr);
         }
     }
-    if (reads_runtime_inputs) self.hoist_runtime_code_sites.appendAssumeCapacity(expr);
-
     _ = self.hoist_frames.pop();
     self.debugAssertHoistSelectionConsistent();
-}
-
-/// Whether `expr` is a lambda written at a `Code` position.
-fn isInlineCodeSite(self: *const Self, expr: CIR.Expr.Idx) bool {
-    const site = self.cir.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr)) orelse return false;
-    return site.kind == .inline_lambda;
-}
-
-/// Whether `expr` is a lambda written at a `Code` position whose run-time
-/// reads a call binds as input slots.
-fn isBoundCodeSite(self: *const Self, expr: CIR.Expr.Idx) bool {
-    const site = self.cir.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(expr)) orelse return false;
-    return site.kind == .inline_lambda and site.bound_call != can.NodeStore.CodeReificationSite.no_bound_call;
-}
-
-/// Whether the solved type of `expr` is the builtin `Code.Bound`, read
-/// through transparent aliases: the return type a translator declares to
-/// receive captured run-time inputs.
-fn exprIsCodeBound(self: *Self, expr: CIR.Expr.Idx) bool {
-    var current = ModuleEnv.varFrom(expr);
-    var guard = types_mod.debug.IterationGuard.init("exprIsCodeBound");
-    while (true) {
-        guard.tick();
-        switch (self.types.resolveVar(current).desc.content) {
-            .structure => |structure| switch (structure) {
-                .nominal_type => |nominal| return nominal.originIsBuiltin() and
-                    nominal.ident.ident_idx.eql(self.cir.idents.builtin_code_bound),
-                .record, .tuple, .fn_pure, .fn_effectful, .fn_unbound, .empty_record, .tag_union, .empty_tag_union => return false,
-            },
-            .alias => |alias| current = self.types.getAliasBackingVar(alias),
-            .flex, .rigid, .field_presence, .err => return false,
-        }
-    }
 }
 
 fn markCurrentHoistRuntimeDependency(self: *Self) void {
@@ -6728,6 +6700,7 @@ const HoistSelectionTestState = struct {
         checker.selected_hoisted_roots = .empty;
         checker.last_hoist_result = null;
         checker.code_site_bindings = .{};
+        checker.bound_call_scheme_owners = .{};
         checker.hoist_promotion_dependencies = .empty;
         checker.hoist_promotion_conjunctions = .empty;
         checker.pending_comptime_conditions = .empty;
@@ -6742,6 +6715,7 @@ const HoistSelectionTestState = struct {
         self.checker.hoist_promotion_dependencies.deinit(self.allocator);
         self.checker.hoist_promotion_conjunctions.deinit(self.allocator);
         self.checker.code_site_bindings.deinit(self.allocator);
+        self.checker.bound_call_scheme_owners.deinit(self.allocator);
         self.checker.pending_comptime_conditions.deinit(self.allocator);
         self.checker.hoist_frames.deinit(self.allocator);
         self.checker.hoist_expr_candidates.deinit(self.allocator);
@@ -14445,7 +14419,26 @@ fn hoistedRootIsIntrinsicallyKept(
     root.value_kind = .data_constant;
     if (self.cir.store.getExpr(root.expr) == .e_runtime_error) return true;
     if (isFunctionDef(&self.cir.store, self.cir.store.getExpr(root.expr))) return false;
+    if (code_roots.rootValueMayHoldFunctions(self.cir, root.*)) {
+        // A call whose type mentions a variable that a scheme around it
+        // quantifies binds at each closing use instead (design.md "Bound
+        // Instance Roots").
+        return try self.varHasConcreteType(type_var) and !try self.boundCallMentionsEnclosingSchemeVars(root.expr, type_var);
+    }
     return try self.varIsConcreteHoistedConstType(type_var);
+}
+
+/// Whether the type of the bound call `expr` mentions a variable that the
+/// scheme of a definition around it quantifies, as checked publication decides
+/// a generic bound call (design.md "Bound Instance Roots").
+fn boundCallMentionsEnclosingSchemeVars(self: *Self, expr: CIR.Expr.Idx, type_var: Var) Allocator.Error!bool {
+    var current = self.bound_call_scheme_owners.get(expr);
+    while (current) |owner| {
+        if (try code_roots.typeMentionsSchemeVars(self.gpa, self.types, self.cir, type_var, owner)) return true;
+        current = self.scheme_owner_parents.get(owner) orelse
+            base.invariant("a bound call's scheme owner was never activated", .{});
+    }
+    return false;
 }
 
 fn debugVerifyKeptHoistedRootDependencies(self: *Self) Allocator.Error!void {
@@ -14942,7 +14935,7 @@ fn hoistedRootExprStep(
         // nothing when the root is evaluated: what it reads at run time is
         // supplied where the program reads the root (roc-reify-proposal.md
         // section 10.1).
-        .e_lambda, .e_closure => self.isBoundCodeSite(expr),
+        .e_lambda, .e_closure => code_roots.isBoundSite(self.cir, expr),
         .e_lookup_required,
         .e_ellipsis,
         .e_anno_only,
@@ -18218,13 +18211,16 @@ fn recordCurrentFunctionEffectDependency(self: *Self, function_var: Var) Allocat
 /// A constrained or otherwise open dispatcher needs specialization-edge
 /// evidence, so selecting it as a caller-less compile-time root would erase the
 /// evidence scope that gives the dispatch meaning.
+/// A concrete dispatcher may hold functions: the receiver is a transient value
+/// of the root, as an argument of a direct call is, so the purpose that
+/// refuses functions in a root's stored value does not apply to it.
 /// A dispatch whose selected target is a method declared inside a function
 /// body calls a local procedure of that body; unless checking promoted that
 /// procedure, a caller-less root has no declaration context in which to call it.
 fn staticDispatchAllowsHoistedRoot(self: *Self, dispatcher_var: Var, callable_var: Var) Allocator.Error!bool {
     if (!self.varIsFunctionType(callable_var) or try self.varIsEffectfulFunction(callable_var)) return false;
     if (self.contextual_local_dispatch_fn_vars.contains(callable_var)) return false;
-    return try self.varIsConcreteHoistedConstType(dispatcher_var);
+    return try self.varHasConcreteType(dispatcher_var);
 }
 
 /// The binding pattern of the local procedure a method binding calls: the

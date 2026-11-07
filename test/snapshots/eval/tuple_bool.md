@@ -52,10 +52,10 @@ NO CHANGE
 		(e-nominal-external
 			(builtin)
 			(e-tag (name "False")))
-		(e-call (constraint-fn-var 488)
+		(e-call (constraint-fn-var 492)
 			(e-lookup-associated-resolved (source "Bool.not") (builtin) (target-node "18406") (target-def "18406"))
 			(e-tag (name "True")))
-		(e-call (constraint-fn-var 493)
+		(e-call (constraint-fn-var 497)
 			(e-lookup-associated-resolved (source "Bool.not") (builtin) (target-node "18406") (target-def "18406"))
 			(e-tag (name "False")))
 		(e-if
@@ -70,14 +70,14 @@ NO CHANGE
 		(e-if
 			(if-branches
 				(if-branch
-					(e-call (constraint-fn-var 510)
+					(e-call (constraint-fn-var 514)
 						(e-lookup-associated-resolved (source "Bool.not") (builtin) (target-node "18406") (target-def "18406"))
 						(e-tag (name "True")))
 					(e-nominal-external
 						(builtin)
 						(e-tag (name "True")))))
 			(if-else
-				(e-call (constraint-fn-var 521)
+				(e-call (constraint-fn-var 525)
 					(e-lookup-associated-resolved (source "Bool.not") (builtin) (target-node "18406") (target-def "18406"))
 					(e-tag (name "True")))))))
 ~~~

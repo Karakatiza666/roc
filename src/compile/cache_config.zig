@@ -541,7 +541,34 @@ pub const Constants = struct {
     /// 235: a method binding of a nominal with a `code_primitives` item
     ///      depends on that item in the definition identities, so a root's
     ///      value identity covers the cut its Code sites read.
-    pub const CACHE_VERSION = 235;
+    /// 236: Gap 1: a call binds the input slots of every lambda that a chain
+    ///      of calls passes to it, and `Code` and its views carry
+    ///      `first_slot`.
+    /// 237: the builtin `Code.Bound.of`, and a root that binds input slots
+    ///      may hold a function in its value.
+    /// 238: a code reification site records what stopped the chain of calls
+    ///      that carries it (`chain_stop`), and a root that binds input slots
+    ///      is a context-free request and never guarded.
+    /// 239: a code reification site records what its bound call reads
+    ///      (`bound_reads`), and the code instance table records the input
+    ///      slots of each generic bound call at each closing use (R7).
+    /// 240: a generic bound call is a literal requirement of kind
+    ///      `bound_call` with a `literal_argument` root per closing use
+    ///      (`LiteralArgumentRoot.requirement_ty`, `CodeInstanceTable.root_bounds`),
+    ///      and a platform requirement is a closing use of its app binding
+    ///      (`CodeInstanceTable.requirement_uses`, the `instances` of a
+    ///      required procedure use and of a root request).
+    /// 241: a generic bound call records its leaves
+    ///      (`CodeInstanceTable.BoundCall.leaves`, `bound_leaves`).
+    /// 242: a platform requirement with a sealed solution is a literal
+    ///      argument edge of its app (`LiteralEdge.requirement`,
+    ///      `literal_requirement_edges`, the `literal_edge` of a required
+    ///      procedure use), and a method call's dispatch edge names its call
+    ///      (`LiteralRequirement.dispatch_use`).
+    /// 243: the leaves of a generic bound call are the binders its site walk
+    ///      reads, through the values of `decl` statements
+    ///      (`checked.appendBoundSiteLeaves`).
+    pub const CACHE_VERSION = 243;
 };
 
 /// Configuration for the Roc cache system.

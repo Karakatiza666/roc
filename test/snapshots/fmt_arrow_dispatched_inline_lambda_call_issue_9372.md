@@ -42,11 +42,11 @@ test1 = 10 |> (|x| x + 1)
 (can-ir
 	(d-let
 		(p-assign (ident "test1"))
-		(e-call (constraint-fn-var 463)
+		(e-call (constraint-fn-var 467)
 			(e-lambda
 				(args
 					(p-assign (ident "x")))
-				(e-dispatch-call (method "plus") (constraint-fn-var 454)
+				(e-dispatch-call (method "plus") (constraint-fn-var 458)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "x"))))

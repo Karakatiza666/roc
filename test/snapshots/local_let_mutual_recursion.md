@@ -119,7 +119,7 @@ EndOfFile,
 					(if-else
 						(e-call
 							(e-runtime-error (tag "local_reference_before_definition"))
-							(e-dispatch-call (method "minus") (constraint-fn-var 505)
+							(e-dispatch-call (method "minus") (constraint-fn-var 509)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "n"))))
@@ -143,16 +143,16 @@ EndOfFile,
 								(builtin)
 								(e-tag (name "False")))))
 					(if-else
-						(e-call (constraint-fn-var 541)
+						(e-call (constraint-fn-var 545)
 							(e-lookup-local
 								(p-assign (ident "is_even")))
-							(e-dispatch-call (method "minus") (constraint-fn-var 539)
+							(e-dispatch-call (method "minus") (constraint-fn-var 543)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "n"))))
 								(args
 									(e-num (value "1")))))))))
-		(e-call (constraint-fn-var 561)
+		(e-call (constraint-fn-var 565)
 			(e-lookup-local
 				(p-assign (ident "is_even")))
 			(e-num (value "4")))))

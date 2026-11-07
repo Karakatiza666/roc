@@ -96,7 +96,7 @@ NO CHANGE
 		(p-assign (ident "main"))
 		(e-tuple
 			(elems
-				(e-call (constraint-fn-var 476)
+				(e-call (constraint-fn-var 480)
 					(e-field-access
 						(receiver
 							(e-lookup-local
@@ -104,7 +104,7 @@ NO CHANGE
 						(segments
 							(segment (name "f") (mode "required"))))
 					(e-runtime-error (tag "erroneous_value_expr")))
-				(e-call (constraint-fn-var 488)
+				(e-call (constraint-fn-var 492)
 					(e-field-access
 						(receiver
 							(e-lookup-local

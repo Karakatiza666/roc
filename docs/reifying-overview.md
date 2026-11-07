@@ -120,8 +120,10 @@ A lambda can read a value that exists only when the program runs, such as a para
 | A slot | A run-time name with the `Field`, `Index` and `Unwrap` reads of it. `order.price` is one slot. The description reads it as `Input(k)`. |
 | Slot types | `Graph.slots`, in the order in which the root first reads each slot. |
 | The translator | Runs once, while the compiler runs, and returns `Code.bound(code, value)`. It emits one placeholder for each slot, for example `?1` in SQL. |
+| The root | The first call whose result is a `Code.Bound`, out from the lambda through calls that take it, or a call that passed it on, as an argument or receiver. Builders between the lambda and that call keep their plain types. A binding, an `if`, a `match`, a record or a block stops the walk. |
+| Many sites | One root binds each lambda its chain holds. The slots are those of each site in site order (node order), then in slot order. `code.first_slot()` is the index of a site's first slot among them. `==` and `to_hash` skip it. |
 | The program | Reads `bound.value()` and `bound.inputs()`: one `Code.Value` for each slot, built where the program reads the call. |
-| Refused | A `var`, a read in a row other than the root, a slot type that holds a function, an opaque type or an optional field, a call with two such sites, a call whose other arguments are not fixed while the compiler runs, and a translator result that holds a function. |
+| Refused | A `var`, a read in a row other than the root, a slot type that holds a function, an opaque type or an optional field, a call whose other arguments are not fixed while the compiler runs, and a translator result that holds a function. |
 
 The SQL example binds a captured value as a `?` parameter (`orders_of_at_least` in [../examples/reifying/sql/main.roc](../examples/reifying/sql/main.roc)).
 

@@ -5889,6 +5889,22 @@ concreteness purpose that rejects a function anywhere in their stored type, so a
 value containing a callable remains one ordinary runtime allocation rather than
 being copied into independently restored callables.
 
+One exception: a root that binds the input slots of code reification sites
+(`code_roots.rootValueMayHoldFunctions`) uses the callable concreteness purpose
+for its stored type, so its result may hold a function that its concrete type
+fixes, as a real field or as a phantom type argument. The program reads that
+value only through the bound-call lowering at its one call, which restores it
+at that call's fixed type, so no other reader copies it into independently
+restored callables. Such a root is never reused across edits: like every root
+whose value holds a function, it is not portable (see "Portability").
+
+A static dispatch inside a root needs a concrete dispatcher type, because an
+open dispatcher needs specialization-edge evidence that a caller-less root does
+not have. That test is concreteness only: a concrete dispatcher may hold
+functions. The receiver is a transient value of the root, as the argument of a
+direct call is, so `q.f(x)` and `Q.f(q, x)` are roots under the same
+conditions.
+
 Hoisted-root selection is positional as well as dependency-based, and the
 checker carries that position as explicit checking context while computing
 hoistability in the normal recursive traversal. Eager child expressions inherit
@@ -6018,7 +6034,16 @@ unannotated data root with a reachable callable slot remains specialization-owne
 because an explicit consumer relation may still determine types inside that
 callable graph; it cannot cross Monotype's relation-freeze boundary as a
 context-free compile-time request. Data roots with no reachable callable slots
-continue to use the ordinary concreteness proof.
+continue to use the ordinary concreteness proof. A call that binds input slots
+fixes its callable graph at the producer too (`code_roots.exprBindsInputs`):
+the program reads it only through the bound-call lowering, at the type
+publication fixed for the call, so no consumer relation reaches it. It is a
+context-free request, evaluated with the module's roots, and a translator's
+refusal in it is reported where `roc check` runs. The exception is a call
+whose `Code.Binds` encoders have a type that an enclosing generic function
+fixes (`boundCaptureEncodersAreConcrete`): evaluating it needs that
+function's evidence, so it stays specialization-owned, and the walk refuses
+its sites as `bound_instance`.
 
 Runtime lowering restores a selected hoisted root by checked expression id. While
 lowering the synthetic compile-time wrapper for that same root, lowering must
@@ -6210,6 +6235,9 @@ marker, say) is ordinary code that must keep compiling:
   along with the failure it would surface.
 - Callable extraction roots are never guarded, since a callable root has no
   runtime form to leave in place.
+- A call that binds input slots (see "Code Reification") is never guarded
+  either. Its in-place form gives the translator's own `inputs`, not the slot
+  values, so a failure is a compile error, as for an unguarded root.
 
 Imported checked modules must contain every checked procedure template and checked
 body that may be instantiated by an importing root. This includes private helper
@@ -14529,6 +14557,9 @@ the compilation runs under: the data describes the program, and a checked
 module serves both strategies' programs (its cache identity names no
 strategy).
 
+A generic `Code.Bound` call is a requirement of this same machinery, of the
+kind `bound_call`: one rule for both kinds (see "Bound Instance Roots").
+
 - A scheme's *literal requirements* (`CheckedProcedureTemplate.literal_requirements`,
   and the dispatch scope's `literal_requirements`): one per literal of its own body
   whose conversion plan is open (`.evidence_dependent` or
@@ -14617,9 +14648,10 @@ per call for a local procedure, in its captures for any other generalized
 lambda; a nested lambda captures the enclosing scopes' literal arguments as
 it captures their dictionaries, after them.
 
-An instantiation checking recorded no edge for (a platform's call of the
-app's binding, a stored closure restored from a constant store, a target
-derived from its callable type) derives its literal arguments from its
+An instantiation checking recorded no edge for (a platform's call of an
+app binding whose requirement solution was not sealed, a stored closure
+restored from a constant store, a target derived from its callable type)
+derives its literal arguments from its
 types as it derives its dictionaries: a *literal thunk* worker per
 literal requirement (`WorkerKey.literal_thunk`, keyed by the worker, the types its
 scheme takes, and the literal requirement), whose body enters the worker's scopes at
@@ -14685,6 +14717,53 @@ the types supplies the table.
   table's contents: an importer's object reads none, and the recipe of a
   stored function that captured a table, which an importer's key hashes,
   names the table by link name and position.
+- **Each successful function requirement of a platform is a closing use, in
+  the app's publication.** A requirement may leave an anonymous open row
+  (`show : [A, ..] -> Str`), so the app binding stays generic, and the
+  platform's call of it is checked in the platform module, before pairing:
+  no module sees a written closing use. The app's publication makes one:
+  the binding at the requirement's solution, with each free variable of the
+  solution sealed as lowering seals it (`checked.sealedVariable`: the
+  numeric default, else the row default, else the empty tag union).
+  Monotype (`lowerCheckedTypeVariable`), Boxy (`sealVariable`) and this use
+  read that one rule, so the table describes the instance that lowering
+  makes. The reifier builds the table (`closeRequirements`, a chain step
+  with `ChainStep.requirement`) where the binding's template has an
+  inventory, and records it by requires index
+  (`CodeInstanceTable.requirement_uses`). Pairing copies it next to the
+  requirement's root evidence (`PlatformRequiredProcedureUse.instances`,
+  `PlatformRequiredProcedureResolvedRef.instances`,
+  `RootRequest.instances`). Monotype's `instancesForUse` and its root of a
+  required binding, and Boxy's `requiredInstanceAt` and
+  `requiredAliasInstance`, pass that table. An exact alias binding
+  (`main! = run!`) carries it to the procedure it forwards to, as a written
+  use through an alias does.
+- A requirement solution that leaves a free variable with a constraint,
+  which sealing would ignore, is refused at the app binding when the
+  binding's template has an inventory (`requirement_constrained_variable`,
+  "Cannot Reify At An Open Platform Requirement"). A `where` clause on the
+  row variable of the app binding's annotation reaches it
+  (test/fx-open/code_site_constrained_requirement.roc).
+- The same use is a literal argument edge of the app
+  (`LiteralEdge.requirement`, by requires index): the binding's scheme (its
+  template, or an exact alias binding's entry wrapper) instantiated at the
+  sealed solution (`requirementSubstitution`: a row variable takes the rest
+  of its row; a variable the solution does not reach, which only a `where`
+  clause names, stays and lowering seals it). Each requirement with a sealed
+  solution records it (`CheckedProcedureTemplateTable.literal_requirement_edges`:
+  binding, scheme, substitution, root evidence, arguments), with no
+  arguments too, so its presence says the solution was sealed. The edge is
+  in no scheme, so each requirement it instantiates is a root of the app:
+  a literal's conversion or a generic bound call at the requirement's
+  types, whose bound entry the requirement's table holds
+  (`attachRoots`). Pairing copies the edge next to the table
+  (`literal_edge`). Boxy's platform call of the binding takes its literal
+  arguments from the app's edge (`requiredInstanceAt`,
+  `requiredAliasLiterals`), and the root's chain enters the binding at the
+  edge's substitution with the requirement's table (`enterEdge`). A
+  requirement with no sealed solution has no edge, and its call derives its
+  literal arguments as before; checking refuses it where the binding has an
+  inventory.
 
 The alternative, a worker per (template, table), would lower a generic
 template once per closing use. That breaks the per-module rule that a
@@ -14693,6 +14772,198 @@ exporter's template, and grows code with every use; a table word costs one
 hidden argument at the templates that have an inventory, none elsewhere.
 Monotype carries the same tables on its specialization evidence, so both
 strategies read the same checked data.
+
+#### Bound Instance Roots
+
+A call whose result is a `Code.Bound` binds the run-time reads of its sites
+as input slots and is a compile-time root of its own (see "Code
+Reification"). In a generic function, the call's type can mention a variable
+of the template, so the call has no one type to be a root at. Each closing
+use fixes that type, so each closing use binds the call's inputs at its own
+instance (R7 of the Gap 1 design). The checked data for this is explicit and
+per instance:
+
+- Hoist selection marks what a bound call reads besides its sites
+  (`CodeReificationSite.bound_reads`). It is `sites_only` when the call
+  binds its sites, is an expression root candidate, and reads no local
+  binding root (no promotion dependency). Then only its type can tie the
+  call to the enclosing function. Any other bound call is `other`.
+- A *generic bound call* is a `sites_only` call whose type mentions a
+  quantified variable of the template that holds it, and of no lambda a
+  block inside it generalized. Each of its sites is described at each
+  closing use, as an instance site is, whatever the site's own type: the
+  site's first slot depends on the instance through the call's earlier
+  sites.
+- The template's inventory lists its generic bound calls
+  (`CodeInstanceTable.BoundCall`): the call and the inventory index of each
+  of its sites in site order (node order, the order the site loop counts
+  first slots in). The recipe of each such site names its call
+  (`Recipe.bound`) and keeps the site's capture reads at `Code.Binds`
+  positions (`Recipe.captures`, `CaptureRead`), because the body store keeps
+  them only while its module is published, and a closing use in another
+  module reads them.
+- Each table of a closing use describes the sites of each generic bound
+  call of its template in site order, with input slots on: the holder's
+  run-time names are the inputs, and each site starts at the count of the
+  slots of the call's earlier sites at this instance. The table records one
+  `BoundEntry` per call (`table_bounds`, `bound_entries`): the call's slots
+  in slot order, and each site's first slot. A refusal of such a site at the
+  closing use refuses the table, as for any instance site.
+- A bound call that is not generic keeps its one root and its one
+  `CheckedCodeBinding`. A bound call that is `other` binds nothing in a
+  generic function.
+
+The rule is the rule of literal arguments, with a second requirement kind:
+**a generic bound call is evaluated where its type first becomes concrete,
+at compile time, and each such place binds the call's inputs.** A literal
+requirement and a *bound requirement* are one `LiteralRequirement` whose
+`LiteralSite.kind` is `numeral`, `quote`, `interpolation` or `bound_call`.
+Requirements, edges, roots, demand, request scheduling, finalization order
+and the `.lss` rule (the roots stay `unevaluated`) are the same code for
+both kinds. Only the two ends of a chain differ: what the own requirement
+lowers, and what a body reads.
+
+- Which calls are generic is decided once, before the requirements are
+  computed, by publication, not by the reifier. The template ref collector
+  records each `sites_only` bound call with the scope that holds it. A call
+  is generic when its type mentions a quantified variable of its template
+  and of no generalized scope around it (`typeMentionsIn`, which the reifier
+  also reads: an undetermined field kind is a variable it mentions). A
+  generic bound call is an own requirement of the innermost scheme around
+  it, as a literal is.
+- Hoist pruning applies the same rule before publication. A call that
+  binds inputs is no root of its own when its type mentions a variable that
+  the scheme of a definition around it quantifies. The checker records the
+  innermost active scheme when the call's hoist frame finishes
+  (`bound_call_scheme_owners`) and follows `scheme_owner_parents` outward.
+  A scheme quantifies its generalized identity variables
+  (`code_roots.typeMentionsSchemeVars`). A field kind that a definition
+  generalized but that its type does not reach (the field kind of a record
+  literal in a function of type `Str -> Str`) is no scheme variable, so the
+  call stays one root, as publication decides. The rank of a variable alone
+  does not decide this.
+- The type of a bound requirement is a tuple: the call's type, the type of
+  each *leaf* of the call, and the function type of the template that
+  holds the call. The last part makes the tuple mention no quantified
+  variable exactly where every variable of that template is fixed, which
+  is where the reifier closes a use.
+- **The leaves of a call are the binders around its sites that the site
+  walk reads as input slots.** The walk replays a name that a `decl`
+  statement defines (`Reifier.replayBinding`), so a slot reads what that
+  value reads, not the captured name: `n = Str.concat(name, "")` captured
+  as `n` gives a slot that reads `name`. One function gives the leaves
+  (`checked.appendBoundSiteLeaves`): each binder the lambda of a site
+  captures, in site order and then capture order, where a binder that a
+  `decl` defines is replaced by the binders its value reads (a closure
+  inside the value reads its captures), again by this rule. A promoted
+  local function and a read of a resolved value fold, so neither is a leaf.
+  The rule reads only the template, so the leaves are the same at every
+  instance. Publication types the requirement with it, and the reifier
+  records it per call (`CodeInstanceTable.BoundCall.leaves`), because
+  after publication a site's lambda is its description and holds no
+  captures. Boxy binds the leaves from that record, and debug builds check
+  that each slot the reifier makes at a closing use reads a leaf
+  (`Walk.Inputs.call_leaves`). A leaf that no slot of an instance reads
+  (normalization dropped the read) is bound and not read.
+- The edges of the requirement computation that hold roots are the
+  closing uses: an edge where the tuple
+  mentions no variable that the edge's scheme (or a generalized local scope
+  around the edge) quantifies holds a root, any other edge forwards the
+  requirement. This is not the literal rule (a literal's root needs a type
+  with no variable at all): a closing use can leave a variable that no
+  scheme quantifies, such as an open row that only an annotation's closed
+  union met, and lowering seals it (its row default, else the empty tag
+  union) as it seals every such variable of the use.
+- The root is a `literal_argument` root whose `LiteralArgumentRoot.site.kind`
+  is `bound_call`. Its `checked_type` and `ty` are the call's type at the
+  edge, the first part of the tuple. `requirement_ty` keeps the closed tuple,
+  whose leaf types Boxy reads. A root whose value holds a function is
+  validate-only, as for a literal.
+- The reifier reads the own bound requirements of each scheme instead of
+  computing generic calls. At a closing use it describes the call's sites
+  as before, and it attaches the call's bound entry (its slots and first
+  slots) to each root whose edge is that use (`CodeInstanceTable.root_bounds`,
+  root to `bound_entries` index, sorted by root). It finds the entry by
+  following the root's requirement chain: a forward entry of the table moves
+  to the table it holds, and an edge to a generalized local function stays
+  in the table of the template whose body holds the function. A root with no
+  closing use the reifier can describe is refused there with the report the
+  use already has; checking then fails, so no lowering reads a root with no
+  entry. Debug builds check that each such root has an entry when no use was
+  refused.
+
+Boxy:
+
+- Root evaluation: the root's entry wrapper walks the edge chain
+  (`lowerLiteralArgumentRoot`, `enterEdge`) and, where the chain ends at the
+  call, lowers the call as an ordinary call in that frame
+  (`Builder.bound_call_lowering`). The value is the `Code.Bound` the
+  translator returned, with no inputs.
+- Each frame of a chain holds the Code instance table of the use that
+  entered it (`AliasScope.instances`): the closing use's table, or the
+  forward entry of the outer frame's table, and for a generalized local
+  function the table of the template whose body holds it. A Code site that
+  the chain lowers reads the innermost frame's table. The frame of an exact
+  procedure alias has no sites, and it keeps the word of the use that
+  entered it (`AliasScope.alias_instances`): the alias's forwarded lookup
+  passes it to the procedure, or to the next alias, where checking keyed no
+  table at the lookup (`chainUseInstanceWord`). This is the rule
+  `aliasChainInstance` applies outside a chain, which also gives the word
+  to a dispatch edge's chain frame of a method bound to an alias.
+  test/cli/StagedBoundGenericAlias.roc and
+  test/fx-open/code_bound_open_requirement_alias.roc run these chains.
+- A bound requirement's hidden parameter is not the root's zero-argument
+  thunk. It is an immortal erased callable of `WorkerKey.code_bound`
+  (module, root) that takes one argument, the tuple of the call's leaf
+  values, and returns the `Code.Bound` with its inputs. Its argument type is
+  the closed leaf part of `requirement_ty`. Its body enters the root's edge
+  chain as the wrapper does (the encoders of encoded slots read the frame's
+  dictionaries), binds the leaves from the argument, restores the stored
+  value (or reads the root's slot while it is pending, or lowers the call
+  where the root is validate-only), and builds the inputs from the root's
+  `root_bounds` entry as `bindCodeInputs` does.
+- A generic body reads the call by building the tuple of its leaves at its
+  own types and calling the parameter (`lowerInstanceBound`). The callee
+  reads the argument at the closed types: both sides compute one layout
+  from the same descriptors. A forwarded argument passes the enclosing
+  scope's own callable.
+- A stored function carries the table of the use that made it
+  (`stored_fn` tag `code_instances`) and its bound callables as it carries
+  literal arguments (`stored_fn` tag `code_bound`).
+- An instantiation checking recorded no edge for (a literal thunk's case)
+  has no closing use, so no table and no slots. A platform requirement with
+  a sealed solution is no such instantiation: its edge in the app is its
+  closing use (see "Code Instance Tables"). A constant is not generalized,
+  so a generic bound function stored in one has the constant's one use as
+  its closing use, and a function that a block generalized is refused
+  (`instance_in_local_generic`, or the capture report where the call reads
+  a value of the block).
+- A dispatch edge that is a method call's own target names the call
+  (`LiteralRequirement.dispatch_use`, `LiteralArgumentRoot.dispatch_use`):
+  the use whose table the method reads. A chain frame entered through it
+  passes the call's table, or the forward entry of the frame's table, as a
+  use does; the reifier follows the same field. A dispatch edge reached
+  through another edge's evidence names no call: a method that a `where`
+  requirement supplies is refused at the use when it reaches an inventory
+  (`instance_through_evidence`).
+
+Monotype keeps one root per specialization: the specialization that fixes
+the call's type lowers the call as a literal root of its program
+(`stepBoundInstance`, `literalRootRead`) and reads the slots from the table
+on its evidence. The checked roots are the `.boxy` evaluator's.
+
+Value identity of a bound root is that of a literal argument root with no
+literal operand, under `test_dependencies` too (`value_identity.zig`, the
+`literal_argument` arm): the holder module's artifact key, the call's
+expression, the kind, and the type. The artifact key hashes the keys of the
+holder's direct imports (`CheckedModuleArtifactKey`), so it changes with
+every module the holder reaches, the translator's and those of the
+functions the call reads among them. A change there changes the root's
+value identity, and the root is evaluated again. This is coarser than the
+identity of a hoisted root, which hashes only the definitions its
+expression reads: an edit to any module the holder reaches evaluates the
+root again, also where the call reads nothing of that module. That costs
+evaluations, never a stale value, so bound roots keep the coarser key.
 
 #### Function Values
 
@@ -24084,26 +24355,81 @@ Invariants:
 - A condition that reads a code reification site draws no compile-time
   condition warning (see "Checked Boundary").
 - A lambda at a `Code` position that reads a value only the running program
-  has is no run-time dependency of its own. The call that holds it decides
-  (`finishHoistFrame` in `src/check/Check.zig`). A call whose solved type is
-  the builtin `Code.Bound` and that holds exactly one such site marks the
-  site (`CodeReificationSite.bound_call`), becomes an expression root of its
-  own and is a run-time dependency of what holds it. The marked lambda is no
+  has is no run-time dependency of its own. The call that holds it decides.
+  This decision and the site mark are in `src/check/code_roots.zig`, which
+  `finishHoistFrame` (`src/check/Check.zig`) calls once for each hoist frame
+  (`selectFrame`, then `Selection.commit`). Such a site is pending until a
+  frame decides it. A call holds a pending site when it takes the site, or a
+  call that passed the site on, as an argument or as its receiver. A call
+  whose solved type is the builtin `Code.Bound` and that holds pending sites
+  marks each of them (`CodeReificationSite.bound_call`), becomes an
+  expression root of its own and is a run-time dependency of what holds it.
+  So one root can bind many sites. Any other call that holds pending sites
+  and is not the right side of a binding passes them to its parent
+  (`Selection.passes_sites`): it is no root and no run-time dependency, and
+  its child candidates go to its parent (`pass_child_candidates`), so the
+  root that binds the sites covers the whole chain. The marked lambda is no
   dependency of that root when pruning checks what a kept root reads
-  (`isBoundCodeSite` in `hoistedRootExprStep`). Any other holder keeps the
-  run-time dependency, and the walk refuses the read. This is hoist
-  selection, which writes no solved type and no dispatch plan.
+  (`code_roots.isBoundSite` in `hoistedRootExprStep`). Any other holder (a
+  binding, an `if`, a `match`, a record, a block) keeps the run-time
+  dependency, and the walk refuses the read. That holder marks each of the
+  sites with what it is (`CodeReificationSite.chain_stop`: a branch, a
+  binding, a value, or the end of the chain), and the report of the refused
+  read says it. A call that binds sites records, on each site, what it
+  reads besides them (`CodeReificationSite.bound_reads`, see "Bound Instance
+  Roots"). This is hoist selection, which writes no solved type and no
+  dispatch plan. A call that binds inputs is never a guarded root, and it is
+  a context-free compile-time request (see "Function Values In Strict
+  Demand" and the guarded root rules), so a refusal in any call of its chain is a compile error at the
+  refused node, also in a function and in a branch.
 - The root of a call that binds inputs is part of what the program means,
   because the program reads that call only through its root. A caller that
   outputs only some of the selected roots (the eval harness outputs only
   top-level roots, `src/eval/inspected.zig`) still outputs it
-  (`selectedHoistedRootBindsCodeInputs` in `src/check/Check.zig`).
+  (`rootBindsInputs` in `src/check/code_roots.zig`).
+- The stored value of a root that binds inputs may hold a function that its
+  concrete type fixes (`rootValueMayHoldFunctions`, the exception to the data
+  root rule in "Checking Effects And Const Roots"). So a translator can return
+  a value with a reader function. A function in the result that reads a
+  run-time value is not possible: a run-time argument of the call keeps the
+  call from being a root, and the walk refuses the site.
+- The opt-in is the solved type of the call, never the function that builds
+  its value. `Code.Bound.of(result)` builds the value with no `Code`
+  argument, for a call at the end of a chain that has no lambda of its own.
+  It and `Code.bound` both give an empty `inputs`, which only the bound-call
+  lowering fills.
 - The walk makes an input slot only at a marked site, only in the root row,
   and never for a `var` (`inputSlot` in `src/check/code_reifier.zig`).
   The checked module builder records the slots of a call that it hoisted as an expression
   root, whose type is closed, on the call (`CheckedCodeBinding` and
   `bindCodeInputs`), and refuses every
-  other marked site that reads a slot. A slot is a binder and the
+  other marked site that reads a slot. Hoisting keeps only a root whose type
+  is concrete, so that type holds no type variable (a debug check,
+  `boundRootTypeIsFixed`). It can hold the kind variable of an undetermined
+  record field: in `|_| { name: n }` the literal's field kind is quantified
+  with the enclosing function and nothing fixes it. The walk reads the kind
+  variable of an undetermined field as a variable it mentions
+  (`Reifier.mentionsIn`), so a site whose type mentions a kind variable of
+  its template is an instance site, and its call is a generic bound call
+  (see "Bound Instance Roots"). Hoisting agrees: it keeps no root for a call
+  that binds inputs whose type holds an undetermined field kind with the
+  generalized rank (`code_roots.typeMentionsGeneralizedFieldKind`, read in
+  hoist pruning), so the call has no root of its own beside the roots of its
+  closing uses. This reads the solved rank and writes nothing. Any
+  other undetermined kind is `required` where the root is evaluated and where
+  the program reads it, as Monotype's relation freeze commits it: Monotype
+  reads the call at the required-defaulted view of its type
+  (`specializationTypeViewForNode` in `boundCodeType`), as it reads a
+  selected hoisted const use. The slots
+  of a call are the slots of its sites concatenated in site order, which is
+  the order of the module's site table (node order) that the walk uses too.
+  A refused site of a call refuses each of its sites that reads a slot.
+  Each site's `Code` value carries `first_slot`, the number of slots of the
+  call's earlier sites (the site loop of `src/check/code_reifier.zig` counts
+  them per call and `Walk.finish` writes it). Like `site`, it is no part of
+  the normal form, so `Code.is_eq`, `to_hash` and the description memo skip
+  it. It depends only on the sites of the root's own expression, whose source
+  bytes the root's value identity covers. A slot is a binder and the
   path steps the description reads it through, in slot order, with the
   shape of the slot type.
 - A captured value that the description reads whole is one slot (N18e in
