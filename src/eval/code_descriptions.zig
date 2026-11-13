@@ -57,6 +57,8 @@ pub fn describeModule(
     reach: []const ImportedModuleView,
 ) Allocator.Error!void {
     std.debug.assert(module.code_output.state == .pending);
+    // The module's inventories, its imports' first (`CodeLookups.codeInventories`).
+    _ = try check.CodeLookups.codeInventories(gpa, checked.importedView(module), reach);
     var lookups = try Lookups.init(gpa, checked.importedView(module), reach);
     defer lookups.deinit(gpa);
     const inputs: code_reifier.ModuleInputs = .{
@@ -745,6 +747,6 @@ pub fn fillCodeInventories(
         defer lookups.deinit(gpa);
         const inputs = checked.foreignModule(view, lookups.own.lookup());
         _ = try view.checked_bodies.codeCuts(inputs);
-        _ = try view.checked_bodies.codeInventories(inputs);
+        _ = try check.CodeLookups.codeInventories(gpa, view, reach);
     }
 }

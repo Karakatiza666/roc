@@ -28,11 +28,58 @@ fn invariant(comptime message: []const u8) noreturn {
 /// the modules the reader sees (it may hold `view` itself). A reader calls
 /// this only for a module whose template it lowers or describes, so a
 /// module no such reader reaches keeps its bodies unindexed.
+///
+/// A module's plan reads the inventories of the modules it imports only
+/// when its import closure records a Code construct (`code_reifier`
+/// `ModuleScan.collect`), and a thread that holds a claim of one slot kind
+/// never waits on another slot of that kind (`OnceSlot`). So in such a
+/// closure the inventories of each import are computed first, with no
+/// claim held.
 pub fn codeInventories(gpa: Allocator, view: ImportedModuleView, reach: []const ImportedModuleView) Allocator.Error!*const code_analyses.CodeInventories {
     if (view.checked_bodies.analyses.code.inventories_slot.peek()) |computed| return computed;
+    if (try closureRecordsCode(gpa, view, reach)) try planImports(gpa, view, reach);
+    return try plan(gpa, view, reach);
+}
+
+/// Compute the inventories of each module `view` imports, transitively,
+/// imports first.
+fn planImports(gpa: Allocator, view: ImportedModuleView, reach: []const ImportedModuleView) Allocator.Error!void {
+    for (view.import_identities) |identity| {
+        const key = identity.artifact_key orelse continue;
+        const imported = checked.viewInReach(reach, key) orelse
+            invariant("a resolved import names a module the reader does not see");
+        if (imported.checked_bodies.analyses.code.inventories_slot.peek() != null) continue;
+        try planImports(gpa, imported.*, reach);
+        _ = try plan(gpa, imported.*, reach);
+    }
+}
+
+/// The inventories of `view`, from its slot, with its own view of `reach`.
+fn plan(gpa: Allocator, view: ImportedModuleView, reach: []const ImportedModuleView) Allocator.Error!*const code_analyses.CodeInventories {
     var lookups = try Lookups.init(gpa, view, reach);
     defer lookups.deinit(gpa);
     return view.checked_bodies.codeInventories(checked.foreignModule(view, lookups.own.lookup()));
+}
+
+/// Whether `view` or a module it imports, transitively, records a Code
+/// site or a Code identity call.
+fn closureRecordsCode(gpa: Allocator, view: ImportedModuleView, reach: []const ImportedModuleView) Allocator.Error!bool {
+    var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer seen.deinit(gpa);
+    var work = std.ArrayList(*const ImportedModuleView).empty;
+    defer work.deinit(gpa);
+    var next: ?*const ImportedModuleView = &view;
+    while (next) |module| : (next = work.pop()) {
+        const store = &module.module_env.store;
+        if (store.codeReificationSites().len != 0 or store.codeIdentityUses().len != 0) return true;
+        for (module.import_identities) |identity| {
+            const key = identity.artifact_key orelse continue;
+            if ((try seen.getOrPut(gpa, key.bytes)).found_existing) continue;
+            try work.append(gpa, checked.viewInReach(reach, key) orelse
+                invariant("a resolved import names a module the reader does not see"));
+        }
+    }
+    return false;
 }
 
 /// The lookups of every module a description step reads: one per module,
