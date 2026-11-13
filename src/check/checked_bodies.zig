@@ -801,16 +801,31 @@ pub const CheckedBodies = struct {
         return self.names.lookupExternalSymbolIdent(&self.env.common.idents, ident) orelse invariant("a hosted symbol name was not interned");
     }
 
+    /// Whether `id`, whose expression is `expr`, is a `Code` site or identity
+    /// call: the same set the module index marks (`ModuleIndex.isCodeSite`).
+    /// A site that checking replaced with a runtime error keeps the error,
+    /// and an identity call is a site only while it is a call.
+    fn isCodeSiteExpr(node_store: *const can.NodeStore, id: ExprId, node_expr: CIR.Expr) bool {
+        const node = ModuleEnv.nodeIdxFrom(id);
+        return switch (node_expr) {
+            .e_runtime_error => false,
+            .e_call => node_store.codeReificationSiteForNode(node) != null or node_store.isCodeIdentityCall(node),
+            else => node_store.codeReificationSiteForNode(node) != null,
+        };
+    }
+
     pub fn exprData(self: CheckedBodies, id: ExprId) ExprData {
         // Rejected binding uses and calls of retired callees evaluate as
         // runtime errors (`ResolvedValueRefTable.retired_exprs`).
         if (self.exprIsRetired(id)) return .{ .runtime_error = .{} };
         // A `Code` site is its description (`NodeStore.code_reification_sites`,
         // `NodeStore.code_identity_uses`), unless it is the value site this
-        // reader opened.
-        if (self.index().isCodeSite(id) and self.open_value_site != id) return .code_site;
+        // reader opened. This reads the node store, not the module index, so
+        // a reader of bodies needs no demand of the index, as upstream.
         const node_store = self.store();
-        return switch (node_store.getExpr(id)) {
+        const node_expr = node_store.getExpr(id);
+        if (self.open_value_site != id and isCodeSiteExpr(node_store, id, node_expr)) return .code_site;
+        return switch (node_expr) {
             .e_num, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral => .numeral,
             .e_frac_f32, .e_frac_f64 => invariant("a float-valued literal without exact digits reached a checked body"),
             .e_str_segment => |segment| .{ .str_segment = segment.literal },
