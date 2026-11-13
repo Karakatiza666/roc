@@ -2967,7 +2967,7 @@ const InstanceTableId = struct {
 /// view.
 const OptionalInstanceTableId = struct {
     view: ?ModuleView = null,
-    table: code_output.TableId = @fromBackingInt(0),
+    table: code_output.TableId = undefined, // read only through `get`, which reads it only where `view` is set
 
     const none: OptionalInstanceTableId = .{};
 
