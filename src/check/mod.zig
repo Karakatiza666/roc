@@ -39,6 +39,8 @@ pub const CheckedBodies = @import("checked_bodies.zig");
 pub const BodyAnalyses = @import("body_analyses.zig");
 /// The on-demand code facts of a checked module: cuts and instance inventories.
 pub const CodeAnalyses = @import("code_analyses.zig");
+/// The lookups through which a module's Code walk reads its reach.
+pub const CodeLookups = @import("code_lookups.zig");
 /// The code descriptions column of a module's evaluation output.
 pub const CodeOutput = @import("code_output.zig");
 /// Import-facing checking identities and explicit binding to current owners.
@@ -100,6 +102,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("checked_bodies.zig"));
     std.testing.refAllDecls(@import("body_analyses.zig"));
     std.testing.refAllDecls(@import("code_analyses.zig"));
+    std.testing.refAllDecls(@import("code_lookups.zig"));
     std.testing.refAllDecls(@import("code_output.zig"));
     std.testing.refAllDecls(@import("sealed_type_view.zig"));
     std.testing.refAllDecls(@import("checked_type_ids.zig"));

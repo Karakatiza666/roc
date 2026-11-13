@@ -302,6 +302,9 @@ const Builder = struct {
     demand: *LiteralDemand,
     declared: *const std.AutoHashMapUnmanaged(DeclaredRoot, void),
     views: std.AutoHashMapUnmanaged([32]u8, checked.ImportedModuleView) = .empty,
+    /// Every module of `views`, through which a module's Code inventories
+    /// are computed on demand.
+    reach: []const checked.ImportedModuleView = &.{},
     types: std.AutoHashMapUnmanaged(TypeKey, NodeId) = .empty,
     /// Own flags, by node.
     own: std.ArrayListUnmanaged(Flags) = .empty,
@@ -323,6 +326,7 @@ const Builder = struct {
 
     fn deinit(self: *Builder) void {
         self.views.deinit(self.allocator);
+        self.allocator.free(self.reach);
         self.converted_literals.deinit(self.allocator);
         self.implicit_methods.deinit(self.allocator);
         self.types.deinit(self.allocator);
@@ -532,7 +536,7 @@ const Builder = struct {
         try self.addTypeEdge(node, view, template.checked_fn_root);
         // A generic bound call is a compile-time root of the program at each
         // specialization (design.md "Bound Instance Roots").
-        const inventories = view.checked_bodies.computedCodeInventories();
+        const inventories = try check.CodeLookups.codeInventories(self.allocator, view, self.reach);
         if (inventories.inventoryOf(template.template_id)) |inventory| {
             if (inventories.inventoryBoundCalls(inventory).len != 0) self.markOwn(node, .{ .strict = true });
         }
@@ -831,6 +835,12 @@ pub fn compute(
     for (modules.root.relation_modules) |view| try addView(&builder, view);
     for (modules.imports) |view| try addView(&builder, view);
     demand.counters.modules = builder.views.count();
+    {
+        const reach = try allocator.alloc(checked.ImportedModuleView, builder.views.count());
+        var reach_views = builder.views.valueIterator();
+        for (reach) |*slot| slot.* = reach_views.next().?.*;
+        builder.reach = reach;
+    }
     demand.builtin = try builder.addNode(.{});
 
     // Every template has its node before any edge names one.

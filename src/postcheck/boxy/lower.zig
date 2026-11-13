@@ -455,9 +455,6 @@ pub const ListIntSlot = struct { slot: u32, item: ListIntItem };
 pub const InstanceInventory = struct {
     module: ModuleIndex,
     template: checked_names.CheckedProcedureTemplateId,
-    /// The inventory's entry count: the arity of the tuple the table's
-    /// worker returns.
-    entries: u32,
 };
 
 /// The Code instance table a static callable word is (`Program.noteInstanceTableWord`).
@@ -579,6 +576,10 @@ pub const Worker = struct {
     /// after its literal arguments (a template with an inventory and the
     /// lambdas in it), or null (design.md "Code Instance Tables").
     instances: ?InstanceInventory = null,
+    /// For the entry of a computed callable (`WorkerKey.callable_eval_entry`):
+    /// whether its binding's entry wrapper has a Code inventory, so a call
+    /// of the entry takes a table (Q16).
+    callable_eval_instances: bool = false,
 
     /// The bytes of the worker's procedure identity.
     pub fn identityBytes(self: Worker, program: *const Program) [32]u8 {
@@ -1445,12 +1446,47 @@ pub const Program = struct {
     /// Whether the entry wrapper of callable-eval binding `binding` has a
     /// Code instance inventory: the binding computes a function at its own
     /// variables (Q16), so a call of the value takes a table.
-    pub fn callableEvalHasInventory(self: *Program, binding: CallableEvalBinding) bool {
+    pub fn callableEvalHasInventory(self: *Program, binding: CallableEvalBinding) Allocator.Error!bool {
         const view = self.module(binding.module);
         const template = view.view.callable_eval_templates.templates[@backingInt(binding.template)];
         const wrapper = self.wrapper_by_root.get(.{ .module = binding.module, .root = template.root }) orelse return false;
         const holder = self.moduleByKey(.{ .bytes = wrapper.artifact.bytes });
-        return holder.codeInventories().inventoryOf(wrapper.template) != null;
+        return (try self.modules.codeInventories(holder.index)).inventoryOf(wrapper.template) != null;
+    }
+
+    /// The entry count of the inventory `inventory` names: the arity of the
+    /// tuple its table's worker returns.
+    pub fn instanceEntryCount(self: *Program, inventory: InstanceInventory) Allocator.Error!u32 {
+        const inventories = try self.modules.codeInventories(inventory.module);
+        const found = inventories.inventoryOf(inventory.template) orelse invariant("a worker's inventory names a template with no inventory");
+        return found.entries.len;
+    }
+
+    /// The inventory whose table template `template_id` of `module_index`
+    /// takes, or null. An owned template's is its module's inventory. An
+    /// imported template is linked, and its own object decided it: its
+    /// table takes one input past the descriptors, dictionaries and literal
+    /// arguments its type gives it exactly when it takes an instance table
+    /// (`Program.inputCount`). So a linked template needs no inventory of
+    /// its module, and its module's bodies stay unindexed.
+    fn templateInstances(
+        self: *Program,
+        module_index: ModuleIndex,
+        template_id: checked_names.CheckedProcedureTemplateId,
+        identity: LIR.ProcIdentity,
+        typed_inputs: usize,
+    ) Allocator.Error!?InstanceInventory {
+        const inventory: InstanceInventory = .{ .module = module_index, .template = template_id };
+        if (self.ownsModule(module_index)) {
+            return if ((try self.modules.codeInventories(module_index)).inventoryOf(template_id) != null) inventory else null;
+        }
+        const unit = self.moduleUnit() orelse invariant("an imported worker outside a module unit");
+        const interface = unit.imports.get(identity) orelse
+            invariant("a lowering reached a worker of an imported module whose object exports no such worker");
+        if (interface.table_needs.len == 0) return null;
+        const input_count = try StoredFn.decodeNeedsInputCount(self, interface.table_needs);
+        if (input_count != typed_inputs and input_count != typed_inputs + 1) invariant("an imported worker's inputs differ from its type's beyond one instance table");
+        return if (input_count == typed_inputs + 1) inventory else null;
     }
 
     /// The table module `module_index`'s description step recorded for
@@ -1537,7 +1573,10 @@ pub const Program = struct {
             .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .nominal, .variable => invariant("a method bound to a computed callable has no function type"),
         };
         const params = try self.arena.allocator().dupe(TypeId, self.store.span(function.args));
-        return try self.addErasedWorker(key, module_index, &.{}, params, function.ret, "boxy.callable_eval_entry");
+        const takes_table = try self.callableEvalHasInventory(binding);
+        const id = try self.addErasedWorker(key, module_index, &.{}, params, function.ret, "boxy.callable_eval_entry");
+        self.worker(id).callable_eval_instances = takes_table;
+        return id;
     }
 
     pub fn moduleByIdx(self: *const Program, idx: u32) *const types.ModuleView {
@@ -1664,10 +1703,7 @@ pub const Program = struct {
             .dict_scope_params = try self.arena.allocator().dupe([]const static_dispatch.EvidenceParamRecord, &.{evidence_params}),
             .literal_params = @intCast(literal_requirements.len),
             .literal_scopes = try self.arena.allocator().dupe([]const checked.LiteralRequirement, &.{literal_requirements}),
-            .instances = if (view.codeInventories().inventoryOf(template_id)) |inventory|
-                .{ .module = module_index, .template = template_id, .entries = inventory.entries.len }
-            else
-                null,
+            .instances = try self.templateInstances(module_index, template_id, identity, scheme_vars.items.len + dictionary_params.items.len + literal_requirements.len),
             .imported = imported,
             .lowered = imported,
         });
@@ -2371,7 +2407,7 @@ pub const Program = struct {
                 if (descFormatIsVector(primitive)) {
                     const owner: static_dispatch.MethodOwner = .{ .builtin = checked.builtinOwnerForPrimitive(primitive) };
                     const root_module = self.modules.views.items[0].index;
-                    const found = self.registeredMethod(root_module, null, owner, "to_inspect") orelse
+                    const found = (try self.registeredMethod(root_module, null, owner, "to_inspect")) orelse
                         invariant("a SIMD vector type registers no to_inspect, which Builtin declares for each");
                     const template = switch (found) {
                         .target => |target| switch (target.kind) {
@@ -2408,7 +2444,7 @@ pub const Program = struct {
                 // A method the description step refused (Q17) is a rejected
                 // declaration here: inspection renders the default form, and
                 // a comparison or hash is checked-error code.
-                if (view.codeInventories().refusesMethod(key)) {
+                if ((try self.modules.codeInventories(view.index)).refusesMethod(key)) {
                     if (std.mem.eql(u8, method_name, "to_inspect")) continue;
                     const crash = try self.crashDictionaryWorker(nominal.decl.module, .checked_error);
                     slot.* = .{ .procedure = .{ .entry = crash, .target = crash, .bound = &.{}, .dicts = &.{} } };
@@ -2512,7 +2548,7 @@ pub const Program = struct {
     /// whose binding computes a function at its own variables.
     pub fn workerTakesTable(self: *Program, id: WorkerId) bool {
         const target = self.worker(id);
-        if (target.key == .callable_eval_entry) return self.callableEvalHasInventory(target.key.callable_eval_entry);
+        if (target.key == .callable_eval_entry) return target.callable_eval_instances;
         return target.instances != null;
     }
 
@@ -2877,7 +2913,7 @@ pub const Program = struct {
             .primitive, .empty_record, .record, .tuple, .tag_union, .list, .box, .nominal, .function => {},
         }
         if (self.methodOwner(requirement.dispatcher)) |owned| {
-            if (self.registeredMethod(requirement.module, owned.module, owned.owner, method_text)) |found| switch (found) {
+            if (try self.registeredMethod(requirement.module, owned.module, owned.owner, method_text)) |found| switch (found) {
                 .rejected => return .{ .crash = .checked_error },
                 .target => |target| switch (target.kind) {
                     // A method only a Code description reads fills its slot with
@@ -2948,13 +2984,13 @@ pub const Program = struct {
     /// The registration of `owner.method_text`, as `scope_module` names the
     /// owner: an owner's methods live in its declaring module's registry
     /// alone, Builtin's for a builtin owner.
-    fn registeredMethod(self: *Program, scope_module: ModuleIndex, owner_module: ?ModuleIndex, owner: static_dispatch.MethodOwner, method_text: []const u8) ?static_dispatch.CheckedMethodLookup {
+    fn registeredMethod(self: *Program, scope_module: ModuleIndex, owner_module: ?ModuleIndex, owner: static_dispatch.MethodOwner, method_text: []const u8) Allocator.Error!?static_dispatch.CheckedMethodLookup {
         const owner_names = self.module(owner_module orelse scope_module).nameStore();
         const declaring = switch (owner) {
             .builtin => self.builtinModule(),
             .nominal => self.module(owner_module orelse scope_module),
         };
-        return methodIn(declaring, owner_names, owner, method_text);
+        return methodIn(&self.modules, declaring, owner_names, owner, method_text);
     }
 
     /// The Builtin module, which declares every builtin owner's methods.
@@ -2969,13 +3005,13 @@ pub const Program = struct {
         invariant("a program reaches a builtin owner's method without the Builtin module");
     }
 
-    fn methodIn(view: *const types.ModuleView, owner_names: anytype, owner: static_dispatch.MethodOwner, method_text: []const u8) ?static_dispatch.CheckedMethodLookup {
+    fn methodIn(modules: *const types.Modules, view: *const types.ModuleView, owner_names: anytype, owner: static_dispatch.MethodOwner, method_text: []const u8) Allocator.Error!?static_dispatch.CheckedMethodLookup {
         const view_owner = static_dispatch.methodOwnerInImportedStore(owner_names, view.nameStore(), owner) orelse return null;
         const method = view.nameStore().lookupMethodName(method_text) orelse return null;
         const key: static_dispatch.MethodKey = .{ .owner = view_owner, .method = method };
         // A method the description step refused (Q17) is a rejected
         // declaration for every requirement resolved from a type.
-        if (view.codeInventories().refusesMethod(key)) return .rejected;
+        if ((try modules.codeInventories(view.index)).refusesMethod(key)) return .rejected;
         return view.view.method_registry.lookup(key);
     }
 
@@ -3434,7 +3470,7 @@ pub const Program = struct {
         const served = self.module(module_index).code().tableTemplate(@fromBackingInt(table));
         const holder = self.moduleByKey(.{ .bytes = served.module.bytes });
         const template_id: checked_names.CheckedProcedureTemplateId = @fromBackingInt(served.template);
-        const inventories = holder.codeInventories();
+        const inventories = try self.modules.codeInventories(holder.index);
         const inventory = inventories.inventoryOf(template_id) orelse invariant("a Code instance table serves a template with no inventory");
         // A table has one entry per entry of its template's inventory.
         std.debug.assert(self.module(module_index).code().tables[table].entries.len == inventory.entries.len);
@@ -3874,7 +3910,7 @@ pub const Program = struct {
         return switch (target.key) {
             .template, .lambda => target.instanceWords(),
             .method_entry => |entry_target| self.instanceInputs(entry_target),
-            .callable_eval_entry => |binding| @intFromBool(self.callableEvalHasInventory(binding)),
+            .callable_eval_entry => @intFromBool(target.callable_eval_instances),
             .adapter, .codec, .default, .structural, .structural_map, .literal_thunk, .root_slot, .root, .static_data, .crash_dictionary, .convert, .code_value, .code_bound, .code_instances, .code_description => 0,
         };
     }

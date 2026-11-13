@@ -53,12 +53,6 @@ pub const ModuleView = struct {
     pub fn code(self: *const ModuleView) *const check.CodeOutput.CodeOutput {
         return self.view.code_output;
     }
-
-    /// The instance inventories of the module's templates, its
-    /// `codeInventories` slot.
-    pub fn codeInventories(self: *const ModuleView) *const check.CodeAnalyses.CodeInventories {
-        return self.view.codeInventories();
-    }
 };
 
 /// Exact error reachability within one Boxy lowering's immutable checked
@@ -228,6 +222,19 @@ pub const Modules = struct {
 
     pub fn get(self: *const Modules, index: ModuleIndex) *const ModuleView {
         return &self.views.items[@backingInt(index)];
+    }
+
+    /// The instance inventories of module `index`'s templates, computed on
+    /// first demand with every module of this lowering in reach. Lowering
+    /// demands them only for a module whose template it lowers or whose
+    /// table it builds, so the bodies of every other module stay unindexed.
+    pub fn codeInventories(self: *const Modules, index: ModuleIndex) Allocator.Error!*const check.CodeAnalyses.CodeInventories {
+        const view = self.get(index).view;
+        if (view.checked_bodies.analyses.code.inventories_slot.peek()) |computed| return computed;
+        const reach = try self.allocator.alloc(checked.ImportedModuleView, self.views.items.len);
+        defer self.allocator.free(reach);
+        for (self.views.items, reach) |module, *slot| slot.* = module.view;
+        return check.CodeLookups.codeInventories(self.allocator, view, reach);
     }
 
     /// Rebase a checked default from its name store into this program's modules.

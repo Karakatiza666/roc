@@ -1991,6 +1991,16 @@ fn encodeOperand(encoder: *Encoder, operand: Tables.Operand) Allocator.Error!voi
 /// lowering, allocated in the program's arena. Its bytes are this
 /// compiler's: complete entries are admitted by `boxy_object_cache.decodeView`.
 /// Link identities bind the records to the current checked module graph.
+/// The input count of an encoded needs list (`encodeNeeds`), read without
+/// its recipes.
+pub fn decodeNeedsInputCount(program: *Program, bytes: []const u8) Allocator.Error!u32 {
+    var decoder = Decoder{ .program = program, .link_names = true, .bytes = bytes };
+    decoder.readModules();
+    try decoder.readTable();
+    defer program.allocator.free(decoder.table);
+    return decoder.word();
+}
+
 pub fn decodeNeeds(program: *Program, bytes: []const u8) Allocator.Error!Tables.Needs {
     const arena = program.arena.allocator();
     var decoder = Decoder{ .program = program, .link_names = true, .bytes = bytes };

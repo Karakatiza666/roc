@@ -3567,7 +3567,7 @@ pub const Builder = struct {
         if (self.refusedUse(expr_id)) return try self.pushRefused(expr_id);
         // A generic bound call reads its bound requirement, unless a literal
         // chain lowers it as its root's own evaluation.
-        if (self.view.codeInventories().boundCallIndex(expr_id)) |call_index| {
+        if ((try self.program.modules.codeInventories(self.view.index)).boundCallIndex(expr_id)) |call_index| {
             if (self.bound_call_lowering != null and self.bound_call_lowering.? == expr_id) {
                 self.bound_call_lowering = null;
             } else return try self.lowerInstanceBound(expr_id, call_index);
@@ -4793,7 +4793,7 @@ pub const Builder = struct {
             .deferred = deferred,
             .deferred_dicts = instance.deferred_dicts,
             .saved_env = self.env,
-            .instances = if (target.instances) |inventory| .{ .word = instance.hidden[instance.hidden.len - 1], .entries = inventory.entries } else null,
+            .instances = if (target.instances) |inventory| .{ .word = instance.hidden[instance.hidden.len - 1], .entries = try self.program.instanceEntryCount(inventory) } else null,
         });
         return literal_requirements;
     }
@@ -4928,7 +4928,7 @@ pub const Builder = struct {
     /// Instance Tables").
     pub fn lowerCodeSite(self: *Builder, expr_id: ExprId) Allocator.Error!void {
         const site_ty = try self.exprType(expr_id);
-        if (self.view.codeInventories().siteIndex(expr_id)) |index| {
+        if ((try self.program.modules.codeInventories(self.view.index)).siteIndex(expr_id)) |index| {
             const table = (try self.ownInstanceTable()) orelse invariant("an instance site was lowered with no instance table in scope");
             const thunk = try self.materialize(try self.instanceTableEntry(table, index));
             const fn_ty = try self.program.store.intern(.{ .function = .{ .args = &.{}, .ret = site_ty, .effectful = false } });
@@ -5006,7 +5006,7 @@ pub const Builder = struct {
         if (self.thunk_frames) |first| if (self.alias_scopes.items.len > first) return self.alias_scopes.items[self.alias_scopes.items.len - 1].instances;
         const word = (try self.instanceInputWord()) orelse return null;
         const inventory = self.servedInventory() orelse invariant("a body holds an instance table its worker has no inventory for");
-        return .{ .word = word, .entries = inventory.entries };
+        return .{ .word = word, .entries = try self.program.instanceEntryCount(inventory) };
     }
 
     /// The inventory the table this body holds serves: its worker's, or a
@@ -5044,7 +5044,7 @@ pub const Builder = struct {
     /// use.
     fn instanceWordForUse(self: *Builder, use: ExprId, in_force: ?InstanceTable) Allocator.Error!?Word {
         if (self.code().edgeTable(.{ .use = use })) |closing| return try self.closingUseWord(self.module, closing);
-        const index = self.view.codeInventories().forwardIndex(.{ .use = use }) orelse return null;
+        const index = (try self.program.modules.codeInventories(self.view.index)).forwardIndex(.{ .use = use }) orelse return null;
         const table = in_force orelse invariant("a forward use was lowered with no instance table in force");
         return try self.instanceTableEntry(table, index);
     }
@@ -5080,7 +5080,7 @@ pub const Builder = struct {
             invariant("a body holds an instance table its worker has no inventory for");
         const scope = try self.servedScope();
         if (served.module != scope.module) invariant("a body's inventory is another module's than its scope's");
-        const inventories = self.program.module(served.module).codeInventories();
+        const inventories = (try self.program.modules.codeInventories(served.module));
         const inventory = inventories.inventoryOf(served.template) orelse
             invariant("a worker's inventory names a template with no inventory");
         for (inventories.inventoryEntries(inventory), 0..) |entry, index| {
@@ -5122,7 +5122,7 @@ pub const Builder = struct {
             .table => .{ .word = try self.closingUseWord(self.module, closing) },
             .refused => .refused,
         };
-        const index = self.view.codeInventories().forwardIndex(.{ .node = node_id }) orelse
+        const index = (try self.program.modules.codeInventories(self.view.index)).forwardIndex(.{ .node = node_id }) orelse
             invariant("evidence selects a method with a Code inventory at an edge the description step gave no table");
         const table = (try self.ownInstanceTable()) orelse invariant("a forward evidence edge was lowered with no instance table in force");
         return .{ .word = try self.instanceTableEntry(table, index) };
@@ -5146,7 +5146,7 @@ pub const Builder = struct {
     /// `binding`, as `dispatchInstanceWord` reads it, or null where the
     /// wrapper takes none.
     fn computedMethodWord(self: *Builder, binding: lower.CallableEvalBinding, node_id: static_dispatch.EvidenceNodeId, use: ?ExprId) Allocator.Error!?Word {
-        if (!self.program.callableEvalHasInventory(binding)) return null;
+        if (!try self.program.callableEvalHasInventory(binding)) return null;
         return try self.dispatchInstanceWord(node_id, try self.program.callableEvalEntryWorker(self.module, binding), use) orelse
             invariant("a dispatch to a computed callable with a Code inventory has no table");
     }
@@ -5264,7 +5264,7 @@ pub const Builder = struct {
     fn lowerInstanceBound(self: *Builder, expr: ExprId, call_index: u32) Allocator.Error!void {
         const index = self.ownLiteralRequirementIndex(@backingInt(expr)) orelse invariant("a generic bound call has no bound requirement in its scope");
         const callable = try self.scopeLiteral(.{ .depth = 0, .index = index });
-        const leaves = self.view.codeInventories().boundCallLeaves(call_index);
+        const leaves = (try self.program.modules.codeInventories(self.view.index)).boundCallLeaves(call_index);
         const values = try self.allocator.alloc(LocalId, leaves.len);
         defer self.allocator.free(values);
         const leaf_types = try self.allocator.alloc(TypeId, leaves.len);
@@ -5324,7 +5324,7 @@ pub const Builder = struct {
         const site = requirements[index].site;
         if (site.kind != .bound_call or !site.module.eql(self.view.key)) invariant("a bound root's chain does not end at its call");
         const call: ExprId = @fromBackingInt(site.node);
-        const inventories = self.view.codeInventories();
+        const inventories = (try self.program.modules.codeInventories(self.view.index));
         const call_index = inventories.boundCallIndex(call) orelse invariant("a bound root's call is no generic bound call of its holder");
         const leaves = inventories.boundCallLeaves(call_index);
         if (leaves.len != leaf_types.len) invariant("a bound requirement's argument differs from its call's leaves");

@@ -72,10 +72,6 @@ pub const BuiltinModules = struct {
             .{ .static_builtin = builtin_module.env },
         );
         try checked_artifact.attachSealedTypes(allocator, io);
-        // The serialized artifact holds no code slots; lowering reads the
-        // inventories slot, so fill it here.
-        const view = check.CheckedArtifact.importedView(&checked_artifact);
-        try @import("code_descriptions.zig").fillCodeInventories(allocator, &.{view}, &.{view});
 
         return BuiltinModules{
             .allocator = allocator,

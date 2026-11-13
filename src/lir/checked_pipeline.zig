@@ -1408,6 +1408,7 @@ pub fn prepareCheckedModulesMonotype(
 ) LowerResourceError!PreparedMonotype {
     if (target.specialization_strategy != .lss) checkedPipelineInvariant("Monotype preparation requires LSS");
     try modules.demandBodyIndexes();
+    try modules.demandCodeInventories(allocator);
     try verifyCheckedBoundary(modules, target);
     try requireHostedProceduresBound(modules, target);
 

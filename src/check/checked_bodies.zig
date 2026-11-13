@@ -1211,13 +1211,14 @@ pub const CheckedBodies = struct {
         return self.analyses.code.inventories(inputs);
     }
 
-    /// The module's instance inventories, which compile-time evaluation
-    /// computed before lowering: the description step of a fresh module, or
-    /// finalization for a module from the cache. Lowering reads them here,
-    /// and has no inputs to compute them with.
+    /// The module's instance inventories, which a reader computed before:
+    /// the evaluation that builds the module's object (its interface digest
+    /// reads them), or Monotype, which demands every module's up front
+    /// (`CheckedModules.demandCodeInventories`). Boxy computes them on
+    /// demand (`Modules.codeInventories`).
     pub fn computedCodeInventories(self: CheckedBodies) *const code_analyses.CodeInventories {
         return self.analyses.code.inventories_slot.peek() orelse
-            invariant("lowering read the code inventories of a module before evaluation computed them");
+            invariant("a reader read the code inventories of a module no reader computed");
     }
 
     /// The instance inventory of a local template, or null for a template

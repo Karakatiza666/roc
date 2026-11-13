@@ -32655,8 +32655,9 @@ pub const CheckedModuleArtifact = struct {
         return &self.code_output;
     }
 
-    /// The instance inventories of the module's templates. Evaluation fills
-    /// the slot before any lowering (`CheckedBodies.computedCodeInventories`).
+    /// The instance inventories of the module's templates. The evaluation
+    /// that builds the module's object fills the slot
+    /// (`CheckedBodies.computedCodeInventories`).
     pub fn codeInventories(self: *const CheckedModuleArtifact) *const code_analyses.CodeInventories {
         return self.bodies().computedCodeInventories();
     }
@@ -34877,12 +34878,6 @@ pub const ImportedModuleView = struct {
     /// The keys of the modules this module imports directly.
     pub fn directImportKeys(self: ImportedModuleView) []const CheckedModuleArtifactKey {
         return self.direct_import_module_keys;
-    }
-
-    /// The instance inventories of the module's templates. Evaluation fills
-    /// the slot before any lowering (`CheckedBodies.computedCodeInventories`).
-    pub fn codeInventories(self: ImportedModuleView) *const code_analyses.CodeInventories {
-        return self.checked_bodies.computedCodeInventories();
     }
 };
 

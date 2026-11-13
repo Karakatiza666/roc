@@ -1228,7 +1228,12 @@ fn describeProgramModules(
     try reach.appendSlice(allocator, lowering_modules.imports);
     try reach.appendSlice(allocator, lowering_modules.root.relation_modules);
     for (modules) |entry| try reach.append(allocator, checked.importedView(entry.module));
-    try code_descriptions.fillCodeInventories(allocator, reach.items, reach.items);
+    // Each module of the batch publishes its own inventories with its object
+    // interface; lowering computes any other module's on demand.
+    const own = try allocator.alloc(checked.ImportedModuleView, modules.len);
+    defer allocator.free(own);
+    for (modules, own) |entry, *view| view.* = checked.importedView(entry.module);
+    try code_descriptions.fillCodeInventories(allocator, own, reach.items);
     try code_descriptions.describeModules(allocator, batch, reach.items, executor);
 }
 
@@ -4139,7 +4144,9 @@ fn finalize(
         try reach.appendSlice(allocator, relation_modules);
         if (module.code_output.state == .pending) try code_descriptions.describeModule(allocator, module, problem_store, reach.items);
         try reach.append(allocator, checked.importedView(module));
-        try code_descriptions.fillCodeInventories(allocator, reach.items, reach.items);
+        // The module publishes its own inventories with its object
+        // interface; lowering computes any other module's on demand.
+        try code_descriptions.fillCodeInventories(allocator, &.{checked.importedView(module)}, reach.items);
     }
     const requests = module.root_requests.compile_time_requests;
     const total_started_ns = if (requests.len != 0) if (options.timing) |timing| timing.start() else 0 else 0;
