@@ -176,7 +176,7 @@ main = (captureSimple, captureMultiple, outerFn, useClosure)
 		(e-lambda
 			(args
 				(p-underscore))
-			(e-dispatch-call (method "plus") (constraint-fn-var 297)
+			(e-dispatch-call (method "plus") (constraint-fn-var 532)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "x"))))
@@ -203,7 +203,7 @@ main = (captureSimple, captureMultiple, outerFn, useClosure)
 						(e-lambda
 							(args
 								(p-underscore))
-							(e-dispatch-call (method "plus") (constraint-fn-var 313)
+							(e-dispatch-call (method "plus") (constraint-fn-var 548)
 								(receiver
 									(e-lookup-local
 										(p-assign (ident "level1"))))
@@ -227,7 +227,7 @@ main = (captureSimple, captureMultiple, outerFn, useClosure)
 						(p-assign (ident "n")))))))
 	(d-let
 		(p-assign (ident "useClosure"))
-		(e-call (constraint-fn-var 329)
+		(e-call (constraint-fn-var 564)
 			(e-lookup-local
 				(p-assign (ident "makeClosure")))
 			(e-num (value "100"))))
@@ -257,7 +257,7 @@ main = (captureSimple, captureMultiple, outerFn, useClosure)
 		(patt (type "_arg -> (_arg2 -> Dec)"))
 		(patt (type "a -> (_arg -> a)"))
 		(patt (type "_arg -> Dec"))
-		(patt (type "(_arg -> Dec, _arg2 -> Dec, _arg3 -> (_arg4 -> Dec), _arg5 -> Dec)")))
+		(patt (type "((_arg -> Dec), (_arg2 -> Dec), (_arg3 -> (_arg4 -> Dec)), (_arg5 -> Dec))")))
 	(expressions
 		(expr (type "Dec"))
 		(expr (type "_arg -> Dec"))
@@ -268,5 +268,5 @@ main = (captureSimple, captureMultiple, outerFn, useClosure)
 		(expr (type "_arg -> (_arg2 -> Dec)"))
 		(expr (type "a -> (_arg -> a)"))
 		(expr (type "_arg -> Dec"))
-		(expr (type "(_arg -> Dec, _arg2 -> Dec, _arg3 -> (_arg4 -> Dec), _arg5 -> Dec)"))))
+		(expr (type "((_arg -> Dec), (_arg2 -> Dec), (_arg3 -> (_arg4 -> Dec)), (_arg5 -> Dec))"))))
 ~~~

@@ -208,7 +208,7 @@ main! = |_| {
 		(e-lambda
 			(args
 				(p-assign (ident "number")))
-			(e-dispatch-call (method "plus") (constraint-fn-var 290)
+			(e-dispatch-call (method "plus") (constraint-fn-var 525)
 				(receiver
 					(e-lookup-local
 						(p-assign (ident "number"))))
@@ -222,33 +222,33 @@ main! = |_| {
 			(e-block
 				(s-let
 					(p-assign (ident "a"))
-					(e-call (constraint-fn-var 306)
+					(e-call (constraint-fn-var 541)
 						(e-lookup-local
 							(p-assign (ident "unused_regular")))
 						(e-num (value "5"))))
 				(s-let
 					(p-assign (ident "b"))
-					(e-call (constraint-fn-var 316)
+					(e-call (constraint-fn-var 551)
 						(e-lookup-local
 							(p-assign (ident "used_underscore")))
 						(e-num (value "10"))))
 				(s-let
 					(p-assign (ident "c"))
-					(e-call (constraint-fn-var 331)
+					(e-call (constraint-fn-var 566)
 						(e-lookup-local
 							(p-assign (ident "unused_underscore")))
 						(e-num (value "15"))))
 				(s-let
 					(p-assign (ident "d"))
-					(e-call (constraint-fn-var 347)
+					(e-call (constraint-fn-var 582)
 						(e-lookup-local
 							(p-assign (ident "used_regular")))
 						(e-num (value "20"))))
-				(e-dispatch-call (method "plus") (constraint-fn-var 352)
+				(e-dispatch-call (method "plus") (constraint-fn-var 587)
 					(receiver
-						(e-dispatch-call (method "plus") (constraint-fn-var 350)
+						(e-dispatch-call (method "plus") (constraint-fn-var 585)
 							(receiver
-								(e-dispatch-call (method "plus") (constraint-fn-var 348)
+								(e-dispatch-call (method "plus") (constraint-fn-var 583)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "a"))))

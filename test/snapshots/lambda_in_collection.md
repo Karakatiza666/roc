@@ -71,7 +71,7 @@ NO CHANGE
 				(p-assign (ident "a"))
 				(p-assign (ident "b")))
 			(e-block
-				(e-dispatch-call (method "plus") (constraint-fn-var 228)
+				(e-dispatch-call (method "plus") (constraint-fn-var 463)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "a"))))
@@ -83,7 +83,7 @@ NO CHANGE
 				(p-assign (ident "a"))
 				(p-assign (ident "b")))
 			(e-block
-				(e-dispatch-call (method "minus") (constraint-fn-var 234)
+				(e-dispatch-call (method "minus") (constraint-fn-var 469)
 					(receiver
 						(e-lookup-local
 							(p-assign (ident "a"))))
@@ -93,5 +93,5 @@ NO CHANGE
 ~~~
 # TYPES
 ~~~clojure
-(expr (type "(c, d -> c, e, f -> e) where [c.plus : c, d -> c, e.minus : e, f -> e]"))
+(expr (type "((c, d -> c), (e, f -> e)) where [c.plus : c, d -> c, e.minus : e, f -> e]"))
 ~~~

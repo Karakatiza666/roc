@@ -33,11 +33,11 @@ NO CHANGE
 ~~~
 # CANONICALIZE
 ~~~clojure
-(e-call (constraint-fn-var 230)
+(e-call (constraint-fn-var 465)
 	(e-lambda
 		(args
 			(p-assign (ident "x")))
-		(e-call (constraint-fn-var 225)
+		(e-call (constraint-fn-var 460)
 			(e-lookup-associated-resolved (source "Bool.not") (builtin) (target-node "18574") (target-def "18574"))
 			(e-lookup-local
 				(p-assign (ident "x")))))

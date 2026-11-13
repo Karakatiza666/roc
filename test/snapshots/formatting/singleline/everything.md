@@ -57,7 +57,6 @@ MOD NOT FOUND - everything.md:2:1:2:30
 MOD NOT FOUND - everything.md:3:1:3:46
 NOT A WHERE ALIAS - everything.md:20:20:20:22
 NOT A WHERE ALIAS - everything.md:20:25:20:27
-DECLARATION HAS NO VALUE - everything.md:20:1:20:28
 NON EXHAUSTIVE MATCH - everything.md:29:2:29:7
 # PROBLEMS
 ~~~clojure
@@ -278,17 +277,6 @@ NON EXHAUSTIVE MATCH - everything.md:29:2:29:7
 			(reflow "and written in a where clause as")
 			(reflow " ")
 			(annotated code "where [a.Sortable]")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 20 1) (end 20 28))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "everything.md") (start 20 1) (end 20 28) (annotation error) (line-text "g : e -> e where [e.A, e.B]"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
 	(report
 		(severity runtime_error)
 		(title "Non Exhaustive Match")
@@ -572,7 +560,7 @@ NO CHANGE
 												(p-assign (ident "y"))))))))))
 				(s-let
 					(p-assign (ident "h2"))
-					(e-call (constraint-fn-var 379)
+					(e-call (constraint-fn-var 614)
 						(e-lookup-local
 							(p-assign (ident "h")))
 						(e-lookup-local
@@ -637,11 +625,11 @@ NO CHANGE
 								(value
 									(e-lookup-local
 										(p-assign (ident "a")))))))))))
-	(s-import (mod "I1")
+	(s-import (mod "I1") (alias "I1")
 		(exposes
 			(exposed (name "I11") (wildcard false))
 			(exposed (name "I12") (wildcard false))))
-	(s-import (mod "I2")
+	(s-import (mod "I2") (alias "I2")
 		(exposes
 			(exposed (name "I21") (alias "Ias1") (wildcard false))
 			(exposed (name "I22") (alias "Ias2") (wildcard false))))

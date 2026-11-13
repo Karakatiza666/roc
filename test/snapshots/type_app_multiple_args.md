@@ -95,12 +95,12 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-underscore))
-			(e-call (constraint-fn-var 316)
+			(e-call (constraint-fn-var 551)
 				(e-lookup-local
 					(p-assign (ident "processDict")))
-				(e-dispatch-call (method "insert") (constraint-fn-var 279)
+				(e-dispatch-call (method "insert") (constraint-fn-var 514)
 					(receiver
-						(e-call (constraint-fn-var 275)
+						(e-call (constraint-fn-var 510)
 							(e-lookup-external
 								(builtin))))
 					(args

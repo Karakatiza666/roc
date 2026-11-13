@@ -254,21 +254,16 @@ EXPOSED BUT NOT DEFINED - fuzz_crash_028.md:2:6:2:11
 MOD NOT FOUND - fuzz_crash_028.md:6:1:8:4
 DOES NOT EXIST - fuzz_crash_028.md:120:2:120:7
 DOES NOT EXIST - fuzz_crash_028.md:134:2:134:7
-DECLARATION HAS NO VALUE - fuzz_crash_028.md:28:1:31:2
-DECLARATION HAS NO VALUE - fuzz_crash_028.md:47:1:47:21
 NAME NOT BOUND IN EVERY ALTERNATIVE - fuzz_crash_028.md:64:17:64:20
 TYPE MISMATCH - fuzz_crash_028.md:68:3:68:8
 TYPE MISMATCH - fuzz_crash_028.md:68:3:68:8
 TYPE MISMATCH - fuzz_crash_028.md:64:2:64:2
-DECLARATION HAS NO VALUE - fuzz_crash_028.md:95:1:95:34
 TYPE MISMATCH - fuzz_crash_028.md:102:8:102:11
 TOO FEW ARGS - fuzz_crash_028.md:104:2:106:3
-REFERENCE HAS NO VALUE - fuzz_crash_028.md:115:3:115:10
+TYPE MISMATCH - fuzz_crash_028.md:115:3:115:3
 TYPE MISMATCH - fuzz_crash_028.md:133:5:133:18
 TYPE MISMATCH - fuzz_crash_028.md:133:5:133:25
 TYPE MISMATCH - fuzz_crash_028.md:133:5:133:31
-DECLARATION HAS NO VALUE - fuzz_crash_028.md:141:1:141:7
-DECLARATION HAS NO VALUE - fuzz_crash_028.md:144:1:144:13
 MISSING METHOD - fuzz_crash_028.md:133:5:133:12
 MISSING METHOD - fuzz_crash_028.md:133:5:133:18
 # PROBLEMS
@@ -2059,28 +2054,6 @@ MISSING METHOD - fuzz_crash_028.md:133:5:133:18
 		(document
 			(source-region (file "fuzz_crash_028.md") (start 134 2) (end 134 7) (annotation error) (line-text "\tline!("))))
 	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 28 1) (end 31 2))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_028.md") (start 28 1) (end 31 2) (annotation error) (line-text "line : ( # Cpen\n\tBar, #\n\tBaz, #m\n) # Co"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 47 1) (end 47 21))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_028.md") (start 47 1) (end 47 21) (annotation error) (line-text "add_one : U64 -> U64"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
 		(severity runtime_error)
 		(title "Name Not Bound In Every Alternative")
 		(region (start 64 17) (end 64 20))
@@ -2200,17 +2173,6 @@ MISSING METHOD - fuzz_crash_028.md:133:5:133:18
 			(line-break)
 			(reflow "These can never match! Either the pattern or expression has a problem.")))
 	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 95 1) (end 95 34))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_028.md") (start 95 1) (end 95 34) (annotation error) (line-text "main! : (String) -> Result({}, _)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
 		(severity runtime_error)
 		(title "Type Mismatch")
 		(region (start 102 8) (end 102 11))
@@ -2287,15 +2249,43 @@ MISSING METHOD - fuzz_crash_028.md:133:5:133:18
 			(reflow "Are there any missing commas?")))
 	(report
 		(severity runtime_error)
-		(title "Reference Has No Value")
-		(region (start 115 3) (end 115 10))
+		(title "Type Mismatch")
+		(region (start 115 11) (end 116 3))
 		(headline
-			(reflow "This refers to a declaration that has a type annotation but no implementation, so there is no value here to use."))
+			(reflow "The")
+			(reflow " ")
+			(reflow "first")
+			(reflow " ")
+			(reflow "argument being passed to this function has the wrong type."))
 		(document
-			(source-region (file "fuzz_crash_028.md") (start 115 3) (end 115 10) (annotation error) (line-text "\t\tadd_one(dbg # Afist"))
+			(source-underlines
+				(display (file "fuzz_crash_028.md") (start 115 3) (end 117 4) (annotation dim) (line-text "\t\tadd_one(dbg # Afist\ner, # afarg\n\t\t),\t456, # ee"))
+				(underline (start 115 11) (end 116 3) (annotation error)))
+			(line-break)
+			(reflow "This argument has the type:")
 			(line-break)
 			(line-break)
-			(reflow "Give that declaration a value body, or stop referring to it here.")))
+			(annotation-start code-block)
+			(indent 1)
+			(text "{}")
+			(annotation-end)
+			(line-break)
+			(line-break)
+			(reflow "But")
+			(reflow " ")
+			(annotated code "add_one")
+			(reflow " ")
+			(reflow "needs the")
+			(reflow " ")
+			(reflow "first")
+			(reflow " ")
+			(reflow "argument to be:")
+			(line-break)
+			(line-break)
+			(annotation-start code-block)
+			(indent 1)
+			(text "U64")
+			(annotation-end)))
 	(report
 		(severity runtime_error)
 		(title "Type Mismatch")
@@ -2422,28 +2412,6 @@ MISSING METHOD - fuzz_crash_028.md:133:5:133:18
 			(annotated code "?")
 			(reflow " ")
 			(reflow "operators and the function body must be compatible, since any of them could be the actual return value.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 141 1) (end 141 7))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_028.md") (start 141 1) (end 141 7) (annotation error) (line-text "y : {}"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 144 1) (end 144 13))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_028.md") (start 144 1) (end 144 13) (annotation error) (line-text "t : V((a,c))"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
 	(report
 		(severity runtime_error)
 		(title "Missing Method")
@@ -3108,7 +3076,7 @@ EndOfFile,
 					(e-num (value "5"))))))
 	(d-let
 		(p-assign (ident "add_one"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-fn (effectful false)
 				(ty-lookup (name "U64") (builtin))
@@ -3198,7 +3166,7 @@ EndOfFile,
 							(p-assign (ident "#interp_0"))
 							(e-lookup-local
 								(p-assign (ident "world"))))
-						(e-interpolation (constraint-fn-var 1375) (dispatcher-var 281)
+						(e-interpolation (constraint-fn-var 1610) (dispatcher-var 281)
 							(first
 								(e-literal (string "H, ")))
 							(parts
@@ -3207,8 +3175,7 @@ EndOfFile,
 								(e-literal (string ""))))))
 				(s-let
 					(p-assign (ident "t"))
-					(e-runtime-error (tag "erroneous_value_expr")
-						(e-runtime-error (tag "erroneous_value_expr"))))
+					(e-runtime-error (tag "erroneous_value_expr")))
 				(s-for
 					(p-assign (ident "n"))
 					(e-runtime-error (tag "ident_not_in_scope"))
@@ -3255,11 +3222,11 @@ EndOfFile,
 					(e-if
 						(if-branches
 							(if-branch
-								(e-dispatch-call (method "is_gt") (constraint-fn-var 1584)
+								(e-dispatch-call (method "is_gt") (constraint-fn-var 1819)
 									(receiver
 										(e-runtime-error (tag "erroneous_value_expr")))
 									(args
-										(e-dispatch-call (method "times") (constraint-fn-var 1581)
+										(e-dispatch-call (method "times") (constraint-fn-var 1816)
 											(receiver
 												(e-num (value "5")))
 											(args
@@ -3274,18 +3241,18 @@ EndOfFile,
 										(e-if
 											(if-branches
 												(if-branch
-													(e-dispatch-call (method "is_lt") (constraint-fn-var 1617)
+													(e-dispatch-call (method "is_lt") (constraint-fn-var 1852)
 														(receiver
-															(e-dispatch-call (method "plus") (constraint-fn-var 1607)
+															(e-dispatch-call (method "plus") (constraint-fn-var 1842)
 																(receiver
 																	(e-num (value "13")))
 																(args
 																	(e-num (value "2")))))
 														(args
 															(e-num (value "5"))))
-													(e-dispatch-call (method "is_gte") (constraint-fn-var 1644)
+													(e-dispatch-call (method "is_gte") (constraint-fn-var 1879)
 														(receiver
-															(e-dispatch-call (method "minus") (constraint-fn-var 1634)
+															(e-dispatch-call (method "minus") (constraint-fn-var 1869)
 																(receiver
 																	(e-num (value "10")))
 																(args
@@ -3300,11 +3267,11 @@ EndOfFile,
 											(builtin)
 											(e-tag (name "True")))))
 								(if-else
-									(e-dispatch-call (method "is_lte") (constraint-fn-var 1683)
+									(e-dispatch-call (method "is_lte") (constraint-fn-var 1918)
 										(receiver
 											(e-num (value "12")))
 										(args
-											(e-dispatch-call (method "div_by") (constraint-fn-var 1680)
+											(e-dispatch-call (method "div_by") (constraint-fn-var 1915)
 												(receiver
 													(e-num (value "3")))
 												(args
@@ -3319,12 +3286,12 @@ EndOfFile,
 										(e-match
 											(match
 												(cond
-													(e-dispatch-call (method "ned") (constraint-fn-var 1749)
+													(e-dispatch-call (method "ned") (constraint-fn-var 1984)
 														(receiver
 															(e-match
 																(match
 																	(cond
-																		(e-dispatch-call (method "od") (constraint-fn-var 1719)
+																		(e-dispatch-call (method "od") (constraint-fn-var 1954)
 																			(receiver
 																				(e-runtime-error (tag "erroneous_value_expr")))
 																			(args)))
@@ -3384,7 +3351,7 @@ EndOfFile,
 				(e-runtime-error (tag "erroneous_value_expr")))))
 	(d-let
 		(p-assign (ident "y"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-record)))
 	(d-let
@@ -3395,11 +3362,11 @@ EndOfFile,
 		(e-runtime-error (tag "erroneous_value_expr"))
 		(annotation
 			(ty-malformed)))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "e!") (wildcard false))))
-	(s-import (mod "Stdot")
+	(s-import (mod "Stdot") (alias "Stdot")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Some")
