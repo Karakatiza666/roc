@@ -15005,6 +15005,7 @@ fn constantEntryTemplate(reifier: *const Reifier, body: checked.CheckedConstBody
 /// (`methodDefinition`), and each such module is a dependency of a module
 /// on the way. An importer is never visited, so no slot reads its own.
 fn importsHoldInventories(reifier: *Reifier) Allocator.Error!bool {
+    if (!try importsRecordCode(reifier)) return false;
     const gpa = reifier.gpa;
     var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer seen.deinit(gpa);
@@ -15013,6 +15014,27 @@ fn importsHoldInventories(reifier: *Reifier) Allocator.Error!bool {
     try pushImports(gpa, reifier.env, reifier.lookup, &seen, &work);
     while (work.pop()) |module| {
         if ((try module.sources.bodies.codeInventories(module)).inventories.len != 0) return true;
+        try pushImports(gpa, module.env(), module.lookup, &seen, &work);
+    }
+    return false;
+}
+
+/// Whether a module this module depends on, as `importsHoldInventories`
+/// walks them, records a `Code` site or identity call in its node store.
+/// Every inventory starts at one: a template holds an inventory only for
+/// an occurrence of a site or identity call, or for a use of a template
+/// that holds one. So with no such record, no dependency holds an
+/// inventory, and the walk reads no dependency's bodies.
+fn importsRecordCode(reifier: *Reifier) Allocator.Error!bool {
+    const gpa = reifier.gpa;
+    var seen: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer seen.deinit(gpa);
+    var work = std.ArrayList(ForeignModule).empty;
+    defer work.deinit(gpa);
+    try pushImports(gpa, reifier.env, reifier.lookup, &seen, &work);
+    while (work.pop()) |module| {
+        const store = &module.env().store;
+        if (store.codeReificationSites().len != 0 or store.codeIdentityUses().len != 0) return true;
         try pushImports(gpa, module.env(), module.lookup, &seen, &work);
     }
     return false;

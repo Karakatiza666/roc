@@ -812,6 +812,16 @@ pub const CheckedBodies = struct {
         return node_expr == .e_call and node_store.isCodeIdentityCall(node);
     }
 
+    /// Whether `call` is the bound call of a `Code` site this module
+    /// records (`NodeStore.CodeReificationSite.bound_call`): the only call
+    /// whose input slots the description step may bind.
+    pub fn isCodeBoundCall(self: CheckedBodies, call: ExprId) bool {
+        for (self.store().codeReificationSites()) |site| {
+            if (site.bound_call == @backingInt(call)) return true;
+        }
+        return false;
+    }
+
     pub fn exprData(self: CheckedBodies, id: ExprId) ExprData {
         // Rejected binding uses and calls of retired callees evaluate as
         // runtime errors (`ResolvedValueRefTable.retired_exprs`).
