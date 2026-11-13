@@ -26,6 +26,17 @@ const Codec = @import("codec.zig");
 const const_schema = @import("const_schema.zig");
 const StoredFn = @import("stored_fn.zig");
 const Tables = @import("tables.zig");
+const TableDigest = @import("table_digest.zig");
+
+/// The link name of each module of a lowering, by artifact key
+/// (`TableDigest.instanceTableDigest`).
+const LinkNames = struct {
+    modules: *const types.Modules,
+
+    pub fn nameOf(self: LinkNames, key: [32]u8) [32]u8 {
+        return self.modules.byKey(.{ .bytes = key }).link_name;
+    }
+};
 const ConstSchema = const_schema.ConstSchema;
 
 const Allocator = std.mem.Allocator;
@@ -890,6 +901,9 @@ pub const Program = struct {
     /// The Code instance table each static callable word that is one names
     /// (`instanceEntryWord`), noted where the word is evaluated.
     instance_table_words: std.AutoHashMapUnmanaged(u32, InstanceTableWord) = .empty,
+    /// The Code instance tables of modules this unit does not own whose
+    /// entries `instanceEntryWord` read, in first-read order.
+    imported_tables: std.AutoArrayHashMapUnmanaged(struct { module: ModuleIndex, table: u32 }, void) = .empty,
     /// The nested procedure site of each lambda and closure expression.
     sites_by_expr: std.AutoHashMapUnmanaged(ExprKey, u32) = .empty,
     /// The default a record construction that omits a field materializes.
@@ -1072,8 +1086,10 @@ pub const Program = struct {
     /// defines for other objects, named by content identity.
     pub fn exportableKind(key: WorkerKey) bool {
         return switch (key) {
-            .template, .lambda, .method_entry, .default, .code_instances => true,
-            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .callable_eval_entry, .code_bound, .code_description => false,
+            // A description thunk is its table's module's, which an importer
+            // reading the table's entries calls (`instanceEntryWord`).
+            .template, .lambda, .method_entry, .default, .code_instances, .code_description => true,
+            .adapter, .structural, .structural_map, .root, .codec, .static_data, .crash_dictionary, .convert, .code_value, .literal_thunk, .root_slot, .callable_eval_entry, .code_bound => false,
         };
     }
 
@@ -1415,6 +1431,7 @@ pub const Program = struct {
         self.implicit_tables.deinit(self.allocator);
         self.implicit_indexed.deinit(self.allocator);
         self.instance_table_words.deinit(self.allocator);
+        self.imported_tables.deinit(self.allocator);
         self.omitted_defaults.deinit(self.allocator);
         self.codec.deinit(self.allocator);
         self.arena.deinit();
@@ -3393,6 +3410,9 @@ pub const Program = struct {
             .refused => return table_word,
             .table => |named| named,
         };
+        // Another module's table is that module's object's: this object
+        // depends on what it reads of it, which its cache entry records.
+        if (!self.ownsModule(named.module)) try self.imported_tables.put(self.allocator, .{ .module = named.module, .table = named.table }, {});
         const served = try self.servedInventory(named.module, named.table);
         if (index >= served.entries.len) invariant("an instance table entry index is outside its inventory");
         const entry_worker = switch (self.module(named.module).code().entry(@fromBackingInt(named.table), index)) {
@@ -3461,7 +3481,29 @@ pub const Program = struct {
         for (bound, 0..) |*slot, index| slot.* = try self.store.variable(@intCast(index));
         const view = self.module(served.module);
         const site_ty = try self.converter().convert(served.module, view.bodies().exprType(site.node), .{ .module = served.module, .vars = scope.scheme_vars, .bound = bound });
-        return try self.addErasedWorker(key, module_index, &.{}, &.{}, try self.closedRepresentation(site_ty), "boxy.code_description");
+        const ret = try self.closedRepresentation(site_ty);
+        // Another module's description is its object's, as its table is:
+        // this object names it, and so does not change with its content.
+        if (!self.ownsModule(module_index)) {
+            const id: WorkerId = @fromBackingInt(@intCast(self.workers.items.len));
+            const identity = try self.generatedWorkerIdentity(key, module_index, @backingInt(id), &.{});
+            const proc = try self.addImportedProc(identity, module_index, .erased_record);
+            try self.workers.append(self.allocator, .{
+                .key = key,
+                .proc = proc,
+                .module = module_index,
+                .scheme_vars = &.{},
+                .dictionary_params = &.{},
+                .params = &.{},
+                .ret = ret,
+                .imported = true,
+                .lowered = true,
+                .queued = true,
+            });
+            try self.worker_ids.put(self.allocator, key, id);
+            return id;
+        }
+        return try self.addErasedWorker(key, module_index, &.{}, &.{}, ret, "boxy.code_description");
     }
 
     /// The template Code instance table `table` of `module_index` serves,
@@ -4218,6 +4260,15 @@ pub fn run(allocator: Allocator, input: Input) Allocator.Error!Output {
                 try program.result.boxy_table_needs.put(result_allocator, program.result.store.getProcSpec(worker.proc).identity, bytes);
             }
         }
+    }
+
+    for (program.imported_tables.keys()) |read| {
+        const view = program.module(read.module);
+        try program.result.boxy_imported_tables.append(program.result.store.allocator, .{
+            .module = view.link_name,
+            .table = read.table,
+            .digest = TableDigest.instanceTableDigest(view.view, read.table, LinkNames{ .modules = &program.modules }),
+        });
     }
 
     if (base.dev_diagnostics.isSet(.perf_map)) try recordPerfNames(program);

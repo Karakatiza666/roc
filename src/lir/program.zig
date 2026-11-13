@@ -481,6 +481,14 @@ pub fn staticDataNodeSymbolName(allocator: Allocator, owner: u32, index: u32) Al
 
 /// Everything one lowering produced: the procedure store, its layouts, the
 /// root and specialization tables, and the static data the program carries.
+/// A Code instance table of another module that a `.boxy` unit read: the
+/// module's link name, the table, and the digest of the table's content.
+pub const ImportedTableRead = struct {
+    module: [32]u8,
+    table: u32,
+    digest: [32]u8,
+};
+
 pub const Result = struct {
     store: LirStore,
     layouts: layout.Store,
@@ -493,6 +501,12 @@ pub const Result = struct {
     /// type table, by its procedure's identity: what an importer fills the
     /// worker's tables from (`postcheck.Boxy.Tables`).
     boxy_table_needs: std.AutoHashMapUnmanaged(LIR.ProcIdentity, []const u8) = .empty,
+    /// The Code instance tables of other modules whose entries a `.boxy`
+    /// unit read while filling its type tables, each with the digest of
+    /// what it read (`postcheck.Boxy.instanceTableDigest`). The unit's
+    /// object cache entry records them, and a restore checks them against
+    /// the tables now (design.md "Code Instance Tables").
+    boxy_imported_tables: std.ArrayList(ImportedTableRead) = .empty,
     root_metadata: std.ArrayList(root.RootMetadata) = .empty,
     requested_layouts: std.ArrayList(RequestedLayout) = .empty,
     const_types: const_store.ConstTypeStore,
@@ -553,6 +567,7 @@ pub const Result = struct {
         var needs = self.boxy_table_needs.valueIterator();
         while (needs.next()) |bytes| allocator.free(bytes.*);
         self.boxy_table_needs.deinit(allocator);
+        self.boxy_imported_tables.deinit(allocator);
         self.layouts.deinit();
         self.store.deinit();
     }

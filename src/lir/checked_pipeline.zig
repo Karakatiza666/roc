@@ -92,6 +92,8 @@ pub const BoxyStoredFunctions = postcheck.Boxy.StoredFn.Retained;
 pub const BoxyFunctionMetadata = postcheck.Boxy.StoredFn;
 /// The names the modules of one link give their workers and nominal types.
 pub const BoxyModuleNames = postcheck.Boxy.Types.ModuleNames;
+/// The digest of a Code instance table a `.boxy` unit read of another module.
+pub const BoxyTableDigest = postcheck.Boxy.TableDigest;
 
 /// Resource failure while lowering checked modules to LIR, plus the one
 /// checked input this entrance rejects outright: see

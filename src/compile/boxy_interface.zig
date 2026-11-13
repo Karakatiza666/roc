@@ -198,7 +198,7 @@ pub const Digests = struct {
             .name => hasher.update(&self.nameOf(artifact.key.bytes)),
             .checking => hasher.update(&artifact.moduleEnvConst().checking_dependency.digest),
             .templates => for (artifact.exported_procedure_templates.templates) |exported| self.hashTemplateRef(hasher, artifact, exported.template),
-            .inventories => try hashInventories(hasher, artifact),
+            .inventories => try self.hashInventories(hasher, artifact),
             .bindings => self.hashBindings(hasher, artifact),
             .methods => self.hashMethods(hasher, artifact),
             .defaults => hasher.update(std.mem.asBytes(&@as(u32, @intCast(try artifact.bodies().defaultExprCount(self.gpa))))),
@@ -296,7 +296,7 @@ pub const Digests = struct {
         for (artifact.exported_procedure_templates.templates) |exported| {
             self.hashTemplateRef(hasher, artifact, exported.template);
         }
-        try hashInventories(hasher, artifact);
+        try self.hashInventories(hasher, artifact);
         self.hashBindings(hasher, artifact);
         self.hashMethods(hasher, artifact);
         hasher.update(std.mem.asBytes(&@as(u32, @intCast(try artifact.bodies().defaultExprCount(self.gpa)))));
@@ -446,13 +446,31 @@ pub const Digests = struct {
         hasher.update(std.mem.asBytes(&@as(u32, @intCast(templates.templateLiteralRequirements(&template).len))));
     }
 
+    /// `artifact`'s Code inventories, computed on first demand with the
+    /// link's modules in reach: an interface digest reads them, for the
+    /// unit being keyed and for each import whose interface it folds in.
+    fn codeInventoriesOf(self: *Digests, artifact: *const Artifact) Allocator.Error!*const check.CodeAnalyses.CodeInventories {
+        const view = CheckedArtifact.importedView(artifact);
+        if (view.checked_bodies.analyses.code.inventories_slot.peek()) |computed| return computed;
+        var reach = std.ArrayList(CheckedArtifact.ImportedModuleView).empty;
+        defer reach.deinit(self.gpa);
+        {
+            self.link_mutex.lockUncancelable(self.io);
+            defer self.link_mutex.unlock(self.io);
+            try reach.ensureTotalCapacity(self.gpa, self.artifacts.count());
+            var linked = self.artifacts.valueIterator();
+            while (linked.next()) |module| reach.appendAssumeCapacity(CheckedArtifact.importedView(module.*));
+        }
+        return check.CodeLookups.codeInventories(self.gpa, view, reach.items);
+    }
+
     /// The Code inventory of each template of `artifact` that has one: such
     /// a template takes an instance table whose tuple has one callable per
     /// entry, and the module of a closing use restores each site entry's
     /// description at the representation of the site's kind (design.md
     /// "Code Instance Tables").
-    fn hashInventories(hasher: *Sha256, artifact: *const Artifact) Allocator.Error!void {
-        const inventories = artifact.codeInventories();
+    fn hashInventories(self: *Digests, hasher: *Sha256, artifact: *const Artifact) Allocator.Error!void {
+        const inventories = try self.codeInventoriesOf(artifact);
         hashTag(hasher, "code_inventories");
         hasher.update(std.mem.asBytes(&@as(u32, @intCast(inventories.inventories.len))));
         for (inventories.inventories) |inventory| {

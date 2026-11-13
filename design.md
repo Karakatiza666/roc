@@ -16343,12 +16343,29 @@ which hold no site and no literal requirement
   (`CodeOutput.no_template`), and no worker is planned for it. A stored
   function records its table (`stored_fn` tag `code_instances`).
 - The table workers of a closing use are emitted by the unit of the use's
-  module, from that module's own evaluation output, so no object reads
-  another module's tables. That unit emits every table whose template it would
-  emit, and a table worker is named by content identity (the module's link
-  name and the table's position), since a stored function can capture any
-  table: an importer that restores one calls the defining object's worker,
-  as it calls an imported lambda.
+  module, from that module's own evaluation output. That unit emits every
+  table whose template it would emit, and a table worker is named by content
+  identity (the module's link name and the table's position), since a stored
+  function can capture any table: an importer that restores one calls the
+  defining object's worker, as it calls an imported lambda. The description
+  thunks of a table's node entries are the defining object's too, named by
+  the module's link name, the table and the entry, so an importer names them
+  and does not hold their content.
+- An importer that fills a type table from another module's table reads
+  that table's entries (`Program.instanceEntryWord`): the template it
+  serves, its entry count, each entry's kind, and each forward entry's
+  table. Its object key covers its imports' interfaces, not their code
+  output, so the importer's object cache entry records each such table (the
+  module's link name, the table, and `TableDigest.instanceTableDigest` of
+  what it read), and a restore rebuilds the object when a recorded table
+  changed (`boxy_unit.importedTablesCurrent`, test
+  `code_instance_table_reads`).
+- Lowering reads the code output only where checked facts say a read is
+  needed: a bound call of a recorded Code site (`isCodeBoundCall`), and a use
+  whose callee takes a table (`useTakesTable`). So a module whose code needs
+  nothing from the description step lowers with that step pending, as an
+  upstream lowering of pending compile-time roots does. A debug build checks
+  at every other edge that the description step gave it no table.
 - The object key of a module covers the Code descriptions its object
   restores (`Digests.objectInput`, `hashCodeDescriptions` in
   `src/compile/boxy_interface.zig`), read from its `CodeOutput`: each site

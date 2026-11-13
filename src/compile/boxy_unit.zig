@@ -133,6 +133,10 @@ pub const Built = struct {
     /// unit's `gpa`.
     expect_sites: []const object_cache.ExpectSiteRecord = &.{},
     test_roots: []const object_cache.TestRootRecord = &.{},
+    /// The imported Code instance tables a built object read, which its
+    /// cache entry records. Empty for a restored object. Owned by the
+    /// unit's `gpa`.
+    imported_tables: []const object_cache.ImportedTableRecord = &.{},
 
     /// Take the decoded entry's owned metadata after code restoration succeeds.
     /// On allocation failure, the caller still owns every input.
@@ -180,6 +184,7 @@ pub const Built = struct {
         gpa.free(self.hosted_symbols);
         gpa.free(self.expect_sites);
         gpa.free(self.test_roots);
+        gpa.free(self.imported_tables);
     }
 };
 
@@ -295,8 +300,10 @@ fn imageReads(entry: object_cache.Entry, kind: ImageKind) bool {
 /// Restore `key`'s entry like `restore`, serving it from a mapping of the
 /// cache file: the pieces are left undecoded and the image is borrowed from
 /// the mapping, which the returned `Image` keeps alive.
-fn restoreMapped(gpa: Allocator, cache_manager: ?*CacheManager, key: object_cache.Key, target: roc_target.RocTarget, interfaces: *ExportInterfaces, function_metadata: bool) Allocator.Error!?struct { entry: object_cache.Entry, data: CacheData } {
-    const manager = cache_manager orelse return null;
+fn restoreMapped(gpa: Allocator, unit: Unit, function_metadata: bool) Allocator.Error!?struct { entry: object_cache.Entry, data: CacheData } {
+    const key = unit.key;
+    const target = unit.target;
+    const manager = unit.cache_manager orelse return null;
     const data = manager.loadFamilyMapped(gpa, .checked, .boxy_object, key.bytes, object_cache.scope) orelse {
         if (dev_diagnostics.isSet(.trace_boxy_work)) std.debug.print("boxy-work: no object cache entry for key {s}\n", .{&std.fmt.bytesToHex(key.bytes[0..8], .lower)});
         return null;
@@ -321,7 +328,13 @@ fn restoreMapped(gpa: Allocator, cache_manager: ?*CacheManager, key: object_cach
         data.deinit(gpa);
         return null;
     }
-    try recordInterfaces(interfaces, entry);
+    if (!importedTablesCurrent(unit, entry)) {
+        if (dev_diagnostics.isSet(.trace_boxy_work)) std.debug.print("boxy-work: object cache entry for key {s} read imported Code tables that changed\n", .{&std.fmt.bytesToHex(key.bytes[0..8], .lower)});
+        object_cache.deinitEntryView(gpa, entry);
+        data.deinit(gpa);
+        return null;
+    }
+    try recordInterfaces(unit.interfaces, entry);
     return .{ .entry = entry, .data = data };
 }
 
@@ -417,7 +430,7 @@ pub fn restoreOrBuild(unit: Unit) BuildError!Built {
     const module_name = unit.artifact.canonical_names.moduleNameText(unit.artifact.module_identity.module_name);
     var restore_scope = lir.CheckedPipeline.PipelineStageScope.begin(unit.config.timing, .boxy_unit_restore);
     defer restore_scope.end();
-    if (try restoreMapped(gpa, unit.cache_manager, unit.key, unit.target, unit.interfaces, unit.config.boxy_function_unit != null)) |restored| {
+    if (try restoreMapped(gpa, unit, unit.config.boxy_function_unit != null)) |restored| {
         // The view's owned export records, symbols, and test tables move into
         // the returned `Built`; the view releases its remaining allocations.
         var entry = restored.entry;
@@ -490,6 +503,7 @@ pub fn restoreOrBuild(unit: Unit) BuildError!Built {
         .image = if (built.image) |image| image.bytes else &.{},
         .expect_sites = built.expect_sites,
         .test_roots = built.test_roots,
+        .imported_tables = built.imported_tables,
     });
     if (unit.want_pieces or built.pieces == null) return built;
     var without_pieces = built;
@@ -571,6 +585,7 @@ fn build(unit: Unit, module_name: []const u8) BuildError!Built {
             .hosted_symbols = hosted_symbols,
             .exports = try dupeRecords(gpa, records),
             .exports_digest = exports_digest,
+            .imported_tables = try importedTableRecords(gpa, &lowered.lir_result),
         };
     }
     var object_compiler = backend.ObjectFileCompiler.init(gpa);
@@ -674,8 +689,63 @@ fn build(unit: Unit, module_name: []const u8) BuildError!Built {
         .exports_digest = exports_digest,
         .expect_sites = expect_sites,
         .test_roots = test_roots,
+        .imported_tables = try importedTableRecords(gpa, &lowered.lir_result),
     };
 }
+
+/// The imported Code instance tables `result`'s lowering read, as cache
+/// records owned by `gpa`.
+fn importedTableRecords(gpa: Allocator, result: *const lir.Program.Result) Allocator.Error![]const object_cache.ImportedTableRecord {
+    const records = try gpa.alloc(object_cache.ImportedTableRecord, result.boxy_imported_tables.items.len);
+    for (result.boxy_imported_tables.items, records) |read, *record| record.* = .{ .module = read.module, .table = read.table, .digest = read.digest };
+    return records;
+}
+
+/// Whether every imported Code instance table `entry`'s object read still
+/// has the digest the entry records. The object's key covers its imports'
+/// interfaces, not their code output, so an entry whose tables changed is
+/// stale and is rebuilt (design.md "Code Instance Tables").
+fn importedTablesCurrent(unit: Unit, entry: object_cache.Entry) bool {
+    if (entry.imported_tables.len == 0) return true;
+    const module_unit = unit.config.boxy_unit orelse base.invariant("a Boxy object unit was lowered with no module unit", .{});
+    const names: UnitLinkNames = .{ .names = module_unit.names, .unit = unit };
+    for (entry.imported_tables) |read| {
+        const view = names.viewNamed(read.module) orelse return false;
+        if (view.code_output.state != .complete or read.table >= view.code_output.tables.len) return false;
+        const digest = lir.CheckedPipeline.BoxyTableDigest.instanceTableDigest(view, read.table, names);
+        if (!std.mem.eql(u8, &digest, &read.digest)) return false;
+    }
+    return true;
+}
+
+/// The link name of each module of a unit, by artifact key, as the unit's
+/// lowering names them (`lir.CheckedPipeline.BoxyTableDigest`).
+const UnitLinkNames = struct {
+    names: *const lir.CheckedPipeline.BoxyModuleNames,
+    unit: Unit,
+
+    fn viewOf(self: UnitLinkNames, key: [32]u8) ?ImportedView {
+        if (std.mem.eql(u8, &self.unit.artifact.key.bytes, &key)) return check.CheckedArtifact.importedView(self.unit.artifact);
+        for (self.unit.views) |view| if (std.mem.eql(u8, &view.key.bytes, &key)) return view;
+        if (self.unit.platform) |view| if (std.mem.eql(u8, &view.key.bytes, &key)) return view;
+        return null;
+    }
+
+    /// The module of the unit whose link name is `name`, or null when the
+    /// unit no longer reaches one.
+    fn viewNamed(self: UnitLinkNames, name: [32]u8) ?ImportedView {
+        const own = check.CheckedArtifact.importedView(self.unit.artifact);
+        if (std.mem.eql(u8, &self.names.of(own), &name)) return own;
+        for (self.unit.views) |view| if (std.mem.eql(u8, &self.names.of(view), &name)) return view;
+        if (self.unit.platform) |view| if (std.mem.eql(u8, &self.names.of(view), &name)) return view;
+        return null;
+    }
+
+    pub fn nameOf(self: UnitLinkNames, key: [32]u8) [32]u8 {
+        const view = self.viewOf(key) orelse base.invariant("an imported table names a module outside its unit", .{});
+        return self.names.of(view);
+    }
+};
 
 /// A module's top-level expects, in source order: the roots a test unit
 /// exports wrappers for, and the roots `roc test` plans for the module.
