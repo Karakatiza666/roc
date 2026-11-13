@@ -54726,7 +54726,7 @@ test "issue 12873: private codec copies register nested owners and preserve shar
 
     const copy = try checker.finalCodecRelationInstance(.{
         .dispatcher_var = receiver,
-        .constraint = .{ .fn_name = checker.cir.idents.encoder_for, .fn_var = outer, .origin = .{ .where_clause = .{} } },
+        .constraint = .{ .fn_name = checker.cir.idents.encoder_for, .fn_var = outer, .origin = .{ .where_clause = .{} }, .runs = true },
         .failure_expr = .none,
         .owner = .current_group,
     }, &use_env);
