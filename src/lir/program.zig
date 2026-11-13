@@ -479,8 +479,6 @@ pub fn staticDataNodeSymbolName(allocator: Allocator, owner: u32, index: u32) Al
     return try std.fmt.allocPrint(allocator, "roc__d{d}_{d}", .{ owner, index });
 }
 
-/// Everything one lowering produced: the procedure store, its layouts, the
-/// root and specialization tables, and the static data the program carries.
 /// A Code instance table of another module that a `.boxy` unit read: the
 /// module's link name, the table, and the digest of the table's content.
 pub const ImportedTableRead = struct {
@@ -489,6 +487,8 @@ pub const ImportedTableRead = struct {
     digest: [32]u8,
 };
 
+/// Everything one lowering produced: the procedure store, its layouts, the
+/// root and specialization tables, and the static data the program carries.
 pub const Result = struct {
     store: LirStore,
     layouts: layout.Store,
