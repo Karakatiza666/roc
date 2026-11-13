@@ -12,7 +12,7 @@ const checked = check.CheckedModule;
 const code_output = check.CodeOutput;
 
 /// The digest of table `table` of `view`'s code output. `names` gives the
-/// link name of a module by its artifact key (`nameOf`), as the unit's
+/// link name of a module by its checked module key (`nameOf`), as the unit's
 /// lowering names modules, so the digest is the same in the build and in a
 /// later restore of the same link.
 pub fn instanceTableDigest(view: checked.ImportedModuleView, table: u32, names: anytype) [32]u8 {

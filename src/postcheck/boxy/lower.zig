@@ -28,7 +28,7 @@ const StoredFn = @import("stored_fn.zig");
 const Tables = @import("tables.zig");
 const TableDigest = @import("table_digest.zig");
 
-/// The link name of each module of a lowering, by artifact key
+/// The link name of each module of a lowering, by checked module key
 /// (`TableDigest.instanceTableDigest`).
 const LinkNames = struct {
     modules: *const types.Modules,

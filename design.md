@@ -16360,7 +16360,7 @@ which hold no site and no literal requirement
   what it read), and a restore rebuilds the object when a recorded table
   changed (`boxy_unit.importedTablesCurrent`, test
   `code_instance_table_reads`).
-- Lowering reads the code output only where checked facts say a read is
+- Lowering reads the code output only where checked data says a read is
   needed: a bound call of a recorded Code site (`isCodeBoundCall`), and a use
   whose callee takes a table (`useTakesTable`). So a module whose code needs
   nothing from the description step lowers with that step pending, as an
