@@ -1463,7 +1463,7 @@ test "diagnostic snapshots render frozen identities after poisoning and naming s
     const shared = try store.fresh();
     const root = try store.freshFromContent(try store.mkFuncPure(&.{shared}, shared));
     const constraints = try store.appendStaticDispatchConstraints(&.{
-        .{ .fn_name = method, .fn_var = root, .origin = .{ .where_clause = .{} } },
+        .{ .fn_name = method, .fn_var = root, .origin = .{ .where_clause = .{} }, .runs = true },
     });
     try store.setVarContent(shared, .{ .flex = .{ .name = null, .constraints = constraints } });
     var writer = try TypeWriter.initFromParts(gpa, &store, &idents, null);
@@ -1511,7 +1511,7 @@ test "diagnostic snapshot rendering options belong to each capture" {
     const receiver = try store.fresh();
     const callable = try store.freshFromContent(try store.mkFuncPure(&.{receiver}, receiver));
     const constraints = try store.appendStaticDispatchConstraints(&.{
-        .{ .fn_name = method, .fn_var = callable, .origin = .{ .from_literal = .quote } },
+        .{ .fn_name = method, .fn_var = callable, .origin = .{ .from_literal = .quote }, .runs = true },
     });
     try store.setVarContent(receiver, .{ .flex = .{ .name = null, .constraints = constraints } });
     var writer = try TypeWriter.initFromParts(gpa, &store, &idents, null);
@@ -1547,6 +1547,7 @@ fn diagnosticAllocationBytes(requirement_count: usize) (Allocator.Error || error
         .fn_name = method,
         .fn_var = try store.freshFromContent(try store.mkFuncPure(&.{receiver}, result)),
         .origin = .{ .where_clause = .{} },
+        .runs = true,
     };
     try store.setVarContent(receiver, .{ .flex = .{
         .name = null,

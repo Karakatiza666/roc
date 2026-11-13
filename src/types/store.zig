@@ -3303,7 +3303,7 @@ test "sealing releases checker-only buffers without allocating" {
             try @field(store, field).ensureTotalCapacity(gpa, 8);
         }
         try store.static_dispatch_constraint_room.ensureTotalCapacity(gpa, 8);
-        try store.static_dispatch_relation_merges.append(gpa, .{ .dropped_fn_var = alias, .retained_fn_var = value });
+        try store.static_dispatch_relation_merges.append(gpa, .{ .dropped_fn_var = alias, .retained_fn_var = value, .dropped_runs = true });
         try std.testing.expect(counter.allocated_bytes - counter.freed_bytes > solved_bytes);
         const allocations_before_seal = counter.allocated_bytes;
 

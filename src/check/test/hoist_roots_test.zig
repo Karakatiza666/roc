@@ -261,7 +261,7 @@ test "hoist roots select a static dispatch on a concrete receiver that holds a f
         try test_env.assertNoErrors();
         const roots = test_env.checker.selectedHoistedRoots();
         try std.testing.expectEqual(@as(usize, 1), roots.len);
-        try std.testing.expect(roots[0].pattern != null);
+        try std.testing.expect(roots[0].pattern.get() != null);
         try expectExprTag(&test_env, roots[0].expr, tag);
     }
 }

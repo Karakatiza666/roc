@@ -567,7 +567,7 @@ fn storedAnswer(coord: *Coordinator, name: []const u8) error{ AnswerWasNotStored
     const view = check.CheckedArtifact.importedView(artifact);
     for (view.compile_time_roots.roots) |root| {
         if (root.kind != .constant) continue;
-        const pattern = root.pattern orelse continue;
+        const pattern = root.pattern.get() orelse continue;
         if (!std.mem.eql(u8, env.getSource(artifact.bodies().pattern(pattern).source_region), name)) continue;
         const node = switch (root.payload) {
             .const_node => |const_node| const_node,

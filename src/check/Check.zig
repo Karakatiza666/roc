@@ -54713,8 +54713,8 @@ test "issue 12873: private codec copies register nested owners and preserve shar
     const nested = try checker.fresh(&generic_env, Region.zero());
     const shared = try checker.fresh(&use_env, Region.zero());
     const constraints = try checker.types.appendStaticDispatchConstraints(&.{
-        .{ .fn_name = checker.cir.idents.is_eq, .fn_var = nested, .origin = .{ .where_clause = .{} } },
-        .{ .fn_name = checker.cir.idents.to_hash, .fn_var = shared, .origin = .{ .where_clause = .{} } },
+        .{ .fn_name = checker.cir.idents.is_eq, .fn_var = nested, .origin = .{ .where_clause = .{} }, .runs = true },
+        .{ .fn_name = checker.cir.idents.to_hash, .fn_var = shared, .origin = .{ .where_clause = .{} }, .runs = true },
     });
     const receiver = try checker.freshFromContent(.{ .flex = .{ .name = null, .constraints = constraints } }, &generic_env, Region.zero());
     checker.active_scheme_root = other_owner;
