@@ -6682,24 +6682,38 @@ pub const ReportBuilder = struct {
 
         // A refusal outside the site's own source is shown where it is, and
         // the site is where the walk reached it from (F4, D9).
-        if (data.foreign) |place| {
-            const path = self.problems.getExtraString(place.path);
-            try report.document.addSourceExcerpt(.{
-                .line_text = self.problems.getExtraString(place.line_text),
-                .start_line = place.start_line,
-                .start_column = place.start_column,
-                .end_line = place.end_line,
-                .end_column = place.end_column,
-                .region_annotation = .error_highlight,
-                .filename = path,
-            });
-            try report.setPrimary(.{
-                .file = path,
-                .start_line = place.start_line,
-                .start_column = place.start_column,
-                .end_line = place.end_line,
-                .end_column = place.end_column,
-            });
+        if (data.reached) |reached| {
+            switch (reached) {
+                .local => |region| {
+                    try report.document.addSourceRegion(
+                        self.module_env.calcRegionInfo(region),
+                        .error_highlight,
+                        self.filename,
+                        self.source,
+                        self.module_env.getLineStarts(),
+                    );
+                    try report.setPrimary(self.localLocation(region));
+                },
+                .foreign => |place| {
+                    const path = self.problems.getExtraString(place.path);
+                    try report.document.addSourceExcerpt(.{
+                        .line_text = self.problems.getExtraString(place.line_text),
+                        .start_line = place.start_line,
+                        .start_column = place.start_column,
+                        .end_line = place.end_line,
+                        .end_column = place.end_column,
+                        .region_annotation = .error_highlight,
+                        .filename = path,
+                    });
+                    try report.setPrimary(.{
+                        .file = path,
+                        .start_line = place.start_line,
+                        .start_column = place.start_column,
+                        .end_line = place.end_line,
+                        .end_column = place.end_column,
+                    });
+                },
+            }
             try report.setReachedFrom(self.localLocation(data.region));
             try report.document.addLineBreak();
             try report.document.addText("The reified function reaches it from the site at ");

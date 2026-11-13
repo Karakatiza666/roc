@@ -556,7 +556,12 @@ fn appendStagedCodeRefusal(
         .chain_stop = if (rejection.kind == .capture) chain_stop else .none,
         .chain_end_type = chain_end_type,
         .region = if (reached_place) site_region else rejection.region,
-        .foreign = if (reached_place) try foreignRefusalPlace(problems, rejection.module.env, rejection.region) else null,
+        .reached = if (!reached_place)
+            null
+        else if (foreign_place)
+            .{ .foreign = try foreignRefusalPlace(problems, rejection.module.env, rejection.region) }
+        else
+            .{ .local = rejection.region },
         .detail = detail,
         .open = if (rejection.open) |open| .{
             .cause = switch (open.cause) {

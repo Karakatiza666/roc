@@ -411,7 +411,7 @@ pub const StagedCode = struct {
     /// callee or a constant the walk entered in another module (F4), or one
     /// this module defines outside the site (D9). `region` is then the site.
     /// Null when the walk stopped inside the site.
-    foreign: ?Foreign = null,
+    reached: ?Reached = null,
     /// For `captures_a_binding` at a lambda whose run-time reads no call
     /// binds: what stopped the calls that carry it. `none` otherwise.
     chain_stop: ChainStop = .none,
@@ -421,9 +421,20 @@ pub const StagedCode = struct {
 
     pub const ChainStop = can.NodeStore.CodeReificationSite.ChainStop;
 
-    /// A place outside the site's own source, as the report shows it: the
-    /// path of its module's file, the text of the lines the place spans, and
-    /// its 1-based start and end.
+    /// Where the walk stopped, outside the site's own source.
+    pub const Reached = union(enum) {
+        /// A place this module defines outside the site (D9). The report
+        /// shows it from this module's source and file, as it shows the
+        /// site, so a report rendered again from a cache entry names the
+        /// file the build reads now.
+        local: base.Region,
+        /// A place in another module (F4).
+        foreign: Foreign,
+    };
+
+    /// A place in another module, as the report shows it: the path of its
+    /// module's file, the text of the lines the place spans, and its 1-based
+    /// start and end.
     pub const Foreign = struct {
         path: ExtraStringIdx,
         line_text: ExtraStringIdx,

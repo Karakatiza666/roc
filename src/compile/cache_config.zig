@@ -391,7 +391,9 @@ pub const Constants = struct {
     /// 262: a value at a `Code.Binds` position whose `a` is known is decided
     ///      at its frame finish, and a site records `decided_late`.
     /// 263: the reify fork on the nightly 2026-11-12 base, whose tables
-    ///      store optionals in compact zero-absent forms.
+    ///      store optionals in compact zero-absent forms, and whose stored
+    ///      reports keep refusal calls and give a refusal place in the
+    ///      reporting module as a region.
     pub const CACHE_VERSION = 263;
 };
 
