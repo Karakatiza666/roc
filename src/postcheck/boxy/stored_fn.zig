@@ -1987,10 +1987,6 @@ fn encodeOperand(encoder: *Encoder, operand: Tables.Operand) Allocator.Error!voi
     }
 }
 
-/// Read the needs list `encodeNeeds` wrote, its types and workers in this
-/// lowering, allocated in the program's arena. Its bytes are this
-/// compiler's: complete entries are admitted by `boxy_object_cache.decodeView`.
-/// Link identities bind the records to the current checked module graph.
 /// The input count of an encoded needs list (`encodeNeeds`), read without
 /// its recipes.
 pub fn decodeNeedsInputCount(program: *Program, bytes: []const u8) Allocator.Error!u32 {
@@ -2001,6 +1997,10 @@ pub fn decodeNeedsInputCount(program: *Program, bytes: []const u8) Allocator.Err
     return decoder.word();
 }
 
+/// Read the needs list `encodeNeeds` wrote, its types and workers in this
+/// lowering, allocated in the program's arena. Its bytes are this
+/// compiler's: complete entries are admitted by `boxy_object_cache.decodeView`.
+/// Link identities bind the records to the current checked module graph.
 pub fn decodeNeeds(program: *Program, bytes: []const u8) Allocator.Error!Tables.Needs {
     const arena = program.arena.allocator();
     var decoder = Decoder{ .program = program, .link_names = true, .bytes = bytes };

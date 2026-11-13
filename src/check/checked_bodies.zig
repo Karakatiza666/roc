@@ -807,11 +807,9 @@ pub const CheckedBodies = struct {
     /// and an identity call is a site only while it is a call.
     fn isCodeSiteExpr(node_store: *const can.NodeStore, id: ExprId, node_expr: CIR.Expr) bool {
         const node = ModuleEnv.nodeIdxFrom(id);
-        return switch (node_expr) {
-            .e_runtime_error => false,
-            .e_call => node_store.codeReificationSiteForNode(node) != null or node_store.isCodeIdentityCall(node),
-            else => node_store.codeReificationSiteForNode(node) != null,
-        };
+        if (node_expr == .e_runtime_error) return false;
+        if (node_store.codeReificationSiteForNode(node) != null) return true;
+        return node_expr == .e_call and node_store.isCodeIdentityCall(node);
     }
 
     pub fn exprData(self: CheckedBodies, id: ExprId) ExprData {

@@ -3373,7 +3373,7 @@ pub const Program = struct {
         const table: InstanceTableWord = switch (self.worker(entry).key) {
             .code_instances => |key| .{ .table = .{ .module = key.module, .table = key.table } },
             .crash_dictionary => |kind| if (kind == .checked_error) .refused else return,
-            else => return,
+            .template, .lambda, .adapter, .default, .method_entry, .structural, .structural_map, .root, .codec, .static_data, .convert, .literal_thunk, .root_slot, .callable_eval_entry, .code_value, .code_bound, .code_description => return,
         };
         try self.instance_table_words.put(self.allocator, node, table);
     }

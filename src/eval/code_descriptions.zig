@@ -29,11 +29,9 @@ const Allocator = std.mem.Allocator;
 const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
 const checked = check.CheckedArtifact;
-const canonical = check.CanonicalNames;
 const code_reifier = check.CodeReifier;
 const code_output = check.CodeOutput;
 const problem = check.problem;
-const static_dispatch = check.StaticDispatchRegistry;
 
 const CheckedModuleArtifact = checked.CheckedModuleArtifact;
 const CheckedModuleArtifactKey = checked.CheckedModuleArtifactKey;
