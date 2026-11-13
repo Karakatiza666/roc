@@ -887,6 +887,7 @@ test "unify - erroneous type does not overwrite a constrained flex" {
 
     const method_var = try env.module_env.types.fresh();
     const constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("method")),
         .fn_var = method_var,
         .origin = .{ .where_clause = .{} },
@@ -2348,6 +2349,7 @@ test "unify - flex with no constraints unifies with flex with constraints" {
     const list_a = try env.module_env.types.fresh();
     const sort_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{list_a}, list_a));
     const sort_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("sort")),
         .fn_var = sort_fn,
         .origin = .{ .where_clause = .{} },
@@ -2379,6 +2381,7 @@ test "unify - flex with constraints unifies with flex with same constraints" {
     // Create constraint: a.to_str : Str -> Str
     const to_str_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
     const sort_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("to_str")),
         .fn_var = to_str_fn,
         .origin = .{ .where_clause = .{} },
@@ -2422,16 +2425,19 @@ test "unify - literal static dispatch representative survives repeated merges" {
     );
 
     const declarative_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = method_name,
         .fn_var = declarative_fn,
         .origin = .{ .from_literal = .quote },
     };
     const first_call_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = method_name,
         .fn_var = first_call_fn,
         .origin = .method_call,
     };
     const second_call_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = method_name,
         .fn_var = second_call_fn,
         .origin = .method_call,
@@ -2485,17 +2491,20 @@ test "unify - numeral literal with unchanged facts keeps the receiver's requirem
     const facts = types_mod.NumeralInfo.testOnlyInt(0, false, base.Region.zero());
 
     const retained_numeral = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = from_numeral,
         .fn_var = try types.freshFromContent(try env.mkFuncPure(&.{argument}, result_var)),
         .origin = .{ .from_literal = .numeral },
         .numeral = try types.appendNumeralInfo(facts),
     };
     const comparison = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = is_eq,
         .fn_var = try types.freshFromContent(try env.mkFuncPure(&.{ argument, argument }, result_var)),
         .origin = .{ .desugared_binop = .{ .negated = false } },
     };
     const later_numeral = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = from_numeral,
         .fn_var = try types.freshFromContent(try env.mkFuncPure(&.{argument}, result_var)),
         .origin = .{ .from_literal = .numeral },
@@ -2543,16 +2552,19 @@ test "unify - operator and dot call requirements stay separate until generalizat
     );
 
     const declarative_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = method_name,
         .fn_var = declarative_fn,
         .origin = .{ .desugared_binop = .{ .negated = true } },
     };
     const first_call_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = method_name,
         .fn_var = first_call_fn,
         .origin = .method_call,
     };
     const second_call_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = method_name,
         .fn_var = second_call_fn,
         .origin = .method_call,
@@ -2615,11 +2627,13 @@ test "unify - static dispatch method ordering ignores ident interning order" {
         try env.mkFuncPure(&.{argument}, result_var),
     );
     const zeta_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = zeta,
         .fn_var = fn_var,
         .origin = .method_call,
     };
     const alpha_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = alpha,
         .fn_var = fn_var,
         .origin = .method_call,
@@ -2664,6 +2678,7 @@ test "unify - flex with constraints vs structure captures deferred check" {
     // Create constraint: a.to_str : Str -> Str
     const to_str_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
     const to_str_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("to_str")),
         .fn_var = to_str_fn,
         .origin = .{ .where_clause = .{} },
@@ -2699,6 +2714,7 @@ test "unify - structure vs flex with constraints captures deferred check (revers
     // Create constraint: a.to_str : Str -> Str
     const to_str_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
     const to_str_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("to_str")),
         .fn_var = to_str_fn,
         .origin = .{ .where_clause = .{} },
@@ -2747,6 +2763,7 @@ test "unify - rigid with from_numeral flex retains constraints on resolved rigid
     const str = try env.module_env.types.freshFromContent(Content{ .structure = .empty_record });
     const to_str_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
     const to_str_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("to_str")),
         .fn_var = to_str_fn,
         .origin = .{ .from_literal = .numeral },
@@ -2780,6 +2797,7 @@ test "unify - non-numeric flex with rigid keeps constraints deferred-only" {
     const str = try env.module_env.types.freshFromContent(Content{ .structure = .empty_record });
     const to_str_fn = try env.module_env.types.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
     const to_str_constraint = types_mod.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("to_str")),
         .fn_var = to_str_fn,
         .origin = .method_call,
@@ -2858,6 +2876,7 @@ test "unify order - deferred constraint origin var depends on operand order" {
             const str = try ts.freshFromContent(Content{ .structure = .empty_record });
             const fn_var = try ts.freshFromContent(try env.mkFuncPure(&[_]Var{str}, str));
             const constraint = types_mod.StaticDispatchConstraint{
+                .runs = true,
                 .fn_name = try env.module_env.getIdentStore().insert(env.module_env.gpa, Ident.for_text("m")),
                 .fn_var = fn_var,
                 .origin = .method_call,

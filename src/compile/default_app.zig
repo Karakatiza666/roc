@@ -14,6 +14,8 @@ const std = @import("std");
 const base = @import("base");
 const parse = @import("parse");
 const check = @import("check");
+const echo_platform = @import("echo_platform");
+const CoreCtx = @import("ctx").CoreCtx;
 
 const Allocator = std.mem.Allocator;
 const Report = @import("reporting").Report;
@@ -83,13 +85,69 @@ pub const Staged = struct {
     header_len: usize,
     /// Lines the staging inserted before the user's body.
     header_lines: u32,
+    /// The offset in the user's source where the body starts. Every byte
+    /// from here on sits `header_len` bytes later in the staged source.
+    body_start: usize,
+    /// Whether the staged source starts with the user's bytes before
+    /// `body_start` unchanged. It does not when staging rewrote a relative
+    /// package path in the header.
+    prefix_verbatim: bool,
 
     pub fn deinit(self: *Staged, gpa: Allocator) void {
         gpa.free(self.original_source);
         gpa.free(self.synthetic_source);
         self.* = undefined;
     }
+
+    /// The staged offset of a byte offset in the user's source, or null
+    /// when the staging changed the text there.
+    pub fn stagedOffset(self: *const Staged, user_offset: usize) ?usize {
+        std.debug.assert(user_offset <= self.original_source.len);
+        if (user_offset >= self.body_start) return user_offset + self.header_len;
+        return if (self.prefix_verbatim) user_offset else null;
+    }
+
+    /// The offset in the user's source of a byte offset in the staged
+    /// source, or null when the staging wrote the text there.
+    pub fn userOffset(self: *const Staged, staged_offset: usize) ?usize {
+        std.debug.assert(staged_offset <= self.synthetic_source.len);
+        const staged_body_start = self.body_start + self.header_len;
+        if (staged_offset < self.body_start) return if (self.prefix_verbatim) staged_offset else null;
+        if (staged_offset < staged_body_start) return null;
+        const user_offset = staged_offset - self.header_len;
+        return if (user_offset <= self.original_source.len) user_offset else null;
+    }
 };
+
+/// Errors from writing a staged app and its platform to disk.
+pub const WriteError = Allocator.Error || CoreCtx.MakePathError || CoreCtx.WriteError;
+
+/// Write what `roc check` compiles for a staged app into `dir`: the staged
+/// app, named like the user's file, and the Echo platform beside it. Returns
+/// the staged app's path, owned by `gpa`.
+pub fn writeCheckSources(
+    gpa: Allocator,
+    fs: CoreCtx,
+    dir: []const u8,
+    user_path: []const u8,
+    staged: *const Staged,
+) WriteError![]u8 {
+    const platform_dir = try std.fs.path.join(gpa, &.{ dir, platform_dir_name });
+    defer gpa.free(platform_dir);
+    try fs.makePath(platform_dir);
+
+    const platform_main_path = try std.fs.path.join(gpa, &.{ platform_dir, "main.roc" });
+    defer gpa.free(platform_main_path);
+    const echo_module_path = try std.fs.path.join(gpa, &.{ platform_dir, "Echo.roc" });
+    defer gpa.free(echo_module_path);
+    const app_path = try std.fs.path.join(gpa, &.{ dir, std.fs.path.basename(user_path) });
+    errdefer gpa.free(app_path);
+
+    try fs.writeFile(app_path, staged.synthetic_source);
+    try fs.writeFile(platform_main_path, echo_platform.platform_main_source);
+    try fs.writeFile(echo_module_path, echo_platform.echo_module_source);
+    return app_path;
+}
 
 /// Errors staging can produce. Invalid source is returned as reports.
 pub const Error = Allocator.Error;
@@ -153,6 +211,8 @@ pub fn stage(
             .synthetic_source = try std.mem.concat(gpa, u8, &.{ headerless_wiring, original_source }),
             .header_len = headerless_wiring.len,
             .header_lines = countNewlines(headerless_wiring),
+            .body_start = 0,
+            .prefix_verbatim = true,
         },
         .app => |app| try stagePlatformlessApp(gpa, source_dir, owned_source, ast, app),
         .module, .package, .platform, .hosted, .malformed => unreachable, // rootAppKind classifies these headers as non_app, handled above
@@ -270,6 +330,7 @@ fn stagePlatformlessApp(
     // one: the staged copy sits in a staging directory, so a path written
     // relative to the user's file would otherwise resolve there.
     var copied_through: usize = 0;
+    var prefix_verbatim = true;
     for (fields) |field_idx| {
         // The compiler version pin shares the record with the dependencies
         // but is not one of them.
@@ -290,6 +351,7 @@ fn stagePlatformlessApp(
         try synthetic.appendSlice(gpa, original_source[copied_through..spec_region.start.offset]);
         try appendDependencySource(gpa, &synthetic, absolute);
         copied_through = spec_region.end.offset;
+        prefix_verbatim = false;
     }
     try synthetic.appendSlice(gpa, original_source[copied_through..splice_at]);
 
@@ -316,6 +378,8 @@ fn stagePlatformlessApp(
         .synthetic_source = try synthetic.toOwnedSlice(gpa),
         .header_len = header_len,
         .header_lines = 0,
+        .body_start = splice_at,
+        .prefix_verbatim = prefix_verbatim,
     };
 }
 
@@ -562,4 +626,26 @@ test "stage: entrypoint arity and type remain checking responsibilities" {
         try testing.expectEqual(Kind.headerless, result.staged.kind);
         try testing.expectEqualStrings(source, result.staged.original_source);
     }
+}
+
+test "stage: offsets map between the user's source and the staged source" {
+    const headerless_source = "main! = |_| Ok({})\n";
+    var headerless = (try stage(testing.allocator, "/tmp", headerless_source, .checking, "main.roc")).staged;
+    defer headerless.deinit(testing.allocator);
+    try testing.expectEqual(@as(?usize, headerless.header_len), headerless.stagedOffset(0));
+    try testing.expectEqual(@as(?usize, 3), headerless.userOffset(headerless.header_len + 3));
+    try testing.expectEqual(@as(?usize, null), headerless.userOffset(0));
+
+    const app_source = "app [main!] {}\n\nmain! = |_| Ok({})\n";
+    var app = (try stage(testing.allocator, "/tmp", app_source, .checking, "main.roc")).staged;
+    defer app.deinit(testing.allocator);
+    const main_offset = std.mem.find(u8, app_source, "main! =").?;
+    const staged_main = app.stagedOffset(main_offset).?;
+    try testing.expectEqualStrings("main! =", app.synthetic_source[staged_main..][0.."main! =".len]);
+    try testing.expectEqual(@as(?usize, main_offset), app.userOffset(staged_main));
+    // The header before the splice is copied as written.
+    try testing.expectEqual(@as(?usize, 5), app.stagedOffset(5));
+    // The appended `echo!` binding is not the user's text.
+    const echo_offset = std.mem.find(u8, app.synthetic_source, "echo! =").?;
+    try testing.expectEqual(@as(?usize, null), app.userOffset(echo_offset));
 }

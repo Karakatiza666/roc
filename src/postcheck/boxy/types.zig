@@ -48,6 +48,17 @@ pub const ModuleView = struct {
     pub fn nameStore(self: *const ModuleView) *const names.CanonicalNameStore {
         return self.view.canonical_names;
     }
+
+    /// The module's code descriptions, a column of its evaluation output.
+    pub fn code(self: *const ModuleView) *const check.CodeOutput.CodeOutput {
+        return self.view.code_output;
+    }
+
+    /// The instance inventories of the module's templates, its
+    /// `codeInventories` slot.
+    pub fn codeInventories(self: *const ModuleView) *const check.CodeAnalyses.CodeInventories {
+        return self.view.codeInventories();
+    }
 };
 
 /// Exact error reachability within one Boxy lowering's immutable checked
@@ -1198,21 +1209,12 @@ pub const Converter = struct {
     /// A variable the converting scope does not bind: it seals to its row
     /// default or its numeric default (`CheckedTypePayload.variableSealsToRowDefault`).
     fn sealVariable(self: Converter, variable: checked.CheckedTypeVariable) Allocator.Error!TypeId {
-        if (variable.numeric_default_phase) |phase| {
-            const target = checked.literal_defaulting.defaultTargetForPhase(phase) orelse
-                invariant("a checking-finalized numeric variable reached Boxy lowering unresolved");
-            return switch (target) {
-                .dec => try self.store.primitive(.dec),
-                .str => try self.store.primitive(.str),
-            };
-        }
-        if (variable.row_default) |row_default| return switch (row_default) {
+        return switch (checked.sealedVariable(variable)) {
+            .dec => try self.store.primitive(.dec),
+            .str => try self.store.primitive(.str),
             .empty_record => try self.store.emptyRecord(),
             .empty_tag_union => try self.store.emptyTagUnion(),
         };
-        // An unconstrained variable no scope binds has no values reachable at
-        // it; its type is the empty tag union, as every other strategy gives it.
-        return try self.store.emptyTagUnion();
     }
 
     fn pushFrame(self: Converter, frames: *std.ArrayList(Frame), pending: *std.ArrayList(Child), results_start: usize, module: ModuleIndex, ty: checked.CheckedTypeId) Allocator.Error!void {
@@ -1309,7 +1311,7 @@ pub const Converter = struct {
                     for (0..current_fields.len()) |field_index| {
                         const field = current_fields.get(field_index);
                         const field_name = try self.store.internName(name_store.recordFieldLabelText(field.name));
-                        try fields.append(allocator, self.convertedField(module, field_name, children[child_index], field.kind, env));
+                        try fields.append(allocator, self.convertedField(types, module, field_name, children[child_index], field.kind, env));
                         child_index += 1;
                     }
                     current_fields = .empty;
@@ -1326,15 +1328,41 @@ pub const Converter = struct {
                     .empty_record => null,
                     .pending, .field_kind, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .function, .tag_union, .empty_tag_union => children[child_index],
                 };
-                // A remainder that converted to a closed record joins this row.
+                // A remainder that converted to a closed record joins this
+                // row as is: an owner term binds a row variable to exactly
+                // the rest of its row (Q17, `TableBuilder.ownerTerm`).
                 if (ext) |ext_ty| switch (self.store.get(ext_ty)) {
                     .empty_record => ext = null,
                     .record => |ext_record| if (ext_record.ext == .none) {
-                        try fields.appendSlice(allocator, self.store.fieldSpan(ext_record.fields));
+                        const nearer = fields.items.len;
+                        for (self.store.fieldSpan(ext_record.fields)) |field| {
+                            // The reifier leaves out each field a nearer
+                            // link names.
+                            std.debug.assert(for (fields.items[0..nearer]) |known| {
+                                if (known.name == field.name) break false;
+                            } else true);
+                            try fields.append(allocator, field);
+                        }
                         ext = null;
                     },
+                    // A `:=` nominal in an extension slot is read
+                    // transparently: its backing's fields join this row, and
+                    // the backing's own remainder is this row's (design.md
+                    // "Record Extension Well-Formedness").
+                    .nominal => |nominal| {
+                        if (nominal.is_opaque or nominal.builtin != null) invariant("a record extension slot holds an opaque or builtin nominal");
+                        const ext_backing = try self.backing(ext_ty);
+                        switch (self.store.get(ext_backing)) {
+                            .empty_record => ext = null,
+                            .record => |backing_record| {
+                                try fields.appendSlice(allocator, self.store.fieldSpan(backing_record.fields));
+                                ext = backing_record.ext.get();
+                            },
+                            .primitive, .tuple, .tag_union, .list, .box, .nominal, .function, .variable => invariant("a record extension nominal's backing is not a record"),
+                        }
+                    },
                     .variable => {},
-                    .primitive, .tuple, .tag_union, .list, .box, .nominal, .function => invariant("a record row's remainder converted to a non-record type"),
+                    .primitive, .tuple, .tag_union, .list, .box, .function => invariant("a record row's remainder converted to a non-record type"),
                 };
                 if (fields.items.len == 0 and ext == null) return try self.store.emptyRecord();
                 const store = self.store;
@@ -1378,9 +1406,17 @@ pub const Converter = struct {
                 var ext_payload_copies: std.ArrayList(TypeId) = .empty;
                 defer ext_payload_copies.deinit(allocator);
                 if (ext) |ext_ty| switch (self.store.get(ext_ty)) {
+                    // A closed remainder joins this union as is, as for a
+                    // record's remainder above.
                     .tag_union => |ext_union| {
                         if (ext_union.ext == null) {
+                            const nearer = tags.items.len;
                             for (self.store.tagSpan(ext_union.tags)) |tag| {
+                                // The reifier leaves out each tag a nearer
+                                // link names.
+                                std.debug.assert(for (tags.items[0..nearer]) |known| {
+                                    if (known.name == tag.name) break false;
+                                } else true);
                                 try tags.append(allocator, .{ .name = tag.name, .payloads = self.store.span(tag.payloads) });
                             }
                             ext = null;
@@ -1482,14 +1518,78 @@ pub const Converter = struct {
     /// A record field of value type `ty`: an undetermined kind takes the
     /// binding its scheme gives it, and a kind no scope binds commits to
     /// `required`, as it does for every other strategy.
-    fn convertedField(self: Converter, module: ModuleIndex, name: NameId, ty: TypeId, kind: checked.CheckedFieldKind, env: Env) Field {
+    /// A field of a closed row that `restRecord` builds.
+    pub const RestField = struct {
+        /// The module whose store holds `label`.
+        module: ModuleIndex,
+        label: @FieldType(checked.CheckedRecordField, "name"),
+        kind: checked.CheckedFieldKind,
+        ty: TypeId,
+    };
+
+    /// The closed record of `rest` (Q17, the rest of a row an owner term
+    /// binds a row variable to).
+    pub fn restRecord(self: Converter, rest: []const RestField) Allocator.Error!TypeId {
+        const allocator = self.store.allocator;
+        var fields: std.ArrayList(Field) = .empty;
+        defer fields.deinit(allocator);
+        for (rest) |field| {
+            const view = self.modules.get(field.module);
+            const field_name = try self.store.internName(view.nameStore().recordFieldLabelText(field.label));
+            const env: Env = .{ .module = field.module, .vars = &.{}, .bound = &.{} };
+            try fields.append(allocator, self.convertedField(view.types(), field.module, field_name, field.ty, field.kind, env));
+        }
+        if (fields.items.len == 0) return try self.store.emptyRecord();
+        const store = self.store;
+        std.mem.sort(Field, fields.items, store, struct {
+            fn lessThan(s: *Store, a: Field, b: Field) bool {
+                return s.nameLessThan(a.name, b.name);
+            }
+        }.lessThan);
+        return try self.store.intern(.{ .record = .{ .fields = fields.items, .ext = null } });
+    }
+
+    /// A tag of a closed union that `restTagUnion` builds.
+    pub const RestTag = struct {
+        /// The module whose store holds `label`.
+        module: ModuleIndex,
+        label: @FieldType(checked.CheckedTag, "name"),
+        payloads: []const TypeId,
+    };
+
+    /// The closed tag union of `rest` (Q17, the rest of a row an owner term
+    /// binds a row variable to).
+    pub fn restTagUnion(self: Converter, rest: []const RestTag) Allocator.Error!TypeId {
+        const allocator = self.store.allocator;
+        var tags: std.ArrayList(TagInput) = .empty;
+        defer tags.deinit(allocator);
+        for (rest) |tag| try tags.append(allocator, .{ .name = try self.store.internName(self.modules.get(tag.module).nameStore().tagLabelText(tag.label)), .payloads = tag.payloads });
+        const store = self.store;
+        std.mem.sort(TagInput, tags.items, store, struct {
+            fn lessThan(s: *Store, a: TagInput, b: TagInput) bool {
+                return s.nameLessThan(a.name, b.name);
+            }
+        }.lessThan);
+        return try self.store.intern(.{ .tag_union = .{ .tags = tags.items, .ext = null } });
+    }
+
+    fn convertedField(self: Converter, types: checked.CheckedTypeStoreView, module: ModuleIndex, name: NameId, ty: TypeId, kind: checked.CheckedFieldKind, env: Env) Field {
         return switch (kind.tag) {
             .required => .{ .name = name, .ty = ty, .kind = .inline_slot },
             .defaulted => .{ .name = name, .ty = ty, .kind = .inline_slot, .default = .some(self.modules.fieldDefault(module, kind.default)) },
             .optional => .{ .name = name, .ty = ty, .kind = .presence_slot },
             .undetermined => {
+                const variable = kind.undeterminedVariable() orelse invariant("an undetermined field kind has no variable");
+                // A substitution that fixed the kind put the committed kind
+                // in place of the variable.
+                switch (types.payload(variable)) {
+                    .field_kind => |committed| return .{ .name = name, .ty = ty, .kind = switch (committed) {
+                        .required => .inline_slot,
+                        .optional => .presence_slot,
+                    } },
+                    .pending, .err, .flex, .rigid, .alias, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union => {},
+                }
                 if (!self.seal_undetermined_kinds) {
-                    const variable = kind.undeterminedVariable() orelse invariant("an undetermined field kind has no variable");
                     if (env.lookup(module, variable)) |slot| return self.store.instantiatedField(name, ty, slot);
                 }
                 return .{ .name = name, .ty = ty, .kind = .inline_slot };

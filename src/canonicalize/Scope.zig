@@ -159,6 +159,10 @@ pub const ExposedItemInfo = struct {
     /// True when this item is an import's own name, which denotes the
     /// declaration the import selects rather than a name inside the module.
     names_import_main_type: bool = false,
+    /// True when the import lists this item in its `exposing` list. The type
+    /// that a nested import path selects (`import Basics.Try`) is not such an
+    /// item.
+    from_exposing_list: bool = false,
 };
 
 /// Result of looking up an exposed item

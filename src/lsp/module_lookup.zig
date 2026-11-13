@@ -79,7 +79,172 @@ pub fn getDeclarationPattern(statement: CIR.Statement) ?CIR.Pattern.Idx {
     };
 }
 
+/// The pattern a statement binds new names with: a declaration's or a `for`
+/// loop's. A reassignment binds no new name.
+pub fn boundPattern(statement: CIR.Statement) ?CIR.Pattern.Idx {
+    if (statement == .s_for) return statement.s_for.patt;
+    return getDeclarationPattern(statement);
+}
+
+/// The annotation written on a value declaration.
+pub fn statementAnnotation(statement: CIR.Statement) ?CIR.Annotation.Idx {
+    return switch (statement) {
+        inline .s_decl, .s_var, .s_var_uninitialized => |decl| decl.anno,
+        .s_reassign,
+        .s_crash,
+        .s_dbg,
+        .s_expr,
+        .s_expect,
+        .s_for,
+        .s_while,
+        .s_infinite_loop,
+        .s_breakable_loop,
+        .s_break,
+        .s_return,
+        .s_import,
+        .s_alias_decl,
+        .s_nominal_decl,
+        .s_where_alias_decl,
+        .s_type_anno,
+        .s_type_var_alias,
+        .s_runtime_error,
+        => null,
+    };
+}
+
+/// The type annotation a statement writes: a value declaration's annotation,
+/// a standalone annotation, or the body of an alias or nominal declaration.
+pub fn statementTypeAnno(store: *const NodeStore, statement: CIR.Statement) ?CIR.TypeAnno.Idx {
+    if (statementAnnotation(statement)) |anno_idx| return store.getAnnotation(anno_idx).anno;
+    return switch (statement) {
+        inline .s_type_anno, .s_alias_decl, .s_nominal_decl => |type_anno| type_anno.anno,
+        .s_decl,
+        .s_var,
+        .s_var_uninitialized,
+        .s_reassign,
+        .s_crash,
+        .s_dbg,
+        .s_expr,
+        .s_expect,
+        .s_for,
+        .s_while,
+        .s_infinite_loop,
+        .s_breakable_loop,
+        .s_break,
+        .s_return,
+        .s_import,
+        .s_where_alias_decl,
+        .s_type_var_alias,
+        .s_runtime_error,
+        => null,
+    };
+}
+
+/// The where clauses written on a statement's annotation or declaration.
+pub fn statementWhere(store: *const NodeStore, statement: CIR.Statement) ?CIR.WhereClause.Span {
+    if (statementAnnotation(statement)) |anno_idx| return store.getAnnotation(anno_idx).where;
+    return switch (statement) {
+        .s_type_anno => |type_anno| type_anno.where,
+        .s_where_alias_decl => |where_alias| where_alias.where,
+        .s_decl,
+        .s_var,
+        .s_var_uninitialized,
+        .s_alias_decl,
+        .s_nominal_decl,
+        .s_reassign,
+        .s_crash,
+        .s_dbg,
+        .s_expr,
+        .s_expect,
+        .s_for,
+        .s_while,
+        .s_infinite_loop,
+        .s_breakable_loop,
+        .s_break,
+        .s_return,
+        .s_import,
+        .s_type_var_alias,
+        .s_runtime_error,
+        => null,
+    };
+}
+
+/// The header and body of an alias or nominal declaration.
+pub const TypeDeclParts = struct {
+    header: CIR.TypeHeader.Idx,
+    anno: CIR.TypeAnno.Idx,
+};
+
+/// The parts of a statement that is an alias or nominal declaration.
+pub fn typeDeclParts(statement: CIR.Statement) ?TypeDeclParts {
+    return switch (statement) {
+        inline .s_alias_decl, .s_nominal_decl => |decl| .{ .header = decl.header, .anno = decl.anno },
+        .s_decl,
+        .s_var,
+        .s_var_uninitialized,
+        .s_reassign,
+        .s_crash,
+        .s_dbg,
+        .s_expr,
+        .s_expect,
+        .s_for,
+        .s_while,
+        .s_infinite_loop,
+        .s_breakable_loop,
+        .s_break,
+        .s_return,
+        .s_import,
+        .s_where_alias_decl,
+        .s_type_anno,
+        .s_type_var_alias,
+        .s_runtime_error,
+        => null,
+    };
+}
+
+/// The header of a type declaration: an alias, nominal or where-alias.
+pub fn typeDeclHeader(statement: CIR.Statement) ?CIR.TypeHeader.Idx {
+    return switch (statement) {
+        inline .s_alias_decl, .s_nominal_decl, .s_where_alias_decl => |decl| decl.header,
+        .s_decl,
+        .s_var,
+        .s_var_uninitialized,
+        .s_reassign,
+        .s_crash,
+        .s_dbg,
+        .s_expr,
+        .s_expect,
+        .s_for,
+        .s_while,
+        .s_infinite_loop,
+        .s_breakable_loop,
+        .s_break,
+        .s_return,
+        .s_import,
+        .s_type_anno,
+        .s_type_var_alias,
+        .s_runtime_error,
+        => null,
+    };
+}
+
 // Definition Search Functions
+
+/// The method table key of the associated item bound as `ident`: its owner
+/// type and its member name. Null for a binding that is not an associated item.
+pub fn associatedItemKey(module_env: *const ModuleEnv, ident: Ident.Idx) ?ModuleEnv.MethodKey {
+    for (module_env.method_idents.entries.items) |entry| {
+        if (entry.value.eql(ident)) return entry.key;
+    }
+    return null;
+}
+
+/// The name a binding is written with at its declaration: the member name of
+/// an associated item, otherwise the bound name.
+pub fn declaredName(module_env: *const ModuleEnv, ident: Ident.Idx) []const u8 {
+    const key = associatedItemKey(module_env, ident) orelse return module_env.getIdentText(ident);
+    return module_env.getIdentText(key.methodIdent());
+}
 
 /// Find a definition by name, searching through all_defs and all_statements.
 /// Returns information about the first matching definition found.

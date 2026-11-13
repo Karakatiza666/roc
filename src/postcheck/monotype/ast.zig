@@ -380,6 +380,9 @@ pub const FnTemplate = struct {
     const_evidence: ConstEvidenceSpans = .{},
     const_evidence_frames: Span(check.ConstStore.ConstFnEvidenceFrame) = Span(check.ConstStore.ConstFnEvidenceFrame).empty(),
     const_evidence_frame_head: collections.OptionalU32 = .none,
+    /// The Code instance table the specialization describes its instance
+    /// sites from (D1), retained for compile-time function values.
+    const_instances: ?check.ConstStore.ConstFnInstances = null,
 };
 
 comptime {
@@ -711,6 +714,11 @@ fn writeFnEvidence(
                 writeU32(hasher, target.callable_contracts);
                 writeEvidenceModule(hasher, &target.view.bytes, site_names);
                 writeMethodTarget(hasher, target.method, target.method_callable_key, site_names);
+                if (target.instances) |instances| {
+                    writeU8(hasher, 1);
+                    writeEvidenceModule(hasher, &instances.module.bytes, site_names);
+                    writeU32(hasher, instances.table);
+                } else writeU8(hasher, 0);
                 if (target.instantiation) |instantiation| {
                     writeU8(hasher, 1);
                     writeEvidenceModule(hasher, &instantiation.view.bytes, site_names);
@@ -808,6 +816,10 @@ fn fnEvidenceTargetEql(left: anytype, right: @TypeOf(left)) bool {
     if (left.callable_contracts != right.callable_contracts) return false;
     if (!keyBytesEql(left.view, right.view)) return false;
     if (!methodTargetIdentityEql(left.method, left.method_callable_key, right.method, right.method_callable_key)) return false;
+    if (left.instances) |left_instances| {
+        const right_instances = right.instances orelse return false;
+        if (!keyBytesEql(left_instances.module, right_instances.module) or left_instances.table != right_instances.table) return false;
+    } else if (right.instances != null) return false;
     if (left.instantiation) |left_instantiation| {
         const right_instantiation = right.instantiation orelse return false;
         if (!keyBytesEql(left_instantiation.view, right_instantiation.view)) return false;

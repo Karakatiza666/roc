@@ -228,6 +228,63 @@ test "hoist roots selected for direct closed static dispatch function body" {
     try expectExprTag(&test_env, roots[0].expr, .e_dispatch_call);
 }
 
+test "hoist roots select a static dispatch on a concrete receiver that holds a function, as for the direct call" {
+    const sources = [_][]const u8{
+        \\Holder := [Run(I64 -> I64)].{
+        \\    apply = |Holder.Run(run), n| run(n)
+        \\}
+        \\
+        \\make = |k| Holder.Run(|v| v + k)
+        \\
+        \\main = |arg| {
+        \\    x = make(1.I64).apply(41.I64)
+        \\    x + arg
+        \\}
+        ,
+        \\Holder := [Run(I64 -> I64)].{
+        \\    apply = |Holder.Run(run), n| run(n)
+        \\}
+        \\
+        \\make = |k| Holder.Run(|v| v + k)
+        \\
+        \\main = |arg| {
+        \\    x = Holder.apply(make(1.I64), 41.I64)
+        \\    x + arg
+        \\}
+        ,
+    };
+    const tags = [_]std.meta.Tag(CIR.Expr){ .e_dispatch_call, .e_call };
+    for (sources, tags) |source, tag| {
+        var test_env = try TestEnv.init("Test", source);
+        defer test_env.deinit();
+
+        try test_env.assertNoErrors();
+        const roots = test_env.checker.selectedHoistedRoots();
+        try std.testing.expectEqual(@as(usize, 1), roots.len);
+        try std.testing.expect(roots[0].pattern != null);
+        try expectExprTag(&test_env, roots[0].expr, tag);
+    }
+}
+
+test "hoist roots are not selected for a static dispatch whose receiver type is not concrete" {
+    var test_env = try TestEnv.init("Test",
+        \\Holder(a) := [Run(a -> a)].{
+        \\    count = |_| 1.I64
+        \\}
+        \\
+        \\make = || Holder.Run(|v| v)
+        \\
+        \\main = |arg| {
+        \\    x = make().count()
+        \\    x + arg
+        \\}
+    );
+    defer test_env.deinit();
+
+    try test_env.assertNoErrors();
+    try std.testing.expectEqual(@as(usize, 0), countExprRootsByTag(&test_env, .e_dispatch_call));
+}
+
 test "iterator producer calls leave their closed inputs available for hoisting" {
     var test_env = try TestEnv.init("Test",
         \\main = |runtime| {

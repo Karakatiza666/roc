@@ -226,7 +226,11 @@ pub fn restoreTyping(context: *const Context, env: *ModuleEnv) Allocator.Error!?
         },
     };
     try check.CheckingDependencies.bindOwners(cached, &context.scope);
+    // The workspace fields are not in the capsule: the coordinator
+    // recorded them on the env this one replaces.
     cached.qualified_module_name = env.qualified_module_name;
+    cached.package_name = env.package_name;
+    cached.source_path = env.source_path;
     env.deinit();
     env.* = cached.*;
     return metadata;

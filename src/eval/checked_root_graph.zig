@@ -18,6 +18,7 @@ const std = @import("std");
 const base = @import("base");
 const check = @import("check");
 const lir = @import("lir");
+const collections = @import("collections");
 
 const Allocator = std.mem.Allocator;
 const checked = check.CheckedArtifact;
@@ -263,7 +264,10 @@ const Walker = struct {
         const wrapper = root.request.procedure_template orelse
             base.invariant("compile-time finalization invariant violated: a compile-time root has no checked wrapper template", .{});
         try self.pushTemplate(wrapper);
-        if (self.modules[root.module].compile_time_roots.root(root.root).literal_argument) |argument| try self.walkLiteralEdge(root.module, argument.edge);
+        if (self.modules[root.module].compile_time_roots.root(root.root).literal_argument) |argument| {
+            try self.walkLiteralEdge(root.module, argument.edge);
+            try self.boundRootReads(root.module, root.root, argument);
+        }
         while (self.pending.pop()) |next| try self.walkTemplate(next);
         std.sort.pdq(u32, self.reads.items, {}, std.sort.asc(u32));
         var out = std.ArrayList(u32).empty;
@@ -342,6 +346,9 @@ const Walker = struct {
         // The literal argument roots the template's edges read (design.md
         // "Literal Arguments").
         for (module.checked_procedure_templates.templateLiteralArgumentDemand(&template)) |root| try self.readRoot(key.module, root);
+        // The literal roots the code descriptions of the template's unit
+        // read (design.md "Code Reification").
+        try self.codeReads(key.module, template);
         const summary: DirectDependencies = .{
             .templates_start = @intCast(self.summary_templates.items.len),
             .templates_len = @intCast(self.pending.items.len - templates_start),
@@ -415,14 +422,22 @@ const Walker = struct {
         const artifact = self.modules[module];
         switch (edge) {
             .literal => {},
-            .node => |id| switch (artifact.static_dispatch_plans.evidenceNode(id).target.kind) {
-                .procedure => |procedure| try self.pushTemplate(procedure.template),
-                .callable_binding => |binding| try self.readCallableBinding(binding),
-                .local_proc, .structural => {},
+            inline .node, .derivation_call => |key, tag| {
+                const id = if (tag == .node) key else key.node;
+                switch (artifact.static_dispatch_plans.evidenceNode(id).target.kind) {
+                    .procedure => |procedure| try self.pushTemplate(procedure.template),
+                    .callable_binding => |binding| try self.readCallableBinding(binding),
+                    .local_proc, .structural => {},
+                }
             },
             .use => |expr| {
                 const ref_id = artifact.resolved_value_refs.lookupIdByExpr(expr) orelse return;
                 try self.walkRef(artifact.resolved_value_refs.records[@backingInt(ref_id)].ref);
+            },
+            .requirement => |requires_idx| {
+                const requirement = artifact.checked_procedure_templates.literalRequirementEdge(requires_idx) orelse
+                    base.invariant("compile-time finalization invariant violated: a literal argument root's requirement edge is not recorded", .{});
+                try self.pushTemplate(requirement.template);
             },
         }
     }
@@ -493,6 +508,89 @@ const Walker = struct {
             },
             .callable_eval_template => |template_id| try self.readRoot(module, artifact.callable_eval_templates.templates[@backingInt(template_id)].root),
             .checked_error => {},
+        }
+    }
+
+    /// Read the literal roots that the code descriptions of the top-level
+    /// unit holding `template`'s body read: each described site's reads,
+    /// and the reads of each entry of each closing use's table, forward
+    /// tables included (`CodeOutput`). The description step completed the
+    /// output before the graph is built. A unit over-approximates the
+    /// template, as the graph does elsewhere.
+    fn codeReads(self: *Walker, module: u32, template: checked.CheckedProcedureTemplate) Allocator.Error!void {
+        const root_expr = switch (template.body) {
+            .checked_body => |root_expr| root_expr,
+            .intrinsic_wrapper, .entry_wrapper, .unimplemented => return,
+        };
+        const artifact = self.modules[module];
+        const index = artifact.bodies().index();
+        const unit = index.unitOf(@backingInt(root_expr));
+        const output = artifact.code();
+        for (output.sites) |site| {
+            if (site.outcome != .value or index.unitOf(@backingInt(site.node)) != unit) continue;
+            try self.readCodeReads(output.reads[site.reads.start..][0..site.reads.len]);
+        }
+        var tables: std.ArrayList(check.CodeOutput.TableId) = .empty;
+        defer tables.deinit(self.allocator);
+        for (output.edge_tables) |edge| {
+            // A platform requirement's closing use is in no body.
+            if (edge.edge.kind != .use) continue;
+            if (edge.outcome != .value or index.unitOf(edge.edge.first) != unit) continue;
+            try tables.append(self.allocator, edge.table);
+        }
+        // A method call's table is keyed by the node it targets, which
+        // names no body: read the table of each call the unit holds.
+        const bodies = artifact.bodies();
+        for (index.unitNodeSlice(unit)) |raw_node| {
+            if (index.nodeKind(raw_node) != .expr) continue;
+            const node = bodies.directDispatchNode(@fromBackingInt(raw_node)) orelse continue;
+            const closing = output.edgeTable(.{ .node = node }) orelse continue;
+            switch (closing) {
+                .table => |table| try tables.append(self.allocator, table),
+                .refused => {},
+            }
+        }
+        try self.readTables(output, &tables);
+    }
+
+    /// Read the literal roots that the entries of `tables` of `output`
+    /// read, forward tables included.
+    fn readTables(self: *Walker, output: *const check.CodeOutput.CodeOutput, tables: *std.ArrayList(check.CodeOutput.TableId)) Allocator.Error!void {
+        var seen: collections.DenseMapUnmanaged(check.CodeOutput.TableId, void) = .empty;
+        defer seen.deinit(self.allocator);
+        while (tables.pop()) |table| {
+            if ((try seen.getOrPut(self.allocator, table)).found_existing) continue;
+            for (0..output.tables[@backingInt(table)].entries.len) |position| switch (output.entry(table, @intCast(position))) {
+                .node => |described| try self.readCodeReads(described.reads),
+                .forward => |forward| try tables.append(self.allocator, forward),
+                .refused => {},
+            };
+        }
+    }
+
+    /// A bound literal root (`CodeOutput.rootBound`) evaluates its call in
+    /// the frame its edge enters, whose instance sites read the table of
+    /// the edge's closing use: read the literal roots of that table.
+    fn boundRootReads(self: *Walker, module: u32, root: checked.ComptimeRootId, argument: checked.LiteralArgumentRoot) Allocator.Error!void {
+        const output = self.modules[module].code();
+        if (output.rootBound(root) == null) return;
+        const closing: ?check.CodeOutput.Use = switch (argument.edge) {
+            .use, .requirement, .node => output.edgeTable(argument.edge),
+            .literal, .derivation_call => null,
+        };
+        var tables: std.ArrayList(check.CodeOutput.TableId) = .empty;
+        defer tables.deinit(self.allocator);
+        if (closing) |use| switch (use) {
+            .table => |table| try tables.append(self.allocator, table),
+            .refused => {},
+        };
+        try self.readTables(output, &tables);
+    }
+
+    fn readCodeReads(self: *Walker, reads: []const checked.CheckedCodeRead) Allocator.Error!void {
+        for (reads) |read| {
+            const module = self.by_key.get(read.module) orelse continue;
+            try self.readRoot(module, read.rootId());
         }
     }
 

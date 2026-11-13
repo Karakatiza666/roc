@@ -70,6 +70,7 @@ fn constrainedVar(env: *ModuleEnv, method_name: []const u8) std.mem.Allocator.Er
         .ret = unit_var,
     } } });
     const constraint = types.StaticDispatchConstraint{
+        .runs = true,
         .fn_name = try env.insertIdent(@import("base").Ident.for_text(method_name)),
         .fn_var = fn_var,
         .origin = .{ .where_clause = .{} },

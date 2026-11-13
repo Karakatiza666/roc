@@ -406,6 +406,11 @@ pub const Instantiator = struct {
     /// recorded requirement's callable afterwards (`DeferredCallable`).
     /// Requirements with interpolation parts are always copied.
     deferred_slots: ?*std.ArrayListUnmanaged(u32) = null,
+    /// The `runs` bit of the use this instantiation is for. Each copied
+    /// static-dispatch constraint takes its source's bit ANDed with this one
+    /// (design.md "The Runs Bit"). True
+    /// keeps every source bit, which is what a faithful copy with no use does.
+    runs_mask: bool = true,
     /// Source vars this instantiation must SHARE rather than copy, mapped to
     /// themselves in `var_map` before the walk starts. Used by a predeclared
     /// scheme for an annotation with `_` inference holes: a hole's type is
@@ -1507,6 +1512,9 @@ pub const Instantiator = struct {
         // the list can no longer move.
         const source_start: usize = @backingInt(source.start);
         constraints.appendSliceAssumeCapacity(constraints.items[source_start..][0..source.count]);
+        if (!self.runs_mask) {
+            for (constraints.items[fresh_start..][0..source.count]) |*fresh| fresh.runs = false;
+        }
         return fresh_start;
     }
 
@@ -1952,6 +1960,7 @@ pub const Instantiator = struct {
         force_root_copy: bool,
     ) std.mem.Allocator.Error!StaticDispatchConstraint {
         var result = constraint;
+        result.runs = constraint.runs and self.runs_mask;
         if (self.deferredCallable(constraint)) |source| {
             result.fn_var = source;
             return result;

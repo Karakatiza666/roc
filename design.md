@@ -133,6 +133,31 @@ no build, content hash, or diagnostics from it, and the document stays
 scheduled until the message that canceled it is handled. Cancellation is an
 explicit input from the embedder, never inferred from timing or progress.
 
+A document that runs on the default platform (a headerless file with a
+`main!`, or an `app` header that names no platform) is checked as `roc check`
+checks it. `compile.default_app` stages the document text, writes the staged
+app and the Echo platform into a scratch directory, and the build compiles the
+staged app with the same source mapping and import directory that `roc check`
+sets. The scratch directory and the staging live as long as the build. The
+document's module therefore holds the staged source, so every query converts
+document positions into it and converts its ranges back. A range in text that
+staging wrote, such as the `echo!` binding, is in no document: queries leave
+it out, and a rename that would have to edit it is refused.
+
+A `Report` gives its places as data, apart from its document. The primary
+location is the place a builder names with `setPrimary`, else the first
+highlighted source region. `related` lists each other place the report names,
+with a short message. `reached_from` is set when the primary location is in a
+file other than the file of the module that reports it: it is the place in that
+module's file that reaches the primary location. Builders fill these where they
+name the places in the document (`Report.addRelatedSourceLocation`), so the
+rendered text and the data stay the same places. The server sends each
+report in the file of its module, at `reached_from` when it is set and at the
+primary location otherwise. When the client accepts related information, the
+diagnostic's `relatedInformation` holds the primary location (when the report
+is shown at `reached_from`) and then each related place. A place in no file of
+the build has no URI and is left out.
+
 ## Core Principles
 
 Compiler stages after parsing and error reporting must not use workarounds,
@@ -2122,6 +2147,34 @@ separate Boxy pipeline after checking completes. Under either strategy the
 value ("Compile-Time Evaluation Under `.lss`"). This split follows the
 selected strategy, never a failed specialization attempt.
 
+#### The Description Step
+
+The first step of the compile-time evaluation of each module whose code
+output is `pending` is the description step (`describeModule` in
+`src/eval/code_descriptions.zig`, see "Code Reification"). It reads only
+sealed data and the per-module slots `codeCuts` and `codeInventories` of the
+module and its imports, never another module's evaluation output. It writes
+only that module's evaluation output: `Code` values into its `ConstStore`
+and the `CodeOutput` column. It reports each refusal into the module's
+problem store, so every command that evaluates reports it, and a module
+whose step reported is not cached.
+
+- It runs before any root of the module is evaluated. The steps of all
+  prepared modules are independent, so they run as one batch on the
+  post-check executor lanes, after the slots of every module in reach are
+  filled on one thread.
+- A Boxy unit can start while checking continues, before that batch. The
+  coordinator then runs the step of each pending module the unit reads, on
+  the coordinating thread, before it builds the unit
+  (`Coordinator.describePreparedModule`). The output is the same, because
+  the step reads only sealed data and slots. The batch skips such a module.
+- Inside a module the order is fixed: cut problems, identity calls in node
+  order, sites in node order, closing uses in node order, then platform
+  requirement uses by requires index, then bound inputs. So the output and
+  the `ConstStore` ids it writes are deterministic.
+- A cache hit and a reopened checked module have a `complete` output and run no
+  step. The quiet second specialization never runs it.
+
 #### Demand-Driven Compile-Time Specialization
 
 Compile-time evaluation runs the compile-time roots, and the literal roots
@@ -2276,7 +2329,9 @@ command and whatever its strategy, and reports every failure. `roc build` is
 `roc check` plus a linked program, so `roc check`, `roc run`, `roc build` and
 `roc test` report the same failures for the same sources, including failures in
 roots nothing reads and in the modules of dependencies. A failure is an error
-in every command.
+in every command. Every compilation also describes every code site and
+closing use of every module it evaluates (see "The Description Step");
+descriptions are never `unevaluated`.
 
 This policy is chosen for these reasons:
 
@@ -3093,11 +3148,14 @@ variable names, and comments. They may appear only in this ban. Say the
 specific operation instead, such as conversion, field read, tag payload read,
 capture slot, or wrapper function.
 
-The terms `readback`, `reification`, `value graph`,
-`compile-time value store`, and `representation repair` are also banned in new
-post-check docs and code. Compile-time evaluation stores results in
-`ConstStore`; later compilations restore cached consts from `ConstStore`.
-There is no separate phase or store under the const-related names. If two
+The terms `readback`, `value graph`, `compile-time value store`, and
+`representation repair` are also banned in new post-check docs and code, and so
+is `reification` for compile-time values (rebuilding a value from the result of
+evaluation). Code reification is a different feature, which describes a
+function for a translator and keeps its name; see "Code Reification".
+Compile-time evaluation stores results in `ConstStore`; later compilations
+restore cached consts from `ConstStore`. There is no separate phase or store
+under the const-related names. If two
 representations unexpectedly differ for the same value at the same boundary,
 that is an invariant violation; fix the producer instead of adding a later
 conversion.
@@ -3310,6 +3368,16 @@ an auto-imported type, redeclares an existing type, or repeats the same external
 type must live in one place. Callers may choose which source operation they are
 performing, but they must not duplicate the type-binding collision matrix.
 
+A module qualifier (`M` in `M.x`, `M.T`, `M.T.Tag`, or a hosted entry `M.f!`)
+has one rule, stated once in `resolveModuleQualifier`
+(src/canonicalize/Can.zig): a module the source imports under the name wins
+over the builtin type of the same name, and the builtin type is the qualifier
+only where no import binds the name. An import whose name is a builtin type's
+replaces the builtin binding and reports `builtin_type_shadowed_warning`, not a
+redeclaration. A type binding denotes a builtin type only when the compiler
+installed it (`builtinTypeOfBinding`), never because a module has a builtin
+type's name.
+
 Local type bindings record their exact declaration kind when introduced,
 including forward placeholders. Completing a placeholder fills its body without
 changing that kind. Scope aliases retain the same statement identity and need
@@ -3395,19 +3463,40 @@ that could reach one. The check reads only the declaration's own annotation
 type: a hosted declaration has no dependencies, so it is checked before any
 definition that refers to it, and nothing about it needs recording elsewhere.
 
-An annotation-only declaration that no implementation supersedes names no value
-at all, whatever its annotation says, and `e_anno_only` is the body-free state
-that records this. Two rewrites give such an annotation a body, and only these
-two: a platform package's hosted rewrite, which produces `e_hosted_lambda`
-during canonicalization, and Builtin.roc's compiler-owned intrinsic annotations,
-whose bodies post-check lowering emits at each checked call site. Every other
-`e_anno_only` declaration keeps its declared type, so surrounding code still
-checks, but reading it is an error: checking reports the missing value at the
-reference and marks that expression erroneous. This holds for a plain lookup,
-an imported lookup, a qualified associated read, and a method dispatch alike, so
-no reference to a valueless declaration survives checking. Post-check stages
-therefore never see one, and their rule that a procedure use carries a
-function-shaped request node needs no exception for it.
+An annotation-only declaration that no implementation supersedes is
+`e_anno_only`, the body-free state. It has one of three kinds
+(`AnnotationOnlyKind`):
+
+- Two rewrites give such an annotation a body, and only these two: a platform
+  package's hosted rewrite, which produces `e_hosted_lambda` during
+  canonicalization, and Builtin.roc's compiler-owned intrinsic annotations,
+  whose bodies post-check lowering emits at each checked call site.
+- In a module that is neither the builtin module nor a module of the platform
+  package, the declaration is an intrinsic (`.intrinsic`). An intrinsic is a
+  value of its declared type, so checking reports nothing at its declaration
+  or at a reference to it. Only reified code can use it: a description names
+  it as a `Prim` (see "Code Reification"). A reference to one in code that
+  runs is judged after checking, by the roots rule (see "Reify-Only
+  Definitions"), which reports and poisons it in a root. The coordinator
+  marks the intrinsics of each module it canonicalizes outside the platform
+  package. A tool that canonicalizes one module without its package (the
+  snapshot tool, the playground, the checker's tests) marks them from the
+  module's header (`HostedCompiler.markIntrinsicsByModuleHeader`): a
+  `platform` or `hosted` module keeps its declarations ordinary.
+- Every other `e_anno_only` declaration (`.ordinary`, for example in a
+  platform module that the hosted rewrite did not process, and
+  `.unsupported_generated_method`) names no value at all, whatever its
+  annotation says. It keeps its declared type, so surrounding code still
+  checks, but reading it is an error: checking reports the missing value at
+  the reference and marks that expression erroneous. This holds for a plain
+  lookup, an imported lookup, a qualified associated read, and a method
+  dispatch alike, so no reference to a valueless declaration survives
+  checking.
+
+Post-check stages therefore never see a reference to a valueless declaration,
+and they never reach an intrinsic (invariant 1, see "Reify-Only
+Definitions"). Their rule that a procedure use carries a function-shaped
+request node needs no exception for either.
 
 The `Scope.type_bindings` table has one ordinary mutation API for type names.
 It accepts the full scope slice, the target scope index, the introduced name,
@@ -3576,6 +3665,14 @@ return variables, deferred dispatch constraints, generalization pools, checked
 type keys, and every other consumer of solved variable identity observe that
 checked representative whatever shape structural balancing gives the forest.
 They must never observe or infer meaning from the storage root.
+
+An expression whose type is the type of one of its operands (a lookup of a
+binding, a block's final value, a record update's base) relates its own
+variable as the first operand, so the operand's class keeps its checked
+representative and the expression joins it as an occurrence. A later mismatch
+at the expression, such as against an annotation, then poisons only that
+occurrence (`Store.poisonOnMismatch`) and never the binding the operand reads,
+which other definitions may already have used.
 
 The storage root is selected by a separate union-find rank. This structural
 rank is not `Descriptor.rank`: descriptor rank is the Hindley-Milner scope level
@@ -3811,6 +3908,75 @@ checked data. Nominal identities, including their type arguments and backing
 authority, remain distinct. Root requests and ordinary calls therefore agree
 on runtime type identity without alias-aware codec lookup or extra graph
 construction for already closed roots.
+
+### Record Extension Well-Formedness
+
+This is a typing rule of the language. It was added on purpose, and it
+changes which programs check. Earlier compilers did not state it: they let
+any type reach a record extension slot, and later stages crashed on a
+record extended by a non-record (`Ref(Str)` with `Ref(r) := { ..r }`).
+
+A record extension slot `..r` accepts these types, and no others:
+
+| Type in the slot | Result |
+|---|---|
+| A record, or the empty record | accepted |
+| A row variable (flex, or a rigid that stands in a row slot) | accepted |
+| A transparent alias whose backing is a record | accepted, through the alias |
+| A `:=` nominal whose backing is a record (after its own extension) | accepted, transparent: its fields join the record |
+| A `::` opaque nominal | refused in every module, its own module too |
+| A builtin opaque type (`Str`, `Dict`, `List`) | refused |
+| Any other type (number, tag union, tuple, function) | refused |
+| A flex variable that carries a literal constraint (`from_quote`, `from_numeral`) | refused |
+
+How the checker applies it:
+
+| Where | What |
+|---|---|
+| Annotation generation (`stepRecordAnnoGen`, applications of a local, external or self-recursive type) | the argument of a formal that stands in an extension slot is judged by `requireRecordRow` |
+| Type declarations | a declaration's own formals are judged after all declarations of the module are generated (`judgePendingRecordRows`, called by `finalizeTypeDeclarationValidity`); a declaration that forwards a formal to another declaration's row slot marks it too, to a fixed point. A refused declaration is invalid |
+| Unification | a variable in a row slot carries `DescriptorFlags.record_row`, and `unifyVars` refuses to merge it with a type that `recordRowFit` (`src/check/unify.zig`) classifies as not a record. The flag rides the union-find class (`Store.union_` ORs it) and import copies (`copy_import.zig`) |
+| Checked types | the sealed type view reads the flag into `CheckedTypeVariable.record_row` (as it reads `bounded_row_ext`), so later stages read it from the checked type |
+| Report | an annotation is reported as "Not A Record Extension". A unification refusal is a type mismatch with a hint that names the row slot |
+
+The flag is set when annotation generation creates the slot. It is a
+property of the variable from its start, like its rank, so the rule is not
+a probe-then-mutate rewrite and it adds no `RedirectRule` member (see
+"Solver-Mutating Rewrites"). The refusal changes no solved type: it only
+reports a mismatch.
+
+A record update of an opaque value in its own module (`{ ..p, x: 1 }` with
+`P :: { x : I64 }`) is not a type in an extension slot and is unchanged.
+
+Monotype reads a record extended by a record-backed nominal through the
+nominal's backing (`rowExtensionChainResolved` in
+`src/postcheck/monotype/solve.zig` follows an inspectable, non-recursive
+backing), so the nominal's fields are fields of the record. The Boxy
+pipeline (`--specialize=no`) reads it the same way. A nominal shares its
+backing's representation, so type conversion (`Converter.finish` in
+`src/postcheck/boxy/types.zig`) reads a transparent nominal in a record's
+remainder through its backing: the backing's fields join the record's
+fields, with the defaults the backing's own conversion recorded, and the
+backing's remainder is the record's. An empty-record backing closes the
+row. Substituting a template's variables does the same where a remainder
+variable is bound to such a nominal (`rewriteType` in
+`src/postcheck/boxy/lower.zig`), and so does the run-time composition of
+an open row's descriptor, through the nominal descriptor's backing
+(`recordExtended` in `src/boxy_runtime/compose.zig`). A record's fields are sorted by label text, so a field from the
+nominal's own module takes its place among the others. An opaque or builtin
+nominal in a record's remainder, or a nominal there whose backing is not a
+record, is a compiler invariant. The shapes are pinned
+by `test/cli/RecordExtension/shapes.roc` in both lowerings.
+
+A variable that stands in a row slot through an application (`r` in
+`name_of : Ref(r) -> Str`) is a row extension of the template that
+quantifies it. Its demand is `full` (see "Specialization By Demand"), so a
+shaped request keeps its record type. A layout representative of a record
+is a tuple, and a tuple in a row slot is a compiler invariant. Calls of such
+a function are pinned by `test/cli/RecordExtension/generic.roc` in both
+lowerings. Boxy does not yet lower a record that is only a row variable
+(`{ ..r }`, also without a nominal), so
+`test/cli/RecordExtension/generic_bare.roc` runs in Monotype only.
 
 ### Where Method Annotations
 
@@ -5361,8 +5527,12 @@ sealed. It consists of exactly these parts:
   from the module, after a cache hit as well. An exhaustiveness check's
   index in its list is its checked site id.
 - The evaluation output: the constant store (`ConstStore`), compile-time root
-  payloads and compile-time root reads. Compile-time evaluation writes it and
-  nothing else does.
+  payloads and compile-time root reads, and the code descriptions
+  (`CodeOutput`): each `Code` site's description or refusal by site node,
+  each closing use's instance table by use node or requires index, each
+  bound call's input slots by call node, each bound literal root's bound
+  entry by root identity, and each description's provenance by site key.
+  Compile-time evaluation writes it and nothing else does.
 
 **Sealing.** Checking canonicalizes the solver store in place as its last
 write before sealing it (`types.Store.canonicalizeAndSeal`). Every slot comes
@@ -5752,7 +5922,16 @@ cache entry stores one: a cache hit recomputes each result on its first demand.
 - Per-module slots: the key index (one over source types, one over
   synthesized types), interface capabilities, the method registry view,
   provided exports, the nodes whose dispatch plan cannot run, diagnostic
-  errors, and single-source calls.
+  errors, and single-source calls; and the code slots (`CodeAnalyses`,
+  `src/check/code_analyses.zig`): `codeCuts`, the cut table of each
+  nominal's `code_primitives` with its problems as data, and
+  `codeInventories`, the instance sites, each template's inventory, recipes,
+  generic bound calls and their leaves, and the inventory refusals as data.
+  The consumer supplies their inputs (`CutInputs`, `PlanInputs`: the
+  module's sources and its view of the modules it reaches). Only the
+  description step reports their problems. Finalization fills both slots
+  of every module before lowering, which reads `codeInventories` and never
+  computes it (`computedCodeInventories`).
 
 A slot (`collections.OnceSlot`) is a state word with three states: empty,
 claimed and done; a claimed word also records whether a consumer is parked on
@@ -5840,7 +6019,9 @@ of a node's shape costs what reading the node costs:
   expression reads as a runtime error (the resolved value reference
   table's retired bitset, one bit per node), and a promoted local
   procedure's declaration and a rejected method declaration that evaluates
-  nothing are bits of the module index;
+  nothing are bits of the module index, and so is a `Code` site or identity
+  call (from `code_reification_sites` and `code_identity_uses`), which
+  reads as `.code_site`;
 - data attached to a node, each its own accessor called only by the
   readers that need it: literal digits (`numeralLiteral`, from the
   module's numeral digit table), dispatch plans (`dispatchPlan`,
@@ -5877,6 +6058,12 @@ of a node's shape costs what reading the node costs:
   touch each node of the unit once per analysis; divergence is decided for
   both inline-expect modes in one traversal, and the module's dispatch
   nodes whose plan cannot run are one per-module bit column.
+
+One raw accessor reads a node under a `.code_site`: `codeSiteLambda` gives the
+lambda or closure data of a lambda site, and only the description step (the
+walk) calls it. A refused site, identity call or closing use keeps its CIR
+shape; lowering reads the refusal in the module's `CodeOutput` and lowers a
+crash that carries `checked_error` (see "Code Reification").
 
 A literal conversion compile-time root names its literal explicitly
 (`CompileTimeRoot.literal`, an expression or a custom literal pattern), and a
@@ -5917,6 +6104,8 @@ and these shapes are forbidden:
   import projector;
 - a pairing that rewrites bodies or templates;
 - a value identity, or reuse of a previous cache entry;
+- a `Code` description, a refusal, or an instance table in a checked table,
+  or written by checking or by any later pass but compile-time evaluation;
 - a verification gate that compares a view against a second representation;
 - releasing a module's solver store before every consumer of the module is
   done.
@@ -6117,9 +6306,29 @@ function arguments, runtime pattern binders, mutable locals, runtime control
 decisions, effectful calls, host calls, platform requirements whose values are
 not available during checking finalization, and any static dispatch whose
 checked plan does not identify a pure compile-time-evaluable operation.
+A selected root is evaluated once for every instance of the functions around
+it, so after solving no expression in it may have a type that mentions a rigid
+type variable (`hoistedRootTypeMentionsRigid` in `src/check/Check.zig`). A
+rigid variable stands for the type each instance fixes, and code reification
+lets a value read that type (`Code.ty_of`, `Code.type_id`, a `Code` site, or a
+function that reaches one; see "Code Reification"). Only an annotation names a
+rigid variable. A variable of an unannotated function reaches a root only
+through the root's own type, which must already be concrete.
 Low-level operations may participate only through explicit checked purity and
 totality metadata; they must never be allowed by whitelist, name, or backend
 knowledge.
+
+Code that only reified code can use is not a compile-time-evaluable
+dependency: an intrinsic has no Roc body. So a selected root is pruned when
+the code it evaluates references an intrinsic or a reify-only definition, or
+holds a dispatch that selected one. The code a root evaluates is its
+expression without the description-only bodies below it: a lambda at a
+`Code` place below the root is described, not evaluated, so a call that binds
+a site's inputs stays a root whatever its description names. A root inside a
+description-only body evaluates its whole expression. The reify-only pass
+records these expressions, in code that runs and in description-only bodies
+(`reify_only_reaching_exprs`), and `hoistedRootReachesReifyOnlyCode` reads
+them.
 
 Checking errors are dependency-local for hoistability. A malformed expression,
 unresolved static-dispatch call, type error, or other checker-owned diagnostic
@@ -6223,6 +6432,22 @@ it as one exact callable root, never as ConstStore data. Data roots use a separa
 concreteness purpose that rejects a function anywhere in their stored type, so a
 value containing a callable remains one ordinary runtime allocation rather than
 being copied into independently restored callables.
+
+One exception: a root that binds the input slots of code reification sites
+(`code_roots.rootValueMayHoldFunctions`) uses the callable concreteness purpose
+for its stored type, so its result may hold a function that its concrete type
+fixes, as a real field or as a phantom type argument. The program reads that
+value only through the bound-call lowering at its one call, which restores it
+at that call's fixed type, so no other reader copies it into independently
+restored callables. Such a root is never reused across edits: like every root
+whose value holds a function, it is not portable (see "Portability").
+
+A static dispatch inside a root needs a concrete dispatcher type, because an
+open dispatcher needs specialization-edge evidence that a caller-less root does
+not have. That test is concreteness only: a concrete dispatcher may hold
+functions. The receiver is a transient value of the root, as the argument of a
+direct call is, so `q.f(x)` and `Q.f(q, x)` are roots under the same
+conditions.
 
 Hoisted-root selection is positional as well as dependency-based, and the
 checker carries that position as explicit checking context while computing
@@ -6359,7 +6584,16 @@ unannotated data root with a reachable callable slot remains specialization-owne
 because an explicit consumer relation may still determine types inside that
 callable graph; it cannot cross Monotype's relation-freeze boundary as a
 context-free compile-time request. Data roots with no reachable callable slots
-continue to use the ordinary concreteness proof.
+continue to use the ordinary concreteness proof. A call that binds input slots
+fixes its callable graph at the producer too (`code_roots.exprBindsInputs`):
+the program reads it only through the bound-call lowering, at the type
+the checked module data fixed for the call, so no consumer relation reaches it. It is a
+context-free request, evaluated with the module's roots, and a translator's
+refusal in it is reported where `roc check` runs. The exception is a call
+whose `Code.Binds` encoders have a type that an enclosing generic function
+fixes (`boundCaptureEncodersAreConcrete`): evaluating it needs that
+function's evidence, so it stays specialization-owned, and the walk refuses
+its sites as `bound_instance`.
 
 Runtime lowering restores a selected hoisted root by checked expression id. While
 lowering the synthetic compile-time wrapper for that same root, lowering must
@@ -6644,6 +6878,19 @@ another CIR traversal. Eligibility for compile-time condition warnings remains
 independent of whether a condition is selected as an independent root or covered
 by an enclosing root.
 
+A condition that reads a code reification site draws no compile-time condition
+warning. A described function exists only while the compiler runs, so the
+result of a translator is known at compile time by design, and a `match` over
+it is how a program reads it. The author cannot act on the warning. The
+checker records this as explicit data: a hoist frame carries
+`reads_code_site`, set where a site is recorded and passed to every parent
+frame, and a binder whose right-hand side reads a site is kept in
+`code_site_bindings`, so a later lookup of that binder carries the flag. Only
+a binder named by a plain pattern is kept. Accepted: `match Stage.describe(f)`,
+a match over a top-level or local value bound to that call. Rejected: an `if`
+on a plain constant still warns. Both sides are pinned by
+test/cli/StagedTranslatorMatch.roc.
+
 Unguarded hoisted roots use the same compile-time constant rules as ordinary
 top-level constants. A failure produced while evaluating one is a checking-time
 failure reported at the hoisted expression's original source region.
@@ -6676,6 +6923,9 @@ marker, say) is ordinary code that must keep compiling:
   along with the failure it would surface.
 - Callable extraction roots are never guarded, since a callable root has no
   runtime form to leave in place.
+- A call that binds input slots (see "Code Reification") is never guarded
+  either. Its in-place form gives the translator's own `inputs`, not the slot
+  values, so a failure is a compile error, as for an unguarded root.
 
 Imported checked modules must contain every checked procedure template and checked
 body that may be instantiated by an importing root. This includes private helper
@@ -8196,12 +8446,15 @@ interpret the shape to recover a call absent from
 `StaticDispatchPlanTable.generated_codec_derivations`. Debug compiler builds
 audit that every producer-required call was consumed and that repeated roles
 have equal checked type graphs up to transparent aliases. A parent
-structural-call edge and its nested derivation independently snapshot one
-checker relation, so their debug audit requires equal checked root keys plus
-full graph equality under a bijective
+structural-call edge and its nested derivation independently snapshot checker
+relations that denote one type. A repeated application reuses the derivation
+of an earlier equal application, and the checker compares applications with
+transparent aliases expanded, so the two can spell that type through different
+aliases. Their debug audit therefore requires full graph equality, with
+transparent aliases expanded at every depth, under a bijective
 renaming of flex and rigid identities shared across both relation roots;
-variable sharing, constraints, defaults, and every non-variable payload remain
-exact. Conditional capabilities are
+variable sharing, constraints, defaults, and every other non-variable payload
+remain exact. Conditional capabilities are
 omitted from the consumption requirement unless the specialization selects
 their generated-code path. A format procedure's specialization identity does
 not name the individual call edge that first reached it. Equivalent checked
@@ -10301,6 +10554,258 @@ requirements retain their existing introduction path. Tests in
 `issue_11960_test.zig` pin concrete, inferred, custom, and rejected cases, and the
 absence of per-literal signature graphs for concrete builtin lists.
 
+### Bound Capture Encoding Placement
+
+At a `Code.Binds(code, fmt)` site, a capture read `R` gets the requirement
+`t.encoder_for(fmt)` of rule "Bound Capture Encoding" (Code Reification)
+exactly when the type `t` of `R`, where it is final in the module, holds an
+opaque type or a type variable. The walk binds a slot whose type holds no
+opaque type as its `Code.Value`, so no encoder runs for it, and a format
+need not have one. This is policy: under the rule as first written every
+read got the requirement, and pure solving rejects a program whose format
+has no encoder for such a type.
+
+- The predicate is one function, `code_opacity.holds`, with one reading of a
+  nominal type, `code_opacity.nominalRead`. The walk asks it of a slot's
+  `Code.Ty` (`holdsOpaque` in code_reifier.zig) and the checker of the
+  read's solved type (`boundCaptureReadHolds`). A function type is a leaf.
+  A copy of a variable's requirement that a use fixes to a function is
+  satisfied by rule "Function Capture Resolution" (below).
+  The checker reads a nominal that reads as its backing as the
+  declaration's backing template with the arguments in place of the
+  formals, as the walk reads the slot's backing. So an argument the backing
+  does not use (a phantom argument) holds nothing, and the checker requires
+  an encoder exactly where the walk uses one.
+- Final point: the site queues its reads (`pending_bound_capture_reads`,
+  discipline `boundary`, with the site's rank). A generalization boundary
+  of rank `r` judges the reads of sites at rank `r` or above, once nothing
+  else at the boundary can fix their types: the inner-lambda and local
+  function boundaries after their literal defaulting, a group boundary when
+  its fixpoint is otherwise stable. A read whose type holds a variable of
+  rank `r` or above gets the requirement: the boundary generalizes the
+  variable, and a caller can fix it to an opaque type. A read whose type
+  holds only variables of a lower rank stays queued for the boundary of
+  that rank. The end of the module (`finalizeTypes`) judges what remains,
+  after literal defaulting (`finalizeLiteralDefaults`), so a number literal's
+  variable is judged at its default type. There every variable that remains
+  keeps the requirement.
+- The site owns the requirement as it owns its `default`: its value
+  relation owns what solving reports, an instantiation that solving makes
+  belongs to the site, and what the requirement queues is solved at once
+  (`introduceBoundCaptureEncoder`).
+- What a read's requirement derives (a record's encoder needing its
+  fields', `boundCaptureOf`) follows from the read's own judgment: no
+  component is judged on its own.
+
+Accepted side: `test/cli/StagedBinds/plain.roc` (a format with no encoder
+binds `Str`, `U64`, a record, a list, `F32`, a transparent nominal and a
+record that holds a function, and a list whose item type a later line
+fixes), `test/cli/StagedBinds/phantom.roc` (a nominal whose phantom
+argument is `Time`), `test/cli/StagedBinds/numeral.roc` (a number literal
+captured in a top-level value takes `Dec` first). Rejected side: `test/cli/StagedBinds/typing.roc` (a
+`Time`, an opaque type with no encoder and a record holding `Time` still
+need their encoders; a generic capture fixed to `Str` keeps its
+requirement), `test/cli/StagedBinds/numeral_refused.roc` (a captured
+`Time` in a top-level value, judged at the end of the module),
+`test/cli/StagedBinds/phantom_refused.roc` (a nominal whose
+backing uses its `Time` argument needs the encoder), and
+`test/cli/StagedBinds/generic.roc` (the kept requirement of a generic
+capture lets the caller that fixes it to `Time` bind the encoded value).
+
+### Function Capture Resolution
+
+A requirement `t.encoder_for(fmt)` with the origin `bound_capture` whose
+dispatcher `t` resolves to a function type is satisfied with no method. The
+walk describes a captured function as code, so it binds no slot for it and
+runs no encoder. This is the meaning of the origin (src/types/types.zig,
+`Origin.bound_capture`), read on the resolved dispatcher before any failure,
+not a recovery from one. It is policy: pure dispatch rejects a function
+dispatcher, since a function type has no methods.
+
+- A site's own read of a function type gets no requirement (rule "Bound
+  Capture Encoding Placement": a function type is a leaf). So the rule meets
+  only a copy of a generic function's requirement, which a use fixed to a
+  function (`kept = |value| Stage.keep(|_| value)`, then `kept(|x| x + 1)`).
+  The drain asserts this in debug builds (`functionBoundCaptureSatisfied`).
+- Checking: the drain arm `functionBoundCaptureSatisfied` in
+  `processDeferredDispatchEntry` skips the requirement. It writes no type, no
+  redirect and no plan.
+- Publication: the evidence of such a requirement is `unreachable_value`
+  (`EvidencePass.resolveContextObligation`), since no encoder of a function
+  runs.
+- The walk then reads the capture as any read of a function parameter. A
+  function that the program passes exists only when the program runs, so the
+  walk refuses the read by name (`Rejection.Kind.function_parameter`, the
+  report "cannot reify a function parameter"), as it refuses a read of a
+  function parameter in a function that is not generic. The walk knows the
+  read is a parameter from its resolved reference (`.local_param`). The rule
+  removes the type error that named a missing `encoder_for` of a function
+  type. It does not make a run-time function describable.
+
+Accepted side: `test/cli/StagedBinds/generic_function.roc` (a generic
+capture fixed to a function has no encoder error, and its only report is the
+walk's refusal of the function parameter; the same capture fixed to `Time`
+checks with its encoder), `test/cli/StagedBinds/function_parameter_refused.roc`
+(the same refusal of a call of a function parameter in a function that is
+not generic), `test/cli/StagedBinds/generic.roc` (a capture
+fixed to `Time` binds the encoded value). Rejected side: `test/cli/StagedBinds/typing.roc`
+(a generic capture fixed to `Str`, a type that is no function, keeps its
+requirement and fails with the rule's error).
+
+### Value Code Positions
+
+A call argument `e` at a `Code(a)` position (the expected type passes
+`stagedCode`, `Code.Binds` included) that is not a lambda, a closure or a
+lookup of a block lambda is checked into a fresh type `t` with no expected
+type. Its node takes `Code(a)`. The solved type `t` at its decision point
+decides what `e` is:
+
+| `t` (through aliases) | Decision | Relation |
+|---|---|---|
+| a function | function site: a name of a definition is a `named_function` site, else the ordinary mismatch | `t ~ a` for a name, else `t ~ Code(a)` |
+| `Code(_)` | pass on | `t ~ Code(a)` |
+| any other structure | value site (`CodeReificationSite.Kind.value`) | `t ~ a` |
+| a variable, where `a` is a function | pass on | `t ~ Code(a)` |
+| a variable, where `a` is no function | value site | `t ~ a` |
+
+A lambda, a closure and a lookup of a block lambda are function sites at
+once. An `if`, a `match` and a block give the position to each result they
+can deliver, and each result is decided on its own. The rule is policy: before it, every argument at a `Code`
+position was related to `Code(a)` or described as a function, and pure
+unification rejects a value there.
+
+- Decision point. A structure or a rigid head is final at once, so `e` is
+  decided at its frame finish. A flex head waits in
+  `pending_code_arguments` (discipline `boundary`, with the rank of `e`'s
+  frame). A generalization boundary of rank `r` decides the arguments of
+  rank `r` or above whose flex has rank `r` or above, before its literal
+  defaulting: the inner-lambda and local function boundaries, and a group
+  boundary, which takes one more fixpoint round when it decides one
+  (`BoundaryActivity.decided_code_arguments`). `finalizeTypes` decides what
+  remains. A numeral at `Code(a)` is a flex until its boundary, so it is a
+  value, and its default fixes its type.
+- Known values at `Code.Binds` (`binds_known_value`). At a
+  `Code.Binds(Code(a), fmt)` position whose `a`, through aliases, is a
+  structure that is no function at the argument's frame finish
+  (`codeContentIsValue`), a flex `t` is final there too: `e` is a value
+  whatever `t` becomes, so it is decided at the frame finish, and `t ~ a`
+  gives `t` its type there. Hoist selection then reads whether the call
+  binds it (below). So `Stage.since(42)` and `Stage.since(zero_of({}))`,
+  at `since : Code.Binds(Code(Time), Fmt) -> Code.Bound(Str)`, are one
+  encoded input slot each, as `Stage.since(Time.zero())` is. A plain `Code`
+  position and an `a` that is still a variable keep the decision points
+  above.
+- Run-time arguments (O1). An argument that reads a value that exists only
+  when the program runs, and whose type is a flex at its frame finish, is
+  decided at the frame finish, by the variable rows. Hoist selection reads
+  the decision there: a value is an input slot of the enclosing
+  `Code.Bound` call, a pass on is a run-time dependency, and the two give
+  different roots. So an unannotated function that passes on its `Code`
+  parameter before a later line fixes the parameter to `Code` gets a type
+  mismatch at the later line. In the body of a compile-time root (an
+  ordinary top-level constant) no hoist frame is eligible, but that alone
+  is no run-time read: only a frame that reads run time or has an effect
+  makes its parent read run time (`finishHoistFrame`). So a literal written
+  at a `Code(a)` position in a top-level constant is fixed, as it is in a
+  function. A name that a block in such a body binds is fixed when its
+  value is: the value's hoist frame reads no run time and no binding of its
+  context, and has no effect (`CompletedHoistResult.fixed`). The checker
+  records each name such a `decl` statement binds (`comptime_fixed_bindings`,
+  `recordComptimeFixedBinding`). A `var` statement is no `decl`, so a `var`,
+  which is written again, is never recorded. A read of
+  it reads no run time, as a read of a top-level name does. So
+  `x = { n = "a"; Stage.text(n) }` is described as `Stage.text("a")` is. The
+  body of a lambda in the constant is no compile-time root body, so a name
+  bound there is not recorded.
+- Fixed values. A value site no call binds is walked as the body of a root
+  row with no parameter, and its normal form must be a data literal. The
+  literal shows the whole value, so a value whose type holds an opaque type
+  (`code_opacity`) is refused there (`value_not_computable`). Any other
+  value is computed through the bodies of the functions it calls, an opaque
+  type's operations included: the walk of such a site reads each opaque
+  type of a package as its backing and walks each operation of such a type
+  instead of naming it as a primitive (`Walk.opaque_backings`,
+  `Reifier.readsOpaque`). What 10.1 makes opaque is the slot type, not the
+  functions that compute a fixed value. A builtin keeps its primitives and
+  its hidden representation, and an intrinsic and a member of the site's
+  cut stay a `Prim`, so a value that reaches one is not computable.
+- Bound values. A value site a call binds is an input slot, which the
+  program computes where the call stands. The compile-time root of the call
+  does not evaluate it, so the template of a compile-time root collects no
+  reference below such a site (`CheckedTemplateRefCollector.collecting_root`),
+  as `hoistedRootReachesReifyOnlyCode` reads no code below it. The template
+  of the function that holds the call collects it. A dispatch plan whose node
+  is a value site dispatches for the value written there, so Monotype reads
+  it at the value's type (`dispatchPlanSite`), not at the `Code` its node
+  holds. A custom literal written as a whole value site converts at the
+  value's type in the same way: its conversion plan, its conversion root and
+  its literal requirement read the site opened
+  (`CheckedBodies.literalConversion`, `ExprSite.conversionLiteral`). In a generic function a bound value whose type is a variable of the
+  function makes its call a generic bound call (rule "Bound Instance
+  Roots"): the call's function type holds the site's `Code(a)`, so each
+  closing use binds the value at its own type.
+- The decision is made outside any probe, in `decideCodeArguments` and
+  `applyCodeArgumentDecision`, which record the site and relate `t` with
+  `unifyInContext` in the argument's own relation. It writes no redirect,
+  so it cites no `RedirectRule`, and restamps no plan.
+- At a `Code.Binds(Code(a), fmt)` position a value site is judged as one
+  capture read whose type is the value's type (rule "Bound Capture Encoding
+  Placement", `introduceValueSiteEncoding`). The encoding records that type
+  (`BoundCaptureEncoding.read_var`), because the site's node holds `Code(a)`.
+- Fixed opaque values at `Code.Binds`. A value decided at its frame finish
+  whose type there, after the relation `t ~ a`, holds an opaque type
+  (`boundCaptureReadHolds` is `opaque_`) has no literal. At a
+  `Code.Binds(Code(a), fmt)` position its frame reads run time
+  (`applyCodeArgumentDecision`), so hoist selection makes it a pending site,
+  and a call binds it as one input slot, as it binds a run-time value. The
+  program computes it where the call stands, and the format encodes it. The
+  body of a compile-time root has no run time, so there such a value stays
+  fixed and is refused. A value decided after its frame finish (its type and
+  the `a` of its `Code(a)` were both variables there) stays fixed, since
+  hoist selection is over. The checker records this on the site
+  (`CodeReificationSite.decided_late`, `markCodeSiteDecidedLate`), and the
+  walk refuses such a value whose final type holds an opaque type by name
+  (`value_typed_late`, "Value Has No Type Where It Is Written"), with the
+  advice to write the type at the value.
+
+Accepted side: `test/cli/StagedValueSites/main.roc` (literals plain and in a
+chain, a value that reads a parameter as one input slot, records, tags,
+lists, a numeral and a lambda at a bare `Code(a)`, an annotated pass on, an
+unannotated pass on that an earlier line fixes, an unannotated pass on at a
+function position, a fixed value of a generic function at each closing
+use), `test/cli/StagedValueSites/opaque.roc` (a fixed value computed by an
+operation of an opaque type, of the module and of a package),
+`test/cli/StagedValueSites/top_literal.roc` (literals at the top level),
+`test/cli/StagedValueSites/top_block.roc` (names a block in a top-level
+constant binds to fixed values: a `Str`, a record, nested blocks, a
+destructure),
+`test/cli/StagedValueSites/fixed_input.roc` (a run-time value at a free
+`Code(a)`), `test/cli/StagedValueSites/generic_input.roc` (a run-time value
+whose type is a variable of a generic function, at a value site and in a
+lambda, binds at each closing use), `test/cli/StagedBinds/value.roc` (an
+opaque value at `Code.Binds` is encoded), `test/cli/StagedBinds/fixed_value.roc`
+(a fixed opaque value at `Code.Binds` is one encoded input slot, written
+directly, through a name and through a local function, and a fixed `U64`
+there stays a literal), `test/cli/StagedBinds/custom_numeral.roc` (at a
+`Code.Binds(Code(Time))` position a custom numeral with and without its
+suffix, and a call generic in what it returns, are decided at the frame
+finish and are one encoded input slot each). Rejected side: `test/cli/StagedValueSites/late.roc` (a late-fixed
+unannotated pass on is a type mismatch at the later line),
+`test/cli/StagedValueSites/function_content.roc` (a variable at a function
+position is a `Code`, so a call of it is an error),
+`test/cli/StagedBinds/value_refused.roc` (an opaque value at plain `Code`),
+`test/cli/StagedValueSites/opaque_refused.roc` (a fixed value whose type
+holds an opaque type), `test/cli/StagedBinds/fixed_top_refused.roc` (a fixed
+opaque value at `Code.Binds` in a top-level constant),
+`test/cli/StagedBinds/late_value_refused.roc` (a numeral and a generic call
+at a generic translator's `Code.Binds(Code(a))`, whose `a` a later argument
+fixes to `Time`, are decided late and refused by name),
+`test/cli/StagedValueSites/custom_numeral_refused.roc` (a custom numeral at
+a plain `Code` position reaches a builtin conversion the walk does not
+compute), `test/cli/StagedValueSites/top_block_refused.roc` (a
+`var` in a top-level block, and a name bound in a lambda that a constant
+holds, are run-time values no call there binds).
+
 ### Expected Shape Context
 
 An expected aggregate shape guides construction but introduces no new value
@@ -10555,6 +11060,13 @@ copy takes its own copy first, so the shared one stays pristine. Identity
 compares only the flags a copy carries (`DescriptorFlags.copied`), so a type
 whose classes record a defaulting decision or a rejection is identical to its
 own copy and shares it like any other.
+
+A contextual type (a call's parameter, which an argument is checked in) is
+never copied: the call relates the argument to it. A staged argument relates
+its function to the `f` of the parameter's `Code(f)`, and its node to the
+parameter, and takes no copy of the parameter either. A copy would hold a
+second instance of each flex `where` receiver in `f`, which nothing relates to
+the call and so nothing fixes.
 
 A row the reference itself WRITES as a type argument is decided the same way,
 by composition rather than by inheritance. A declaration's formal stands
@@ -12215,7 +12727,10 @@ extra arguments, effectful functions, results `Str` cannot be (a numeral, `I64`,
 a rigid variable), and results that are `Str` only when one of `T`'s variables
 is (interpolating a payload of type `a`) do not. Inspection ignores an
 ineligible method and renders the value's default form; per the method-naming
-principle in Core Principles, this is never reported.
+principle in Core Principles, this is never reported. An override that holds
+a Code site at its own type variables is described at each type occurrence
+of its owner (see "Code Instance Tables"); an ineligible method has no such
+occurrence, and a written call of it is described as any use is.
 
 Checking forms that instance once per `to_inspect` declaration
 (`recordInspectOverrideInstances`): it instantiates the method's scheme as a
@@ -12821,6 +13336,222 @@ settled, checked module output preserves the discharged root scheme's
 polymorphism without checker-local requirement state.
 Rejected—"weak top-level literal rejects second use at different type"—proves
 the representation does not make the weak receiver itself polymorphic.
+
+### The Runs Bit
+
+Each static-dispatch constraint has a `runs` bit. It is set when some code
+that runs at run time uses the relation. Compile-time evaluation counts as run
+time. The bit is metadata, like `provenance`: type keys,
+`GeneralizedAttachedConstraintKey`, constraint equivalence and unification do
+not read it, so it never changes typing. It is the input for finding the
+definitions that only reified code can use (intrinsics).
+
+A body is description-only when it is one of these:
+
+- the body of a lambda written at a `Code` place;
+- a function name written as a `Code` argument, or as the callee of a
+  template call;
+- the whole body of a template. The reifier walks a template body as code to
+  describe at each call (`reifyTemplateSite`), and refuses each expression
+  that it cannot describe, so nothing in the body is evaluated.
+
+The checker counts the description-only bodies that enclose the expression it
+checks (`description_only_depth`). It raises the count in `beginExprCheckFrame`
+and lowers it when the frame ends. A definition that is checked on demand
+starts at zero, and `SavedDefState` restores the count after it. The checker
+also records the expression at the start of each description-only subtree
+(`description_only_roots`).
+
+The bit follows these rules:
+
+- Creation. A constraint created while the count is zero runs. A derived
+  method's component requirement takes the bit of the comparison or hash it
+  serves. A `Code.Binds` capture encoder runs when its site is not inside
+  another description-only body, because the encoder runs when the site's
+  description is built.
+- Where clauses. A where-clause relation created for the annotation of a body
+  that this checker checks starts clear. Each body dispatch that matches the
+  clause ORs its bit into it, where `body_required` is set. Every other
+  annotation sets the bit: a predeclared scheme, and a declaration with no
+  Roc body (annotation-only, hosted or low-level).
+- Instantiation. A use ANDs each copied constraint's bit with its own bit
+  (`Instantiator.runs_mask`). A value use runs when the count is zero. A
+  dispatch target's instantiation uses the bit of the constraint it resolves.
+  An instantiation with no use (`.none`) keeps each bit. A boundary replay of a
+  predeclared use, and the later link of a use's deferred callables, use the
+  bit that the use recorded.
+- Merges. When one relation is dropped for an equal one, the kept relation ORs
+  the two bits. This applies to unification of fixed literal relations, the
+  generalized dedup of attached constraints and of scheme requirements, a
+  requirement that a scheme already holds, and the rigid where-clause match.
+- Copies across modules keep the bit. The checked module's type store holds
+  it, so the module cache keeps it too.
+
+These are declared over-approximations. Each one can only set a bit that
+could be clear, so a reader of the bit can only reject more code, never
+accept code that it must reject.
+
+- A use through a predeclared scheme copies the where-clauses before the body
+  sets their bits. The copy therefore takes the use's bit only.
+- A generated codec body is generated once for its nominal and shared by each
+  use of the codec, so the methods it calls run.
+- An inspect override runs, because run-time code can inspect a value of its
+  type.
+- A call of an imported template is claimed after its callee is checked, so
+  its callee is not a description-only body.
+
+`ROC_REIFY_ONLY` prints each top-level definition's generalized requirements
+with their bits after the module is checked (see "Developer Diagnostics").
+
+### Reify-Only Definitions
+
+An intrinsic is an annotated declaration with no body outside the builtin and
+platform modules (`AnnotationOnlyKind.intrinsic`). Only reified code can use
+it. A top-level definition is reify-only when code of it that runs at run
+time references an intrinsic or another reify-only definition. Compile-time
+evaluation counts as run time.
+
+The pass `src/check/reify_only.zig` finds these definitions once, after the
+module is checked and before the selected hoisted roots are pruned. It reads
+only data that checking produced:
+
+- The checked body of each top-level definition and of each top-level
+  `expect`. The walk of the code that runs skips each subtree in
+  `description_only_roots`. A second walk of those subtrees finds only the
+  references that the hoisting rule reads (see "Compile-Time Constants and
+  Hoisted Roots").
+- The roots (see "The Roots Rule" below).
+- The lookups in a body: of a local top-level definition, of an imported
+  definition, and of a resolved associated item, and a static call of a local
+  method. The argument of a `Code.prim` call is no use of the definition it
+  names (`NodeStore.isCodePrimArgument`), so it is no lookup here.
+- The dispatch edges. Each `DispatchTargetInstantiation` records its use site
+  (`site_expr`) and the `runs` bit of the constraint it resolves. The site is
+  the use that the constraint was copied for (`failure_expr`), else the
+  expression that created the constraint. An edge derived from another edge
+  has the site of that edge. Only an edge with a set bit counts, and the walk
+  gives it to the definition or `expect` whose body holds its site.
+
+A reference whose target is an intrinsic, or a reify-only definition of an
+imported module (read from that module's `reify_only_defs`), seeds the
+fixpoint. The fixpoint is breadth-first. Round 0 marks each definition with
+a reference to a seed. Round `n` marks each unmarked definition with a
+reference to a definition that a round before `n` marked. Each marked
+definition records its witness: its first such reference, with its kind
+(lookup, call or dispatch), its region, the target's module and definition,
+and the method name of a dispatch. Every witness points to an intrinsic or
+to an earlier round, so the chain of witnesses ends at an intrinsic and has
+no cycle. A mutually recursive group that reaches no intrinsic stays
+unmarked, because the fixpoint is the least one.
+
+A dispatch edge carries the final `runs` bit of the relation that dispatches
+at its site. The bit of a relation can change after its dispatch selected a
+target only through a fold: the unifier folds one literal relation into an
+equal one (`static_dispatch_relation_merges`), and the dropped relation then
+dispatches through the target of the relation it was folded into, with no
+`DispatchTargetInstantiation` of its own. Each fold records the dropped
+relation's bit (`dropped_runs`). So the pass gives each such dropped relation
+an edge of its own, at its literal (the node of its `LiteralDispatchPlan`),
+with its own bit and the target of the relation it reaches through its folds
+(`RelationFolds.selected`). A selected relation keeps the bit of its own site:
+a fold adds the bit of another site, which that site's own edge carries. No
+decision is taken at dispatch resolution, so no edge is judged from a bit that
+a later merge could set.
+
+`intrinsic_value_references` holds each lookup of an intrinsic and whether it
+runs. Debug builds also walk each description-only subtree and assert that no
+dispatch edge below its root has a set bit, and that each recorded lookup of
+an intrinsic runs exactly when the walk reaches it outside these subtrees.
+
+#### The Roots Rule
+
+A root is a definition whose code runs whatever references it:
+
+- a platform requirement that an app supplies (`platform_required_defs`),
+  an entry of the module's provides list (`provides_entries`), and a
+  zero-argument definition that the caller records as an evaluated root.
+  The checker reads these from the module header, the platform, and the
+  caller. It never finds a root by its name;
+- a top-level constant, which compile-time evaluation runs (a top-level
+  definition whose body is not a function);
+- a top-level `expect`.
+
+A root is never reify-only, so a reference to a root makes no definition
+reify-only. Each reference in a root that runs and whose target is an
+intrinsic or a reify-only definition is a violation. Checking reports
+`exists_only_in_reified_code` at it and marks it erroneous
+(`markErroneousValueExpr`), so poisoning replaces it with a runtime error:
+the reference lowers to a crash, and nothing behind it is lowered. The
+reported expression is the call of a callee and the use of a value; for a
+dispatch it is its site, or the call whose callee's requirement it resolves.
+The report prints the chain from the reference to the intrinsic, one line for
+each witness, then the intrinsic and its declaration. A frame in another
+module names that module's file (`SourcePlace`). An `expect` with a violation
+counts as a compiler-error test result, a dev run crashes only if it reaches
+the poisoned reference, and `roc build` writes the binary and exits 1, as for
+every other checking error.
+
+The decision reads only the final data of the pass, so it runs after the
+fixpoint, before `pruneSelectedHoistedRootsAfterSolving`. Two invariants
+follow, each a debug assertion:
+
+- Each run-time edge to an intrinsic belongs to a root, where it is a
+  violation, or to a definition that the fixpoint marked reify-only.
+- Invariant 1: Monotype lowering never reaches an intrinsic. A root's
+  references to one are poisoned, and no root reaches a reify-only
+  definition, so no lowering request names one. `UnimplementedDeclaration`
+  records whether the declaration is an intrinsic, and the `.unimplemented`
+  arms of Monotype (`lowerUnimplementedTemplateAtNode`, the constant use)
+  assert that it is not. Boxy has no requests: a unit lowers every template
+  of its module that run-time code may call (see "`.boxy` Runtime
+  Lowering"). So the checked module records the set Monotype never lowers
+  as explicit data: `CheckedProcedureTemplate.description_only` is set on
+  the template of an intrinsic's declaration, of a reify-only definition and
+  of a Code template (a definition whose annotation returns `Code`, listed
+  in `ModuleEnv.code_template_defs`; its body is read only by the
+  reifier). A Boxy unit emits no worker for such a template
+  (`unitEmitsTemplate`), and `Program.templateWorker` asserts that no use
+  asks for one. The flag is part of the cached checked module, and the
+  object key of an importer reads it through the template's interface.
+
+Boxy needs one more rule. Monotype lowers only the code that a request
+reaches, but Boxy fills each dictionary that a call passes with one slot for
+each relation of the callee's scheme. A fragment such as
+`|q| Db.Q.filter(q, |x| x.t.now())` has the relation `now` in its scheme, and
+only the described lambda uses it, so its runs bit is clear. A call of the
+fragment at `Clock` selects `Clock.now`, an intrinsic, for that slot. Evidence
+output sets `CheckedEvidence.description_only_target` when the
+resolution is direct to a template flagged `description_only` (an
+intrinsic, a reify-only definition or a Code template) and the callee's
+relation has a clear runs bit. Boxy then fills the slot with the crashing dictionary
+`description_only_target` (`CrashDictionary` in
+`src/postcheck/boxy/lower.zig`), as it fills an `unreachable` slot, in
+place of a worker. No run-time code reads the
+slot. The resolution stays `direct`, because the reifier reads the target to
+describe the fragment. A slot of an ordinary method keeps its worker, whatever
+its runs bit.
+
+A nominal's `is_eq`, `to_hash` or `to_inspect` override that is an
+intrinsic is a slot of the type's descriptor in the same way. The
+descriptor holds it, but checking rejects every run-time comparison, hash
+or inspection that reaches it, so `Program.nominalOverrides` fills the slot
+with the crashing dictionary `description_only_target` in place of a
+worker.
+
+`ModuleEnv.reify_only_defs` stores the reify-only definitions that are not
+roots, in ascending order of definition id. Each entry holds its witness,
+its full chain (`reify_only_frames`: each frame's text, and its place as a
+path, a line and a column), and the qualified name of the intrinsic at the
+end. The checker builds the chain when it writes the module: it follows
+the local witnesses, and at an imported reify-only definition it appends the
+chain that the imported module exported. So an importer reports the full
+chain from explicit exported data, whichever modules it imports: an app that
+imports `Lib` and not `Text` still names `Text.is_email` and its place. The
+module cache keeps these lists, and the checking interface hashes the bit,
+the witness and the chain of each exported definition, and the line and
+column of each intrinsic, so an importer is checked again when a frame that
+it reports changes. The cached checking outcome keeps the frames of each
+report (`refusal_calls`). The reify-only `expect`s are not exported.
 
 ### Field Kinds (All-Dynamic Optional Fields)
 
@@ -13945,6 +14676,38 @@ Other solved-graph mutations:
   equivalence class, descriptor flag, structural edge, and dispatch decision.
   The normalized mapping contributes to the native checking-interface digest.
 
+- `introduceBoundCaptureEncoding` (src/check/Check.zig)—not a rewrite:
+  constraint generation for the typing rule "Bound Capture Encoding" (see
+  Code Reification). At a lambda whose written position is `Code.Binds(c,
+  fmt)`, it introduces the ordinary method requirement `fmt.default` with
+  the origin `bound_capture`, and queues each capture read (syntax) for
+  `judgeBoundCaptureReads`. It reads no solved type; the only probe is the
+  existing `Code` position detection (`stagedCode`), which reads the
+  written alias.
+- `judgeBoundCaptureReads` (src/check/Check.zig)—policy: Bound Capture
+  Encoding Placement (above). It reads the solved type of a capture read
+  where the type is final in the module, through the predicate the walk
+  uses (`code_opacity.zig`), and the result gates the introduction of the
+  ordinary `t.encoder_for` requirement, which unifies a constrained flex
+  into the read's type. It writes no redirect, so it cites no
+  `RedirectRule`, and restamps no plan. The drain discharges a copy of the
+  requirement whose dispatcher is a function by the rule below.
+- `functionBoundCaptureSatisfied` (src/check/Check.zig)—policy: Function
+  Capture Resolution (above). It reads the resolved dispatcher of a drained
+  `bound_capture` `encoder_for` requirement, and a function there satisfies
+  the requirement. It writes no type and no redirect, so it cites no
+  `RedirectRule`, and restamps no plan. Publication resolves the evidence of
+  such a requirement as `unreachable_value`.
+- `decideCodeArguments` and `applyCodeArgumentDecision`
+  (src/check/Check.zig), policy: Value Code Positions (above). They read the
+  solved head of a `Code(a)` call argument at its decision point
+  (`codeArgumentDecision`), and the result gates which ordinary relation
+  is made (`t ~ a` or `t ~ Code(a)`) and which site is recorded. They write
+  no redirect, so they cite no `RedirectRule`, and restamp no plan.
+- `introduceValueSiteEncoding` (src/check/Check.zig), not a rewrite:
+  constraint generation for the typing rule "Bound Capture Encoding" at a
+  value site. It introduces `fmt.default` and queues the whole value as one
+  capture read for `judgeBoundCaptureReads`.
 - `checkConcreteBuiltinNumeral`—mechanism: Concrete Builtin Numeral
   Introduction (above). Uses the existing `unifyWith` descriptor-introduction
   mechanism for a proved concrete builtin conversion; does not mutate the
@@ -13998,6 +14761,13 @@ Other solved-graph mutations:
   for immediate rejection while the expression frame owns the result;
   deferred rejection follows the expression replacement described under Module
   Completion Boundary and never poisons either shared solved class.
+- `poisonUndescribableStagedCode` (`markErroneous` and
+  `erroneous_value_exprs`)—mechanism: diagnostic recovery after an
+  already-reported error. It probes only whether a description site's function
+  type holds an error, which an error-free program never does, and then retires
+  the definition holding the site the same way an erroneous value is retired,
+  so that compile-time evaluation does not instantiate an erroneous function.
+  No error-free program's typechecking or checked-module output changes.
 - `retireCallLikeExprWithErroneousOperands` / statement-owned iterator plan
   recovery (`markErroneous`, `markStaticDispatchFnRejected`, and the explicit
   `call_operand_type_error_exprs` table)—mechanism: Erroneous Call Operand Retirement
@@ -14779,7 +15549,8 @@ TypeDesc {
     tag union: discriminant offset and width, variants ordered by
         discriminant, each { payload fields as a record },
     methods: optional erased callables for `is_eq`, `to_hash`, `to_inspect`
-        overrides, plus their rejected marks,
+        overrides (each may capture a Code instance word), plus their
+        rejected marks,
     presence_slot_present_discriminant: optional, for optional-field slots,
     inspect_opaque: bool,
 }
@@ -14900,6 +15671,17 @@ is described by a recipe of the body even when it is closed. The override is
 the local procedure's function value at the method's interface, an immortal
 callable, since the descriptor holding it lives for the program's lifetime.
 
+A slot of an `is_eq`, `to_hash` or `to_inspect` override whose target holds a
+Code instance inventory (or the entry of a computed callable whose binding's
+entry wrapper holds one) captures the method's instance table at the
+descriptor's type (`Program.overrideTakesTable`, `Body.implicitInstanceWord`,
+see "Code Instance Tables"). The table comes from the body that describes the
+type, so a type whose descriptor reaches such a slot is described by a recipe
+of that body (`Program.composedInBody`), whose override scope holds the slot.
+Where the table is closed, the recipe reads no input and is static data. A
+slot whose table the description step refused holds the crashing dictionary
+`refused_description`.
+
 Two descriptors of the same type may be distinct static data (one without
 override scope, one carrying a body's overrides); no consumer compares
 descriptors by identity, and equality, hashing, and inspection are defined on
@@ -14908,7 +15690,8 @@ values through descriptors, never on descriptors.
 #### Type Tables
 
 A worker with hidden inputs (the descriptors of its type variables, its
-dictionaries, then its literal arguments) takes one hidden argument: the
+dictionaries, its literal arguments, then its Code instance table) takes one
+hidden argument: the
 address of its type table, immutable static data. A template takes it after
 its explicit parameters. An erased worker's capture record holds it after the
 captured values, except for a generalized local procedure whose calls pass
@@ -14925,7 +15708,9 @@ literal thunk, an immortal callable capturing its entry's table; an argument
 record's descriptor; the table of each worker the body calls or packs; the
 discriminant of a tag or the label-order index of a field under a descriptor
 (`tag_index`, `field_index`), an integer word read into a `u32` local; and a
-record update's or a coercion's plan (`update_plan`, `adapt_plan`). A
+record update's or a coercion's plan (`update_plan`, `adapt_plan`); and an
+entry of the worker's Code instance table (`instance_entry`, "Code Instance
+Tables"). A
 position or plan whose descriptor reads no input is static: a position is an
 immediate operand, a plan static data the body reads directly.
 The worker's needs list says what each word is, as a recipe over its inputs.
@@ -15153,6 +15938,9 @@ payload. A dictionary of closed types is static data where the body reads it,
 in a generic body too; one whose captures mention the enclosing worker's
 hidden inputs is a word of that worker's type table, evaluated at each of the
 worker's instantiations ("Type Tables").
+A dictionary whose target holds a Code instance inventory also captures
+the instance table of the evidence edge that selects the target, as its last
+input (see "Code Instance Tables").
 
 A method whose scheme requires itself has a dictionary that captures itself,
 directly or through other dictionaries: resolving a requirement can reach a
@@ -15233,6 +16021,9 @@ the compilation runs under: the data describes the program, and a checked
 module serves both strategies' programs (its cache identity names no
 strategy).
 
+A generic `Code.Bound` call is a requirement of this same machinery, of the
+kind `bound_call`: one rule for both kinds (see "Bound Instance Roots").
+
 - A scheme's *literal requirements* (`CheckedProcedureTemplate.literal_requirements`,
   and the dispatch scope's `literal_requirements`): one per literal of its own body
   whose conversion plan is open (`.evidence_dependent` or
@@ -15254,7 +16045,11 @@ strategy).
   arguments (`.forwarded`). An instantiation at a type mentioning a variable
   that no scheme around the edge quantifies (a use's copy that nothing relates
   to the program, as in `_ = local` for a generalized local function nothing
-  calls) is fixed by no use, so nothing reads its value (`.unbound`). A
+  calls) is fixed by no use, so nothing reads its value (`.unbound`). The
+  `.unbound` class is for literals only. A bound requirement that is not
+  closed forwards, also when its type mentions a variable that no scheme
+  quantifies (an open row that only an annotation's closed union met): the
+  closing use seals that variable (see "Bound Instance Roots"). A
   template's `literal_argument_demand` lists the
   roots its edges read, so compile-time evaluation orders them before any
   evaluation of the template.
@@ -15264,6 +16059,30 @@ strategy).
   dictionaries, reading each lookup's edge in that alias's scope. A dispatch
   edge bound to an alias holds the target's arguments composed through the
   chain (`aliasChainSubstitution`), resolved in the scope holding the edge.
+- A call of a generated codec contract is an edge of its own,
+  `LiteralEdge.derivation_call`, keyed by the contract
+  (`GeneratedCodecDerivationId`, a nested contract for a call of a nested
+  codec) and the call's evidence node. Evidence nodes are interned, so the
+  node alone does not name one instance. A contract derives one relation at
+  the types of one use, so the edge has one instance: the node's
+  substitution with the contract's renamed variables mapped back to the
+  use's own types (`GeneratedCodecDerivation.renamed_vars`), recorded with
+  the call's callable type and its arguments
+  (`CheckedProcedureTemplateTable.literal_derivation_edges`). Checking makes
+  each codec relation whose type mentions a scheme variable a template
+  relation, validated at each use of the scheme
+  (`activateSchemeDeferredCodecConstraints`). So a contract call edge is
+  always closed, and each of its requirements is a root. A forwarded
+  contract call edge cannot occur, and a debug assertion in the fixpoint
+  checks it. Boxy's codec family reads the edge's arguments as
+  module-level constants (`Gen.callResolved` with the call's own
+  derivation), so families stay shared by content digest.
+- The literal collector and the reifier's edge scan find the edges with one
+  walk (`static_dispatch.EvidenceEdgeWalk`): each evidence node of a use,
+  nested nodes and contract calls included, the nested evidence of a `for`
+  loop's `iter` call, the `next` call's own node, and the targets of the
+  dispatches a `Code.Binds` site runs (`fmt.default()` and the
+  `encoder_for` of each captured value), which no use names.
 - The root's value type is the conversion's `Ok` payload type at the closed
   type: the literal's type for a numeral or a quote, the assembler's function
   type for an interpolation. A root whose value holds a function
@@ -15356,9 +16175,10 @@ per call for a local procedure, in its captures for any other generalized
 lambda; a nested lambda captures the enclosing scopes' literal arguments as
 it captures their dictionaries, after them.
 
-An instantiation checking recorded no edge for (a platform's call of the
-app's binding, a stored closure restored from a constant store, a target
-derived from its callable type) derives its literal arguments from its
+An instantiation checking recorded no edge for (a platform's call of an
+app binding whose requirement solution was not sealed, a stored closure
+restored from a constant store, a target derived from its callable type)
+derives its literal arguments from its
 types as it derives its dictionaries: a *literal thunk* worker per
 literal requirement (`WorkerKey.literal_thunk`, keyed by the worker, the types its
 scheme takes, and the literal requirement), whose body enters the worker's scopes at
@@ -15374,6 +16194,494 @@ literal argument carries the value, and the dictionary is what a derived
 instantiation resolves. The runtime has no numeral table and no descriptor
 selection among candidate types: `dyn_numeral` and `dyn_desc_index` do not
 exist.
+
+#### Code Instance Tables
+
+A Code site in a generic function (an *instance site*, whose rules the Code description
+section gives) has no description of its own: each closing use describes it at
+the types that use fixes, and the description step of the use's module
+records the descriptions in its evaluation output as a table of its
+`CodeOutput`, one entry per entry of the template's inventory (the
+template module's `codeInventories` slot). A node entry is a description; a forward entry names the table of
+a nested use, which a closing use further out fixes. Boxy follows the rule of
+literal arguments: the template is lowered once, and the caller that fixes
+the types supplies the table.
+
+A method selected at an evidence edge is described at that edge. More
+generally, a template selected at an edge is described at that edge. An
+edge (`CodeEdge`, which is `checked.LiteralEdge` with no `literal`) is one
+of these:
+
+- `use`: a written call, a value lookup, a use through a procedure alias,
+  or a `for` loop's `iter` call (keyed by the loop's body).
+- `node`: an evidence node. This is the target that a direct static
+  dispatch calls (a method call, `a == b` on a written `is_eq`,
+  `T.method(..)`), the target that `where` evidence or nested evidence
+  selects, a `for` loop's `next` call, and a dispatch that a `Code.Binds`
+  site runs (`fmt.default()`, the `encoder_for` of a captured value).
+  Evidence nodes are interned, so two calls at one target and one
+  instantiation share one edge and one table. Each call is still a use:
+  its refusal is reported at the call, and it depends on the node alone,
+  so the node's record is the refusal (`CheckedBodies.directDispatchNode`
+  finds a call's node).
+- `requirement`: a platform requirement's closing use, by requires index.
+- `derivation_call`: a call of a generated codec contract, keyed by
+  `{derivation, node}` (see "Literal Arguments").
+
+A table and a literal root name an edge in the same way, so the root of a
+generic bound call finds its bound entry in the table of its own edge
+(`attachRoots`). The description step records every table in one column,
+`CodeOutput.edge_tables`, sorted by `EdgeKey`, and both lowerings read it
+through `CodeOutput.edgeTable`. The reifier finds the edges with the walk
+that the literal collector uses (`static_dispatch.EvidenceEdgeWalk`, see
+"Literal Arguments"), and treats each edge as it treats a use:
+
+- A closed edge gets a table (`closeEdge`, called by `closeWrittenUses`,
+  `closeRequirements` and `closeEvidenceEdges`).
+- An edge at its holder's own variables is a forward entry of the holder's
+  inventory (`forward_edges`), which a closing edge further out fixes.
+- An edge at the variables of a lambda that a block generalized is refused
+  (`instance_in_local_generic`).
+
+A chain step at a `node` or a `derivation_call` edge resolves the node's
+target (`TableBuilder.evidenceEdgeTarget`). For a contract call, the frame
+binds the contract's renamed copies to the use's own types. A method bound
+to a computed callable takes its instance from the callable that the edge
+relates it to (`Reifier.computedMethodCallee`).
+
+The lowerings read the table of the edge that selected the target:
+
+- Monotype carries a node edge's table on the evidence target
+  (`SpecEvidenceTarget.instances`, from `evidenceEdgeInstances`), as part of
+  the target's identity. A contract call's table is on the codec context
+  (`contractCallInstances`). A direct callee's interface reads the use's
+  table (`beginDirectCalleeInterface`).
+- Boxy's dictionary of a node edge captures the edge's word
+  (`evidenceInstanceWord`): a closed edge's own table, or the entry of the
+  body's own table at a forward edge. A contract call passes its edge's
+  table (`contractCallInstanceWord`), and a stored evidence target keeps
+  its table (`ConstFnTargetEvidence.instances`, `storedTableWord`).
+
+Codec and format methods (`encoder_for`, `parser_for`, and the methods of a
+user format) can hold Code sites, and generic `Code.Bound` calls in them
+are supported. The contract call or the `where` evidence that selects such
+a method is its edge. Contract call edges are closed only: a forwarded one
+cannot occur (see "Literal Arguments"), and a debug assertion checks this
+in the reifier's edge scan and in the literal collector.
+test/cli/StagedFragmentImplicitCodec/, test/cli/StagedFragmentCodecEdges/
+and test/cli/CodecErrorRowLiteral.roc pin this in both lowerings.
+
+An edge whose target is a method that a description step refused (Q17,
+`CodeInventories.refused_methods`) keeps that method's own rejection at
+the use (`evidenceReachesRefused`). Both lowerings read the method as a
+checked error on both sides of the edge.
+
+A node whose target derives its own evidence from its callable
+(`from_callable`) has no checked node for a method that this evidence
+selects. Both lowerings select such a method from the method registry of
+the dispatcher's owner type. If a method selected in this way, at any
+depth, holds an inventory, no edge keys its table. The use is then refused
+(`instance_through_derived_evidence`, "Cannot Reify In A Method Selected
+From A Type", `TableBuilder.derivedEvidenceReachesInventory`). The check
+also runs at a forward use (a use at its template's own variables): there
+the template's types name the dispatchers' owners, so every closing use of
+the template reaches the same methods. test/cli/StagedFragmentDerivedEvidence.roc,
+test/cli/StagedFragmentDerivedRecursion.roc and
+test/cli/StagedFragmentDerivedForward.roc pin this.
+
+To read a derived target at its instance, the reifier fixes the variables
+of the target that only its `where` requirements reach
+(`Reifier.relateDerivedEvidence`):
+
+1. For each requirement whose dispatcher the substitution fixes, select
+   the method that the dispatcher's owner declares, as both lowerings
+   select it.
+2. Match the requirement's callable type (`EvidenceParamRecord.callable_ty`)
+   with that method's type at the receiver.
+3. Repeat until no requirement binds more. A dispatcher that another
+   requirement's result fixes (the receiver of `x.pred().is_odd()`) is read
+   after that requirement. A dispatcher that stays open binds nothing.
+
+The reifier uses this for a `from_callable` node's own instance
+(`derivedNodeInstantiation`) and in the walk of the refusal above.
+
+A `for` loop's `iter` call is a use. The nested evidence of the `iter` call
+and the `next` call's own node are node edges. The `next` edge cannot hold
+a Code site today: `iter` must return the builtin `Iter` (or `Stream` for
+`for!`), so the `next` target is always `Iter.next` or `Stream.next!`,
+which hold no site and no literal requirement
+(test/cli/StagedFragmentLoopEvidence.roc).
+
+- A worker whose template has an inventory takes its Code instance table as
+  its last input, after its literal arguments (`Worker.instances`,
+  `Program.instanceInputs`): a word of its type table, like its other inputs
+  ("Type Tables"). The lambdas of such a template take the same input, a
+  method entry takes its target's, and the entry of a computed callable
+  whose binding has an inventory takes it as its one input.
+- A closed table's word is static: the immortal callable of the table worker
+  `WorkerKey.code_instances` (module and table), with no captures. A refused
+  table's word is the crash callable `checked_error`, and a refused closing
+  use crashes in place of the use.
+- An entry of a table is the type table word of the recipe
+  `instance_entry {table, index}`, which the lowering evaluates at compile
+  time from the module's `CodeOutput` when it fills a type table
+  (`Program.instanceEntryWord`). A node entry is the immortal callable of a
+  `WorkerKey.code_description` thunk (module, table, entry) that restores the
+  description at the closed representation of the site's type. A forward
+  entry is the nested table's word. A refused entry, and every entry of a
+  refused table, is the refused crash word. The lowering notes, for each
+  static callable word that is a table, which table it is
+  (`Program.noteInstanceTableWord`), so the recipe reads a table only by its
+  word. No body reads an entry at run time and no body composes a table.
+- A Code site calls the entry its index names in the worker's own table
+  (`Body.lowerCodeSite`, `instanceTableEntry`). A closing use passes its
+  table's word (`instanceWordForUse`, which reads `CodeOutput.edgeTable`); a
+  forward use passes the `instance_entry` word of the enclosing table. A use
+  through an exact procedure alias carries the table the description step
+  keyed at the use down the chain to the final target. A table whose walk
+  was refused records no template and no entries
+  (`CodeOutput.no_template`), and no worker is planned for it. A stored
+  function records its table (`stored_fn` tag `code_instances`).
+- The table workers of a closing use are emitted by the unit of the use's
+  module, from that module's own evaluation output, so no object reads
+  another module's tables. That unit emits every table whose template it would
+  emit, and a table worker is named by content identity (the module's link
+  name and the table's position), since a stored function can capture any
+  table: an importer that restores one calls the defining object's worker,
+  as it calls an imported lambda.
+- The object key of a module covers the Code descriptions its object
+  restores (`Digests.objectInput`, `hashCodeDescriptions` in
+  `src/compile/boxy_interface.zig`), read from its `CodeOutput`: each site
+  and identity call (a description by value, or a refusal), each
+  closing use, binding and bound entry, and each of its tables, with the
+  template the table serves and each entry, a description by value, a
+  refusal, or a nested table by position. The key hashes content, never
+  storage, so an output restored from the cache gives the key a fresh one
+  gives, and a warm build reuses the object
+  (test `code_description_object_reuse`). A
+  description is a function of the bodies it describes, which are often
+  another module's (a fragment's site, a helper or method the walk reads,
+  and the checked keys a `Prim` names), so the module's source and its
+  imports' interfaces do not determine it. A module's interface adds the
+  shape of its inventories, entry kinds and site kinds, read from its
+  `codeInventories` slot (`hashInventories`), which a closing use's tables
+  are built against. No interface carries a
+  table's contents: an importer's object reads none, and the recipe of a
+  stored function that captured a table, which an importer's key hashes,
+  names the table by link name and position.
+- **Each successful function requirement of a platform is a closing use, in
+  the app's description step.** A requirement may leave an anonymous open
+  row (`show : [A, ..] -> Str`), so the app binding stays generic, and the
+  platform's call of it is checked in the platform module, before pairing:
+  no module sees a written closing use. The app's checked module data records, on
+  each function requirement's solution, the solution with each free
+  variable sealed as lowering seals it (`PlatformRequirementSolution.sealed_root`,
+  `checked.sealedVariable`: the numeric default, else the row default, else
+  the empty tag union), and the app's description step closes the binding
+  at that type (`platformRequirementUses`).
+  Monotype (`lowerCheckedTypeVariable`), Boxy (`sealVariable`) and this use
+  read that one rule, so the table describes the instance that lowering
+  makes. The reifier builds the table (`closeRequirements`, a chain step
+  at the `requirement` edge) where the binding's template has an
+  inventory, and records it in the app's `CodeOutput.edge_tables` under
+  that edge. Pairing copies no table: the pairing
+  names the requirement by its requires index, and lowering reads the table in the app's output
+  (`CodeOutput.edgeTable`). Monotype's `instancesForUse` and its root
+  of a required binding, and Boxy's `requiredInstanceAt` and
+  `requiredAliasInstance`, pass that table. An exact alias binding
+  (`main! = run!`) carries it to the procedure it forwards to, as a written
+  use through an alias does.
+- A requirement solution that leaves a free variable with a constraint,
+  which sealing would ignore, is refused at the app binding when the
+  binding's template has an inventory (`requirement_constrained_variable`).
+  A `where` clause on the
+  row variable of the app binding's annotation reaches it
+  (test/fx-open/code_site_constrained_requirement.roc).
+- The same use is a literal argument edge of the app
+  (`LiteralEdge.requirement`, by requires index): the binding's scheme (its
+  template, or an exact alias binding's entry wrapper) instantiated at the
+  sealed solution (`requirementSubstitution`: a row variable takes the rest
+  of its row; a variable the solution does not reach, which only a `where`
+  clause names, stays and lowering seals it). Each requirement with a sealed
+  solution records it (`CheckedProcedureTemplateTable.literal_requirement_edges`:
+  binding, scheme, substitution, root evidence, arguments), with no
+  arguments too, so its presence says the solution was sealed. The edge is
+  in no scheme, so each requirement it instantiates is a root of the app:
+  a literal's conversion or a generic bound call at the requirement's
+  types, whose bound entry the requirement's table holds
+  (`attachRoots`). Pairing copies the edge next to the table
+  (`literal_edge`). Boxy's platform call of the binding takes its literal
+  arguments from the app's edge (`requiredInstanceAt`,
+  `requiredAliasLiterals`), and the root's chain enters the binding at the
+  edge's substitution with the requirement's table (`enterEdge`). A
+  requirement with no sealed solution has no edge, and its call derives its
+  literal arguments as before; checking refuses it where the binding has an
+  inventory.
+
+- **A descriptor method is described where a type of its owner occurs
+  (Q17).** The compiler calls `is_eq`, `to_hash` and an eligible
+  `to_inspect` with no written use, only for a value of the owner type, and
+  each such type is a type of an expression, a pattern or a use substitution
+  of some body. So a type occurrence of a nominal is a use of each of its
+  descriptor methods whose target (a procedure of any module, through the
+  alias chain, or a computed callable's entry wrapper) holds an inventory.
+  The occurrence scan reads these types, closed over components, nominal
+  arguments and nominal backings (`ImplicitScan`), as it reads uses. An
+  occurrence at the holder's variables is an `implicit` inventory entry
+  (`CodeInventories.implicits`: the method and the owner type as a term of
+  `CodeInventories.terms`), so the holder takes a table. A closed
+  occurrence, or one a closing use fixes, gets the method's table at that
+  type (`closeImplicits`, `ChainStep.implicit`); the description step
+  records it in `CodeOutput.implicit_instances` with the owner type as a
+  term that other modules can read (`owner_terms`, `owner_bindings`,
+  `owner_members`, `owner_member_terms`, `owner_modules`). A frame binds a
+  row variable to the whole row its use matched, so the owner term binds a
+  row variable that ends a row to a row term of exactly the rest of that
+  row: the fields or tags no nearer link names, through each binding of a
+  row variable the matched row ends at (`TableBuilder.ownerTerm`). The scan
+  over-approximates: a type that no lowering
+  inspects still gets a table, so no lowering asks for a table that is not
+  there.
+- Monotype indexes `implicit_instances` by the owner's Monotype type and the
+  method (`indexImplicitInstances`). A row term joins its row as is in
+  Monotype and in Boxy, and a debug assertion checks that no nearer link
+  names one of its members. The callers that make these calls state where the
+  table comes from (`MethodInstances.implicit`): inspection, structural
+  equality and hashing, and the derivations. `where` evidence that selects
+  a descriptor method and a written dispatch to a computed callable are
+  edges, so they read the edge's table. Two
+  modules that record one owner type record tables of one template at one
+  instance (a debug assertion). Boxy puts the word in the descriptor slot:
+  a closed type takes the table its body's module recorded, and a type at
+  the body's variables takes the `implicit` entry of the body's own word,
+  matched by method and owner type read in the body's scope. A method entry
+  holds its target's word, and `restore_callable_eval` passes a slot's word
+  to the binding's entry wrapper. A dictionary that a type alone selects
+  (derived evidence, with no edge) takes the same word at its dispatcher
+  (`dictionaryInstanceWord`). A refused table
+  makes the method's body a crash in Monotype and the slot a crash in Boxy,
+  where the compiler calls the method.
+- The codec methods (`encoder_for`, `parser_for`) are no descriptor
+  methods: their instance also holds the format and the state types, which
+  the owner type does not fix. The edge that selects them describes them
+  (see the edge rule above).
+
+The alternative, a worker per (template, table), would lower a generic
+template once per closing use. That breaks the per-module rule that a
+template is lowered once in its own unit, needs the importer to emit the
+exporter's template, and grows code with every use; a table word costs one
+hidden argument at the templates that have an inventory, none elsewhere.
+Monotype carries the same tables on its specialization evidence, so both
+strategies read the same evaluation output.
+
+#### Bound Instance Roots
+
+A call whose result is a `Code.Bound`, or a type built on it (the opt-in
+rule in "Code Reification"), binds the run-time reads of its sites
+as input slots and is a compile-time root of its own
+(see "Code Reification"). In a generic function, the call's function type
+(the type it instantiated its callee at: its arguments, its receiver
+included, and its result, `code_roots.boundCallFnVar`) can mention a variable
+of the template, so the call has no one type to be a root at. A site's part
+of it is `Code(a)`, so a value or a lambda at a site whose type holds a
+variable of the template makes the call generic even when its result type is
+closed. Each closing
+use fixes that type, so each closing use binds the call's inputs at its own
+instance (R7 of the Gap 1 design). The checked data for this is explicit and
+per instance:
+
+- Hoist selection marks what a bound call reads besides its sites
+  (`CodeReificationSite.bound_reads`). It is `sites_only` when the call
+  binds its sites, is an expression root candidate, and reads no local
+  binding root (no promotion dependency). Then only its type can tie the
+  call to the enclosing function. Any other bound call is `other`.
+- A *generic bound call* is a `sites_only` call whose function type mentions a
+  quantified variable of the template that holds it, and of no lambda a
+  block inside it generalized. Each of its sites is described at each
+  closing use, as an instance site is, whatever the site's own type: the
+  site's first slot depends on the instance through the call's earlier
+  sites.
+- The template's inventory lists its generic bound calls
+  (`CodeInventories.BoundCall` in the `codeInventories` slot): the call and
+  the inventory index of each of its sites in site order (node order, the
+  order the site loop counts first slots in). The recipe of each such site
+  names its call (`Recipe.bound`). A closing use in another module reads the
+  site's capture reads at `Code.Binds` positions where checking recorded
+  them (CIR and `ModuleEnv.bound_capture_encodings`), so the recipe copies
+  none.
+- Each table of a closing use describes the sites of each generic bound
+  call of its template in site order, with input slots on: the holder's
+  run-time names are the inputs, and each site starts at the count of the
+  slots of the call's earlier sites at this instance. The table records one
+  `BoundEntry` per call (`table_bounds`, `bound_entries`): the call's slots
+  in slot order, and each site's first slot. A refusal of such a site at the
+  closing use refuses the table, as for any instance site.
+- A bound call that is not generic keeps its one root and its one
+  `CodeOutput.bindings` entry. A bound call that is `other` binds nothing in a
+  generic function. `test/cli/StagedValueSites/generic_input.roc` binds a
+  value site and a lambda site whose types alone hold the variable, at two
+  closing types each; `test/cli/StagedValueSites/generic_refused.roc` and
+  `test/cli/StagedFragmentRefused.roc` pin calls that are `other`.
+- A descriptor method (see "Code Instance Tables") whose scheme has a
+  `bound_call` literal requirement is refused at the method
+  (`bound_call_in_implicit_method`, "Cannot Bind Inputs In A Method The
+  Compiler Calls"): the requirement's root exists only at a checked literal
+  edge, and the compiler's own calls of the method have none
+  (test/cli/StagedFragmentImplicitBound.roc). Accepting it needs a literal
+  edge per type occurrence. A codec or format method is no descriptor
+  method: the edge that selects it roots its generic bound calls, keyed
+  `derivation_call` for a contract call (test/cli/StagedFragmentCodecEdges/
+  binds a call in `encoder_for` and in a format method at two closing
+  types).
+
+The rule is the rule of literal arguments, with a second requirement kind:
+**a generic bound call is evaluated where its type first becomes concrete,
+at compile time, and each such place binds the call's inputs.** A literal
+requirement and a *bound requirement* are one `LiteralRequirement` whose
+`LiteralSite.kind` is `numeral`, `quote`, `interpolation` or `bound_call`.
+Requirements, edges, roots, demand, request scheduling, finalization order
+and the `.lss` rule (the roots stay `unevaluated`) are the same code for
+both kinds. Only the two ends of a chain differ: what the own requirement
+lowers, and what a body reads.
+
+- Which calls are generic is decided once, before the requirements are
+  computed, by the literal requirement computation, not by the reifier. The template ref collector
+  records each `sites_only` bound call with the scope that holds it. A call
+  is generic when its function type mentions a quantified variable of its template
+  and of no generalized scope around it (`typeMentionsIn`, which the reifier
+  also reads: an undetermined field kind is a variable it mentions). A
+  generic bound call is an own requirement of the innermost scheme around
+  it, as a literal is.
+- Hoist pruning applies the same rule before the literal requirement
+  computation. A call that
+  binds inputs is no root of its own when its function type mentions a
+  variable that the scheme of a definition around it quantifies. The checker records the
+  innermost active scheme when the call's hoist frame finishes
+  (`bound_call_scheme_owners`) and follows `scheme_owner_parents` outward.
+  A scheme quantifies its generalized identity variables
+  (`code_roots.typeMentionsSchemeVars`). A field kind that a definition
+  generalized but that its type does not reach (the field kind of a record
+  literal in a function of type `Str -> Str`) is no scheme variable, so the
+  call stays one root, as the literal requirement computation decides. The rank of a variable alone
+  does not decide this.
+- The type of a bound requirement is a tuple: the call's function type, the
+  type of each *leaf* of the call, and the function type of the template that
+  holds the call. The last part makes the tuple mention no quantified
+  variable exactly where every variable of that template is fixed, which
+  is where the reifier closes a use.
+- **The leaves of a call are the binders around its sites that the site
+  walk reads as input slots.** The walk replays a name that a `decl`
+  statement defines (`Reifier.replayBinding`), so a slot reads what that
+  value reads, not the captured name: `n = Str.concat(name, "")` captured
+  as `n` gives a slot that reads `name`. A value site's slot is the whole
+  value, which Boxy evaluates in the requirement's worker as it is written,
+  so its leaves are the names its expression reads, with no replay; only a
+  read of a definition outside every body (a constant, or a procedure the
+  program reaches by name) and a promoted local function are no leaf. One function gives the leaves
+  (`checked.appendBoundSiteLeaves`): each binder the lambda of a site
+  captures, in site order and then capture order, where a binder that a
+  `decl` defines is replaced by the binders its value reads (a closure
+  inside the value reads its captures), again by this rule. A promoted
+  local function and a read of a resolved value fold, so neither is a leaf.
+  The rule reads only the template, so the leaves are the same at every
+  instance. The literal requirement computation types the requirement
+  with it, and the
+  `codeInventories` slot records it per call (`BoundCall.leaves`). Boxy
+  binds the leaves from that record, and debug builds check
+  that each slot the reifier makes at a closing use reads a leaf
+  (`Walk.Inputs.call_leaves`). A leaf that no slot of an instance reads
+  (normalization dropped the read) is bound and not read.
+- The edges of the requirement computation that hold roots are the
+  closing uses: an edge where the tuple
+  mentions no variable that the edge's scheme (or a generalized local scope
+  around the edge) quantifies holds a root, any other edge forwards the
+  requirement. This is not the literal rule (a literal's root needs a type
+  with no variable at all): a closing use can leave a variable that no
+  scheme quantifies, such as an open row that only an annotation's closed
+  union met, and lowering seals it (its row default, else the empty tag
+  union) as it seals every such variable of the use.
+- The root is a `literal_argument` root whose `LiteralArgumentRoot.site.kind`
+  is `bound_call`. Its `checked_type` and `ty` are the call's result type
+  at the edge, the result of the first part of the tuple. `requirement_ty` keeps the closed tuple,
+  whose leaf types Boxy reads. A root whose value holds a function is
+  validate-only, as for a literal.
+- The reifier reads the own bound requirements of each scheme instead of
+  computing generic calls. At a closing use it describes the call's sites
+  as before, and the description step attaches the call's bound entry (its
+  slots and first slots) to each root whose edge is that use
+  (`CodeOutput.root_bounds`, root to `bound_entries` index, sorted by
+  root; `CodeOutput.rootBound`). It finds the entry by
+  following the root's requirement chain: a forward entry of the table moves
+  to the table it holds, and an edge to a generalized local function stays
+  in the table of the template whose body holds the function. A root with no
+  closing use the reifier can describe is refused there with the report the
+  use already has; the compilation then fails, so no lowering reads a root
+  with no entry. Debug builds check that each such root has an entry when no use was
+  refused.
+
+Boxy:
+
+- Root evaluation: the root's entry wrapper walks the edge chain
+  (`lowerLiteralArgumentRoot`, `enterEdge`) and, where the chain ends at the
+  call, lowers the call as an ordinary call in that frame
+  (`Builder.bound_call_lowering`). The value is the `Code.Bound` the
+  translator returned, with no inputs.
+- Each frame of a chain holds the Code instance table of the use that
+  entered it (`AliasScope.instances`): the closing use's table, or the
+  forward entry of the outer frame's table, and for a generalized local
+  function the table of the template whose body holds it. A Code site that
+  the chain lowers reads the innermost frame's table. The frame of an exact
+  procedure alias has no sites, and it keeps the word of the use that
+  entered it (`AliasScope.alias_instances`): the alias's forwarded lookup
+  passes it to the procedure, or to the next alias, where the description
+  step keyed no table at the lookup (`chainUseInstanceWord`). This is the rule
+  `aliasChainInstance` applies outside a chain, which also gives the word
+  to a dispatch edge's chain frame of a method bound to an alias.
+  test/cli/StagedBoundGenericAlias.roc and
+  test/fx-open/code_bound_open_requirement_alias.roc run these chains.
+- A bound requirement's hidden parameter is not the root's zero-argument
+  thunk. It is an immortal erased callable of `WorkerKey.code_bound`
+  (module, root) that takes one argument, the tuple of the call's leaf
+  values, and returns the `Code.Bound` with its inputs. Its argument type is
+  the closed leaf part of `requirement_ty`. Its body enters the root's edge
+  chain as the wrapper does (the encoders of encoded slots read the frame's
+  dictionaries), binds the leaves from the argument, restores the stored
+  value (or reads the root's slot while it is pending, or lowers the call
+  where the root is validate-only), and builds the inputs from the root's
+  `root_bounds` entry as `bindCodeInputs` does.
+- A generic body reads the call by building the tuple of its leaves at its
+  own types and calling the parameter (`lowerInstanceBound`). The callee
+  reads the argument at the closed types: both sides compute one layout
+  from the same descriptors. A forwarded argument passes the enclosing
+  scope's own callable.
+- A stored function carries the table of the use that made it
+  (`stored_fn` tag `code_instances`) and its bound callables as it carries
+  literal arguments (`stored_fn` tag `code_bound`).
+- An instantiation checking recorded no edge for (a literal thunk's case)
+  has no closing use, so no table and no slots. A platform requirement with
+  a sealed solution is no such instantiation: its edge in the app is its
+  closing use (see "Code Instance Tables"). A constant is not generalized,
+  so a generic bound function stored in one has the constant's one use as
+  its closing use, and a function that a block generalized is refused
+  (`instance_in_local_generic`, or the capture report where the call reads
+  a value of the block).
+- A dispatch edge is a `node` edge, a method call's own target included.
+  A chain frame entered through it passes the table of that edge, or the
+  forward entry of the frame's table (see "Code Instance Tables").
+
+Monotype keeps one root per specialization: the specialization that fixes
+the call's type lowers the call as a literal root of its program
+(`stepBoundInstance`, `literalRootRead`) and reads the slots from the table
+on its evidence. The root's identity holds the instance table of the
+closing use next to the call and its result type (`boundRootIdentity`): two
+closing uses can give the call one result type and different site types,
+and each has its own value. The checked roots are the `.boxy` evaluator's.
+
+A bound root's value is part of the holder module's evaluation output, so
+it is cached with the module. The module's cache key hashes the keys of
+its direct imports, so an edit to any module
+the holder reaches, the translator's and those of the functions the call
+reads among them, evaluates the root again.
 
 #### Function Values
 
@@ -15635,8 +16943,9 @@ and Per-Module Output is the invariant that makes it possible:
   extended with the compiler version, the opt level, and the target
   (`compile.boxy_interface`, `Digests.objectInput`): the content hashes of the
   checked modules it was built from (the module's own checked entry key, which
-  covers its imports' keys) and its evaluation output, together with its name
-  in the link. It is never a hash of a derived table: evidence, worker
+  covers its imports' keys) and its evaluation output (which holds the Code
+  descriptions it restores, Code Instance Tables), together with its name in
+  the link. It is never a hash of a derived table: evidence, worker
   signatures, ownership signatures and layouts are functions of those checked
   modules, so their keys already cover them. A key names one file.
 - An edit to a module changes its checked entry key and therefore the key of
@@ -18356,7 +19665,9 @@ The demand of a variable is one of three values, the same scale
   mentions the variable (lambda sets are program-specific), an argument of a
   builtin whose representation follows its argument's structure (`FieldNames`,
   `FieldName`, `ParseTagUnionSpec`, `Iter`, `Stream`), a variable used as a row
-  extension, and a variable the scheme's root type does not mention.
+  extension (directly, or as the record-row argument of an alias or nominal
+  application, which `CheckedTypeVariable.record_row` records), and a variable
+  the scheme's root type does not mention.
 
 A template's demand vector is a per-component on-demand analysis
 (`TemplateDemandPass`): the first consumer that needs one claims the strongly
@@ -18532,13 +19843,17 @@ A top-level method binding whose callable no procedure stands behind
 never forwards) is a method whose value is computed: the registry's target is
 the binding's own callable-eval template (`MethodTargetKind.callable_binding`),
 whose compile-time root evaluates the function value. The binding is a value,
-so it is monomorphic: the target carries no scheme, no evidence, and no
-alias, and its callable type is the template's root in the declaring module's
-store. A dispatch calls the value exactly as a call of the binding by name
-does: Monotype restores the stored value at the call (a value call, which a
-capture-free value makes a call of a known function), or lowers the root's
-wrapper body in place where this program evaluated no root; Boxy restores it
-through `restore_callable_eval` and makes an erased call. A Boxy dictionary
+so it is monomorphic in its own module: the target carries no scheme, no
+evidence, and no alias, and its callable type is the template's root in the
+declaring module's store. A use in another module instantiates each type
+variable the value's type leaves open, as a use by name does, so its edge
+records a substitution of the entry wrapper's scheme. Monotype reads the
+target's scheme from that wrapper. A dispatch calls the value exactly as a
+call of the binding by name does: Monotype restores the stored value at the
+call (a value call, which a capture-free value makes a call of a known
+function), or lowers the root's wrapper body in place where this program
+evaluated no root; Boxy restores it through `restore_callable_eval` and makes
+an erased call. A Boxy dictionary
 or descriptor that names such a method holds its erased entry worker
 (`WorkerKey.callable_eval_entry`), which restores the value when called,
 never the value itself: the value may hold the owner's descriptor (a computed
@@ -19377,6 +20692,23 @@ checking, and during requirement derivation for compiler-generated edges. The
 registry only ever answers exact lookups after the owner is known from checked
 type content or from a live cell's content; no stage asks "which owners could
 match this constraint?".
+
+A Code instance table (see "Code Reification") travels as evidence does. A
+specialization of a template from a closing use carries the use's table on
+the root frame of its evidence chain (`EdgeEvidence.instances`,
+`EvidenceChain.instanceTable`). The draft and sealed template requests and
+the queued specialization job keep it, and a forward use inside the template
+passes on the nested table its entry names (`instancesForUse`). An evidence
+target that a node edge selects carries that edge's table
+(`SpecEvidenceTarget.instances`), and a codec contract call carries the
+table of its `derivation_call` edge. An instance
+site restores the node of its entry in the table in force
+(`restoreCodeSiteAtNode`). A template with an inventory requested with no
+table is a compiler invariant.
+
+Boxy lowers the template once and passes the table as a hidden instance
+word, composed by the caller from the use's table, or taken from the
+enclosing word's entry at a forward use ("Code Instance Tables").
 
 ### Iterator `for`
 
@@ -20613,6 +21945,11 @@ exactly when the site is in a compile-time root's own expression (not in a
 function it calls or defines) and checking left the site a pending diagnostic,
 so the evaluator reports the site's empirical failure whichever strategy
 lowered the root; every other failed test ends in `runtime_error`.
+
+In debug builds the emitter checks that its statement count stays within a
+linear bound of the pattern node count (`LINT_MULT` and `LINT_BASE` in
+`src/postcheck/match_tree.zig`). The count leaves out statements of bodies and
+guards.
 
 Named record-rest binders are derived values, not durable pattern decisions.
 Monotype pattern lowering removes the rest binder from the record pattern,
@@ -23287,6 +24624,17 @@ so the join value carries one intact unit and a later dismantle in the join
 body starts a claim set of its own. Without a claimable stored unit the spent
 value stays dead past the join.
 
+Two reads of one place can be live on the same path: ARC releases a field
+that dies on one branch through a new read from the dismantle root, while an
+older read of the same place lives on past the join. The release spends some
+slots of the place in its container, so the older read cannot claim the whole
+place when the join quotients it. It claims the slots that the container still
+holds, and the spent slots become its own claims: the join value carries the
+place as a residual shell, which agrees with the shell that ARC writes on its
+reads after the join. This applies when the join value reads the place
+directly from its unit-holding container, or through views of it. In every
+other case the claim fails as before.
+
 #### Per-edge aggregate residuals
 
 Field ownership is not a property of a container local for its whole lifetime.
@@ -23447,12 +24795,12 @@ against the borrow typing rules:
   the name count; balance divergence across mode-identical entries is itself a
   finding—per-iteration accumulation),
   so certification of every procedure runs to completion
-- an intermediate aggregate field read needed to claim a selected field
+- an intermediate aggregate field or payload read needed to claim a selected field
   keeps its carrier local across inner-join frames as well as join summaries.
   Retaining only the anonymous value preserves a liveness proof but loses the
   exact ownership path when the enclosing loop is summarized again. Copying
   reachable frame values therefore also copies the carrier bindings of their
-  payload sources, including field reads defined inside an exited region.
+  payload sources, including field and payload reads defined inside an exited region.
 - no join discards a lifetime proof; a group-count threshold must never
   discard provenance and manufacture a borrowed entry with no owner. Valid
   incoming paths with different lenders join to a value that needs every one
@@ -23757,6 +25105,12 @@ The first two conditions are one more monotone bit per local in the ARC
 solver—born unique, destroyed by any flow edge that can add a holder—
 over the same alias and call edges the solver already walks. The third is a
 query against liveness state emission already maintains.
+
+A low-level argument at a `retain_args` or `result_shares_args` position
+loses its uniqueness. A `result_shares_args` op (`str_split_on`,
+`str_split_first`, `str_to_utf8` and the others) increments the argument's
+count inside the builtin for each handle it puts in the result. Thus it adds
+a holder that the unit masks do not show.
 
 `RcEffect` gains one more explicit mask, `result_unique`: the result's
 outermost allocation has count 1 on return. Mutating ops qualify on both of
@@ -25000,6 +26354,852 @@ Roots that finish before the slow threshold therefore pay only monitor setup and
 signaling overhead, not the reporting period. Roots that exceed the threshold
 are reported, then the worker waits interruptibly until the next per-root report
 deadline or finalization stop.
+
+## Code Reification
+
+A function that stands where the type says `Code(f)` becomes a description of
+itself, which a translator (ordinary Roc, run while the compiler runs) reads.
+The word "reification" here is this feature. It is not the banned
+compile-time-value term (see "Source Parsing Boundary"). A described function
+is an ordinary constant in `ConstStore` once it exists. The design and the
+rules are in `roc-reify-proposal.md`, `roc-reify-normal-form.md` and
+`roc-reify-normalization-plan.md`. The user page is `docs/langref/reifying.md`.
+
+| Stage | What it does with a description | Where |
+|---|---|---|
+| Checking | Types a function at a `Code` position as usual, records a `CodeReificationSite` (and each identity call in `code_identity_uses`), and rejects a `Code` anywhere except a parameter of the annotation's outermost function or what that function returns (see the position rules below). The module index gives each site and identity call the code-site bit, so `CheckedBodies.exprData` reads it as `.code_site` before and after evaluation | `src/check/Check.zig` (`stagedCode`, `checkStagedCodePositions`); `ModuleIndex.isCodeSite` |
+| Slots | `codeCuts` (the cut table of each nominal's `code_primitives`, with its problems as data) and `codeInventories` (instance sites, per template its inventory, recipes, generic bound calls and their leaves, inventory refusals as data). Pure functions of sealed data, computed on first demand, never cached, never reporting | `src/check/code_analyses.zig`; `moduleCuts` and `planModule` in `src/check/code_reifier.zig` |
+| Description step | The first step of compile-time evaluation of each module whose code output is `pending`. Walks each site's checked bodies, solved types and dispatch plans, builds the normal form with `src/reify`, writes each `Code` value into the module's `ConstStore`, and records it in the module's `CodeOutput`. It walks a site once, or, for an instance site, once per closing use, in the module of the use (see the instance invariant below). A refusal is one `staged_code` problem in the module's problem store, and the site, identity call or closing use keeps its CIR shape: `CodeOutput` records it as refused | `describeModule` in `src/eval/code_descriptions.zig` |
+| Lowering | Restores the node `CodeOutput` records for the site as a constant, or, for an instance site, the node the instance table in force names. It walks no function. A refused site, identity call or closing use lowers to a crash that carries `checked_error`, in place of the expression; its operands are not evaluated | `.code_site` in `src/postcheck/monotype/lower.zig` (`restoreCodeSiteAtNode`) and `lowerCodeSite` in `src/postcheck/boxy/body.zig` |
+| Root evaluation | Runs a translator as any other Roc. `Code.refuse_at` lowers to a crash statement that carries a `Refusal`, and compile-time evaluation reports it at the source regions of the node | `src/lir/LIR.zig` (`Refusal`), `CodeOutput.provenance` (`CodeProvenanceTable`) |
+
+The description step is evaluation, not checking: it computes the
+compile-time value of each `Code` site and writes it only into the module's
+evaluation output, which "The Live Checked Module" says only compile-time
+evaluation writes. Checking and the passes that build checked module data write no description, no
+refusal and no instance table, and nothing rewrites a CIR node for a site.
+
+| Rule | Detail |
+|---|---|
+| Who runs it | `finalizeProgram` (both strategies) before any root, `CompileTimeFinalization.finalize`, and the coordinator for a module that finishes with no evaluator (`describeModuleCode` in `commitPreparedModule`). The quiet second specialization never runs it. A cache hit and a reopened checked module have a `complete` output and run nothing. |
+| What it reads | Only sealed data and the code slots of the module and its imports, never another module's evaluation output, so the steps of all prepared modules are independent. They run as one batch on the post-check executor lanes; each step writes only its own module. |
+| Order in a module | cut problems; identity calls in node order; sites in node order; closing uses in node order, then platform requirement uses by requires index, then evidence node and contract call edges; bound inputs in site order. The `ConstStore` nodes it writes come before any root's values, so the ids are deterministic. |
+| `CodeOutput` | `sites` and `identities` (described, with the literal roots the walk read, or refused) by node; `edge_tables` by closing edge (`EdgeKey`: a use, a `for` loop by its body, an evidence node, a platform requirement by requires index, or a contract call by contract and node, with a table or a refusal); `tables` keyed by template and `instantiationKey`, with entries `node`, `forward` or `refused`; `bindings` by bound call (slots, or refused); `root_bounds` by root; `provenance` by site key. Reading a site of an output that is not `complete` is a debug assertion. |
+| Refusals | Reported once, by the description step, into the module's problem store, in every command that evaluates (`roc check`, `roc build`, `roc run`, `roc test`, the LSP). A module whose evaluation reports is never cached, so a warm compilation reports the refusal again (test/cli/StagedRefusalCache). The crash a refusal lowers to carries `checked_error`, so a root that reaches it discards its result and reports nothing more (test/cli/StagedRefusedRootReportsOnce.roc). |
+| Inventories at finalization | Lowering reads the `codeInventories` slot and never computes it. Finalization fills the `codeCuts` and `codeInventories` slots of every module in reach before the batch of description steps, on one thread (`fillCodeInventories`): a cache hit and a reopened checked module included, whose slots are empty until then. The coordinator also fills them when it restores a module from the cache (`finishCachedModule`) and a cached pairing: a Boxy unit started during checking keys or lowers a restored module before finalization runs, and a description step does not read the slots of a restored module it does not use (test "a unit started during checking reads the inventories of a module restored from the cache"). Cost: a module restored from the cache recomputes its inventories, because slots are never cached. The scan is cheap for most modules: a module with no site, no identity call and no inventory in its transitive imports scans nothing (`importsHoldInventories`). |
+
+Two lowering rules depend on these outputs:
+
+- A module unit emits no entry wrapper of an exact procedure alias root
+  (`f = g`, a callable binding whose callable-eval template has a
+  `forwarded_lookup`; `unitEmitsTemplate` and `rootIsProcedureAlias` in
+  `src/postcheck/boxy/lower.zig`). Such a root is never evaluated, and every
+  use calls the procedure it forwards to, so nothing calls the wrapper. Its
+  body can be a use of a template with an inventory at the binding's own
+  variables, which only the binding's uses close, so it would have no table
+  to lower with. The rule reads explicit data; it does not skip a missing
+  table. `roc run --no-cache --specialize=no` builds every module as a
+  module unit, so this applies to every such build.
+- Boxy reads an undetermined field kind whose variable a substitution fixed
+  as the committed kind (`convertedField` in `src/postcheck/boxy/types.zig`):
+  `cloneCheckedTypeRootSubstituting` writes `.undetermined(actual)` where
+  `actual` is a `.field_kind` payload, and that payload is the kind,
+  read before the environment and before the seal rule. So the root of a
+  generic bound call and the call in its holder's frame agree on the field's
+  representation (test/cli/StagedBoundKindVariable.roc).
+
+Value sites (rule "Value Code Positions" in Solver-Mutating Rewrites): a
+value at a `Code(a)` call argument is a `CodeReificationSite` of kind
+`value`, whose `fn_var` is the value's type.
+
+- The site's node reads as `.code_site`. `CheckedBodies.openingValueSite`
+  opens it for the description step, and `CheckedBodies.running` opens a
+  site that a call binds for each pass that reads the code that runs, because
+  the program computes that value where the call binds it.
+- A site that no call binds is fixed while the compiler runs. The walk
+  describes it as a root row with no parameter whose body is the value, and
+  its normal form must be a data literal: a tree of `lit`, `record`,
+  `tuple`, `list`, `tag` and `wrap` nodes (`rootDeliversDataLiteral`). Any
+  other normal form is refused as `value_not_computable` ("Cannot Compute
+  This Value"), with the advice to use a lambda. A site at `Code.Binds` that
+  the checker decided late (`CodeReificationSite.decided_late`) and whose
+  type holds an opaque type is refused as `value_typed_late` ("Value Has No
+  Type Where It Is Written") instead, with the advice to write the type at
+  the value.
+- A site that a `Code.Bound` call binds is one input slot that holds the
+  whole value: a root row with no parameter whose body is `Input`. Its slot
+  names the site (`CheckedCodeSlot.Source.value_site`), and lowering
+  computes the value expression where the call binds the slot
+  (`boundSlotValue` in both strategies). A value whose type holds an opaque
+  type is encoded at `Code.Binds` and refused at plain `Code` (`value_not_bound`,
+  "Cannot Bind This Value"). The root of
+  the call does not evaluate the value (`hoistedRootReachesReifyOnlyCode`).
+- A value is code that runs, so it cannot reach an intrinsic. The report
+  "exists only in reified code" adds "To evaluate it on the server, use a
+  lambda." when the reference or a frame of its chain in the module is in a
+  value site (`ExistsOnlyInReifiedCode.in_value_site`).
+
+Invariants:
+
+- The walk is the only stage that reads a function body for a `Code`. It
+  consumes solved types and dispatch plans and never infers a missing one. A
+  construct with no normal form stops the walk with a named reason, and no
+  partial description exists.
+- A description is a specialization read without lowering, so the walk reads
+  types by Monotype's rules and checking commits nothing for it. A variable a
+  substitution fixes is read through it. A dispatch edge whose target
+  the checker selected (`derived_from_callable`) relates a monomorphic
+  target's type to the edge's callable, which fixes the callable's other
+  variables (`y` in `|x, y| x + y`). A variable still open after that seals
+  to its recorded `numeric_default_phase` by
+  `literal_defaulting.defaultTargetForPhase` (`x` in `|x| x * 2` is `Dec`). A
+  variable with no default (`same = |x| x`), or a dispatcher whose selected
+  target does not fit its callable (`x` in `|x| x * 2.U8`), is refused. A
+  variable that an enclosing template quantifies is never sealed: the site
+  is an instance site, described at each closing use. A dispatcher that no
+  use pins (a parameter of a lambda nothing calls) has the resolution
+  `unreachable`, since no run-time code reaches it. When its variable has a
+  numeric default, the walk reads the method of the default's owner
+  (`defaultOwnerMethod`), the method the sealed variable dispatches to, and
+  relates or refuses it the same way. See
+  `relateSelectedTargets`, `defaultOwnerMethod` and `defaultedVariable` in
+  `src/check/code_reifier.zig`. A record or tag row tail still open seals to
+  its recorded row default by `CheckedTypePayload.variableSealsToRowDefault`,
+  as Monotype seals it (`r` in `|r| r.id > 0` is `{ id : Dec }`), so checking
+  closes no row at a `Code` site. A tag row tail that carries no row default
+  seals to the empty union too, as `lowerCheckedTypeVariable` does, so a tag
+  union the checker left open has the variants the definition names
+  (`collectVariants`). A record or tag row tail that the call being walked
+  fixed is read in the caller's module and frame, and a field or variant that
+  a nearer link already named is dropped (`collectRecordFields`,
+  `collectVariants`). So a helper over `[Cat, ..t]` read at `[Cat, Dog]` keeps
+  `Dog`, and a helper over `{ city : Str, ..r }` read at `Owner` has every
+  field of `Owner`.
+- Each `FramedType` names the frame its variables are read in (`FrameId`,
+  `Walk.frames`). A call pushes one frame that holds what the call fixed, and
+  each binding of that frame names the caller's frame. So a chain of
+  annotated generic helpers over open rows reads each variable at the
+  caller that fixed it, however deep the chain is. `instantiationKey` hashes
+  a binding by its content, and a record binding by its set of fields
+  (labels sorted, each field once, tail last), so a row that recursion
+  rebuilds hashes the same and the key does not grow.
+- A record extended by a record-backed `:=` nominal (see "Record
+  Extension Well-Formedness") has the backing's fields at the use's
+  arguments, as Monotype's `flattenRecordRow` reads it. The walk binds the
+  nominal's declared variables while it reads those field types
+  (`BoundNominal`), and the nominal's name is not kept in the `Ty`.
+- A nominal whose backing the site may read is `Named(name, args,
+  backing)`. `args` are the use's type arguments in declaration order, read
+  before the nominal binds its own variables, and inside the nominal as its
+  backing is: a `Recursive` of its name in an argument refers to it (T1,
+  `Reifier.nominalTy`, `Spelling.partsOf` in `src/reify/types.zig`). An
+  argument the backing does not hold is part of the type, so a phantom
+  parameter (`Id(row) := { table : Str, key : Str }`) tells `Id(Customer)`
+  from `Id(Product)`, and a slot of an `Id` holds only the backing
+  (`slotShape` reads the backing, never the arguments). `widens` reaches the
+  arguments as it reaches the backing.
+- A named `Code` site (a definition passed by name, `owners.filter(f)`) is
+  walked with the evidence the checker recorded on that lookup. The evidence
+  pass writes the use's evidence and substitution for the named site,
+  and the root walk supplies it
+  (`siteEvidence`), as `calledRow` supplies a call's evidence.
+- An instance site is a site whose function type mentions a quantified
+  variable of the template that holds it (D1 of
+  `roc-reify-structural-proposal.md`). It has no `sites` entry in `CodeOutput`. The
+  inventory of a template is its instance sites, plus one forward entry per
+  use inside it of a template with an inventory at its own variables. A
+  closing use is a use of a template with an inventory whose substitution
+  mentions no variable an enclosing template quantifies. For a closing use,
+  the description step of its module builds one instance table: per inventory
+  entry, the node of the site described at the use's instance, or the nested
+  table of a forward entry. Tables are keyed by template and
+  `instantiationKey`, so equal instances share one table, and a recursive
+  template is a graph. The inventories are the `codeInventories` slot of the
+  template's module, and the tables are the `tables` column of the use
+  module's `CodeOutput`. A use is a call, a lookup of the template as a value, or a
+  direct static dispatch to it: a method call, `a == b` on a written
+  `is_eq` and `T.method(..)`, which are keyed by the evidence node they
+  target, and a `for` loop's `iter` call, which is keyed by the loop's
+  body. The inventory scan also reads each compile-time constant
+  body and each top-level binding evaluation computes; a use there at a
+  variable of the binding's own type is closed by the binding's use. It
+  reads each top-level `expect` too, where every use is a closing use. It
+  reads the `evaluated` operands of a checked `runtime_error`: an
+  expression retired because an operand is erroneous (an unresolved name
+  passed at a `Code` position, say) still evaluates its operands up to the
+  erroneous one (see "Erroneous Call Operand Retirement"), so a use among
+  them is lowered and gets its table like any other. A
+  stored function value keeps the table it was built with
+  (`ConstFn.instances`), and a restore puts it on the root frame of the
+  restored evidence. A binding stored at its own type variables keeps none,
+  and the binding's use gives it. A constant whose type its use fixes is
+  computed by its entry template at each use: the constant's body is read
+  at that template's variables, and a use of the constant is a use of the
+  template, whose table rides on the root frame of the evaluation (Monotype)
+  or is the entry worker's instance word (Boxy, see "Code Instance
+  Tables"). A top-level binding that computes a function and is not an
+  exact alias (`pick = if c named_only else named_only`) follows the same
+  rule with its entry wrapper as the template
+  (`Reifier.usedComputed`, `ModuleScan.collect`). Such a binding does not
+  generalize, but a variable its module leaves free is copied fresh at each
+  use in another module, so each importer fixes it at its own type. A root
+  with a free variable is never evaluated (it is not a context-free
+  request), so each use runs the wrapper at its own types, and the use's
+  table is the wrapper's: on the wrapper's root frame in Monotype
+  (`lowerPendingCallableEvalBindingValueAtNode`), and as the wrapper
+  worker's instance word in Boxy (`restore_callable_eval`). A binding whose
+  root holds a stored function has no free variable, so its wrapper has no
+  inventory, and the stored function keeps the table of the use inside the
+  binding that made it. An app binding of this kind that a platform
+  requirement names never has an inventory: its type is the requirement's,
+  and a requirement leaves free only tag rows written `..` (a record `..`,
+  an undeclared type variable, and a `..` in a type declaration are
+  rejected, and a `for` clause variable is the app's declared type), so
+  `Check.closeTopLevelValueRows` closes every such row when the app module
+  finishes checking. `TableBuilder.computedRequirementInventory` asserts
+  this; `test/fx-open/code_site_open_requirement_computed.roc` and
+  `test/fx-open/code_bound_open_requirement_computed.roc` run such a
+  `main!`. An exact alias is not read this way: a use of it
+  reaches the procedure its lookup names, and the lookup takes the table.
+  `test/cli/StagedComputedBinding/` and `test/cli/StagedFragmentComputed/`
+  run such bindings in both lowerings, at three rows from three modules,
+  read by another such binding, and fixed in the module that uses it. The walk reads a lambda written at a site in CIR, through
+  `CheckedBodies.codeSiteLambda`, in its own module and from another
+  module alike. The walk refuses by name: a site that binds inputs
+  (`bound_instance`, "Cannot Bind Inputs In A Generic Function"), a closing
+  use inside a generic local function (`instance_in_local_generic`), and a
+  use whose derived evidence selects a method with an inventory from a type
+  (`instance_through_derived_evidence`, "Cannot Reify In A Method Selected
+  From A Type"). A codec method (`encoder_for`, `parser_for`) and a method
+  of a user format are ordinary holders: the edge that selects such a
+  method describes it (see "Code Instance Tables"). A descriptor method (`is_eq`,
+  `to_hash`, an eligible `to_inspect`) is an ordinary holder too: each
+  edge that selects it, and each type occurrence of its owner, is a closing
+  use of it, or an entry of the template that holds the edge or the
+  occurrence. One whose scheme needs a generic bound call's input binding
+  is refused at the method (`bound_call_in_implicit_method`, see "Bound
+  Instance Roots"). The module that binds the method records the refusal
+  (`CodeInventories.refused_methods`), also when the method is bound to a
+  procedure of another module: the procedure keeps its inventory for its written uses, and each call the
+  compiler makes by type treats the method as a rejected declaration.
+  An edge to a refused method, at any depth of a use's evidence, keeps the
+  method's own rejection at the use: no table describes the method, and a
+  bound root the method's scheme gives the use has no table to bind it.
+  Both lowerings read a refused method the same way on both sides of an
+  edge: Monotype materializes a `direct` checked evidence reference whose
+  key (the dispatcher's owner and the requirement's method) is refused as
+  `checked_error`, as it derives that evidence from the type. The root of
+  a generic bound call at a refused closing use crashes in Boxy, as the use
+  does (`test/cli/StagedFragmentImplicitBoundEvidence.roc`).
+  A use of a primitive with an inventory (a method of a `::` type, D1 of
+  `roc-reify-opaque-proposal.md`) is a use of its template: a description
+  names the primitive, but the program runs its body, so the table reads the
+  definition (`CalleeUse.instance_table`). A body that reads no parameter
+  but holds an inventory entry is no hoisted root, because an expression in
+  it has a type that mentions a rigid variable of the template (see
+  "Compile-Time Constants and Hoisted Roots").
+  A refused use keeps its CIR shape. `CodeOutput.uses` records the refusal
+  by the use node (a `for` loop by its body), and lowering crashes in place
+  of the use with `checked_error`, before any operand: a refused call, value
+  lookup or dispatch is that crash, and a refused `for` loop crashes in
+  place of its `iter` call, before the iterable is evaluated
+  (test/cli/StagedLoopRefusedInPlace.roc). A refusal at a closing use of an
+  imported template is reported in the use's module, at the use, and names
+  the template's source (test/cli/StagedRefusalImportedTemplate). So
+  lowering never specializes a template with an inventory without a table.
+  `ROC_REIFY_INSTANCES` prints each closing use with its table from the
+  description step, and each type occurrence's table of a descriptor method
+  (`reify instances: <method> at <region>`); a table that a table above it
+  already prints, as a recursive table is, is printed by its number only.
+- A `Code` value met inside a walked body (a constant that holds a `Code`, or
+  a `Code` the body passes on) is refused as `code_value`. The report title
+  is the one for the `code_value` rejection, and it names the constant the walk was
+  folding when it met the value (`Walk.constant`).
+- A record field's `presence` in `Code.Ty` is `Required`, `Optional`,
+  `Default(Value)` or `DefaultComputed` (D5). A field with a default (`??`)
+  is `Default` of the `Code.Value` of its default where the walk describes
+  the default as a literal, or as a list, tuple, record, tag or nominal of
+  literals, read in the module that declares the default
+  (`CheckedBodies.defaultExpr`, `Reifier.fieldDefault`). A name is the
+  value its constant holds, unless it is a primitive (a constant of an
+  opaque type). Any other default is `DefaultComputed`: a call, a literal
+  of the author's own type (its conversion call), a value of an opaque
+  type, or a record that leaves out a field the type does not fill (an
+  optional field, or one whose default is computed). The translator's cut
+  does not change a type. The default is part of the type (`types.Member.default`,
+  `Types.values`), so two nominals that differ only in a default are two
+  types.
+- A `Record` node sets every member of its type, or, where the type marks a
+  member optional, lists the members it sets in `aux` (`ir.RecordForm`). A
+  record literal that unsets or omits an optional field, and a record pattern
+  rest or an update over a record with an optional field, are described this
+  way. A record literal that leaves out a field whose presence is
+  `Default(value)` sets the member to the literal of the value
+  (`Reifier.valueRef`, Q18 of `roc-reify-structural-proposal.md`), as the
+  program fills it when it runs. One that leaves out a field whose default is
+  computed (`DefaultComputed`) is refused, and the report says the default is
+  computed. A member the subject may lack is read by a switch on its `OptField`
+  `Try`, so the description decides what Roc decides at run time.
+- A derived `==` over a record (`Reifier.eqOver`) is `And` over its fields in
+  label order (`sortFieldsByLabel`), the order Monotype gives the fields,
+  whatever links the checker made in the row. A field whose
+  `CheckedFieldKind` is `optional` is never read with `Field`: its value type
+  is not the type of what the record holds. Monotype stores the field as the
+  tagged slot `[#Missing, #Present(value)]`, and its derived `is_eq`
+  (`EqDeriver`) compares that slot as every tag union. The walk compares
+  the `OptField` `Try` of each operand the same way
+  (`Reifier.optionalFieldEq`): a switch on the left `Try`, and in each arm a
+  switch on the right one. Two `Ok` arms compare the values at the field's
+  value type, two `Err` arms are `True`, and the other arms are `False`. So
+  two records that both do not hold the field are equal there. `!=` is
+  `Bool.not` of this, and a nested record, a tag payload, a nominal backing
+  and the item comparison of a `List.is_eq` reach the same arm. A derived
+  `to_hash` over a record that holds an optional field is `Derived`
+  (`Reifier.hashOver`), as it is over every tag union, because only the
+  compiler's widths and order agree with the Roc side.
+- A literal of the author's own type whose conversion is a Roc function is a
+  `Call` of that function's row. A `from_numeral` row takes the `Num.Numeral`
+  the compiler builds from the digits of the literal, as one `Code.Lit`
+  `Numeral` at the type of the row's parameter (`numeralArgument`). The value
+  is the one Monotype builds (`lowerNumeralValue`). A conversion that is a
+  builtin or a function in the cut is a `Prim` over the same literal, at the
+  type of the first parameter of the callable the checker solved, so the
+  argument matches the `Prim`'s signature. An integer type's `from_numeral` and
+  the accessors of `Num.Numeral` are in the builtin table, and no rule folds
+  them. The conversion's `Try` is read as the
+  checker reads it: the `Ok` payload is the value, and an `Err` is a crash
+  of kind `rejected_literal` (`ir.CrashKind`), because the compiler wrote it
+  and not the author. Rule N13w of the normal form drops the tests that only
+  lead to such a crash, and keeps every crash the author wrote.
+  A `Str` literal with an interpolation is the `Str.concat` chain of its
+  non-empty segments and its values, as lowering writes it once
+  (`partsExpr`): its assembler is not called. A custom `from_interpolation` is
+  walked by its definition where the literal stands, with the segments as a
+  literal list: the lambda its `Ok` holds is a closure of a row, and the
+  literal is that row called over its captures and an iterator over the
+  interpolated values, the `iter` call on their list that the checker planned
+  (`CheckedInterpolation.iter_plan`), as lowering builds it. A builtin the
+  stage calls that hands back a function (`Str.from_interpolation`,
+  `Try.map_ok`) is walked by its Roc definition, and a lambda the stage
+  applies is walked where it is applied. A conversion in the site's cut is
+  one `Prim` over the segments and the list of the values.
+- A lambda the checker generalized where it is written (a parameter that only
+  a method call reads, as `|values| values.with_index()` in
+  `Str.from_interpolation`) has a dispatch scope of its own
+  (`localScheme`), and the checker records on the lambda the substitution
+  and the evidence of the instance its place gives it (`siteSubstitution`,
+  `siteEvidence`). The walk reads the lambda at that instance
+  (`closureAt`, `instantiationOf` with no type to match), as Monotype lowers
+  it at the function type its place requests. It reads no type from the
+  place itself.
+  The walk reads no shape of the stage to find its rejection: the `Err` of the
+  stage is the conversion's crash, and N13w acts on the graph. One that can
+  leave its body early with `?` is refused.
+- A binder's name in a description is the identifier the canonicalizer
+  recorded on its pattern in CIR (`Reifier.binderName`), never text read
+  back through the pattern's region.
+- A lambda written at a `Code` position is described rather than lowered, so
+  no template lowers it. The template ref seal collects its parameters and
+  body on their own (`collectStagedLambda`, `StagedLambdaRefs` in
+  `TemplateIteratorRefs`), with the template whose body holds it as its
+  owner, in the scope that holds it. The evidence pass resolves each
+  dispatch plan inside it and writes the use-site evidence and substitution
+  of every call inside it in the chain of that owner, as it does for a named
+  function's body. A lambda with no owner, such as one in a defaulted field,
+  has no enclosing template params. The walk reads what each call fixed an
+  unannotated callee to from that entry (`siteSubstitution`,
+  `siteEvidence`), never from the lambda's types. So a dispatch on a type
+  variable of a query fragment (`|x| x.t.now()`) is `evidence_dependent` on
+  the fragment's evidence param, and the walk at a closing use reads its
+  target from the evidence that the use supplied (`Site.enclosing`).
+- A lambda written at a `Code(f)` position checks against `f` in the channel
+  a plain function argument checks against its parameter type: its nested
+  expected type is `f` as the contextual type, in the position's context
+  (`beginExprCheckFrame` in `src/check/Check.zig`). At a call argument
+  (`fn_call_arg`) whose `f` is known, `seedLambdaParamsFromExpectedFn` relates
+  the lambda's parameters to `f` before the body is checked, as for a plain
+  lambda argument, so a field read and a method call on one parameter
+  (`o.c.id` and `o.c.id()`) both resolve. This is the existing seeding path,
+  not a new rewrite. The node's own var is still fresh and takes the `Code`,
+  and `finishBeforeBoundary` relates the function to `f`
+  (`staged_code_fn_var`). A method call on a receiver whose type is not known
+  when the lambda is checked gives no `f`, so it seeds nothing (the hint in
+  `test/cli/StagedUnannotatedReceiver.roc`). Accepted side:
+  `test/cli/StagedFieldAndMethod.roc`.
+- A root whose checked expression holds a checking error
+  (`CheckedBodies.exprContainsDiagnosticError`, a body analysis slot; for a
+  lambda site, its body) is refused by `rootSite` with the rejection
+  `checking_error`. The description step records its site or closing use
+  as refused and adds no report of its own (`appendStagedCodeRefusal` in
+  `src/eval/code_descriptions.zig`), because the checker has reported the
+  error. See `test/cli/StagedCheckingError.roc`.
+- A call to an unannotated generic helper from another unannotated helper
+  reads the callee's evidence through the caller's own: an evidence entry that
+  forwards to the caller's evidence is resolved against the evidence the walk
+  holds, as Monotype does through its evidence chain (`supply` in
+  `src/check/code_reifier.zig`).
+- A `Code` position is read off the annotation the user wrote, not off the
+  solved type. A `Code` is allowed as a parameter of the annotation's outermost
+  function, and as what that function returns. A transparent alias of a
+  `Code` is a `Code` position (`stagedCode`), and an alias used in any other
+  place is rejected. A callback's parameters and a record field of function
+  type are rejected (`rejectMisplacedStagedCode`). A call is a template call
+  only when the callee's own return type is a `Code`
+  (`claimOrRejectCodeCall`), so a generic function that hands a `Code` back is
+  an ordinary call. Each site records the definition or top-level `expect`
+  that owns it, and `poisonUndescribableStagedCode` retires that owner when
+  the site's function type holds an error.
+- A site's cut is explicit data, never a guess about which functions a
+  translator knows (I14 of `roc-reify-normalization-plan.md`). The checker
+  records the call a site is an argument of, a direct call or a method call
+  (`CodeReificationSite.translator`, from the argument's `fn_call_arg`
+  context in `translatorCall`). A method call checks its arguments against
+  the method's parameters only after its dispatch is planned, so the walk
+  reads the method from that plan's target, never from the method's name
+  (`translatorFunction`). A `code_primitives` item of a nominal has the
+  type `List(Code.PrimId)`: `finishDef` in `src/check/Check.zig` unifies the
+  item with that type under the context `code_primitives_item`, and a
+  mismatch (the old tuple form) is a type error whose hint says to wrap each
+  entry in `Code.prim`. This is constraint generation on the item, not a
+  rewrite of the solved graph. The `codeCuts` slot (`moduleCuts`) reads the item as a list literal,
+  directly or through a top-level constant of the same module, and each
+  entry as a `Code.prim` call that the checker recorded (or a constant that
+  holds one). It resolves the recorded argument of each call, one lookup of a
+  function defined as a lambda or of a top-level constant, each once, and
+  records the lookups in `CodeCutTable`; any other entry is a problem at the
+  entry, which the slot keeps as data (`CodeCuts.problems`) and the
+  description step of the declaring module reports as `staged_code`, and an
+  item that is no list is `primitives_not_a_list`. An entry that names a primitive (a
+  definition of the builtin module, or an operation of an opaque type, see
+  the next item) is the problem `primitive_already_primitive`: a cut lists
+  only what is not a primitive already. The walk resolves the translator to
+  the nominal that has it as an associated item and reads that nominal's cut
+  from the table of the module that declares it (`Walk.useCut`). A callee
+  whose module and body are in the cut is a `Prim` named by the nominal and
+  the item (`inCut`, `qualifiedName`), and a constant in the cut is a `Prim`
+  with no arguments; every other function and computed value, in any
+  package, is walked. The site's rows are keyed by what its walk built, so
+  two sites with different cuts share no normal form they do not both build.
+- One step classifies every definition a description reaches, the same in
+  the direct-call path (`resolvedTarget`), the method-call path
+  (`methodTargetCallee`) and the constant path (`foldedConstant`):
+  `primitiveOf` in `src/check/code_reifier.zig`, asked of the reader of the
+  module that defines the definition. It reads only explicit data: the
+  module's role, the nominal's opaque flag and builtin origin, the module
+  that declares the nominal, and the definition's checked type.
+
+  | Definition | Primitive | Name |
+  |---|---|---|
+  | An intrinsic (`AnnotationOnlyKind.intrinsic`), function or constant | yes, whatever the site's cut says | `qualifiedName` |
+  | A function of the builtin module | yes | its export name (`Str.concat`) |
+  | A constant of the builtin module | no: it folds | |
+  | A function or top-level constant whose checked type mentions, at any depth (parameters, result, fields, payloads, type arguments, `where` method types; never a nominal's backing), a nominal declared with `::` by the module that defines it | yes, except in the walk of a value site no call binds (see "Value Code Positions") | `qualifiedName` (`Time.is_before`, `Cal.parse`) |
+  | Anything else (`Time.days_in_week : U8`, `Util.double` of `Util :: [].{..}`) | no: in the cut it is a `Prim`, otherwise walked | |
+
+  An intrinsic has no body, so each path classifies it before it asks for
+  a body (`intrinsicCallee`, `intrinsicOfTemplate`, `intrinsicConstant`).
+  Its `Prim` carries the evidence of its own `where` clause. The walk never
+  asks for an intrinsic's body: the `.unimplemented` arms that would read
+  one assert this in debug builds. An intrinsic has no inventory, an
+  intrinsic used as a value is refused as a cut member used as a value is,
+  an intrinsic named as the function to describe is refused, and a cut
+  that lists one is `primitive_already_primitive`. A translator sees no
+  difference between the `Prim` of an intrinsic and any other `Prim`: it
+  carries the same fields, and the normal form is the same.
+
+  A primitive function is a `Prim` over its arguments, and a primitive
+  constant is a `Prim` with no arguments. One definition has one name
+  whichever path reaches it, because `Builder.declaredPrim` keys it by
+  `ir.Definition` and every path names it by `qualifiedName`. A package
+  primitive is not in the builtin table, so it gets no law, no fold and no
+  speculation. Its body is never read in a description of code, so a value
+  of an opaque type is built only by a primitive; a walked body that builds one from its fields is
+  refused with a message that names that fix (`nominalExpr`, `recordExpr`).
+  The design is `roc-reify-opaque-proposal.md` D1 and D3.
+- Each `Prim` carries its `Code.PrimId`, and each `Opaque` carries its
+  `Code.TypeId` (D4). Both are 128-bit hashes of the identity the compiler
+  already keys them by, made only in `src/reify/identity.zig`:
+
+  | Identity | Hashed |
+  |---|---|
+  | builtin primitive | owner and method (`Str`, `concat`) |
+  | package primitive | `ir.Definition`: checked module digest of the module and the definition |
+  | builtin nominal | the name a `Ty` spells (`Dict`) |
+  | declared nominal | `types.Declaration`: content identity of the module and the declaration |
+
+  A builtin opaque `Ty` is spelled as the owner of its primitives (`Dict`,
+  `Box`), not `Builtin.Dict` (Q10). This holds for every nominal the
+  builtin module declares, also one the checker does not mark as a builtin
+  (`CheckedBuiltinNominal`), such as `Hasher` or `Code.PrimId`. The walk
+  knows such a nominal by the role of its declaring module
+  (`ForeignLookup.resolve_builtin_module`, keyed by the content identity of
+  the module), not by its name. `Code.prim(f)` and
+  `Code.type_id(proxy)` are intrinsics (`code_prim`, `code_type_id` in
+  `src/canonicalize/BuiltinLowLevel.zig`), and so is `Code.ty_of(proxy)`
+  (`code_ty_of`, D6 of `roc-reify-structural-proposal.md`), the `Code.Ty`
+  of the proxy's type, which equals the `result` of `|x| x` at that type. The checker does not check or
+  instantiate the argument of `Code.prim`, so a generic function with a
+  `where` clause can be named; it records each call in
+  `NodeStore.code_identity_uses`. An argument that is no lookup of a
+  top-level or imported definition is `prim_not_a_definition`, unless
+  canonicalization already reported it as a runtime error, and an
+  identity intrinsic read as a value is `identity_not_called`. A retired
+  identity call evaluates no operand: `appendEvaluationOperands` in
+  `src/check/Check.zig` never lists the identity callee, nor the argument of
+  a one-argument call, so the runtime error that replaces the call never
+  lowers the intrinsic as a value. The description step
+  (`describeIdentities` in `src/check/code_reifier.zig`) computes each call's
+  id with the same functions the emitter uses, and records its constant node
+  in `CodeOutput.identities` by the call node, so Monotype and Boxy restore
+  it as any other constant. `Code.ty_of` converts the proxy's type with the walk's
+  `tyOf` and writes the `Code.Ty` with the emitter (`Reifier.tyOfProxy`). A
+  proxy whose type is not a nominal fixed at the call is
+  `type_id_not_nominal`; a `Code.ty_of` proxy whose type holds a variable
+  the call leaves open is `ty_of_not_closed` ("Type Not Fixed"), and a type
+  the walk has no description for is the walk's own refusal. A
+  `Code.type_id` or `Code.ty_of` call whose proxy type mentions a quantified
+  variable of the template that holds it is an entry of the template's
+  inventory, as an instance site is (recipe kinds `type_id` and `ty_of`,
+  Q8): each closing use computes it at the use's instance, and a refusal is
+  reported at the use. `describeIdentities` skips these calls: the
+  `codeInventories` slot holds them.
+- Each `Prim` carries `evidence`: for each `where` requirement of the
+  primitive's scheme, the method the checker chose at the call (D7,
+  `Code.Evidence` and `Code.Target`). The order is the template's evidence
+  params (`CheckedProcedureTemplateTable.evidenceParams`), with a constraint
+  alias expanded. The walk reads the recorded evidence: the call's
+  `siteEvidence` in the direct form, the dispatch edge's `nestedEvidence` in
+  the method form, and `supply` for an entry that forwards to the enclosing
+  call's evidence. It plans nothing:
+
+  | Recorded resolution | `Target` |
+  |---|---|
+  | `direct` | classified by `methodTargetCallee`: `Prim` with its own evidence, or `Row` of the walked method |
+  | `constraint` | through `supply`, then as `direct`; an `independent_callable` slot through `sharedTarget`, whose target has no requirement of its own. A `Row` target there is built at the instance the dispatcher fixes (`methodTargetCallee` with `.receiver` fixing, `receiverInstantiation`), because the use relates the target to its own callable, whose first parameter is the dispatcher; a non-row variable only the rest of the callable fixes is refused ("a generic method this receiver does not fix") |
+  | `structural` | `Derived(method)` |
+  | `unreachable_value` | `Unreachable` |
+  | none, because the compiler's own derivation reached the primitive (a derived `==` reaching `List.is_eq`) | the receiver fixes each requirement's dispatcher (`receiverEvidence`), and `receiverEntry` resolves it by the checker's rule for that type (the checker's dispatcher resolution step, Monotype's `synthesizeComponentEvidenceAtNodeForPurpose`): a nominal's registry target through `receiverMethod` and `methodTargetCallee`, as `dispatchTarget` reads a derivation-reached dispatch; a structural registry target, or a structural shape whose requirement permits a derived equality or hash, is `Derived(method)`. A type variable, a composite dispatcher, a method no registry in reach declares, and a codec or map requirement on a structural shape are refused by name |
+  | `from_callable`, `from_scheme`, an edge whose nested evidence is `from_callable`, or a `constraint` no walked call answers | refused: "a call whose `where` evidence the compiler did not record" |
+
+  In the IR the evidence is the prim node's `aux` words (`ir.EvidenceWords`,
+  `src/reify/ir.zig`), so it is part of hash-consing, equality
+  (`src/reify/equal.zig`) and the digest (`src/reify/digest.zig`). A row it
+  names is referred to as a `Closure` of the row is: it is an edge of the
+  `references` graph, `mergeInto` renames it, N8f gives it a convention row,
+  and `number.siteRows` emits it, so it stays a row in every view.
+- A row that holds a `Return` in a loop or in a switch arm is not inlined, in
+  the `graph` view and in the `inline` view, because inlining it would make
+  the caller return the value of the callee. A `Return` in a lambda body ends
+  the lambda and does not count (`Returns.holds` in `src/reify/live.zig`,
+  used by `src/reify/views.zig`).
+- A refusal by `Code.refuse_at` carries the calls the refused node was inlined
+  through as structured frames (`RefusalCall`, `src/check/problem/types.zig`).
+  A frame in the reporting module keeps its region, so the report places it
+  through the same mapping as every other region of that module, including the
+  mapping of a synthetic root. A frame in another module carries the path of
+  that module's file and the line and the column (`SourcePlace`), and so does
+  the refused source when it is in another module. Every frame and the source
+  print as `path:line:col`. The path is the one the coordinator records on the
+  module's env (`ModuleEnv.source_path`); a module no file holds is named by
+  its qualified name (`ModuleEnv.diagnosticSourceName`). No second line-shift
+  mechanism exists.
+- A refusal by `Code.refuse_at` of a `Prim` node names each intrinsic that
+  the `Prim` names, its own and each one its evidence names, with one line
+  per intrinsic: it has no Roc body, and a translator binds it by id, as it
+  binds a builtin. The translator writes no code for this line, and the
+  `Prim` has no field for it. `Builder.declaredPrim` records on the
+  primitive whether its definition is an intrinsic (`ir.NamedPrim.intrinsic`,
+  from `ForeignName.intrinsic`), and no rule, digest, numbering or view
+  reads that bit. `provenance.emitted` writes, per node, the names of those
+  intrinsics next to the node's origins, `CodeProvenanceTable` keeps them
+  (`intrinsicsOf`), and `reportRefusal` copies them into the
+  `TranslationRefused` problem. The report never reads the translator's
+  message.
+- A refusal by the walk carries the module whose source holds its region
+  (`Rejection.module` in `src/check/code_reifier.zig`). The walk records that
+  module where it enters a body or an expression of a module (`Walk.body`,
+  `Reifier.enter`), never from the offsets. A refusal in another module's
+  source is reported in that module's file, by the path the coordinator
+  records on its env (`ModuleEnv.source_path`), and the report names the site
+  in the reporting module that reached it (`StagedCode.foreign`). A refusal
+  in the site's own module but outside the site's region, in a helper the
+  site calls, also names the site that reached it.
+- The normal-form version, `normal_form_version` in `src/reify/mod.zig`,
+  changes exactly when the rules, the builtin table or the speculatable lists
+  change. A fingerprint test pins it. `Code.version` carries it, so a
+  translator can key a cache with it.
+- A loop has one of three forms, `ForRange`, `ForList` and a general `Loop`
+  (`src/reify/loops.zig`). A row whose every call to itself is a tail call
+  becomes a `Loop` whose `Break` delivers the row's value (N12). The loop rules
+  rewrite one loop per round as a hook on the rebuild: slots and outputs
+  first, then the kind. A general `Loop` has outputs of its own, so `Break`
+  has one value per output and `Continue` one per slot. A bounded loop has one
+  output per slot. A loop over `List.iter(xs)` is recognized by the
+  checker-authored `IteratorRole` of the named primitive, never by a name.
+  `Code.Row.iteration` reads what a loop iterates over off its node.
+- An `Iter` value has no form of its own in a description. `Iter` is an
+  opaque builtin, so `List.iter`, `Iter.iter`, `Iter.map`,
+  `Iter.with_index`, `Iter.fold` and `List.from_iter` are `Prim`s, and a
+  function they take is a `Closure` of a row, as for `List.map`. The IR
+  stays first order: an iterator is a value that a `Prim` gives and another
+  `Prim` reads, and no rule reads its `step` closure. N17h
+  (`src/reify/lists.zig`) reads a known iterator, `List.iter` of a `List`
+  node under `Iter.iter`, `Iter.with_index` and `Iter.map` with a known
+  function: `Iter.fold` with a known function over it is the chain of calls
+  over its items, `List.from_iter` of it is the `List` node of its items,
+  and `Iter.with_index` of `List.iter` of a `List` node is `List.iter` of the
+  `List` node of the index and item tuples. `List.iter`, `Iter.iter` and
+  `Iter.map` are known by their `IteratorRole`; `Iter.with_index`,
+  `Iter.fold` and `List.from_iter` are in the builtin table, as the list
+  builtins are. So `Str.from_interpolation`'s assembler over the iterator of
+  a literal's values is the flat `Str.concat` chain, and no rule names that
+  assembler.
+- A record or tuple that a non-root row or a loop slot only reads by `Field`
+  or `Index` is split into its components (N14, `src/reify/scalar.zig`). A
+  value splits when no node, and no region end but the loop's own `Continue`
+  and `Break` at the slot, uses it in another way; a component splits again
+  under the same condition. A tag union, a record with a member a value may
+  lack, and an empty record never split. A `Call` of a finalized row with such
+  a parameter is a `Call` of a row built on the spot (`Builder.scalarizedCall`,
+  `Specialize.scalarize`), keyed by the row's digest and the shapes. A loop
+  slot splits in `loops.analyze` when every `Continue` gives it unchanged or
+  as a construction. The measure counts the layers still to split (`split_calls`
+  for calls, `aggregate_slots` for parameters and slots), and the driver's
+  L2 check fails a site that reaches a call it should have split.
+- Equality and hashing of a `Code` read the normal form and the version, and
+  never the site key.
+- The provenance table that maps a node to its source regions is for the
+  compiler. A translator cannot read it.
+- A function that only the walk reads is never lowered, so a literal in it
+  would never be checked. The walk notes the conversion root of each literal of
+  the author's own type that it converts (`Walk.noteRead` in
+  `src/check/code_reifier.zig`). The description step stores the roots with
+  the site's description (`reads` of the site's `CodeOutput` entry,
+  `CheckedCodeRead.rootId`), and
+  lowering reads them where the site stands (`restoreCodeSiteAtNode` in
+  `src/postcheck/monotype/lower.zig`), which demands each root. The
+  checked root graph adds the same reads as edges
+  (`src/eval/checked_root_graph.zig`). A
+  `from_numeral` or `from_quote` literal already had such a root. A literal
+  with an interpolation gets an `interpolation_conversion` root
+  (the builder's literal conversion root step):
+  it runs the first stage of `from_interpolation`, keeps no value (its payload
+  is `discarded` and its result `{}`), and only a read demands it. A rejected
+  literal is reported at the literal, in `roc check` and in `roc build`,
+  whether or not anything calls the function it is in.
+- Later stages treat a description as a constant. They never read its rows,
+  and they never rewrite it.
+- A condition that reads a code reification site draws no compile-time
+  condition warning (see "Checked Boundary").
+- A lambda at a `Code` position that reads a value only the running program
+  has is no run-time dependency of its own. The call that holds it decides.
+  This decision and the site mark are in `src/check/code_roots.zig`, which
+  `finishHoistFrame` (`src/check/Check.zig`) calls once for each hoist frame
+  (`selectFrame`, then `Selection.commit`). Such a site is pending until a
+  frame decides it. A call holds a pending site when it takes the site, or a
+  call that passed the site on, as an argument or as its receiver. A call
+  whose solved type is the opt-in (see below) and that holds pending sites
+  marks each of them (`CodeReificationSite.bound_call`), becomes an
+  expression root of its own and is a run-time dependency of what holds it.
+  So one root can bind many sites. Any other call that holds pending sites
+  and is not the right side of a binding passes them to its parent
+  (`Selection.passes_sites`): it is no root and no run-time dependency, and
+  its child candidates go to its parent (`pass_child_candidates`), so the
+  root that binds the sites covers the whole chain. The marked lambda is no
+  dependency of that root when pruning checks what a kept root reads
+  (`code_roots.isBoundSite` in `hoistedRootExprStep`). Any other holder (a
+  binding, an `if`, a `match`, a record, a block) keeps the run-time
+  dependency, and the walk refuses the read. That holder marks each of the
+  sites with what it is (`CodeReificationSite.chain_stop`: a branch, a
+  binding, a value, or the end of the chain), and the expression the chain
+  ended in (`CodeReificationSite.chain_end`: the holder when it is the last
+  call of the chain, else the site's carrier). The report of the refused
+  read says what stopped it, and, for the end of the chain, the type of that
+  expression (`StagedCode.chain_end_type`, written by the description
+  step). A call that binds sites records, on each site, what it reads
+  besides them (`CodeReificationSite.bound_reads`, see "Bound Instance
+  Roots"). This is hoist selection, which writes no solved type and no
+  dispatch plan. A call that binds inputs is never a guarded root, and it is
+  a context-free compile-time request (see "Function Values In Strict
+  Demand" and the guarded root rules), so a refusal in any call of its chain is a compile error at the
+  refused node, also in a function and in a branch.
+- The root of a call that binds inputs is part of what the program means,
+  because the program reads that call only through its root. A caller that
+  outputs only some of the selected roots (the eval harness outputs only
+  top-level roots, `src/eval/inspected.zig`) still outputs it
+  (`rootBindsInputs` in `src/check/code_roots.zig`).
+- The stored value of a root that binds inputs may hold a function that its
+  concrete type fixes (`rootValueMayHoldFunctions`, the exception to the data
+  root rule in "Checking Effects And Const Roots"). So a translator can return
+  a value with a reader function. A function in the result that reads a
+  run-time value is not possible: a run-time argument of the call keeps the
+  call from being a root, and the walk refuses the site.
+- Opt-in rule (R5 option A' of the Gap 1 design, `exprIsCodeBound` in
+  `src/check/code_roots.zig`): the opt-in is the call's whole solved type,
+  read through aliases, when it is the builtin `Code.Bound(a)`, or a
+  nominal type (`:=` or `::`, of any module) whose backing, read through
+  aliases and further nominals, is `Code.Bound(a)`. A formal parameter of a
+  nominal's declaration stands for the argument its application gave it, so
+  `Wrap(Code.Bound(a))` with `Wrap(x) :: x` is an opt-in. Accepted:
+  `Prepared(out) :: Code.Bound(Try(Ready(out), Error))`, an alias of it, a
+  nominal over it. Rejected: a type that only holds such a type in a tag
+  payload, a field or a list item (`Try(Prepared(out), Error)`, a record, a
+  list); the chain ends there and its sites are refused. The site lowering
+  reads the `Code.Bound` record under every nominal layer (Monotype
+  `boundCodeValueWith` reads its fields by the record shape under the
+  named layers, `.boxy` `bindInputSlots` by `structuralType`), so a type
+  built on `Code.Bound` needs no lowering of its own. Each layer has the
+  record's layout.
+- The opt-in is the solved type of the call, never the function that builds
+  its value. `Code.Bound.of(result)` builds the value with no `Code`
+  argument, for a call at the end of a chain that has no lambda of its own.
+  It and `Code.bound` both give an empty `inputs`, which only the bound-call
+  lowering fills.
+- The walk makes an input slot only at a marked site, only in the root row,
+  and never for a `var` (`inputSlot` in `src/check/code_reifier.zig`).
+  The description step records the slots of a call that checking hoisted as
+  an expression root, whose type is closed, by the call node
+  (`CodeOutput.bindings`, `bindCodeInputs` in
+  `src/eval/code_descriptions.zig`), and refuses every
+  other marked site that reads a slot. The refusal names why the call has
+  no root, from the reason hoist selection recorded on each of its sites
+  (`CodeReificationSite.bound_root`): `runtime_value` when the call's frame
+  depends on run time outside its sites (set by `Selection.commit`; the
+  report says to type the parameter as `Code(a)` or to read the value in a
+  lambda), `open_type` when pruning drops the call because its type holds a
+  variable that no enclosing scheme quantifies (set in
+  `hoistedRootIsIntrinsicallyKept`; the report says to fix the type so the
+  call's result has no type variable), and `other` for any other reason.
+  Hoisting keeps only a root whose type
+  is concrete, so that type holds no type variable (a debug check,
+  `boundRootTypeIsFixed`). It can hold the kind variable of an undetermined
+  record field: in `|_| { name: n }` the literal's field kind is quantified
+  with the enclosing function and nothing fixes it. The walk reads the kind
+  variable of an undetermined field as a variable it mentions
+  (`Reifier.mentionsIn`), so a site whose type mentions a kind variable of
+  its template is an instance site, and its call is a generic bound call
+  (see "Bound Instance Roots"). Hoisting agrees: it keeps no root for a call
+  that binds inputs whose type holds an undetermined field kind with the
+  generalized rank (`code_roots.typeMentionsGeneralizedFieldKind`, read in
+  hoist pruning), so the call has no root of its own beside the roots of its
+  closing uses. This reads the solved rank and writes nothing. Any
+  other undetermined kind is `required` where the root is evaluated and where
+  the program reads it, as Monotype's relation freeze commits it: Monotype
+  reads the call at the required-defaulted view of its type
+  (`specializationTypeViewForNode` in `boundCodeType`), as it reads a
+  selected hoisted const use. The slots
+  of a call are the slots of its sites concatenated in site order, which is
+  the order of the module's site table (node order) that the walk uses too.
+  A refused site of a call refuses each of its sites that reads a slot.
+  Each site's `Code` value carries `first_slot`, the number of slots of the
+  call's earlier sites (the walk counts them per call in site order, and
+  the description step records the same count in the site's `CodeOutput`
+  entry). Like `site`, it is no part of the normal form, so `Code.is_eq`,
+  `to_hash` and the description memo skip it. It depends only on the sites
+  of the root's own expression, in the module's own source. A slot is a binder and the
+  path steps the description reads it through, in slot order, with the
+  shape of the slot type.
+- A captured value that the description reads whole is one slot (N18e in
+  `roc-reify-normal-form.md`). Of the slots the final root reads, a slot
+  whose path extends the path of another one is no slot: the outermost slot
+  whose path it extends is marked `whole` (`ir.Slot.whole`), and the root reads the
+  value as `Field`, `Index` and `Unwrap` nodes over that slot's `Input`
+  (`wholeSlots` in `src/reify/driver.zig`, which copies the root once with
+  `Builder.slotRead` for each such read, then simplifies and finalizes the
+  site's rows again). N18b makes no slot of a path that extends the path of a whole slot.
+  Accepted: `|c| c.address == place` with `zip ?: Str` in the address reads
+  `place` whole through `OptField`, so it binds one input and reads
+  `Field(Input(0), city)`. Rejected: a value that the root reads only
+  through field paths (`|c| c.city == place.city and c.line == place.line`)
+  stays one slot per path, and a whole read of `place.addr` does not take in
+  the path slot `place.name`, whose path does not extend it. The verifier
+  reports a `Field`, `Index` or `Unwrap` node over a slot that is not whole
+  and a read of a slot whose path extends the path of a whole slot, and in
+  debug builds the driver checks that no slot the root reads has a path that
+  extends the path of another one and that the root reads each whole slot
+  only as a whole.
+- Lowering reads the recorded slots and nothing else. Where the program
+  reads a call that binds slots, it reads the call's compile-time value with
+  `inputs` set to one `Code.Value` per slot (`boundCodeValue` in
+  `src/postcheck/monotype/lower.zig`). A value is built by one generated
+  helper per Monotype type, so a recursive type reaches its own helper. In
+  debug builds lowering asserts that each slot's Monotype type has the shape
+  the walk recorded.
+  The walk records `Bool` as the `Bool` shape, and Monotype lowers `Bool` as a
+  nominal tag union, so `codeValueBody` builds `Bool` for a type whose owner is
+  the builtin `Bool`, never `Wrap`.
+- An optional field of a slot type (structural proposal D8) has the shape
+  `opt_field` followed by the shape of its value type. Its `Code.Value` is
+  `Absent` when the record does not hold the field, and the value's own
+  `Code.Value` when it does. Both lowerings read the field's presence from
+  explicit post-check data and never from the shape of the slot: Monotype
+  from the field's `value_ty` (`optionalFieldCodeValue`), which only an
+  optional field has, and `.boxy` from the field's kind (`presence_slot`)
+  and the slot's `#Present` tag (`optionalFieldCodeValue` in
+  `src/postcheck/boxy/body.zig`). Each matches on the field's
+  `#Missing` and `#Present` slot. A field default never uses `Absent`: a
+  default record that leaves out an optional field stays `DefaultComputed`.
+- `.boxy` reads the same recorded slots (`bindCodeInputs` in
+  `src/postcheck/boxy/body.zig`). It reads the call as the program reads
+  any expression, from its stored value or where it runs, and builds the
+  call's `Code.Bound` again around the result's `value` with one
+  `Code.Value` per slot. A slot's value is its binder read through the
+  path steps. Its `Code.Value` is built by one worker per closed type and
+  module (`WorkerKey.code_value`, program-local like a conversion worker),
+  which builds one layer and calls the worker of each component's type, so
+  a recursive type reaches its own worker. In debug builds lowering asserts
+  each slot's type against the recorded shape.
+- Typing rule "Bound Capture Encoding" (`roc-reify-opaque-proposal.md`
+  D5). `Code.Binds(code, fmt) : code` is a builtin transparent alias whose
+  second parameter is phantom, so a parameter of type
+  `Code.Binds(Code(f), fmt)` is the `Code` position it wraps
+  (`stagedCode` reads the first `Binds` the head passes through, and
+  `rejectMisplacedStagedCode` lets `code` stand where the `Binds` stands).
+  Let a lambda `L` stand at such a position. A capture read of `L` is a
+  maximal expression of `L`'s body of the form `x`, `x.a`, `x.a.b`, `x.0`,
+  ... whose `x` is a lookup of one of `L`'s closure captures; a field path
+  with an optional segment ends before it. The checker introduces
+  `fmt.default : () -> fmt` once for the site when the lambda's frame
+  finishes (`introduceBoundCaptureEncoding` in `src/check/Check.zig`). For
+  each capture read `R`, it introduces
+  `t.encoder_for : fmt -> (t, List(U8) -> Try(List(U8), []))` only when the
+  type `t` of `R`, where that type is final in the module, holds an opaque
+  type or a type variable (rule "Bound Capture Encoding Placement" in
+  Solver-Mutating Rewrites, `judgeBoundCaptureReads`). Both requirements
+  have the constraint origin `bound_capture`, which checks as `method_call`
+  and survives instantiation. Once introduced they are ordinary
+  requirements: they are solved, reported, generalized into an enclosing
+  scheme and discharged by each caller as any other.
+
+  A function type holds no opaque type (the predicate does not look inside
+  one), so a captured function gets no requirement: the walk describes it
+  as code. There is no exemption in the constraint drain. A record, tuple or
+  tag union that holds an opaque type is encoded whole, so it needs an
+  encoder for each component, and none exists for a function it also holds.
+  A generic capture keeps its requirement, so a caller that fixes it to a
+  function type gets a type error.
+
+  A missing method on a requirement of the rule, or on a requirement a
+  derived encoder of one needs (`boundCaptureOf` follows the derivation), is
+  reported with the captured value's type and the format
+  (`DispatcherDoesNotImplMethod.bound_capture`), in error reporting only. A
+  copy that instantiation made of a generic function's requirement is noted
+  when the drain enters it (`noteBoundCaptureCopy`), so its failure has the
+  same text.
+
+  | Stage | What it does |
+  |---|---|
+  | Checking | records each capture read that gets its `encoder_for` with its two callables (`ModuleEnv.BoundCaptureEncoding`), and orders the records by site at the end of the module, since reads are judged at different boundaries |
+  | Checked module data | builds, from the two requirements, one plan for `fmt.default()` per site and one plan for `T.encoder_for(fmt.default())` per read, keyed by the site node and the read node (`StaticDispatchPlanTable.bound_default_by_node`, `bound_encoder_by_node`; read through `boundCaptureDefaultPlan` and `boundCaptureEncoderPlan`). The encoder plan's operand is `.bound_capture_default` of the site. The template ref collector adds their refs where it skips the site's lambda, so the evidence pass resolves them in the template that holds the site. No expression is synthesized |
+  | Walk | a slot whose type holds an opaque type is encoded: its path (binder and path steps) must equal a capture read's path, and the slot records that read's node (`CheckedCodeSlot.encoder`, shape `encoded`). Any other such slot is refused, with a message for a site that names no format and one for a value read other than as a capture read (`{ at } = order` then `at`) |
+  | Lowering | Monotype and Boxy (`encodedSlotValue` in each) build the encoder call from the read's encoder plan in their own workspace where the program binds the inputs, apply it to the slot's value and `[]`, and wrap the `Ok` bytes as `Code.Value.Encoded`. Neither plans a dispatch. Debug builds assert that a slot with an encoder has the shape `encoded` |
+
+  A slot whose type holds no opaque type is bound structurally, and the
+  checker required no encoder for it unless the read's type held a type
+  variable where it was judged. A captured function is no slot: the walk
+  describes it as code. A site in a function that
+  stays generic is still refused by the walk, so a generic capture gets the
+  requirement in its scheme and no description.
 
 ## Test Root Ownership
 
@@ -27470,9 +29670,10 @@ each phase's report.
 ### Developer Diagnostics
 
 The compiler's developer-only environment variables (`ROC_LIR_DUMP`,
-`ROC_SPEC_CENSUS`, `ROC_FRESH_TYPE_ANALYSIS`, `ROC_CTFE_DEMAND_TRACE`, the
-object-compile round-trip
-variable and `ROC_TEST_LLVM_OBJECT_COMPILE_COUNT_FILE`) are honored only by a
+`ROC_SPEC_CENSUS`, `ROC_FRESH_TYPE_ANALYSIS`, `ROC_CTFE_DEMAND_TRACE`,
+the object-compile round-trip
+variable, `ROC_TEST_LLVM_OBJECT_COMPILE_COUNT_FILE`, `ROC_REIFY_OUTLINE_STATS`,
+`ROC_REIFY_INSTANCES` and `ROC_REIFY_ONLY`) are honored only by a
 compiler for which `build_options.dev_diagnostics` is true: every Debug compiler, and any
 other build made with `-Ddev-diagnostics`. Every read goes through
 `base.dev_diagnostics`, whose `Var` enum names exactly these variables and
@@ -27485,6 +29686,8 @@ per process, since it never changes its own environment, so a check on a hot
 path costs a load rather than an environment scan. The constant reads each compiler binary's own optimize mode,
 since the release compiler binary shares its modules with the development one. CLI
 cases that set one of these variables skip against a compiler without them.
+`ROC_REIFY_INSTANCES` prints each closing use's instance table and each table
+of a descriptor method at a type occurrence (see "Code Reification").
 Performance work that needs them on an optimized compiler builds it with
 `zig build roc -Doptimize=ReleaseFast -Ddev-diagnostics`.
 
@@ -27496,6 +29699,19 @@ measurement only and does not alter specialization or cache admission. Native
 lookup separates function-type classification from provider queries; the
 provider reports exclusive bucket, offer, metadata, graph, eligibility, payload,
 and installation phases under the same diagnostic.
+
+`ROC_REIFY_ONLY` prints, after a module is checked, one line for each
+generalized requirement of each top-level definition:
+`reify-only: <module>.<def>: <method> runs=<true|false>` (see "The Runs Bit").
+The lines of one definition are sorted, and an equal line is printed once.
+It also prints one line for each reify-only definition, in order of
+definition id:
+`reify-only: <module>.<def>: witness <kind> <target> at <line>:<col>`, where
+`<target>` is `<module>.<def>` and, for a dispatch, `<method> -> <module>.<def>`
+(see "Reify-Only Definitions"). Then it prints one line for each reify-only
+top-level `expect`, with `expect at <line>:<col>` in place of `<def>`. The line and column are in the checked
+source, so in a headerless file they count the lines of the header that the
+compiler adds.
 
 `ROC_TEST_COMMAND_WORK` prints deterministic test-command counters at exit.
 The specialization, evaluation, runtime LIR, ARC, static-data and native test

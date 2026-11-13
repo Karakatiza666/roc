@@ -609,6 +609,10 @@ pub const ModuleState = struct {
     /// that every environment installed for this module borrows as its
     /// `qualified_module_name`; no cache entry carries it.
     qualified_name: []const u8,
+    /// Name of the package that holds this module (e.g., "pf"), borrowed from
+    /// the package state. Workspace information like `qualified_name`, which
+    /// every installed environment borrows as its `package_name`.
+    package_name: []const u8,
     /// Filesystem path to the .roc file
     path: []const u8,
     /// Source-relative import base override for materialized modules.
@@ -672,10 +676,11 @@ pub const ModuleState = struct {
     /// checked artifact, excluding compile-time evaluation run inside the check.
     type_check_ns: u64 = 0,
 
-    pub fn init(name: []const u8, qualified_name: []const u8, path: []const u8) ModuleState {
+    pub fn init(name: []const u8, qualified_name: []const u8, package_name: []const u8, path: []const u8) ModuleState {
         return .{
             .name = name,
             .qualified_name = qualified_name,
+            .package_name = package_name,
             .path = path,
             .cached_ast = null,
             .phase = .Parse,
@@ -1021,7 +1026,7 @@ pub const PackageState = struct {
         const owned_path = try gpa.dupe(u8, path);
         errdefer gpa.free(owned_path);
 
-        try self.modules.append(gpa, ModuleState.init(owned_name, owned_qualified_name, owned_path));
+        try self.modules.append(gpa, ModuleState.init(owned_name, owned_qualified_name, self.name, owned_path));
         errdefer _ = self.modules.pop();
         try self.module_names.put(owned_name, id);
 
@@ -1760,6 +1765,10 @@ const BoxyObjects = struct {
         const platform = self.platformOf(artifact);
         const views = try self.coordinator.collectImportedArtifactViews(gpa, artifact);
         errdefer gpa.free(views);
+        // A unit can start while checking continues, before the program's
+        // finalization runs the description step of the modules it reads.
+        try self.coordinator.describePreparedModule(artifact.key.digest());
+        for (views) |view| try self.coordinator.describePreparedModule(view.key.digest());
         var config = self.lowering.config;
         config.boxy_unit = .{ .imports = self.interfaces, .root = false, .names = &self.digests.names };
         // The unit's ARC and code generation run their waves on the same
@@ -3110,6 +3119,7 @@ pub const Coordinator = struct {
                 &.{},
                 null,
             );
+            try self.describeModuleCode(paired_ptr, null);
             return;
         }
         self.platform_pairing_count += 1;
@@ -4129,12 +4139,46 @@ pub const Coordinator = struct {
         return false;
     }
 
+    /// The description step of one module, when its code output is
+    /// pending, and the fill of its `codeInventories` slot, with every
+    /// checked module the coordinator holds in reach. A module from the cache
+    /// runs only the fill: lowering reads the slot and never computes it.
+    fn describeModuleCode(self: *Coordinator, artifact: *CheckedArtifact.CheckedModuleArtifact, problems: ?*check.problem.Store) Allocator.Error!void {
+        var reach = std.ArrayList(CheckedArtifact.ImportedModuleView).empty;
+        defer reach.deinit(self.gpa);
+        try appendImportedArtifactViewIfMissing(&reach, self.gpa, artifact.key, &self.builtin_modules.checked_artifact);
+        var artifacts = self.checked_artifact_index.iterator();
+        while (artifacts.next()) |entry| {
+            const other = self.checkedArtifactByKey(.{ .bytes = entry.key_ptr.* }).?;
+            try appendImportedArtifactViewIfMissing(&reach, self.gpa, artifact.key, other);
+        }
+        if (artifact.code_output.state == .pending) try eval.CodeDescriptions.describeModule(self.gpa, artifact, problems, reach.items);
+        try eval.CodeDescriptions.fillCodeInventories(self.gpa, &.{CheckedArtifact.importedView(artifact)}, reach.items);
+    }
+
+    /// The description step of the checked module `key`, when its code
+    /// output is pending, ahead of the finalization that evaluates it. The
+    /// step reads only checked data and code slots, so its output is the same
+    /// whenever it runs (design.md "The Description Step"). Its problems join
+    /// the module's pending evaluation reports.
+    fn describePreparedModule(self: *Coordinator, key: CheckedArtifact.ModuleId) Allocator.Error!void {
+        const known = self.checkedArtifactByKey(key) orelse coordinatorInvariant("a unit read a module the coordinator does not hold", .{});
+        if (known.code_output.state != .pending) return;
+        const location = self.checked_artifact_index.get(key.bytes) orelse coordinatorInvariant("a module with a pending code output is not registered", .{});
+        const mod = location.module();
+        const state = mod.pending_evaluation orelse coordinatorInvariant("a module with a pending code output has no pending evaluation", .{});
+        try self.describeModuleCode(mod.checkedArtifact().?, &state.problems);
+    }
+
     /// Commit a finalized module and, when its checked entry can reproduce
     /// everything it reported, queue that entry's write. `report_arena` holds
     /// the queued entries' reports until they are written.
     fn commitPreparedModule(self: *Coordinator, mod: *ModuleState, stores: *std.ArrayList(PendingStore), report_arena: Allocator) CoordinatorError!void {
         const state = mod.pending_evaluation.?;
         const artifact = mod.checkedArtifact().?;
+        // A module that finishes with no evaluator still runs the
+        // description step (design.md "Code Reification").
+        try self.describeModuleCode(artifact, &state.problems);
         try eval.CompileTimeFinalization.finishPendingExhaustiveness(artifact, &state.problems);
         artifact.evaluation_state = .finalized;
         try artifact.verifyComplete();
@@ -5175,6 +5219,8 @@ pub const Coordinator = struct {
         // Identical modules in different packages share this entry, so the
         // package-qualified name comes from the module being installed.
         cached_env.qualified_module_name = mod.qualified_name;
+        cached_env.package_name = mod.package_name;
+        cached_env.source_path = mod.path;
 
         const artifact_serialized: *const check.CheckedArtifact.CheckedModuleArtifact.Serialized = @ptrCast(@alignCast(artifact_buffer.ptr));
         // The envelope establishes completeness and layout compatibility.
@@ -5475,6 +5521,9 @@ pub const Coordinator = struct {
         self.module_time_sum_ns += module_time;
 
         try installPlatformRequirementSurface(mod);
+        // A Boxy unit started during checking can read this module's
+        // inventories before finalization runs.
+        if (mod.checkedArtifact()) |artifact| try self.describeModuleCode(artifact, null);
 
         self.cache_hits += 1;
         const module_id = pkg.getModuleId(mod.name) orelse return;
@@ -5926,20 +5975,27 @@ pub const Coordinator = struct {
             // The bare `display_module_name_idx` is unchanged, and it keeps
             // any directory segments the logical module name carries.
             env.qualified_module_name = mod.qualified_name;
+            env.package_name = mod.package_name;
+            env.source_path = mod.path;
 
             if (can.BuiltinLowLevel.isBuiltinModule(env)) {
                 try can.BuiltinLowLevel.apply(env);
-            } else if (self.enable_hosted_transform) {
+            } else {
                 // Only the platform package provides hosted functions, so only
                 // its modules' annotation-only declarations become hosted
                 // lambdas. Regular package/module dependencies may legitimately
                 // contain annotation-only (unimplemented) declarations; turning
                 // those into hosted lambdas would incorrectly make the
-                // effectful-function-name check flag them as effects.
+                // effectful-function-name check flag them as effects. Those
+                // declarations are intrinsics, whatever the hosted transform says.
                 const is_platform_pkg = self.platform_root_package_name != null and
                     std.mem.eql(u8, package_name, self.platform_root_package_name.?);
                 if (is_platform_pkg) {
-                    try can.HostedCompiler.replaceAnnoOnlyWithHosted(env);
+                    if (self.enable_hosted_transform) {
+                        try can.HostedCompiler.replaceAnnoOnlyWithHosted(env);
+                    }
+                } else {
+                    can.HostedCompiler.markAnnoOnlyAsIntrinsic(env);
                 }
             }
         }
@@ -9972,6 +10028,7 @@ fn hashPatternExtractionRegionsForView(
             .numeral_conversion,
             .quote_conversion,
             .literal_argument,
+            .interpolation_conversion,
             .repl_expr,
             => false,
         };
@@ -10007,6 +10064,7 @@ fn hashPatternExtractionRegionsForView(
             .numeral_conversion,
             .quote_conversion,
             .literal_argument,
+            .interpolation_conversion,
             .repl_expr,
             => unreachable, // is_selected_root skipped every root of these kinds
         }

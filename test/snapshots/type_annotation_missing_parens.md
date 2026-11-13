@@ -10,7 +10,6 @@ nums : List U8
 # EXPECTED
 TYPE APPLICATION NEEDS PARENTHESES - type_annotation_missing_parens.md:2:1:2:1
 TOO FEW ARGS - type_annotation_missing_parens.md:1:8:1:12
-DECLARATION HAS NO VALUE - type_annotation_missing_parens.md:1:1:1:12
 # PROBLEMS
 ~~~clojure
 (reports
@@ -61,18 +60,7 @@ DECLARATION HAS NO VALUE - type_annotation_missing_parens.md:1:1:1:12
 			(reflow " ")
 			(reflow "instead."))
 		(document
-			(source-region (file "type_annotation_missing_parens.md") (start 1 8) (end 1 12) (annotation error) (line-text "nums : List U8"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 1) (end 1 12))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotation_missing_parens.md") (start 1 1) (end 1 12) (annotation error) (line-text "nums : List U8"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "type_annotation_missing_parens.md") (start 1 8) (end 1 12) (annotation error) (line-text "nums : List U8")))))
 ~~~
 # TOKENS
 ~~~zig

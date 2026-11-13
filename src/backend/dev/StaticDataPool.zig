@@ -547,3 +547,16 @@ fn mappedSlice(comptime T: type, mapping: []const u8, offset: u64, count: u64) E
     const ptr: [*]align(1) const T = @ptrCast(mapping.ptr + start);
     return ptr[0..len];
 }
+
+test "exports on a relocation cycle, and those reaching one, are never pooled" {
+    const exports = [_]StaticDataExport{
+        .{ .symbol_name = "slot", .bytes = &@as([8]u8, @splat(0)), .alignment = 8, .relocations = &.{.{ .offset = 0, .target_symbol_name = "a", .target = .{ .data_symbol = @fromBackingInt(1) } }} },
+        .{ .symbol_name = "a", .bytes = &@as([16]u8, @splat(0)), .alignment = 8, .relocations = &.{ .{ .offset = 0, .target_symbol_name = "b", .target = .{ .data_symbol = @fromBackingInt(2) } }, .{ .offset = 8, .target_symbol_name = "leaf", .target = .{ .data_symbol = @fromBackingInt(3) } } } },
+        .{ .symbol_name = "b", .bytes = &@as([8]u8, @splat(0)), .alignment = 8, .relocations = &.{.{ .offset = 0, .target_symbol_name = "a", .target = .{ .data_symbol = @fromBackingInt(1) } }} },
+        .{ .symbol_name = "leaf", .bytes = &@as([8]u8, @splat(0)), .alignment = 8 },
+    };
+    var plan = try Plan.init(std.testing.allocator, &exports, true);
+    defer plan.deinit();
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, true }, plan.poolable);
+    try std.testing.expectEqual(@as(usize, exports.len), plan.order.len);
+}

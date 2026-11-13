@@ -10,32 +10,23 @@ import json.Json
 main = Json.utf8
 ~~~
 # EXPECTED
-DUPLICATE DEFINITION - can_import_json.md:1:1:1:17
+BUILTIN TYPE SHADOWED - can_import_json.md:1:1:1:17
 DOES NOT EXIST - can_import_json.md:3:8:3:17
 # PROBLEMS
 ~~~clojure
 (reports
 	(report
 		(severity warning)
-		(title "Duplicate Definition")
+		(title "Builtin Type Shadowed")
 		(region (start 1 1) (end 1 17))
 		(headline
-			(reflow "The name ")
+			(text "The type ")
 			(annotated symbol-unqualified "Json")
-			(reflow " is being redeclared here."))
+			(text " shadows a builtin type."))
 		(document
-			(source-region (file "can_import_json.md") (start 1 1) (end 1 17) (annotation error) (line-text "import json.Json"))
+			(reflow "This may make the builtin type inaccessible in this scope.")
 			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Json")
-			(reflow " was already defined in ")
-			(source-location
-				(file "can_import_json.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "can_import_json.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import json.Json"))))
+			(source-region (file "can_import_json.md") (start 1 1) (end 1 17) (annotation warning) (line-text "import json.Json"))))
 	(report
 		(severity runtime_error)
 		(title "Does Not Exist")
@@ -72,7 +63,7 @@ NO CHANGE
 	(d-let
 		(p-assign (ident "main"))
 		(e-runtime-error (tag "qualified_ident_does_not_exist")))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes)))
 ~~~
 # TYPES

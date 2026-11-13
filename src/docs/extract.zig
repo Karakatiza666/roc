@@ -1058,6 +1058,7 @@ fn extractDefEntry(
                 .doc_comment = if (doc_extract) |d| d.text else null,
                 .children = empty_children,
                 .doc_comment_start_line = if (doc_extract) |d| d.start_line else 0,
+                .intrinsic = module_env.isIntrinsicDef(def),
             };
         },
         .nominal => |n| {

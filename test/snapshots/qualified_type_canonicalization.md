@@ -46,9 +46,7 @@ transform = |result|
 # EXPECTED
 BUILTIN TYPE SHADOWED - qualified_type_canonicalization.md:1:1:1:18
 MOD NOT IMPORTED - qualified_type_canonicalization.md:15:23:15:38
-MISSING NESTED TYPE - qualified_type_canonicalization.md:19:14:19:21
 UNUSED VARIABLE - qualified_type_canonicalization.md:28:17:28:22
-MISSING NESTED TYPE - qualified_type_canonicalization.md:32:13:32:20
 MOD NOT IMPORTED - qualified_type_canonicalization.md:32:49:32:64
 UNUSED VARIABLE - qualified_type_canonicalization.md:36:17:36:20
 MOD NOT FOUND - qualified_type_canonicalization.md:1:1:1:18
@@ -60,9 +58,11 @@ MOD NOT FOUND - qualified_type_canonicalization.md:8:19:8:24
 MOD NOT FOUND - qualified_type_canonicalization.md:11:26:11:35
 MOD NOT FOUND - qualified_type_canonicalization.md:12:26:12:35
 DOES NOT EXIST - qualified_type_canonicalization.md:16:23:16:32
+MOD NOT FOUND - qualified_type_canonicalization.md:19:14:19:31
 MOD NOT FOUND - qualified_type_canonicalization.md:23:23:23:27
 MOD NOT FOUND - qualified_type_canonicalization.md:24:16:24:21
 MOD NOT FOUND - qualified_type_canonicalization.md:27:21:27:25
+MOD NOT FOUND - qualified_type_canonicalization.md:32:13:32:45
 MOD NOT FOUND - qualified_type_canonicalization.md:32:26:32:30
 MOD NOT FOUND - qualified_type_canonicalization.md:32:38:32:44
 DOES NOT EXIST - qualified_type_canonicalization.md:35:24:35:39
@@ -93,19 +93,6 @@ DOES NOT EXIST - qualified_type_canonicalization.md:36:25:36:38
 		(document
 			(source-region (file "qualified_type_canonicalization.md") (start 15 23) (end 15 38) (annotation error) (line-text "multiLevelQualified : ModA.ModB.TypeC"))))
 	(report
-		(severity runtime_error)
-		(title "Missing Nested Type")
-		(region (start 19 14) (end 19 21))
-		(headline
-			(annotated code "Try")
-			(reflow " is in scope, but it doesn't have a nested type ")
-			(reflow "that's also ")
-			(reflow "named ")
-			(annotated code "Try")
-			(reflow "."))
-		(document
-			(source-region (file "qualified_type_canonicalization.md") (start 19 14) (end 19 21) (annotation error) (line-text "resultType : Try.Try(I32, Str)"))))
-	(report
 		(severity warning)
 		(title "Unused Variable")
 		(region (start 28 17) (end 28 22))
@@ -119,19 +106,6 @@ DOES NOT EXIST - qualified_type_canonicalization.md:36:25:36:38
 			(reflow " to suppress this warning.")
 			(line-break)
 			(source-region (file "qualified_type_canonicalization.md") (start 28 17) (end 28 22) (annotation error) (line-text "processColor = |color|"))))
-	(report
-		(severity runtime_error)
-		(title "Missing Nested Type")
-		(region (start 32 13) (end 32 20))
-		(headline
-			(annotated code "Try")
-			(reflow " is in scope, but it doesn't have a nested type ")
-			(reflow "that's also ")
-			(reflow "named ")
-			(annotated code "Try")
-			(reflow "."))
-		(document
-			(source-region (file "qualified_type_canonicalization.md") (start 32 13) (end 32 20) (annotation error) (line-text "transform : Try.Try(Color.RGB, ExtMod.Error) -> ModA.ModB.TypeC"))))
 	(report
 		(severity runtime_error)
 		(title "Mod Not Imported")
@@ -262,6 +236,18 @@ DOES NOT EXIST - qualified_type_canonicalization.md:36:25:36:38
 	(report
 		(severity runtime_error)
 		(title "Mod Not Found")
+		(region (start 19 14) (end 19 31))
+		(headline
+			(text "This ")
+			(annotated code "Try.Try")
+			(reflow " type is declared to be in ")
+			(annotated code "Basics")
+			(reflow ", which does not exist."))
+		(document
+			(source-region (file "qualified_type_canonicalization.md") (start 19 14) (end 19 31) (annotation error) (line-text "resultType : Try.Try(I32, Str)"))))
+	(report
+		(severity runtime_error)
+		(title "Mod Not Found")
 		(region (start 23 23) (end 23 27))
 		(headline
 			(text "This ")
@@ -295,6 +281,18 @@ DOES NOT EXIST - qualified_type_canonicalization.md:36:25:36:38
 			(reflow ", which does not exist."))
 		(document
 			(source-region (file "qualified_type_canonicalization.md") (start 27 21) (end 27 25) (annotation error) (line-text "processColor : Color.RGB -> Str"))))
+	(report
+		(severity runtime_error)
+		(title "Mod Not Found")
+		(region (start 32 13) (end 32 45))
+		(headline
+			(text "This ")
+			(annotated code "Try.Try")
+			(reflow " type is declared to be in ")
+			(annotated code "Basics")
+			(reflow ", which does not exist."))
+		(document
+			(source-region (file "qualified_type_canonicalization.md") (start 32 13) (end 32 45) (annotation error) (line-text "transform : Try.Try(Color.RGB, ExtMod.Error) -> ModA.ModB.TypeC"))))
 	(report
 		(severity runtime_error)
 		(title "Mod Not Found")
@@ -563,12 +561,12 @@ transform = |result|
 	(s-import (mod "Basics")
 		(exposes
 			(exposed (name "Try") (alias "Try") (wildcard false))))
-	(s-import (mod "Color")
+	(s-import (mod "Color") (alias "Color")
 		(exposes))
-	(s-import (mod "ModA/ModB")
+	(s-import (mod "ModA/ModB") (alias "ModB")
 		(exposes
 			(exposed (name "TypeC") (wildcard false))))
-	(s-import (mod "ExternalMod")
+	(s-import (mod "ExternalMod") (alias "ExtMod")
 		(exposes)))
 ~~~
 # TYPES

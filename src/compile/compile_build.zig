@@ -923,7 +923,7 @@ pub const BuildEnv = struct {
         try report.document.addLineBreaks(2);
         try report.document.addText("The checked module must be inside the selected package's source directory.");
 
-        try self.sink.emitReport("workspace", "root", report);
+        try self.sink.emitReport("workspace", "root", "", report);
     }
 
     /// Initialize the actor model coordinator.
@@ -1579,7 +1579,7 @@ pub const BuildEnv = struct {
                     break :blk other_report;
                 },
             };
-            try self.sink.emitReport("main", file_abs, report);
+            try self.sink.emitReport("main", file_abs, file_abs, report);
             try self.sink.buildOrder(&[_][]const u8{"main"}, &[_][]const u8{file_abs}, &[_]u32{0});
             self.sink.tryEmit();
             return err;
@@ -1608,11 +1608,11 @@ pub const BuildEnv = struct {
 
             for (ast.tokenize_diagnostics.items) |diagnostic| {
                 const report = try ast.tokenizeDiagnosticToReport(diagnostic, self.gpa, file_abs);
-                try self.sink.emitReport(pkg_name, module_name, report);
+                try self.sink.emitReport(pkg_name, module_name, file_abs, report);
             }
             for (ast.parse_diagnostics.items) |diagnostic| {
                 const report = try ast.parseDiagnosticToReport(&parsed.module_env.common, diagnostic, self.gpa, file_abs);
-                try self.sink.emitReport(pkg_name, module_name, report);
+                try self.sink.emitReport(pkg_name, module_name, file_abs, report);
             }
 
             // Build the order so drainReports can find these reports
@@ -1672,7 +1672,7 @@ pub const BuildEnv = struct {
                     error.InvalidTargetConfig => {
                         const pkg_name = "main";
                         const report = try config_diagnostic.toReport(self.gpa, &parsed.module_env.common, file_abs);
-                        try self.sink.emitReport(pkg_name, file_abs, report);
+                        try self.sink.emitReport(pkg_name, file_abs, file_abs, report);
                         try self.sink.buildOrder(&[_][]const u8{pkg_name}, &[_][]const u8{file_abs}, &[_]u32{0});
                         self.sink.tryEmit();
                         return error.UnsupportedHeader;
@@ -1911,7 +1911,7 @@ pub const BuildEnv = struct {
             if (diagnostic.takeLocated()) |located| {
                 var report = located;
                 errdefer report.deinit();
-                try self.sink.emitReport("workspace", "root", report);
+                try self.sink.emitReport("workspace", "root", "", report);
             } else {
                 try self.emitWorkspaceReport(diagnostic.title, diagnostic.message);
             }
@@ -2093,7 +2093,7 @@ pub const BuildEnv = struct {
             const pkg = entry.value_ptr.*;
             for (pkg.modules.items) |*mod| {
                 for (mod.reports.items) |report| {
-                    try self.sink.emitReport(pkg.name, mod.name, report);
+                    try self.sink.emitReport(pkg.name, mod.name, mod.path, report);
                 }
                 mod.reports.clearRetainingCapacity();
             }
@@ -2112,7 +2112,7 @@ pub const BuildEnv = struct {
         const rep = try Report.init(self.gpa, title, msg, .runtime_error);
         // Route through OrderedSink with a stable fully-qualified identity so it participates in ordering.
         // We use "workspace:root" as the fq module identity.
-        try self.sink.emitReport("workspace", "root", rep);
+        try self.sink.emitReport("workspace", "root", "", rep);
     }
 
     /// Order the reports of a build that stops before compiling, so they can
@@ -2140,11 +2140,11 @@ pub const BuildEnv = struct {
         const ast = parsed.ast;
         for (ast.tokenize_diagnostics.items) |diagnostic| {
             const report = try ast.tokenizeDiagnosticToReport(diagnostic, self.gpa, parsed.path);
-            try self.sink.emitReport(pkg_name, parsed.path, report);
+            try self.sink.emitReport(pkg_name, parsed.path, parsed.path, report);
         }
         for (ast.parse_diagnostics.items) |diagnostic| {
             const report = try ast.parseDiagnosticToReport(&parsed.module_env.common, diagnostic, self.gpa, parsed.path);
-            try self.sink.emitReport(pkg_name, parsed.path, report);
+            try self.sink.emitReport(pkg_name, parsed.path, parsed.path, report);
         }
     }
 
@@ -2165,7 +2165,7 @@ pub const BuildEnv = struct {
         try report.document.addText("Tip: Use a relative path like ");
         try report.document.addAnnotated("../path/to/platform", .emphasized);
         try report.document.addText(" or a URL.");
-        try self.sink.emitReport("workspace", "root", report);
+        try self.sink.emitReport("workspace", "root", "", report);
     }
 
     fn validateDiscoveredPlatformTargetFiles(
@@ -2224,7 +2224,7 @@ pub const BuildEnv = struct {
         try report.document.addLineBreaks(2);
         try report.document.addText("Create this directory or update the platform `targets` section. Builds cannot proceed until declared target inputs exist.");
 
-        try self.sink.emitReport("workspace", "root", report);
+        try self.sink.emitReport("workspace", "root", "", report);
     }
 
     fn emitMissingTargetFileReport(
@@ -2251,7 +2251,7 @@ pub const BuildEnv = struct {
         try report.document.addLineBreaks(2);
         try report.document.addText("The selected target's platform entry lists this file. Add the file or remove it from that target config before building.");
 
-        try self.sink.emitReport("workspace", "root", report);
+        try self.sink.emitReport("workspace", "root", "", report);
     }
 
     /// Resolve the platform's target configuration fields that name
@@ -2333,13 +2333,6 @@ pub const BuildEnv = struct {
             }
         }
         self.sink.tryEmitLocked();
-    }
-
-    fn moduleToPath(self: *BuildEnv, pkg_name: []const u8, module_name: []const u8) (Allocator.Error || error{ InvalidPackageName, PathOutsideWorkspace })![]const u8 {
-        if (self.packages.get(pkg_name)) |pkg| {
-            return try self.logicalModuleToPath(pkg.root_dir, module_name);
-        }
-        return error.InvalidPackageName;
     }
 
     fn syntheticRootDisplayPath(self: *BuildEnv, path: []const u8) ?[]const u8 {
@@ -2456,9 +2449,31 @@ pub const BuildEnv = struct {
                 original_line_starts.items.items,
             );
         }
+        const line_count = original_line_starts.items.items.len;
+        if (report.primary) |*location| try self.remapSyntheticRootLocation(report, location, line_count);
+        if (report.reached_from) |*location| try self.remapSyntheticRootLocation(report, location, line_count);
+        for (report.related.items) |*related| try self.remapSyntheticRootLocation(report, &related.location, line_count);
+    }
+
+    /// Map a report location in the staged root back to the user's file, as
+    /// `remapSyntheticRootSourceRegion` maps a source region.
+    fn remapSyntheticRootLocation(self: *BuildEnv, report: *Report, location: *reporting.Location, original_line_count: usize) Allocator.Error!void {
+        const original_path = self.synthetic_root_original_path orelse return;
+        if (self.syntheticRootDisplayPath(location.file) == null) return;
+
+        const header_lines = self.synthetic_root_header_lines;
+        if (location.start_line <= header_lines or location.end_line <= header_lines) return;
+
+        location.file = try report.addOwnedString(original_path);
+        // A location past the last line of the user's source is in wiring
+        // the staging appended, so only its file name maps back.
+        if (original_line_count == 0 or location.end_line - header_lines > original_line_count) return;
+        location.start_line -= header_lines;
+        location.end_line -= header_lines;
     }
 
     pub const DrainedModuleReports = struct {
+        /// The file the reports belong to, or empty for reports of no file.
         abs_path: []const u8,
         reports: []Report,
     };
@@ -2473,10 +2488,7 @@ pub const BuildEnv = struct {
         var out = try self.gpa.alloc(DrainedModuleReports, drained.len);
         var i: usize = 0;
         while (i < drained.len) : (i += 1) {
-            var path = self.moduleToPath(drained[i].pkg_name, drained[i].module_name) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidPackageName, error.PathOutsideWorkspace => try self.gpa.dupe(u8, ""),
-            };
+            var path = try self.gpa.dupe(u8, drained[i].path);
 
             if (self.syntheticRootDisplayPath(path)) |display_path| {
                 self.gpa.free(path);
@@ -2869,10 +2881,6 @@ pub const BuildEnv = struct {
             return importing_pkg.getModule(id);
         }
         return null;
-    }
-
-    pub fn findModuleByName(self: *BuildEnv, module_name: []const u8) ?*coordinator_mod.ModuleState {
-        return self.findModuleByNameInPackage(null, module_name);
     }
 
     /// The environment that the import named `import_name` of the module at
@@ -4107,6 +4115,9 @@ pub const OrderedSink = struct {
     const Entry = struct {
         pkg_name: []const u8, // borrowed from BuildEnv.packages
         module_name: []const u8, // borrowed from Coordinator module state
+        /// The file the reports belong to, as its emitter recorded it, or
+        /// empty for reports of no file. Owned when not empty.
+        path: []const u8,
         depth: u32, // min dependency depth
         reports: std.array_list.Managed(Report), // zero or more reports for this module
         ready: bool,
@@ -4147,6 +4158,7 @@ pub const OrderedSink = struct {
         // Free entries
         for (self.entries.items) |*e| {
             // pkg_name and module_name are borrowed, don't free
+            if (e.path.len > 0) self.gpa.free(e.path);
             // Deinit all reports for this module
             for (e.reports.items) |*rep| {
                 rep.deinit();
@@ -4191,6 +4203,7 @@ pub const OrderedSink = struct {
                 try self.entries.append(.{
                     .pkg_name = pkg_names[i],
                     .module_name = module_names[i],
+                    .path = "",
                     .depth = depths[i],
                     .reports = reports_list,
                     .ready = false,
@@ -4235,8 +4248,9 @@ pub const OrderedSink = struct {
         }.lt);
     }
 
-    // Emit with package and module names
-    pub fn emitReport(self: *OrderedSink, pkg_name: []const u8, module_name: []const u8, report: Report) Allocator.Error!void {
+    /// Emit a report of the module `module_name` of `pkg_name`, whose file is
+    /// `path`. `path` is empty for a report of no file.
+    pub fn emitReport(self: *OrderedSink, pkg_name: []const u8, module_name: []const u8, path: []const u8, report: Report) Allocator.Error!void {
         self.lock.lockUncancelable(self.std_io);
         defer self.lock.unlock(self.std_io);
 
@@ -4258,6 +4272,7 @@ pub const OrderedSink = struct {
             try self.entries.append(.{
                 .pkg_name = pkg_name,
                 .module_name = module_name,
+                .path = "",
                 .depth = std.math.maxInt(u32),
                 .reports = reports_list,
                 .ready = false,
@@ -4265,6 +4280,14 @@ pub const OrderedSink = struct {
             });
             try self.index.put(key, entry_index);
             // Note: do not append to order here; buildOrder will populate and sort later
+        }
+
+        // One module has one file, recorded by its first report.
+        const entry = &self.entries.items[entry_index];
+        if (entry.path.len == 0) {
+            if (path.len > 0) entry.path = try self.gpa.dupe(u8, path);
+        } else {
+            std.debug.assert(std.mem.eql(u8, entry.path, path));
         }
 
         // Record report; take ownership by appending to per-module list
@@ -4320,6 +4343,7 @@ pub const OrderedSink = struct {
     pub const Drained = struct {
         pkg_name: []const u8,
         module_name: []const u8,
+        path: []const u8,
         reports: []Report,
     };
 
@@ -4382,6 +4406,7 @@ pub const OrderedSink = struct {
             out[j] = .{
                 .pkg_name = e.pkg_name,
                 .module_name = e.module_name,
+                .path = e.path,
                 .reports = reps,
             };
             j += 1;

@@ -101,3 +101,17 @@ pub fn pathToUri(allocator: std.mem.Allocator, path: []const u8) Allocator.Error
 
     return std.fmt.allocPrint(allocator, "file://{s}", .{encoded_path});
 }
+
+/// The URI to give the client for the file at `absolute_path`: the first URI
+/// the client opened it under in `client_paths` (URI to path), or one built
+/// from the path when it isn't open.
+pub fn clientUriForPath(
+    allocator: std.mem.Allocator,
+    client_paths: *const std.StringArrayHashMapUnmanaged([]u8),
+    absolute_path: []const u8,
+) Allocator.Error![]u8 {
+    for (client_paths.keys(), client_paths.values()) |uri, path| {
+        if (std.mem.eql(u8, path, absolute_path)) return allocator.dupe(u8, uri);
+    }
+    return pathToUri(allocator, absolute_path);
+}

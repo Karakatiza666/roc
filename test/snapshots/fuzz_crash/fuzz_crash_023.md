@@ -279,7 +279,6 @@ TYPE MISMATCH - fuzz_crash_023.md:150:3:150:6
 TOO FEW ARGS - fuzz_crash_023.md:155:2:157:3
 TYPE MISMATCH - fuzz_crash_023.md:167:3:167:3
 DECLARATION HAS NO VALUE - fuzz_crash_023.md:178:47:178:71
-DECLARATION HAS NO VALUE - fuzz_crash_023.md:201:1:201:25
 MISSING METHOD - fuzz_crash_023.md:189:26:189:40
 MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 # PROBLEMS
@@ -1302,17 +1301,6 @@ MISSING METHOD - fuzz_crash_023.md:189:26:189:66
 			(reflow "This declaration has a type annotation but no implementation."))
 		(document
 			(source-region (file "fuzz_crash_023.md") (start 178 47) (end 178 71) (annotation error) (line-text "\trecord = { foo: 123, bar: \"Hello\", ;az: tag, qux: Ok(world), punned }"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 201 1) (end 201 25))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_023.md") (start 201 1) (end 201 25) (annotation error) (line-text "tuple : Value((a, b, c))"))
 			(line-break)
 			(line-break)
 			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
@@ -2372,22 +2360,22 @@ expect {
 		(e-runtime-error (tag "erroneous_value_expr"))
 		(annotation
 			(ty-malformed)))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "write!") (wildcard false))))
-	(s-import (mod "pf.StdoutMultiline")
+	(s-import (mod "pf.StdoutMultiline") (alias "StdoutMultiline")
 		(exposes
 			(exposed (name "line!") (wildcard false))
 			(exposed (name "write!") (wildcard false))))
-	(s-import (mod "pkg.Something")
+	(s-import (mod "pkg.Something") (alias "Something")
 		(exposes
 			(exposed (name "func") (alias "function") (wildcard false))
 			(exposed (name "Type") (alias "ValueCategory") (wildcard false))
 			(exposed (name "Custom") (wildcard true))))
-	(s-import (mod "BadName")
+	(s-import (mod "BadName") (alias "GoodName")
 		(exposes))
-	(s-import (mod "BadNameMultiline")
+	(s-import (mod "BadNameMultiline") (alias "GoodNameMultiline")
 		(exposes))
 	(s-alias-decl
 		(ty-header (name "Map")

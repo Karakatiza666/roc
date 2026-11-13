@@ -1141,7 +1141,7 @@ test "Monotype inspect-only unresolved values defer until final graph sealing" {
     try expectContains(seal_source, "try graph.freezeRelations()");
     try expectContains(seal_source, "try self.emitDraftDeferredInspects(body_draft, graph, &sealer)");
     try expectContains(lower_source, "try self.prepareDraftInspectMethods(body_draft, graph, boundary)");
-    try expectContains(lower_source, "try self.methodTargetCalleeAtNode(lookup, request_node, null)");
+    try expectContains(lower_source, "try self.methodTargetCalleeAtNode(lookup, request_node, null, .{ .implicit = .to_inspect })");
     try expectContains(lower_source, "ctx.frozen_inspect_method_calls = &prepared_methods");
     const freeze = std.mem.find(u8, seal_source, "try graph.freezeRelations()").?;
     const emit = std.mem.find(u8, seal_source, "try self.emitDraftDeferredInspects").?;

@@ -30,6 +30,8 @@
 //!   a literal whose conversion root no evaluation of this compilation
 //!   requests and whose payload is not stored, each of which registers a
 //!   literal root whatever the instance; or a body no checked data bounds;
+//!   or a generic bound call, which registers a root of the program at each
+//!   specialization;
 //! - *dependent numeral* (*quote*): a numeral (quote) whose conversion depends
 //!   on its instance and which no checked instantiation converts, which
 //!   registers a literal root only at a custom numeral (quote) type;
@@ -528,6 +530,12 @@ const Builder = struct {
     fn addTemplate(self: *Builder, view: checked.ImportedModuleView, node: NodeId, template: checked.CheckedProcedureTemplate) Allocator.Error!void {
         if (template.target == .hosted) return;
         try self.addTypeEdge(node, view, template.checked_fn_root);
+        // A generic bound call is a compile-time root of the program at each
+        // specialization (design.md "Bound Instance Roots").
+        const inventories = view.checked_bodies.computedCodeInventories();
+        if (inventories.inventoryOf(template.template_id)) |inventory| {
+            if (inventories.inventoryBoundCalls(inventory).len != 0) self.markOwn(node, .{ .strict = true });
+        }
 
         const refs = view.resolved_value_refs;
         for (refs.template_refs[template.resolved_value_refs.start..][0..template.resolved_value_refs.len]) |ref_id| {
@@ -625,7 +633,8 @@ const Builder = struct {
                     .quote => .{ conversion.conversion_root, .{ .dependent_quote = true } },
                 };
             },
-            .expr => switch (bodies.exprData(@fromBackingInt(plan.node))) {
+            // A literal written as a whole value site is still a literal.
+            .expr => switch (bodies.exprDataOpeningValueSite(@fromBackingInt(plan.node))) {
                 .numeral => .{ bodies.literalConversionRoot(plan.node), .{ .dependent_numeral = true } },
                 .str => if (bodies.quoteIsCustom(plan.node)) .{ bodies.literalConversionRoot(plan.node), .{ .dependent_quote = true } } else return .{},
                 // An interpolation whose conversion depends on its instance
@@ -673,6 +682,7 @@ const Builder = struct {
                 .expect,
                 .ellipsis,
                 .anno_only,
+                .code_site,
                 .break_,
                 .return_,
                 .for_,

@@ -45,6 +45,8 @@ const ExhaustivenessContext = check.ExhaustivenessContext;
 const exact_numeral = checked.exact_numeral;
 const names = check.CheckedNames;
 const static_dispatch = check.StaticDispatchRegistry;
+const code_output = check.CodeOutput;
+const code_analyses = check.CodeAnalyses;
 const Ident = base.Ident;
 const GuardedList = collections.GuardedList;
 const TypeFieldSpanBorrow = Type.StoreSpanBorrow(Type.Field, "fields");
@@ -1330,6 +1332,7 @@ pub fn run(
         builder.addDigestStats(digest_stats);
     }
     try builder.initHostedCatalog();
+    try builder.indexImplicitInstances();
     setup_timing_scope.end();
 
     // Wave 1: roots in listed order, then the specialization queue. Each
@@ -1492,6 +1495,10 @@ const ModuleViewData = struct {
     const_store: *const checked.ConstStore,
     interface_capabilities: *const checked.ModuleInterfaceCapabilities,
     compile_time_root_reads: *const checked.CompileTimeRootReadTable,
+    /// The module's code descriptions: each site's description, each
+    /// closing use's instance table, each bound call's input slots
+    /// (design.md "The Description Step").
+    code_output: *const code_output.CodeOutput,
     /// This module's dense id among the lowering input's modules, seeded
     /// once with the program's module tables.
     lowering_module: ?Common.LoweringModuleId = null,
@@ -1522,11 +1529,19 @@ const BinderId = checked_bodies.BinderId;
 ///   through the pattern itself as its binder.
 /// - `literal_conversion`: a custom literal pattern's literal converted at
 ///   the pattern's type.
+/// - `bound_default`: the `fmt.default()` call of a `Code.Binds` site
+///   (`StaticDispatchPlanTable.boundCaptureDefaultPlan` of the site).
+/// - `bound_encoder`: the `T.encoder_for(..)` call of one capture read of
+///   such a site (`boundCaptureEncoderPlan` of the read), whose operand is
+///   the site's `bound_default`.
+/// - `value_site`: the expression written at a value site (R12), at the
+///   value's type, which the program evaluates where a call binds it as an
+///   input slot. A `read` of the same node is its description.
 const ExprSite = enum(u32) {
     _,
 
-    const Kind = enum(u3) { read, coerced_value, hoisted_root, hoisted_result, literal_guard, literal_value, literal_conversion };
-    const kind_bits = 3;
+    const Kind = enum(u4) { read, coerced_value, hoisted_root, hoisted_result, literal_guard, literal_value, literal_conversion, bound_default, bound_encoder, value_site };
+    const kind_bits = 4;
 
     fn make(ref_kind: Kind, ref_payload: u32) ExprSite {
         if (ref_payload >= (@as(u32, 1) << (32 - kind_bits))) Common.invariant("Monotype expression reference exceeded its id range");
@@ -1568,25 +1583,39 @@ const ExprSite = enum(u32) {
         return make(.literal_conversion, @backingInt(pattern));
     }
 
+    fn boundDefault(site: CIR.Expr.Idx) ExprSite {
+        return make(.bound_default, @backingInt(site));
+    }
+
+    fn boundEncoder(read_expr: CIR.Expr.Idx) ExprSite {
+        return make(.bound_encoder, @backingInt(read_expr));
+    }
+
+    fn valueSite(site: CIR.Expr.Idx) ExprSite {
+        return make(.value_site, @backingInt(site));
+    }
+
     /// The literal a literal-conversion root converts: a literal expression,
     /// or a custom literal pattern's literal.
     fn conversionLiteral(view: ModuleView, literal: checked.LiteralNode) ExprSite {
         return switch (literal) {
-            .expr => |expr| own(view, expr),
+            // A literal written as a whole value site converts at the
+            // value's type. Its node holds the `Code`.
+            .expr => |expr| if (view.bodies.isValueSite(expr)) valueSite(expr) else own(view, expr),
             .pattern => |pattern| literalConversion(pattern),
         };
     }
 
     fn kind(self: ExprSite) Kind {
-        return @fromBackingInt(@as(u3, @truncate(@backingInt(self))));
+        return @fromBackingInt(@as(u4, @truncate(@backingInt(self))));
     }
 
     /// The raw CIR node a reference is about: its body node, or its custom
     /// literal pattern. Null for a hoisted root construct.
     fn rawNode(self: ExprSite) ?u32 {
         return switch (self.kind()) {
-            .read, .coerced_value, .literal_guard, .literal_value, .literal_conversion => self.payload(),
-            .hoisted_root, .hoisted_result => null,
+            .read, .coerced_value, .literal_guard, .literal_value, .literal_conversion, .value_site => self.payload(),
+            .hoisted_root, .hoisted_result, .bound_default, .bound_encoder => null,
         };
     }
 
@@ -1594,7 +1623,7 @@ const ExprSite = enum(u32) {
     fn literalPattern(self: ExprSite) CIR.Pattern.Idx {
         return switch (self.kind()) {
             .literal_guard, .literal_value, .literal_conversion => @fromBackingInt(self.payload()),
-            .read, .coerced_value, .hoisted_root, .hoisted_result => Common.invariant("a reference that belongs to no custom literal pattern was read as one"),
+            .read, .coerced_value, .hoisted_root, .hoisted_result, .bound_default, .bound_encoder, .value_site => Common.invariant("a reference that belongs to no custom literal pattern was read as one"),
         };
     }
 
@@ -1605,8 +1634,8 @@ const ExprSite = enum(u32) {
     /// The body node a `read` or `coerced_value` reference names.
     fn node(self: ExprSite) CIR.Expr.Idx {
         return switch (self.kind()) {
-            .read, .coerced_value => @fromBackingInt(self.payload()),
-            .hoisted_root, .hoisted_result, .literal_guard, .literal_value, .literal_conversion => Common.invariant("a Monotype construct has no body node"),
+            .read, .coerced_value, .value_site => @fromBackingInt(self.payload()),
+            .hoisted_root, .hoisted_result, .literal_guard, .literal_value, .literal_conversion, .bound_default, .bound_encoder => Common.invariant("a Monotype construct has no body node"),
         };
     }
 
@@ -1615,7 +1644,26 @@ const ExprSite = enum(u32) {
     fn root(self: ExprSite) checked.ComptimeRootId {
         return switch (self.kind()) {
             .hoisted_root, .hoisted_result => @fromBackingInt(self.payload()),
-            .read, .coerced_value, .literal_guard, .literal_value, .literal_conversion => Common.invariant("a reference that belongs to no hoisted root was read as one"),
+            .read, .coerced_value, .literal_guard, .literal_value, .literal_conversion, .bound_default, .bound_encoder, .value_site => Common.invariant("a reference that belongs to no hoisted root was read as one"),
+        };
+    }
+
+    /// The `Code.Binds` site a `bound_default` reference belongs to, or the
+    /// capture read a `bound_encoder` reference belongs to.
+    fn boundNode(self: ExprSite) CIR.Expr.Idx {
+        return switch (self.kind()) {
+            .bound_default, .bound_encoder => @fromBackingInt(self.payload()),
+            .read, .coerced_value, .hoisted_root, .hoisted_result, .literal_guard, .literal_value, .literal_conversion, .value_site => Common.invariant("a reference that belongs to no bound capture was read as one"),
+        };
+    }
+
+    /// The body node a use of a template is keyed by in the code output
+    /// (`CodeOutput.edgeTable`): a body node read in place. Null for a construct
+    /// Monotype builds.
+    fn useNode(self: ExprSite) ?CIR.Expr.Idx {
+        return switch (self.kind()) {
+            .read, .coerced_value, .value_site => self.node(),
+            .hoisted_root, .hoisted_result, .literal_guard, .literal_value, .literal_conversion, .bound_default, .bound_encoder => null,
         };
     }
 };
@@ -1675,10 +1723,11 @@ const ExprData = union(enum) {
     interpolation: Interpolation,
     structural_eq: SourceExprData(.structural_eq),
     structural_hash: SourceExprData(.structural_hash),
-    /// The node keying the equality plan.
-    method_eq: u32,
-    /// The node keying the dispatch plan.
-    type_dispatch_call: u32,
+    /// The equality plan (`CheckedBodies.dispatchPlan` of the node).
+    method_eq: ?static_dispatch.StaticDispatchPlanId,
+    /// The dispatch plan: `CheckedBodies.dispatchPlan` of the node, or a
+    /// bound capture plan.
+    type_dispatch_call: ?static_dispatch.StaticDispatchPlanId,
     tuple_access: SourceExprData(.tuple_access),
     runtime_error: SourceExprData(.runtime_error),
     crash: SourceExprData(.crash),
@@ -1697,6 +1746,10 @@ const ExprData = union(enum) {
     /// (design.md "Row Joins") and lowers `value` into this expression's
     /// destination.
     row_coerce: struct { value: ExprSite },
+    /// A `Code` site or a `Code` identity call. Its value is in the code
+    /// output of its module (`CodeOutput`), or, for an instance site, in the
+    /// instance table in force.
+    code_site,
 
     fn fromSource(view: ModuleView, id: CIR.Expr.Idx, data: checked_bodies.ExprData) ExprData {
         const raw = @backingInt(id);
@@ -1719,9 +1772,10 @@ const ExprData = union(enum) {
             } },
             .call => |call| .{ .call = .{ .node = id, .func = call.func, .args = call.args, .called_via = call.called_via } },
             .dispatch_call => .{ .dispatch_call = raw },
-            .method_eq => .{ .method_eq = raw },
-            .type_dispatch_call => .{ .type_dispatch_call = raw },
+            .method_eq => .{ .method_eq = view.bodies.dispatchPlan(raw) },
+            .type_dispatch_call => .{ .type_dispatch_call = view.bodies.dispatchPlan(raw) },
             .for_ => |for_| .{ .for_ = .{ .node = raw, .pattern = for_.pattern, .expr = for_.expr, .body = for_.body } },
+            .code_site => .code_site,
             inline .str_segment,
             .bytes_literal,
             .list,
@@ -1940,7 +1994,7 @@ fn resolvedRecord(view: ModuleView, resolved: ResolvedUse) ResolvedRecord {
                     .const_use = .{ .const_ref = (view.hoisted_constants.lookupByPattern(result_pattern) orelse
                         Common.invariant("hoisted extraction root had no hoisted constant")).const_ref },
                 } },
-                .constant, .hoisted_validation, .expect, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument => Common.invariant("hoisted extraction root was neither a constant nor a callable binding"),
+                .constant, .hoisted_validation, .expect, .numeral_conversion, .quote_conversion, .repl_expr, .literal_argument, .interpolation_conversion => Common.invariant("hoisted extraction root was neither a constant nor a callable binding"),
             };
             return .{
                 .expr = null,
@@ -1968,13 +2022,29 @@ fn resolvedRecord(view: ModuleView, resolved: ResolvedUse) ResolvedRecord {
 fn exprSourceNode(view: ModuleView, ref: ExprSite) ?CIR.Expr.Idx {
     return switch (ref.kind()) {
         .read => if (view.bodies.rowCoercion(ref.node()) != null) null else ref.node(),
-        .coerced_value => ref.node(),
-        .hoisted_root, .hoisted_result, .literal_guard, .literal_value, .literal_conversion => null,
+        .coerced_value, .value_site => ref.node(),
+        .hoisted_root, .hoisted_result, .literal_guard, .literal_value, .literal_conversion, .bound_default, .bound_encoder => null,
     };
 }
 
 fn patternRegion(view: ModuleView, pattern: CIR.Pattern.Idx) base.Region {
     return view.module_env.store.getNodeRegion(can.ModuleEnv.nodeIdxFrom(pattern));
+}
+
+/// Whether a body node is a closing use of this module that the description
+/// step refused, or a call of one. Every reader of the node, the type
+/// evidence included, reads it as a runtime error, so no specialization
+/// serves the use.
+fn isRefusedClosingUse(view: ModuleView, node: CIR.Expr.Idx, data: checked_bodies.ExprData) bool {
+    const closing = view.code_output.edgeTable(useEdge(view, if (data == .call) data.call.func else node)) orelse return false;
+    return closing == .refused;
+}
+
+/// The edge that keys the Code instance table of the use `use` (design.md
+/// "Code Instance Tables"): the node a static dispatch targets directly, or
+/// the use itself.
+fn useEdge(view: ModuleView, use: CIR.Expr.Idx) checked.LiteralEdge {
+    return if (view.bodies.directDispatchNode(use)) |node| .{ .node = node } else .{ .use = use };
 }
 
 /// The normalized expression `ref` names in `view`.
@@ -1991,10 +2061,17 @@ fn checkedExpr(view: ModuleView, ref: ExprSite) CheckedExpr {
                 };
             }
             const expr = view.bodies.expr(source);
+            if (isRefusedClosingUse(view, source, expr.data)) {
+                return .{ .id = ref, .ty = expr.ty, .source_region = expr.source_region, .data = .{ .runtime_error = .{} } };
+            }
             return .{ .id = ref, .ty = expr.ty, .source_region = expr.source_region, .data = ExprData.fromSource(view, source, expr.data) };
         },
         .coerced_value => {
             const expr = view.bodies.expr(ref.node());
+            return .{ .id = ref, .ty = expr.ty, .source_region = expr.source_region, .data = ExprData.fromSource(view, ref.node(), expr.data) };
+        },
+        .value_site => {
+            const expr = view.bodies.openingValueSite(ref.node()).expr(ref.node());
             return .{ .id = ref, .ty = expr.ty, .source_region = expr.source_region, .data = ExprData.fromSource(view, ref.node(), expr.data) };
         },
         .hoisted_root => {
@@ -2044,7 +2121,7 @@ fn checkedExpr(view: ModuleView, ref: ExprSite) CheckedExpr {
         .literal_guard => {
             const pattern = ref.literalPattern();
             const guard = view.bodies.literalPatternGuard(pattern) orelse Common.invariant("a literal guard belonged to a pattern compared directly");
-            return .{ .id = ref, .ty = guard.equality_ty, .source_region = patternRegion(view, pattern), .data = .{ .method_eq = @backingInt(pattern) } };
+            return .{ .id = ref, .ty = guard.equality_ty, .source_region = patternRegion(view, pattern), .data = .{ .method_eq = view.bodies.dispatchPlan(@backingInt(pattern)) } };
         },
         .literal_value => {
             const pattern = ref.literalPattern();
@@ -2064,7 +2141,44 @@ fn checkedExpr(view: ModuleView, ref: ExprSite) CheckedExpr {
                 },
             };
         },
+        .bound_default => {
+            const site = ref.boundNode();
+            const plan = view.static_dispatch_plans.boundCaptureDefaultPlan(site) orelse
+                Common.invariant("a Code.Binds site had no default plan");
+            return boundCaptureCall(view, ref, site, plan);
+        },
+        .bound_encoder => {
+            const read_expr = ref.boundNode();
+            const plan = view.static_dispatch_plans.boundCaptureEncoderPlan(read_expr) orelse
+                Common.invariant("a bound capture read had no encoder plan");
+            return boundCaptureCall(view, ref, read_expr, plan);
+        },
     }
+}
+
+/// The call a bound capture plan makes, at the return type of the plan's
+/// callable: `fmt.default()` gives the format, `T.encoder_for(..)` the
+/// encoder.
+fn boundCaptureCall(view: ModuleView, ref: ExprSite, node: CIR.Expr.Idx, plan: static_dispatch.StaticDispatchPlanId) CheckedExpr {
+    const callable_ty = view.static_dispatch_plans.plans[@backingInt(plan)].callable_ty;
+    const payload = checkedPayload(view, callable_ty);
+    if (payload != .function) Common.invariant("a bound capture plan's callable was not a function");
+    const ret = payload.function.ret;
+    return .{
+        .id = ref,
+        .ty = ret,
+        .source_region = view.module_env.store.getNodeRegion(can.ModuleEnv.nodeIdxFrom(node)),
+        .data = .{ .type_dispatch_call = plan },
+    };
+}
+
+/// Whether `plan_id` is a bound capture plan: a site's `fmt.default()` or a
+/// capture read's `T.encoder_for(..)`. Its node is the site or the read,
+/// which evaluates neither call.
+fn isBoundCapturePlan(view: ModuleView, plan_id: static_dispatch.StaticDispatchPlanId) bool {
+    const node: CIR.Expr.Idx = @fromBackingInt(view.static_dispatch_plans.plans[@backingInt(plan_id)].node);
+    return view.static_dispatch_plans.boundCaptureDefaultPlan(node) == plan_id or
+        view.static_dispatch_plans.boundCaptureEncoderPlan(node) == plan_id;
 }
 
 /// A dispatch operand as Monotype lowers it. A custom literal pattern's
@@ -2081,6 +2195,7 @@ const DispatchOperand = union(enum) {
             .checked_expr => |expr| .{ .checked_expr = ExprSite.read(expr) },
             .literal_pattern_value => |pattern| .{ .checked_expr = ExprSite.literalValue(pattern) },
             .literal_pattern_conversion => |pattern| .{ .checked_expr = ExprSite.literalConversion(pattern) },
+            .bound_capture_default => |site| .{ .checked_expr = ExprSite.boundDefault(site) },
             .generated_interpolation_segments => |expr| .{ .generated_interpolation_segments = expr },
             .generated_numeral => |numeral| .{ .generated_numeral = numeral },
             .generated_quote => |node| .{ .generated_quote = node },
@@ -2106,7 +2221,16 @@ const DispatchOperand = union(enum) {
 fn dispatchPlanSite(view: ModuleView, plan_id: static_dispatch.StaticDispatchPlanId) ExprSite {
     const node = view.static_dispatch_plans.plans[@backingInt(plan_id)].node;
     return switch (view.bodies.index().nodeKind(node)) {
-        .expr => ExprSite.own(view, @fromBackingInt(node)),
+        .expr => if (view.static_dispatch_plans.boundCaptureEncoderPlan(@fromBackingInt(node)) == plan_id)
+            ExprSite.boundEncoder(@fromBackingInt(node))
+        else if (view.static_dispatch_plans.boundCaptureDefaultPlan(@fromBackingInt(node)) == plan_id)
+            ExprSite.boundDefault(@fromBackingInt(node))
+        else if (view.bodies.isValueSite(@fromBackingInt(node)))
+            // The plan dispatches for the value written at a value site,
+            // whose node holds the `Code`: it has the value's type.
+            ExprSite.valueSite(@fromBackingInt(node))
+        else
+            ExprSite.own(view, @fromBackingInt(node)),
         .pattern => if (view.static_dispatch_plans.lookupByNode(node) == plan_id)
             ExprSite.literalGuard(@fromBackingInt(node))
         else
@@ -2134,7 +2258,7 @@ fn patternIntroducesBinder(view: ModuleView, pattern: CIR.Pattern.Idx) bool {
 fn literalConversionRootOf(view: ModuleView, data: ExprData) ?checked.ComptimeRootId {
     return switch (data) {
         .numeral, .str_from_quote => |node| view.bodies.literalConversionRoot(node),
-        .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => null,
+        .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => null,
     };
 }
 
@@ -2264,6 +2388,11 @@ const SpecEvidenceTarget = struct {
     /// the specialization is keyed by its completed substitution.
     substitution: ?CheckedTargetSubstitution = null,
     callable_contracts: []const SpecEvidence = &.{},
+    /// The Code instance table of the evidence edge that selected the
+    /// target (design.md "Code Instance Tables"), or null where no edge
+    /// selected it or its target has no inventory. Two tables give two
+    /// specializations, as two written uses do.
+    instances: ?InstanceTableId = null,
 };
 
 /// Whether materialized evidence selects a local procedure, as a target or
@@ -2765,7 +2894,79 @@ fn substitutionsShareClasses(graph: *InstGraph, left: SpecSubstitution, right: S
 const EdgeEvidence = struct {
     subst: SpecSubstitution,
     vector: []const SpecEvidence,
+    /// The instance table the edge hands its template (D1): the table of a
+    /// closing use, or the entry of the table in force that a forward use
+    /// names. Null for a template with no inventory.
+    instances: ?InstanceTableId = null,
 };
+
+/// The Code instance table a use of a binding gives (see
+/// `BodyContext.binding_instances`): the table, and the exact alias lookup
+/// it goes on to, if the binding is one.
+const BindingInstances = struct {
+    table: InstanceTableId,
+    forwarded_lookup: ?CIR.Expr.Idx,
+};
+
+/// Where a direct call finds the Code instance table of its callee (D1):
+/// from the use it reads, or, through a procedure alias, from the use of the
+/// alias.
+const InstancesFrom = union(enum) {
+    lookup,
+    forwarded: ?InstanceTableId,
+};
+
+/// Where a method target's specialization finds its Code instance table
+/// (D1). The caller states it.
+const MethodInstances = union(enum) {
+    /// The target has no inventory, or the written use gives none.
+    none,
+    /// The table of the written use that dispatches to the target.
+    table: InstanceTableId,
+    /// A call the compiler makes by the type of a value (Q17): the table the
+    /// description step recorded for this descriptor method at the owner
+    /// type, which the request's first parameter is.
+    implicit: code_analyses.DescriptorMethod,
+
+    fn of(table: ?InstanceTableId) MethodInstances {
+        return if (table) |found| .{ .table = found } else .none;
+    }
+};
+
+/// A descriptor method's table at one owner type (Q17), keyed by the owner's
+/// equality digest. A table the description step refused is
+/// `code_output.refused_table` (`InstanceTableId.refused`).
+const ImplicitInstanceKey = struct {
+    owner: names.TypeDigest,
+    method: code_analyses.DescriptorMethod,
+};
+
+const ImplicitInstances = std.AutoHashMapUnmanaged(ImplicitInstanceKey, InstanceTableId);
+
+/// One instance table (D1): the module whose closing use built it, and the
+/// table in that module's code output.
+const InstanceTableId = struct {
+    view: ModuleView,
+    table: code_output.TableId,
+
+    /// The table as a stored function keeps it (Q16).
+    fn stored(id: ?InstanceTableId) ?check.ConstStore.ConstFnInstances {
+        const table = id orelse return null;
+        return .{ .module = table.view.key, .table = @backingInt(table.table) };
+    }
+
+    /// Whether the description step refused this table: a descriptor
+    /// method's table at an owner type (Q17). The body it reaches lowers as
+    /// a crash.
+    fn refused(id: InstanceTableId) bool {
+        return id.table == code_output.refused_table;
+    }
+};
+
+/// The instance inventories of `view`'s module (`code_analyses.CodeInventories`).
+fn codeInventories(view: ModuleView) *const code_analyses.CodeInventories {
+    return view.bodies.computedCodeInventories();
+}
 
 /// The evidence vectors in scope while lowering a body: the innermost
 /// generalized callable's vector plus its lexical parents (nested local
@@ -2799,6 +3000,16 @@ const EvidenceChain = struct {
     schema: ?SchemeRequirements = null,
     subst: SpecSubstitution = &.{},
     parent: ?*const EvidenceChain = null,
+    /// The instance table of the specialization whose root frame this is
+    /// (D1). Set on the root frame only.
+    instances: ?InstanceTableId = null,
+
+    /// The instance table in force: the one the root frame holds.
+    fn instanceTable(self: *const EvidenceChain) ?InstanceTableId {
+        var chain: *const EvidenceChain = self;
+        while (chain.parent) |parent| chain = parent;
+        return chain.instances;
+    }
 
     fn atScope(self: *const EvidenceChain, scope: EvidenceScope) ?EvidenceChain {
         var chain: ?*const EvidenceChain = self;
@@ -2847,6 +3058,7 @@ fn rootEvidenceWithSubstitution(
         .vector = edge.vector,
         .schema = schema,
         .subst = edge.subst,
+        .instances = edge.instances,
     };
 }
 
@@ -4164,6 +4376,7 @@ fn specEvidenceShallowEql(
                 if (!Ast.valueEql(a_target.view.key, b_target.view.key)) break :blk false;
                 if (!try specMethodTargetEql(a_target, b_target)) break :blk false;
                 if (a_target.local_proc_context != b_target.local_proc_context) break :blk false;
+                if (!instanceTablesEql(a_target.instances, b_target.instances)) break :blk false;
                 if (a_target.instantiation) |a_instantiation| {
                     const b_instantiation = b_target.instantiation orelse break :blk false;
                     if (!Ast.valueEql(a_instantiation.view.key, b_instantiation.view.key)) break :blk false;
@@ -4234,6 +4447,12 @@ fn specStructuralEvidenceEql(left: SpecStructuralEvidence, right: SpecStructural
             try left_checked.view.types.rootKey(left_checked.evidence.callable_ty),
             try right_checked.view.types.rootKey(right_checked.evidence.callable_ty),
         );
+}
+
+fn instanceTablesEql(left: ?InstanceTableId, right: ?InstanceTableId) bool {
+    const a = left orelse return right == null;
+    const b = right orelse return false;
+    return Ast.valueEql(a.view.key, b.view.key) and a.table == b.table;
 }
 
 fn specMethodTargetEql(left: *const SpecEvidenceTarget, right: *const SpecEvidenceTarget) Allocator.Error!bool {
@@ -5154,6 +5373,8 @@ const PendingSpecJob = struct {
     subst: ?SealedSubstitution,
     signature_relation: Ast.SignatureRelation,
     codec_contract: ?SealedCodecContractContext,
+    /// The Code instance table of the request (D1), or null.
+    instances: ?InstanceTableId = null,
     /// Why the body is lowered. The coordinator restates it when it hands the
     /// job to a lane, since an upgrade may arrive while the job is queued.
     demand: Demand = .evaluation,
@@ -5627,6 +5848,7 @@ const SpecJobWorkerInputs = struct {
     replay_interface_summaries: base.TestSwitch(true),
     declared_comptime_roots: *const DeclaredComptimeRoots,
     hosted_catalog: []const HostedCatalogEntry,
+    implicit_instances: *const ImplicitInstances,
     current_loc: base.SourceLoc,
     current_region: base.Region,
     timing_std_io: ?std.Io,
@@ -6153,6 +6375,14 @@ const Builder = struct {
     symbols: SymbolDomains = .{},
     next_instantiation_scope: u64 = 0,
     type_cache: CheckedTypeMemo(Type.TypeId) = .empty,
+    /// While an owner term lowers (Q17), the lowered type of each variable
+    /// it binds: a row variable's binding is the rest of its row.
+    owner_row_bindings: ?*const CheckedTypeMemo(Type.TypeId) = null,
+    /// The table of each descriptor method at each owner type a module's
+    /// description step recorded (Q17), built before any body lowers.
+    implicit_instances: ImplicitInstances = .empty,
+    /// A worker builder reads its coordinator's `implicit_instances`.
+    borrowed_implicit_instances: ?*const ImplicitInstances = null,
     const_type_cache: ConstTypeMemo = .empty,
     /// Deterministic FIFO of reserved specializations awaiting body lowering.
     /// Wave drains execute entries in dispatch order; an executing body may
@@ -6579,6 +6809,7 @@ const Builder = struct {
         builder.borrowed_source_file_ids = inputs.source_file_ids;
         builder.borrowed_module_views = inputs.module_views;
         builder.borrowed_literal_argument_roots = inputs.literal_argument_roots;
+        builder.borrowed_implicit_instances = inputs.implicit_instances;
         try builder.seedModuleIdentityIndex();
         builder.borrowed_lowering_module_ids = inputs.lowering_module_ids;
         builder.borrowed_comptime_roots = inputs.declared_comptime_roots;
@@ -6635,6 +6866,7 @@ const Builder = struct {
     }
 
     fn deinit(self: *Builder) void {
+        self.implicit_instances.deinit(self.allocator);
         self.resolution_profile.report();
         deinitSpecJobLanes(self.allocator, self.spec_job_lanes);
         for (self.lower_frame_pool.items) |*frames| frames.deinit(self.allocator);
@@ -7605,6 +7837,7 @@ const Builder = struct {
             .literal_roots = self.literal_roots,
             .declared_comptime_roots = self.borrowed_comptime_roots orelse &self.declared_comptime_roots,
             .hosted_catalog = self.hosted_catalog,
+            .implicit_instances = self.implicitInstances(),
             .current_loc = self.current_loc,
             .current_region = self.current_region,
             .timing_std_io = if (self.timing) |timing| timing.std_io else null,
@@ -7817,6 +8050,7 @@ const Builder = struct {
             .replay_interface_summaries = self.replay_interface_summaries,
             .declared_comptime_roots = self.borrowed_comptime_roots orelse &self.declared_comptime_roots,
             .hosted_catalog = self.hosted_catalog,
+            .implicit_instances = self.implicitInstances(),
             .current_loc = self.current_loc,
             .current_region = self.current_region,
             .timing_std_io = if (self.timing) |timing| timing.std_io else null,
@@ -8175,7 +8409,12 @@ const Builder = struct {
         const draft = FinalBodyOutputGuard.begin(self);
         var body_timing_scope = ProcedureTimingScope.begin(self.timing, .body_lowering);
         defer body_timing_scope.end();
-        const body, const ret_cell = if (callable_eval) |use| blk: {
+        const body, const ret_cell = if (self.requirementUseRefused(request.instances)) blk: {
+            // The description step refused the requirement's closing use
+            // and reported it: the root crashes in place of the call.
+            const ret = DraftTypeCell.fromGraphNode(initial_fn.ret);
+            break :blk .{ try ctx.addExprWithTypeCell(ret, try ctx.refusedCodeData()), ret };
+        } else if (callable_eval) |use| blk: {
             const callee = try ctx.lowerCallableEvalBindingValueAtNode(
                 use.view,
                 use.template,
@@ -8206,6 +8445,7 @@ const Builder = struct {
                     try procedureUseSourceFnKey(view, procedure),
                     root_node,
                     edge,
+                    self.requirementInstances(request.instances),
                     false,
                 );
                 const callee_fn_node = try ctx.draftFnSlotTypeNode(selected, root_node);
@@ -8594,6 +8834,7 @@ const Builder = struct {
             .queued,
             null,
             self.root_demand,
+            null,
         );
     }
 
@@ -8878,6 +9119,7 @@ const Builder = struct {
                 .callable_ty = instantiation.callable_ty,
             } else null,
             .nested = nested,
+            .instances = InstanceTableId.stored(target.instances),
         };
     }
 
@@ -8934,6 +9176,8 @@ const Builder = struct {
         body_scheduling: TemplateBodyScheduling,
         codec_contract: ?SealedCodecContractContext,
         demand: Demand,
+        /// The Code instance table of the request (D1), or null.
+        instances: ?InstanceTableId,
     ) Allocator.Error!Ast.DefId {
         var lookup_timing_scope = ProcedureTimingScope.begin(self.timing, .lookup_reservation);
         defer lookup_timing_scope.end();
@@ -9028,6 +9272,7 @@ const Builder = struct {
                                 null,
                                 job.signature_relation,
                                 job.codec_contract,
+                                job.instances,
                             );
                             return existing.def;
                         },
@@ -9083,6 +9328,9 @@ const Builder = struct {
             fn_template.const_evidence_frames = try self.program.addConstFnEvidenceFrames(stored_evidence.frames);
             fn_template.const_evidence_frame_head = .of(stored_evidence.head);
         }
+        // A restored compile-time function's topology holds the table it
+        // was stored with (Q16).
+        fn_template.const_instances = InstanceTableId.stored(instances orelse if (retained_topology) |topology| topology.instanceTable() else null);
 
         resolution_profile.enter(.reservation);
         const ReservedSpec = struct { reservation: TemplateReservation, spec: Ast.SpecId };
@@ -9153,6 +9401,7 @@ const Builder = struct {
                     .subst = subst,
                     .signature_relation = signature_relation,
                     .codec_contract = codec_contract,
+                    .instances = instances,
                     .demand = demand,
                 };
                 resolution_profile.enter(.discovery_dispatch);
@@ -9201,6 +9450,7 @@ const Builder = struct {
             retained_topology,
             signature_relation,
             codec_contract,
+            instances,
         );
         return reservation.def;
     }
@@ -9367,6 +9617,7 @@ const Builder = struct {
         retained_topology: ?EvidenceChain,
         signature_relation: Ast.SignatureRelation,
         codec_contract: ?SealedCodecContractContext,
+        instances: ?InstanceTableId,
     ) Allocator.Error!void {
         const view = self.moduleForDigest(names.procTemplateModuleDigest(template_ref));
         const template = view.templates.get(template_ref.template);
@@ -9460,6 +9711,7 @@ const Builder = struct {
             retained_topology,
             signature_relation,
             codec_contract,
+            instances,
         );
         const draft_end = draft.end(self);
         const sealed = try self.sealActiveBodyDraft(
@@ -9999,6 +10251,7 @@ const Builder = struct {
                             .replay_interface_summaries = self.replay_interface_summaries,
                             .declared_comptime_roots = self.borrowed_comptime_roots orelse &self.declared_comptime_roots,
                             .hosted_catalog = self.hosted_catalog,
+                            .implicit_instances = self.implicitInstances(),
                             .current_loc = self.current_loc,
                             .current_region = self.current_region,
                             .timing_std_io = if (self.timing) |timing| timing.std_io else null,
@@ -10269,6 +10522,7 @@ const Builder = struct {
                 null,
                 job.signature_relation,
                 job.codec_contract,
+                job.instances,
             );
             self.acceptSpecDispatch(job.dispatch_index);
             return;
@@ -10445,6 +10699,7 @@ const Builder = struct {
             null,
             job.signature_relation,
             job.codec_contract,
+            job.instances,
         );
         const final_end = final_guard.end(self);
         try self.finalizeBodyDraftGraph(graph, &body_draft, final_guard, final_end);
@@ -10604,6 +10859,7 @@ const Builder = struct {
         retained_topology: ?EvidenceChain,
         signature_relation: Ast.SignatureRelation,
         codec_contract: ?SealedCodecContractContext,
+        instances: ?InstanceTableId,
     ) Allocator.Error!PendingTemplateBody {
         var graph_setup_timing_scope = ProcedureTimingScope.begin(self.timing, .body_graph_setup);
         defer graph_setup_timing_scope.end();
@@ -10637,6 +10893,12 @@ const Builder = struct {
             try body_ctx.seedSubstitution(schema, live);
         } else if (retained_topology == null) {
             body_ctx.evidence = try body_ctx.rootEvidenceAtOwnScheme(template, spec_evidence);
+        }
+        if (instances != null) {
+            // A retained topology is a stored compile-time function's, whose
+            // root frame holds the table it was stored with (Q16).
+            if (retained_topology != null) Common.invariant("a retained evidence topology received a second Code instance table");
+            body_ctx.evidence.instances = instances;
         }
 
         const graph_fn_ty = try body_ctx.importProgramType(lower_fn_ty);
@@ -10771,6 +11033,12 @@ const Builder = struct {
             partial_edge
         else
             try self.completeRootTemplateEvidence(view, template_ref, template, partial_edge);
+        edge.instances = partial_edge.instances;
+        // A template with a Code instance inventory (D1) is reached only by
+        // a closing or forward use, which carries its table.
+        if (edge.instances == null and codeInventories(view).inventoryOf(template_ref.template) != null) {
+            Common.invariant("a template with a Code instance inventory was requested with no instance table");
+        }
         edge.vector = try source_ctx.resolveCallableEvidenceAtNode(
             view,
             view.templates.evidenceParams(&template),
@@ -11043,6 +11311,7 @@ const Builder = struct {
                 .const_evidence = try source_ctx.draft.addConstFnEvidence(stored_evidence.entries),
                 .const_evidence_frames = try source_ctx.draft.addConstFnEvidenceFrames(stored_evidence.frames),
                 .const_evidence_frame_head = .of(stored_evidence.head),
+                .instances = InstanceTableId.stored(edge.instances),
             },
             .signature_relation = signature_relation,
         });
@@ -11078,6 +11347,7 @@ const Builder = struct {
             .initial_request_arg_classes = try source_ctx.graph.snapshotFunctionArgumentClasses(request_fn_node),
             .evidence = evidence,
             .subst = edge.subst,
+            .instances = edge.instances,
             .runtime_demand_guard_frames = try source_ctx.runtimeDemandGuardFrameAddresses(),
             .demand_start = demand_boundary,
             .demand_end = demand_boundary,
@@ -11292,7 +11562,7 @@ const Builder = struct {
         body_ctx.evidence = rootEvidenceWithSubstitution(
             spec.template_ref,
             templateSchemaIn(view, &template),
-            .{ .vector = spec.evidence, .subst = spec.subst },
+            .{ .vector = spec.evidence, .subst = spec.subst, .instances = spec.instances },
         );
         try body_ctx.seedSubstitution(body_ctx.evidence.schema.?, spec.subst);
         body_ctx.runtime_demand_guard_frames = source_ctx.runtime_demand_guard_frames;
@@ -11601,6 +11871,9 @@ const Builder = struct {
         child: checked.CheckedTypeId,
         field: checked.CheckedRecordField,
         tag: checked.CheckedTag,
+        /// The rest of a record's or a tag union's row, which an owner
+        /// term binds to a lowered row (Q17): its fields or its tags.
+        row_rest: Type.TypeId,
     };
 
     /// A checked type whose children are still lowering. Its ops occupy
@@ -11686,17 +11959,37 @@ const Builder = struct {
                     },
                     .field => |field| {
                         const value_ty = type_run.results.pop().?;
-                        try type_run.fields.append(self.allocator, .{
-                            .name = try recordFieldName(self.activeNameStore(), frame.view, field.name),
-                            .ty = switch (field.kind.tag) {
-                                .required, .defaulted => value_ty,
-                                .optional => try self.optionalSlotType(value_ty),
-                                .undetermined => Common.invariant("undetermined checked field kind reached direct record-row lowering"),
-                                .err => Common.invariant("poisoned checked field kind reached direct record-row lowering"),
-                            },
-                            .value_ty = .of(if (field.kind.tag == .optional) value_ty else null),
-                            .default = .of(try self.monoFieldDefault(frame.view, field)),
-                        });
+                        try type_run.fields.append(self.allocator, try self.loweredRecordField(frame.view, field.name, field.kind, value_ty));
+                    },
+                    // An owner term binds a row variable to exactly the
+                    // rest of its row (`TableBuilder.ownerTerm`), so the rest
+                    // joins the row as is.
+                    .row_rest => |rest| switch (self.activeTypeStore().get(rest)) {
+                        .record => |fields| {
+                            const rest_fields = self.activeTypeStore().fieldSpan(fields);
+                            for (0..GuardedList.borrowLen(rest_fields)) |at| {
+                                const field = GuardedList.at(rest_fields, at);
+                                // The reifier leaves out each field a nearer
+                                // link names.
+                                std.debug.assert(for (type_run.fields.items[frame.fields_start..]) |known| {
+                                    if (known.name == field.name) break false;
+                                } else true);
+                                try type_run.fields.append(self.allocator, field);
+                            }
+                        },
+                        .tag_union => |tags| {
+                            const rest_tags = self.activeTypeStore().tagSpan(tags);
+                            for (0..GuardedList.borrowLen(rest_tags)) |at| {
+                                const tag = GuardedList.at(rest_tags, at);
+                                // The reifier leaves out each tag a nearer
+                                // link names.
+                                std.debug.assert(for (type_run.tags.items[frame.tags_start..]) |known| {
+                                    if (known.name == tag.name) break false;
+                                } else true);
+                                try type_run.tags.append(self.allocator, tag);
+                            }
+                        },
+                        .primitive, .named, .tuple, .list, .box, .func, .erased, .zst, .hole => Common.invariant("an owner term binds a row variable to no row"),
                     },
                     .tag => |tag| {
                         const arg_count = tag.args.len;
@@ -11795,6 +12088,10 @@ const Builder = struct {
                         .alias => |alias| current = alias.backing,
                         .empty_record => break,
                         .flex, .rigid => |variable| {
+                            if (self.owner_row_bindings) |bound| if (bound.get(checkedTypeAddress(view, current))) |rest| {
+                                try type_run.ops.append(gpa, .{ .row_rest = rest });
+                                break;
+                            };
                             if (variable.row_default == .empty_record) break;
                             Common.invariant("open non-record checked row reached Monotype record lowering");
                         },
@@ -11825,6 +12122,10 @@ const Builder = struct {
                         .alias => |alias| current = alias.backing,
                         .empty_tag_union => break,
                         .flex, .rigid => |variable| {
+                            if (self.owner_row_bindings) |bound| if (bound.get(checkedTypeAddress(view, current))) |rest| {
+                                try type_run.ops.append(gpa, .{ .row_rest = rest });
+                                break;
+                            };
                             if (variable.row_default == .empty_tag_union) break;
                             Common.invariant("open non-tag checked row reached Monotype tag-union lowering");
                         },
@@ -11984,21 +12285,12 @@ const Builder = struct {
     }
 
     fn lowerCheckedTypeVariable(variable: checked.CheckedTypeVariable) Type.Content {
-        if (variable.numeric_default_phase) |phase| {
-            const target = checked.literal_defaulting.defaultTargetForPhase(phase) orelse
-                Common.invariant("checking-finalized numeric variable reached Monotype unresolved");
-            return switch (target) {
-                .dec => .{ .primitive = .dec },
-                .str => .{ .primitive = .str },
-            };
-        }
-        if (variable.row_default) |row_default| {
-            return switch (row_default) {
-                .empty_record => .{ .record = .empty() },
-                .empty_tag_union => .{ .tag_union = .empty() },
-            };
-        }
-        return .{ .tag_union = .empty() };
+        return switch (checked.sealedVariable(variable)) {
+            .dec => .{ .primitive = .dec },
+            .str => .{ .primitive = .str },
+            .empty_record => .{ .record = .empty() },
+            .empty_tag_union => .{ .tag_union = .empty() },
+        };
     }
 
     fn lowerNominalBackingType(
@@ -12108,8 +12400,30 @@ const Builder = struct {
     }
 
     /// Translate a checked `??` identity into the Monotype name store.
-    fn monoFieldDefault(self: *Builder, view: ModuleView, field: checked.CheckedRecordField) Allocator.Error!?Type.FieldDefault {
-        const default = field.kind.defaultIdentity() orelse return null;
+    /// The Monotype field of a checked field of `view` named `name` with
+    /// kind `kind`, whose value type lowered to `value_ty`.
+    fn loweredRecordField(
+        self: *Builder,
+        view: ModuleView,
+        name: @FieldType(checked.CheckedRecordField, "name"),
+        kind: checked.CheckedFieldKind,
+        value_ty: Type.TypeId,
+    ) Allocator.Error!Type.Field {
+        return .{
+            .name = try recordFieldName(self.activeNameStore(), view, name),
+            .ty = switch (kind.tag) {
+                .required, .defaulted => value_ty,
+                .optional => try self.optionalSlotType(value_ty),
+                .undetermined => Common.invariant("undetermined checked field kind reached direct record-row lowering"),
+                .err => Common.invariant("poisoned checked field kind reached direct record-row lowering"),
+            },
+            .value_ty = .of(if (kind.tag == .optional) value_ty else null),
+            .default = .of(try self.monoFieldDefault(view, kind)),
+        };
+    }
+
+    fn monoFieldDefault(self: *Builder, view: ModuleView, kind: checked.CheckedFieldKind) Allocator.Error!?Type.FieldDefault {
+        const default = kind.defaultIdentity() orelse return null;
         const origin_module = default.origin() orelse Common.invariant("defaulted checked field carried no default origin module");
         return .{
             .module = try self.activeNameStore().internModuleIdentity(view.names.moduleIdentityBytes(origin_module)),
@@ -12326,6 +12640,106 @@ const Builder = struct {
             },
             .target = target,
         };
+    }
+
+    /// Index the table of each descriptor method at each owner type that
+    /// each module's description step recorded (Q17, design.md "Code
+    /// Instance Tables"), by the owner's Monotype type. Two modules that
+    /// record one owner type record tables of one template at one instance.
+    fn indexImplicitInstances(self: *Builder) Allocator.Error!void {
+        for (self.moduleViews()) |*view| {
+            const output = view.code_output;
+            for (output.implicit_instances) |record| {
+                const owner = try self.lowerOwnerTerm(output, record.owner);
+                const key: ImplicitInstanceKey = .{
+                    .owner = self.program.types.equalityDigest(&self.program.names, owner),
+                    .method = record.method,
+                };
+                // A refused record's table is `code_output.refused_table`.
+                const found: InstanceTableId = .{ .view = view, .table = record.table };
+                std.debug.assert((record.outcome == .refused) == found.refused()); // code_descriptions writes refused_table for exactly the refused records
+                const entry = try self.implicit_instances.getOrPut(self.allocator, key);
+                if (!entry.found_existing) {
+                    entry.value_ptr.* = found;
+                    continue;
+                }
+                const kept = entry.value_ptr.*;
+                // Two modules that record one owner type describe one
+                // template at one instance, so they agree.
+                std.debug.assert(kept.refused() == found.refused()); // one template at one instance is refused in every module or in none
+                std.debug.assert(found.refused() or std.meta.eql(kept.view.code_output.tableTemplate(kept.table), found.view.code_output.tableTemplate(found.table))); // one owner type selects one target template
+            }
+        }
+    }
+
+    /// The Monotype type of owner term `term` of `output` (Q17): its checked
+    /// type, lowered with each bound variable read as its binding's type.
+    fn lowerOwnerTerm(self: *Builder, output: *const code_output.CodeOutput, term_index: u32) Allocator.Error!Type.TypeId {
+        const term = output.owner_terms[term_index];
+        const view = self.moduleForKeyBytes(output.owner_modules[term.module].bytes) orelse
+            Common.invariant("an owner term names a module that is not in the lowering input");
+        switch (term.kind) {
+            .type => {},
+            .record_rest => {
+                var fields: std.ArrayList(Type.Field) = .empty;
+                defer fields.deinit(self.allocator);
+                for (output.ownerMembers(term)) |member| {
+                    const value_ty = try self.lowerOwnerTerm(output, output.ownerMemberTerms(member)[0]);
+                    try fields.append(self.allocator, try self.loweredRecordField(try self.ownerMemberView(output, member), @fromBackingInt(member.label), member.kind, value_ty));
+                }
+                return try self.activeTypeStore().add(.{ .record = try self.activeTypeStore().addRecordFields(self.activeNameStore(), fields.items) });
+            },
+            .tag_rest => {
+                var tags: std.ArrayList(Type.Tag) = .empty;
+                defer tags.deinit(self.allocator);
+                var payloads: std.ArrayList(Type.TypeId) = .empty;
+                defer payloads.deinit(self.allocator);
+                for (output.ownerMembers(term)) |member| {
+                    payloads.clearRetainingCapacity();
+                    for (output.ownerMemberTerms(member)) |payload| try payloads.append(self.allocator, try self.lowerOwnerTerm(output, payload));
+                    const tag_name = try tagName(self.activeNameStore(), try self.ownerMemberView(output, member), @fromBackingInt(member.label));
+                    try tags.append(self.allocator, .{ .name = tag_name, .checked_name = tag_name, .payloads = try self.activeTypeStore().addSpan(payloads.items) });
+                }
+                return try self.activeTypeStore().add(.{ .tag_union = try self.activeTypeStore().addTagVariants(self.activeNameStore(), tags.items) });
+            },
+        }
+        const bindings = output.ownerBindings(term);
+        if (bindings.len == 0) return try self.lowerType(view, term.ty);
+        var seeded: CheckedTypeMemo(Type.TypeId) = .empty;
+        defer seeded.deinit(self.allocator);
+        for (bindings) |binding| {
+            try seeded.put(self.allocator, checkedTypeAddress(view, binding.variable), try self.lowerOwnerTerm(output, binding.term));
+        }
+        var bound = try seeded.clone(self.allocator);
+        defer bound.deinit(self.allocator);
+        // The memo of closed checked types reads each bound variable as its
+        // binding while this term lowers, and is kept apart from it. A row
+        // variable is read where its row's extension stands.
+        std.mem.swap(CheckedTypeMemo(Type.TypeId), &self.type_cache, &seeded);
+        defer std.mem.swap(CheckedTypeMemo(Type.TypeId), &self.type_cache, &seeded);
+        const saved_rows = self.owner_row_bindings;
+        self.owner_row_bindings = &bound;
+        defer self.owner_row_bindings = saved_rows;
+        return try self.lowerType(view, term.ty);
+    }
+
+    /// The module whose store holds a row term member's label.
+    fn ownerMemberView(self: *Builder, output: *const code_output.CodeOutput, member: code_output.OwnerMemberRecord) Allocator.Error!ModuleView {
+        return self.moduleForKeyBytes(output.owner_modules[member.module].bytes) orelse
+            Common.invariant("an owner term member names a module that is not in the lowering input");
+    }
+
+    /// The index `indexImplicitInstances` built, which a worker builder
+    /// borrows from its coordinator.
+    fn implicitInstances(self: *const Builder) *const ImplicitInstances {
+        return self.borrowed_implicit_instances orelse &self.implicit_instances;
+    }
+
+    /// The table of `method` at the owner type `owner` (Q17). A refused
+    /// table makes the method's body a crash (`InstanceTableId.refused`).
+    fn implicitInstanceTable(self: *Builder, method: code_analyses.DescriptorMethod, owner: names.TypeDigest) InstanceTableId {
+        return self.implicitInstances().get(.{ .owner = owner, .method = method }) orelse
+            Common.invariant("the compiler calls a descriptor method with an inventory at an owner type no description step recorded");
     }
 
     fn moduleForDigest(self: *Builder, module_digest: names.CheckedModuleDigest) ModuleView {
@@ -13022,6 +13436,13 @@ const Builder = struct {
         owner: static_dispatch.MethodOwner,
     ) ?MethodLookup {
         const owner_view = self.methodOwnerView(owner_names, owner) orelse return null;
+        // A refused `to_inspect` (Q17) is a rejected declaration, so
+        // inspection renders the default form, as for any rejected one.
+        if (static_dispatch.methodOwnerInImportedStore(owner_names, owner_view.names, owner)) |view_owner| {
+            if (owner_view.names.lookupMethodName("to_inspect")) |view_method| {
+                if (codeInventories(owner_view).refusesMethod(.{ .owner = view_owner, .method = view_method })) return null;
+            }
+        }
         return value_rules.lookupInspectOverride(InspectOverrideViews{
             .builder = self,
             .owner_view = owner_view,
@@ -13103,13 +13524,41 @@ const Builder = struct {
         owner: static_dispatch.MethodOwner,
         method_name: []const u8,
     ) ?MethodLookupResult {
+        const declared = self.declaredMethodKey(owner_names, owner, method_name) orelse return null;
+        // A method the compiler calls that the description step refused is
+        // a rejected declaration for every call made by type (Q17).
+        if (codeInventories(declared.view).refusesMethod(declared.key)) return .rejected;
+        return switch (declared.view.method_registry.lookup(declared.key) orelse return null) {
+            .rejected => .rejected,
+            .target => |target| .{ .target = self.registryMethodLookup(declared.view, target) },
+        };
+    }
+
+    /// The key of `owner.method_name` in the registry of the module that
+    /// declares `owner`, with that module's view. Null when that module is
+    /// not in the lowering input or does not name the method.
+    fn declaredMethodKey(
+        self: *Builder,
+        owner_names: *const names.NameStore,
+        owner: static_dispatch.MethodOwner,
+        method_name: []const u8,
+    ) ?struct { view: ModuleView, key: static_dispatch.MethodKey } {
         const owner_view = self.methodOwnerView(owner_names, owner) orelse return null;
         const view_owner = static_dispatch.methodOwnerInImportedStore(owner_names, owner_view.names, owner) orelse return null;
         const view_method = owner_view.names.lookupMethodName(method_name) orelse return null;
-        return switch (owner_view.method_registry.lookup(.{ .owner = view_owner, .method = view_method }) orelse return null) {
-            .rejected => .rejected,
-            .target => |target| .{ .target = self.registryMethodLookup(owner_view, target) },
-        };
+        return .{ .view = owner_view, .key = .{ .owner = view_owner, .method = view_method } };
+    }
+
+    /// Whether the description step refused `owner.method_name` (Q17), as
+    /// the declaring module's `refused_methods` records it.
+    fn declaredMethodRefused(
+        self: *Builder,
+        owner_names: *const names.NameStore,
+        owner: static_dispatch.MethodOwner,
+        method_name: []const u8,
+    ) bool {
+        const declared = self.declaredMethodKey(owner_names, owner, method_name) orelse return false;
+        return codeInventories(declared.view).refusesMethod(declared.key);
     }
 
     fn noteBuiltinTryDef(
@@ -13239,6 +13688,30 @@ const Builder = struct {
     /// The evidence a producer-authored root edge supplies to a template: the
     /// template's own quantified variables, unpinned by any caller, with the
     /// root's recorded entries as contract provenance.
+    /// The table of a platform requirement's closing use in the app
+    /// (design.md "Code Instance Tables"), or null.
+    /// The instance table of a platform requirement's closing use, which
+    /// the app's code output holds by requires index (design.md "Code
+    /// Instance Tables"), or null where the app binding has no inventory. A
+    /// refused use is lowered as a crash (`requirementUseRefused`), so it
+    /// never reaches here.
+    fn requirementInstances(self: *Builder, ref: ?checked.CheckedInstanceTableRef) ?InstanceTableId {
+        const table = ref orelse return null;
+        const app = self.moduleForId(table.checked_module);
+        return switch (app.code_output.edgeTable(.{ .requirement = table.requires_idx }) orelse return null) {
+            .table => |id| .{ .view = app, .table = id },
+            .refused => Common.invariant("a refused platform requirement use reached its template"),
+        };
+    }
+
+    /// Whether the description step of the app refused the closing use of
+    /// a platform requirement.
+    fn requirementUseRefused(self: *Builder, ref: ?checked.CheckedInstanceTableRef) bool {
+        const table = ref orelse return false;
+        const use = self.moduleForId(table.checked_module).code_output.edgeTable(.{ .requirement = table.requires_idx }) orelse return false;
+        return use == .refused;
+    }
+
     fn materializeCheckedProcedureEvidence(
         self: *Builder,
         template_ref: names.ProcTemplate,
@@ -13322,6 +13795,7 @@ const Builder = struct {
             .queued,
             null,
             self.root_demand,
+            null,
         );
         return .{ .local = self.defFnId(def) };
     }
@@ -13423,6 +13897,7 @@ const Builder = struct {
                     // A restored constant function is the value an
                     // evaluation produced; it keeps evaluation demand.
                     .evaluation,
+                    null,
                 );
                 return self.defFnId(def);
             },
@@ -13825,6 +14300,7 @@ const Builder = struct {
             .const_evidence = draft_evidence.entries,
             .const_evidence_frames = draft_evidence.frames,
             .const_evidence_frame_head = .of(stored_evidence.head),
+            .instances = InstanceTableId.stored(source_ctx.evidence.instanceTable()),
         }, .signature_relation = signature_relation });
         const symbol = self.symbols.fresh();
         const spec_index = source_ctx.draft.nested_specs.items.len;
@@ -14298,6 +14774,7 @@ const Builder = struct {
                 boundary.const_use,
                 boundary.request_node,
                 boundary.use_evidence,
+                boundary.instances,
             ),
             .hoisted => |entry| blk: {
                 const previous_restore_evidence = ctx.restore_evidence;
@@ -15014,6 +15491,7 @@ const Builder = struct {
                 body_scheduling,
                 codec_contract,
                 demand,
+                spec.instances,
             );
             break :blk .{ .local = self.defFnId(def) };
         };
@@ -15672,6 +16150,7 @@ const Builder = struct {
                 .source_fn_key = spec.source_fn_key,
                 .request_fn_ty = request_ty,
                 .evidence = if (spec.local_context_dependent and spec.state == .lowered) null else spec.evidence,
+                .instances = spec.instances,
                 .codec_contract = if (spec.codec_contract) |contract| .{
                     .anchor = contract.anchor,
                     .constructor_ty = try sealer.sealNode(contract.constructor_node),
@@ -16981,6 +17460,9 @@ const DraftFnTemplate = struct {
     const_evidence: DraftConstEvidence = .{},
     const_evidence_frames: DraftSpan(check.ConstStore.ConstFnEvidenceFrame) = DraftSpan(check.ConstStore.ConstFnEvidenceFrame).empty(),
     const_evidence_frame_head: collections.OptionalU32 = .none,
+    /// The Code instance table of the specialization (D1), as a stored
+    /// function keeps it (Q16), or null.
+    instances: ?check.ConstStore.ConstFnInstances = null,
 
     fn sealTypeCellsInPlace(self: *DraftFnTemplate, graph: *InstGraph, sealer: *GraphTypeFinals) Allocator.Error!void {
         try self.mono_fn_ty.sealInPlace(graph, sealer);
@@ -17095,6 +17577,9 @@ const DraftCallableBindingCallee = struct {
     module: names.CheckedModuleDigest,
     template: checked.CallableEvalTemplateId,
     fn_node: NodeId,
+    /// The Code instance table the binding's entry wrapper takes (Q17), or
+    /// null where it has no inventory.
+    instances: ?InstanceTableId = null,
 };
 
 const ClosedDirectDraftSpecialization = struct {
@@ -18069,6 +18554,8 @@ const DraftTemplateSpec = struct {
     evidence: []const SpecEvidence,
     /// The substitution the request applied to the template's scheme.
     subst: SpecSubstitution,
+    /// The instance table the request handed the template (D1), or null.
+    instances: ?InstanceTableId = null,
     runtime_demand_guard_frames: []const RuntimeDemandGuardFrameAddress,
     /// Runtime-value demands recorded while this specialization's body (and
     /// any explicitly lexical-context-dependent procedure bodies it owns)
@@ -18117,6 +18604,8 @@ const SealedTemplateSpec = struct {
     /// A fully lowered lexical body carries its resolved calls in the draft.
     /// Only deferred or globally committable requests retain dispatch evidence.
     evidence: ?[]const SpecEvidence,
+    /// The Code instance table of the request (D1), or null.
+    instances: ?InstanceTableId = null,
     /// The request's substitution sealed in the shard's store epoch.
     subst: SealedSubstitution,
     codec_contract: ?SealedCodecContractContext,
@@ -18180,6 +18669,9 @@ const DraftDeferredConstUse = struct {
     provenance: DraftConstUseProvenance,
     context_evidence: EvidenceChain,
     use_evidence: []const SpecEvidence,
+    /// The Code instance table the use gives the constant's evaluation (D1,
+    /// Q16), or null for a constant with no inventory.
+    instances: ?InstanceTableId,
     current_fn_key: names.TypeDigest,
     /// Durable ancestry of constant expansions active at the use site. The
     /// deferred expansion must restore this chain so a delayed recursive edge
@@ -21219,6 +21711,7 @@ const BodyDraftStore = struct {
             },
             .const_evidence_frames = .{ .start = evidence_frames_start + template.const_evidence_frames.start, .len = template.const_evidence_frames.len },
             .const_evidence_frame_head = template.const_evidence_frame_head,
+            .const_instances = template.instances,
         };
     }
 
@@ -22805,6 +23298,8 @@ const BodyContext = struct {
     /// Frame stacks of finished instantiation runs, reused by later runs so
     /// a deep type does not regrow a stack for every instantiation.
     inspect_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
+    /// Helpers that build the `Code.Value` of an input slot's value, by type.
+    code_value_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
     equality_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
     hash_defs: std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry),
     encoder_defs: std.AutoHashMap(GeneratedEncoderDefAddress, DraftGeneratedHelperDefEntry),
@@ -22872,6 +23367,15 @@ const BodyContext = struct {
     /// restored from the constant lower their bodies against this chain
     /// (their plans' `constraint(k)` refs index the constant's scheme).
     restore_evidence: EvidenceChain,
+    /// While lowering a use of a top-level binding whose value evaluation
+    /// computes, the Code instance table that use gives (D1, Q16). A binding
+    /// stored at its own type variables keeps no table, and an exact alias's
+    /// lookup is at those variables, so each takes the use's.
+    binding_instances: ?BindingInstances = null,
+    /// The generic bound call whose own lowering `stepBoundInstance`
+    /// requested, which the next lowering step of that call takes as an
+    /// ordinary call (design.md "Bound Instance Roots").
+    bound_call_lowering: ?ExprSite = null,
     /// While restoring a static-data candidate's runtime expression along its
     /// constructor spine, that candidate. Each non-empty list or box on the
     /// spine restores as its own nested candidate (`restoredStaticDataPart`),
@@ -22892,8 +23396,9 @@ const BodyContext = struct {
     specialization_dispatch_crashes: ?[]bool = null,
     owns_specialization_dispatch_crashes: bool = false,
     /// Per dispatch plan of a custom literal pattern (its `is_eq` or its
-    /// literal's conversion): whether this specialization's evidence resolves
-    /// that plan to a checked error or unreachable value.
+    /// literal's conversion) or of a bound capture: whether this
+    /// specialization's evidence resolves that plan to a checked error or
+    /// unreachable value.
     specialization_pattern_plan_crashes: ?[]bool = null,
     owns_specialization_pattern_plan_crashes: bool = false,
     specialization_dispatch_divergence: ?checked.DispatchDivergence = null,
@@ -23625,6 +24130,7 @@ const BodyContext = struct {
             .codec_support_path = collections.DenseMap(Type.TypeId, void).init(allocator),
             .hash_expansion_stack = collections.DenseMap(Type.TypeId, void).init(allocator),
             .inspect_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
+            .code_value_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
             .equality_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
             .hash_defs = std.AutoHashMap(GeneratedHelperDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
             .encoder_defs = std.AutoHashMap(GeneratedEncoderDefAddress, DraftGeneratedHelperDefEntry).init(allocator),
@@ -23650,6 +24156,7 @@ const BodyContext = struct {
         self.hash_defs.deinit();
         self.equality_defs.deinit();
         self.inspect_defs.deinit();
+        self.code_value_defs.deinit();
         self.hash_expansion_stack.deinit();
         self.equality_expansion_stack.deinit();
         self.codec_support_path.deinit();
@@ -24448,6 +24955,7 @@ const BodyContext = struct {
                 .const_evidence_frames = draft_evidence.frames,
                 .const_evidence_frame_head = .of(stored_evidence.head),
                 .evidence_digest = evidence_digest,
+                .instances = InstanceTableId.stored(self.evidence.instanceTable()),
             },
         });
     }
@@ -25464,7 +25972,7 @@ const BodyContext = struct {
                 Common.invariant("deferred inspect method was not reserved before relation freeze")
         else blk: {
             const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &.{value_ty}, str_ty);
-            break :blk try self.methodTargetCalleeWithMono(lookup, callable_mono_ty);
+            break :blk try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, .{ .implicit = .to_inspect });
         };
 
         const args = [_]DraftExprId{value};
@@ -25553,7 +26061,7 @@ const BodyContext = struct {
         }
         const ret_node = try self.graph.importMono(str_ty);
         const request_node = try self.graphFunctionNode(&.{node}, ret_node);
-        const callee = try self.methodTargetCalleeAtNode(lookup, request_node, null);
+        const callee = try self.methodTargetCalleeAtNode(lookup, request_node, null, .{ .implicit = .to_inspect });
         try self.draft.prepared_inspect_methods.append(self.allocator, .{
             .value_node = node,
             .callee = callee,
@@ -27765,7 +28273,7 @@ const BodyContext = struct {
 
     fn instField(self: *BodyContext, field: checked.CheckedRecordField, value_node: NodeId) Allocator.Error!InstField {
         const name = try recordFieldName(self.nameStoreMut(), self.view, field.name);
-        const default = try self.builder.monoFieldDefault(self.view, field);
+        const default = try self.builder.monoFieldDefault(self.view, field.kind);
         return switch (field.kind.tag) {
             .required => .{ .name = name, .ty = value_node, .kind = .required, .default = .none },
             .defaulted => .{
@@ -28313,6 +28821,10 @@ const BodyContext = struct {
         defer self.function_entry_demand_guards = saved_function_entry_demand_guards;
         self.function_entry_demand_guards = fn_nodes.args;
         const ret_cell = DraftTypeCell.fromGraphNode(fn_nodes.ret);
+        // A descriptor method the compiler calls at an owner type whose
+        // table the description step refused and reported (Q17): the body
+        // crashes in place of the method.
+        if (self.evidence.instanceTable()) |table| if (table.refused()) return try self.refusedTemplateBodyAtNode(fn_nodes, ret_cell);
         return switch (template.body) {
             .checked_body => |root_expr| blk: {
                 const root = checkedExpr(self.view, ExprSite.read(root_expr));
@@ -28329,6 +28841,7 @@ const BodyContext = struct {
                     .hosted_lambda => Common.invariant("hosted lambda template must lower through hosted metadata, not source lambda body"),
                     .numeral,
                     .str_from_quote,
+                    .code_site,
                     .str_segment,
                     .str,
                     .bytes_literal,
@@ -28391,6 +28904,9 @@ const BodyContext = struct {
                     .field_names_for_size,
                     .field_name,
                     => Common.invariant("encoding intrinsic wrapper must lower through a checked direct call"),
+                    // Checking accepts these only as the callee of a call, and
+                    // publication makes each call the constant it computes.
+                    .code_prim, .code_type_id, .code_ty_of => Common.invariant("Code.prim, Code.type_id and Code.ty_of lower as the constant publication wrote at each call"),
                 };
             },
         };
@@ -28998,6 +29514,15 @@ const BodyContext = struct {
             request_fn_node,
             .interface_summary_input,
         );
+        // The callee's interface reads the evidence edges of its body, whose
+        // tables a forward edge reads from the use's table, as the call's
+        // lowering does (design.md "Code Instance Tables"). A refused closing
+        // use is lowered as a crash, so its callee's body is never lowered
+        // and its interface reads the types alone.
+        edge.instances = if (self.view.code_output.edgeTable(.{ .use = record.expr })) |closing| switch (closing) {
+            .table => |table| .{ .view = self.view, .table = table },
+            .refused => null,
+        } else self.instancesForUse(record.expr);
         return try self.applyTemplateInterfaceRelations(
             template_ref,
             callee_view,
@@ -29339,6 +29864,7 @@ const BodyContext = struct {
             .expect,
             .numeral_conversion,
             .quote_conversion,
+            .interpolation_conversion,
             .repl_expr,
             .literal_argument,
             => saved_source_region_override,
@@ -29366,6 +29892,7 @@ const BodyContext = struct {
             },
             .numeral_conversion,
             .quote_conversion,
+            .interpolation_conversion,
             => Common.invariant("literal-conversion root bypassed literal-conversion lowering"),
         };
         const declared_ret_node = try ret_cell.toGraphNode(self.graph);
@@ -29408,7 +29935,13 @@ const BodyContext = struct {
             switch (self.dispatchRuntimePlan(plan)) {
                 .callable => {},
                 .crash => switch (self.view.bodies.index().nodeKind(plan.node)) {
-                    .expr => added_crash = (try self.recordSpecializationDispatchCrash(plan.node)) or added_crash,
+                    // A bound capture plan is evaluated by no body
+                    // expression either: its node is the site or the read.
+                    .expr => if (isBoundCapturePlan(self.view, plan_id))
+                        try self.recordSpecializationPatternPlanCrash(plan_id)
+                    else {
+                        added_crash = (try self.recordSpecializationDispatchCrash(plan.node)) or added_crash;
+                    },
                     // A custom literal pattern's plans are evaluated by no
                     // body expression, so no expression's divergence changes.
                     .pattern => try self.recordSpecializationPatternPlanCrash(plan_id),
@@ -29429,7 +29962,7 @@ const BodyContext = struct {
             };
             const ret_ty = switch (self.view.bodies.index().nodeKind(plan.node)) {
                 .expr => blk: {
-                    const expr = checkedExpr(self.view, ExprSite.own(self.view, @fromBackingInt(plan.node)));
+                    const expr = checkedExpr(self.view, dispatchPlanSite(self.view, plan_id));
                     // An interpolation's conversion returns the `Try` of the
                     // assembler whose result is the interpolation's value.
                     break :blk if (expr.data == .interpolation) self.literalConversionTryType(plan_id) else expr.ty;
@@ -29450,9 +29983,9 @@ const BodyContext = struct {
         }
     }
 
-    /// Whether a custom literal pattern's dispatch plan cannot run: its
-    /// resolution is a checked error or unreachable, or this specialization's
-    /// evidence resolves it to one.
+    /// Whether a custom literal pattern's dispatch plan, or a bound capture
+    /// plan, cannot run: its resolution is a checked error or unreachable,
+    /// or this specialization's evidence resolves it to one.
     fn patternPlanCrashes(self: *const BodyContext, maybe_plan: ?static_dispatch.StaticDispatchPlanId) bool {
         const plan_id = maybe_plan orelse Common.invariant("custom literal pattern dispatch reached Monotype without a dispatch plan");
         switch (self.view.static_dispatch_plans.plans[@backingInt(plan_id)].resolution) {
@@ -29545,21 +30078,27 @@ const BodyContext = struct {
         // RECORDED the materialization, while `self.view` is the declaring
         // module—its template table does not contain that owner.
         if (self.in_default_expr) return;
-        var scopes = std.ArrayList(EvidenceScope).empty;
-        defer scopes.deinit(self.allocator);
+        var frames = std.ArrayList(EvidenceChain).empty;
+        defer frames.deinit(self.allocator);
         var frame = chain;
         while (true) {
             if (!names.procedureTemplateRefEql(frame.scope.owner, self.owner_template)) {
                 Common.invariant("stored function evidence belonged to a different checked template");
             }
-            try scopes.append(self.allocator, frame.scope);
+            try frames.append(self.allocator, frame);
             frame = (frame.parent orelse break).*;
         }
+        // A plan's evidence index counts frames from the plan's own lexical
+        // scope. So each scope's relations replay with that scope's frame as
+        // the head of the chain, as they do when a body lowers the scope.
+        const head = self.evidence;
+        defer self.evidence = head;
         const template = self.view.templates.get(self.owner_template.template);
-        var index = scopes.items.len;
+        var index = frames.items.len;
         while (index > 0) {
             index -= 1;
-            switch (scopes.items[index].lexical) {
+            self.evidence = frames.items[index];
+            switch (frames.items[index].scope.lexical) {
                 .root => try self.instantiateTemplateDispatchRelations(template, null),
                 .generalized => |scope| try self.instantiateTemplateDispatchRelations(template, scope),
             }
@@ -30569,6 +31108,29 @@ const BodyContext = struct {
         return completed_fn;
     }
 
+    /// A template body that crashes because the description step refused
+    /// its instance table (Q17): fresh parameters and a crash.
+    fn refusedTemplateBodyAtNode(
+        self: *BodyContext,
+        fn_nodes: FunctionNodes,
+        ret_cell: DraftTypeCell,
+    ) Allocator.Error!LoweredTemplateBody {
+        const args = try self.allocator.alloc(DraftTypedLocal, fn_nodes.args.len);
+        defer self.allocator.free(args);
+        for (fn_nodes.args, 0..) |arg_node, index| {
+            const cell = DraftTypeCell.fromGraphNode(arg_node);
+            args[index] = .{
+                .local = try self.addLocalWithBinderCell(self.builder.symbols.fresh(), cell, null),
+                .ty = cell,
+            };
+        }
+        return .{
+            .args = try self.draft.addTypedLocalSpan(args),
+            .body = try self.addExprWithTypeCell(ret_cell, try self.refusedCodeData()),
+            .ret = ret_cell,
+        };
+    }
+
     /// Lower a procedure whose declaration carries a type annotation and no
     /// implementation. The procedure keeps its declared arity so every call
     /// site still links and still evaluates its arguments, and reaching the
@@ -30579,6 +31141,10 @@ const BodyContext = struct {
         fn_nodes: FunctionNodes,
         ret_cell: DraftTypeCell,
     ) Allocator.Error!LoweredTemplateBody {
+        // Invariant 1: Monotype lowering never reaches an intrinsic. Checking
+        // poisons each reference to one that runs (design.md "Reify-Only
+        // Definitions").
+        std.debug.assert(!declaration.intrinsic);
         const saved_loc = self.builder.current_loc;
         defer self.builder.current_loc = saved_loc;
         const saved_region = self.builder.current_region;
@@ -30689,7 +31255,7 @@ const BodyContext = struct {
                 if (lambda_expr.data != .lambda) Common.invariant("checked closure did not point at a lambda expression");
                 break :blk .{ ExprSite.read(closure.lambda), lambda_expr.data.lambda };
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("local procedure site did not point at a lambda or closure"),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("local procedure site did not point at a lambda or closure"),
         };
 
         var saved = std.ArrayList(BinderRestore).empty;
@@ -31084,7 +31650,7 @@ const BodyContext = struct {
                             if (lambda.data != .lambda) Common.invariant("checked closure did not point at a lambda expression");
                             break :ty lambda.ty;
                         },
-                        .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("nested callable draft named a non-callable expression"),
+                        .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("nested callable draft named a non-callable expression"),
                     },
                     .value => if (task.closure) |closure| ty: {
                         task.capture_span = try self.lowerClosureCaptureExprSpan(closure.captures);
@@ -31539,7 +32105,7 @@ const BodyContext = struct {
     fn isDispatchExpr(expr: CheckedExpr) bool {
         return switch (expr.data) {
             .dispatch_call, .interpolation, .type_dispatch_call, .method_eq => true,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => false,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => false,
         };
     }
 
@@ -31567,14 +32133,14 @@ const BodyContext = struct {
             .call => |call| .{ .call_result = .{ .expr = expr_id, .checked_ret_ty = expr.ty, .call = call, .expected_ret_ty = null } },
             .dispatch_call => |plan_node| .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_node = null, .phase = .expression_lowering } },
             .interpolation => |interpolation| .{ .interpolation_result = .{ .maybe_plan = self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), .expected_ret_node = null } },
-            .type_dispatch_call, .method_eq => |plan_node| .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_node = null, .phase = .expression_lowering } },
+            .type_dispatch_call, .method_eq => |plan| .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_node = null, .phase = .expression_lowering } },
             .field_access => |field| .{ .field_access = .{ .checked_ty = expr.ty, .access = field, .expected_ty = null } },
             .tuple_access => |access| .{ .tuple_access = .{ .checked_ty = expr.ty, .tuple = ExprSite.read(access.tuple), .elem_index = access.elem_index, .expected_ty = null } },
             .lookup_local => |lookup| return try self.finishTypeNodeLeaf(task, try self.lookupExprTypeNode(expr.ty, lookup.resolved)),
             .lookup_external, .lookup_required => |resolved| return try self.finishTypeNodeLeaf(task, try self.lookupExprTypeNode(expr.ty, resolved)),
             .lambda => |lambda| return try self.finishTypeNodeLeaf(task, try self.lambdaFunctionNode(expr.ty, lambda)),
             .closure => |closure| return try self.finishTypeNodeLeaf(task, try self.closureFunctionNode(closure)),
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .structural_eq, .structural_hash, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return try self.finishTypeNodeLeaf(task, try self.lowerTypeNode(expr.ty)),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .structural_eq, .structural_hash, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return try self.finishTypeNodeLeaf(task, try self.lowerTypeNode(expr.ty)),
         };
         return evidenceCall(self, next);
     }
@@ -31642,13 +32208,13 @@ const BodyContext = struct {
                 frame.cursor = if (expected_ty == null) 4 else 2;
                 return evidenceCall(self, .{ .interpolation_result = .{ .maybe_plan = self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), .expected_ret_node = expected_node } });
             },
-            .type_dispatch_call => |plan_node| {
+            .type_dispatch_call => |plan| {
                 frame.cursor = if (expected_ty == null) 4 else 2;
-                return evidenceCall(self, .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_node = expected_node, .phase = .expression_lowering } });
+                return evidenceCall(self, .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_node = expected_node, .phase = .expression_lowering } });
             },
-            .method_eq => |plan_node| {
+            .method_eq => |plan| {
                 frame.cursor = if (expected_ty == null) 4 else 2;
-                return evidenceCall(self, .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_node = expected_node, .phase = .expression_lowering } });
+                return evidenceCall(self, .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_node = expected_node, .phase = .expression_lowering } });
             },
             .field_access => |field| {
                 frame.cursor = 2;
@@ -31660,7 +32226,7 @@ const BodyContext = struct {
             },
             .lookup_local => |lookup| return .{ .ret = .{ .maybe_node = try self.lookupCallArgumentEvidenceNode(expr.ty, lookup.resolved, expected_ty) } },
             .lookup_external, .lookup_required => |resolved| return .{ .ret = .{ .maybe_node = try self.lookupCallArgumentEvidenceNode(expr.ty, resolved, expected_ty) } },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .structural_eq, .structural_hash, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .structural_eq, .structural_hash, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
         if (expected_ty) |ty| {
             try self.constrainTypeToMono(expr.ty, ty);
@@ -31682,7 +32248,7 @@ const BodyContext = struct {
                 const expr = checkedExpr(self.view, task.expr);
                 switch (expr.data) {
                     .tuple, .record, .tag, .nominal, .list => {},
-                    .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return .{ .ret = .{ .maybe_node = null } },
+                    .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return .{ .ret = .{ .maybe_node = null } },
                 }
                 task.argument_node = try self.freshInstNode(expr.ty);
                 frame.cursor = 2;
@@ -31747,7 +32313,7 @@ const BodyContext = struct {
                         task.current_child_node = backing.node;
                         return evidenceCall(self, .{ .produced_value = .{ .expr = ExprSite.read(nominal.backing_expr), .request_node = backing.node } });
                     },
-                    .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return .{ .ret = .{ .maybe_node = null } },
+                    .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return .{ .ret = .{ .maybe_node = null } },
                 }
                 return try self.nextProducedValueChild(task, expr);
             },
@@ -31823,7 +32389,7 @@ const BodyContext = struct {
                         const witness = try self.graph.namedValueNodeWithBacking(representation_node, backing_witness.slot);
                         return .{ .ret = .{ .maybe_node = try self.relateCheckedNodeToProducedValue(representation_node, witness) } };
                     },
-                    .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => unreachable, // cursor 1 returns for every expression that is not a tuple, tag, record, list, or nominal constructor
+                    .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => unreachable, // cursor 1 returns for every expression that is not a tuple, tag, record, list, or nominal constructor
                 }
                 task.index += 1;
                 return try self.nextProducedValueChild(task, expr);
@@ -31896,7 +32462,7 @@ const BodyContext = struct {
                 const witness = try self.constructorWitnessWithStructuralNode(request_node, structural_node);
                 return .{ .ret = .{ .maybe_node = try self.relateCheckedNodeToProducedValue(request_node, witness) } };
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level, .nominal => unreachable, // only tuple, tag, record, and list constructors request their next child; nominal finishes in stepProducedValue
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level, .nominal => unreachable, // only tuple, tag, record, and list constructors request their next child; nominal finishes in stepProducedValue
         }
     }
 
@@ -32449,6 +33015,9 @@ const BodyContext = struct {
                 return .{ .ret = .{ .node = (try self.graph.functionNodes(callable_node)).ret } };
             }
             const fn_nodes = try self.graph.functionNodes(fn_node);
+            // A refused closing use lowers as a crash in place of the call
+            // (`closingUseRefused`), so no specialization serves it.
+            if (self.useRefusedAt(call.func)) return .{ .ret = .{ .node = fn_nodes.ret } };
             if (try self.checkedExprDivergesInLoweredRuntime(ExprSite.read(call.func))) return .{ .ret = .{ .node = fn_nodes.ret } };
             for (call.args) |arg| {
                 if (try self.checkedExprDivergesInLoweredRuntime(ExprSite.read(arg))) return .{ .ret = .{ .node = fn_nodes.ret } };
@@ -32539,7 +33108,7 @@ const BodyContext = struct {
                     const key = RelatedConstructor{ .expr = checked_expr, .node = self.graph.rootNode(expected_node) };
                     if ((try self.related_constructors.getOrPut(self.allocator, key)).found_existing) return self.finishRelate(task);
                 },
-                .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .call, .empty_record, .block, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+                .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .call, .empty_record, .block, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
             }
             frame.cursor = 1;
             switch (expr.data) {
@@ -32548,7 +33117,7 @@ const BodyContext = struct {
                 .call => |call| return try self.beginRelateCall(frame, task, expr.ty, call),
                 .dispatch_call => |plan_node| return evidenceCall(self, .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_node = expected_node, .phase = .expression_lowering } }),
                 .interpolation => |interpolation| return evidenceCall(self, .{ .interpolation_result = .{ .maybe_plan = self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), .expected_ret_node = expected_node } }),
-                .type_dispatch_call, .method_eq => |plan_node| return evidenceCall(self, .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_node = expected_node, .phase = .expression_lowering } }),
+                .type_dispatch_call, .method_eq => |plan| return evidenceCall(self, .{ .dispatch_result = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_node = expected_node, .phase = .expression_lowering } }),
                 .field_access => |field| return evidenceCall(self, .{ .field_access = .{ .checked_ty = expr.ty, .access = field, .expected_ty = null } }),
                 .tag => |tag| {
                     task.name = try bodyTagName(self.nameStoreMut(), self.view, tag.name);
@@ -32589,7 +33158,7 @@ const BodyContext = struct {
                 // branches.
                 .block, .match_, .if_, .runtime_error => {},
                 .lambda, .closure => _ = try self.graph.functionNodes(expected_node),
-                .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .binop, .unary_minus, .structural_eq, .structural_hash, .tuple_access, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return evidenceCall(self, .{ .type_node = .{ .expr = checked_expr } }),
+                .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .binop, .unary_minus, .structural_eq, .structural_hash, .tuple_access, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return evidenceCall(self, .{ .type_node = .{ .expr = checked_expr } }),
             }
             return self.finishRelate(task);
         }
@@ -32599,7 +33168,7 @@ const BodyContext = struct {
                 try relateRequestComponent(self.graph, input.?.nodeValue(), expected_node);
                 return self.finishRelate(task);
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .binop, .unary_minus, .structural_eq, .structural_hash, .tuple_access, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .binop, .unary_minus, .structural_eq, .structural_hash, .tuple_access, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {
                 try self.graph.unify(expected_node, input.?.nodeValue());
                 return self.finishRelate(task);
             },
@@ -32650,7 +33219,7 @@ const BodyContext = struct {
                     } });
                 }
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level, .nominal => unreachable, // nextRelateChild is called only for tag, tuple, list, and record expressions
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .empty_list, .match_, .if_, .empty_record, .block, .zero_argument_tag, .call, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level, .nominal => unreachable, // nextRelateChild is called only for tag, tuple, list, and record expressions
         }
         return self.finishRelate(task);
     }
@@ -32750,14 +33319,14 @@ const BodyContext = struct {
             .call => |call| (try self.callResultMonoType(expr_id, expr.ty, call, null)) orelse try self.lowerTypeView(expr.ty),
             .dispatch_call => |plan_node| (try self.dispatchResultMonoType(expr.ty, self.view.bodies.dispatchPlan(plan_node), null)) orelse try self.lowerTypeView(expr.ty),
             .interpolation => |interpolation| try self.activeTypeFromNode(try self.interpolationResultTypeNode(self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), null)),
-            .type_dispatch_call, .method_eq => |plan_node| (try self.dispatchResultMonoType(expr.ty, self.view.bodies.dispatchPlan(plan_node), null)) orelse try self.lowerTypeView(expr.ty),
+            .type_dispatch_call, .method_eq => |plan| (try self.dispatchResultMonoType(expr.ty, plan, null)) orelse try self.lowerTypeView(expr.ty),
             .lookup_local => |lookup| try self.lookupExprMonoType(expr.ty, lookup.resolved),
             .lookup_external, .lookup_required => |resolved| try self.lookupExprMonoType(expr.ty, resolved),
             .lambda => |lambda| try self.lambdaFunctionType(expr.ty, lambda),
             .closure => |closure| try self.closureFunctionType(closure),
             .field_access => |field| try self.activeTypeFromNode(try self.fieldAccessTypeNode(expr.ty, field, null)),
             .tuple_access => |access| try self.activeTypeFromNode(try self.tupleAccessTypeNode(expr.ty, ExprSite.read(access.tuple), access.elem_index, null)),
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .structural_eq, .structural_hash, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => try self.lowerTypeView(expr.ty),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .structural_eq, .structural_hash, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => try self.lowerTypeView(expr.ty),
         };
     }
 
@@ -32927,6 +33496,8 @@ const BodyContext = struct {
         expr: struct { expr: ExprSite },
         /// `lowerExprInner`
         expr_inner: struct { expr: ExprSite, saved: ?SavedSourceLocation = null },
+        /// A generic bound call at the instance table in force.
+        bound_instance: struct { expr: ExprSite },
         /// An expression lowered at a sealed type.
         with_type: WithTypeTask,
         /// `lowerRecordExpr` at a sealed record type.
@@ -33902,7 +34473,7 @@ const BodyContext = struct {
                         .result_cell = state.state_cell,
                         .tail = .{ .state_result = .{ .state = state, .result_node = result_node } },
                     }) }),
-                    .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+                    .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
                 }
                 if (try self.nodeIsProvenUninhabited(result_node)) {
                     task.zero_branch_cell = state.state_cell;
@@ -33937,7 +34508,7 @@ const BodyContext = struct {
                 .result_cell = result_cell,
                 .tail = tail,
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => .{
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => .{
                 .statements = &.{},
                 .final_expr = body,
                 .result_cell = result_cell,
@@ -34017,7 +34588,7 @@ const BodyContext = struct {
                 };
                 return self.controlFlowOutputStep(body, task.result_cell, output);
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => {
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => {
                 task.stage = .value;
                 return branchBodyStep(self, body, .{ .value = task.result_cell });
             },
@@ -34042,7 +34613,7 @@ const BodyContext = struct {
                 .output = output,
                 .select = false,
             } }),
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => unreachable, // every caller passes an if or match expression
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => unreachable, // every caller passes an if or match expression
         };
     }
 
@@ -34102,7 +34673,7 @@ const BodyContext = struct {
                     } });
                 }
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
 
         // A divergent discarded expression never yields the value this
@@ -34231,7 +34802,7 @@ const BodyContext = struct {
                 } };
                 return switch (checkedExpr(self.view, ExprSite.read(child)).data) {
                     .if_, .match_ => self.controlFlowOutputStep(ExprSite.read(child), task.state_cell, output),
-                    .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => branchBodyStep(self, ExprSite.read(child), output),
+                    .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => branchBodyStep(self, ExprSite.read(child), output),
                 };
             },
             .expect => |child| {
@@ -34494,7 +35065,7 @@ const BodyContext = struct {
                     .final_expr = ExprSite.read(block.final_expr),
                     .result_cell = cell,
                 }) }),
-                .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {
+                .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {
                     task.finish = .{ .effect_at_cell = cell };
                     return divergentStep(self, expr_id, .{ .at_type = try self.unitType() });
                 },
@@ -34515,7 +35086,7 @@ const BodyContext = struct {
                         }
                         return requestLowerTask(self, .{ .if_task = .{ .expr_id = expr_id, .if_ = if_, .result_cell = .{ .sealed = ty } } });
                     },
-                    .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+                    .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
                 }
                 task.finish = .{ .add_expr = ty };
                 return divergentStep(self, expr_id, .{ .data = ty });
@@ -34606,7 +35177,7 @@ const BodyContext = struct {
             .generated_interpolation_segments => |expr| {
                 const interpolation = switch (checkedExpr(self.view, ExprSite.read(expr)).data) {
                     .interpolation => |value| value,
-                    .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("dispatch interpolation segments referenced a non-interpolation expression"),
+                    .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("dispatch interpolation segments referenced a non-interpolation expression"),
                 };
                 try appendInterpolationOperands(self.allocator, &exprs, interpolation);
             },
@@ -34758,7 +35329,7 @@ const BodyContext = struct {
                 try appendInterpolationOperands(self.allocator, &operands, interpolation);
                 return try self.divergentOperandRefsStep(operands.items, ty);
             },
-            .method_eq, .type_dispatch_call => |plan_node| return try self.divergentDispatchStep(self.view.bodies.dispatchPlan(plan_node), ty),
+            .method_eq, .type_dispatch_call => |plan| return try self.divergentDispatchStep(plan, ty),
             .numeral => |node| return try self.divergentDispatchStep(self.view.bodies.numeralPlan(node), ty),
             .str_from_quote => |node| return try self.divergentDispatchStep(self.view.bodies.quotePlan(node), ty),
             inline .str_segment,
@@ -34773,6 +35344,7 @@ const BodyContext = struct {
             .lambda,
             .anno_only,
             .hosted_lambda,
+            .code_site,
             => |_, kind| {
                 checked.assertExprNeverDiverges(@field(check.BodyAnalyses.ExprKind, @tagName(kind)));
                 Common.invariant("non-divergent checked expression reached divergent lowering");
@@ -34917,11 +35489,22 @@ const BodyContext = struct {
                             task.stage = .{ .crashing_iter = reason };
                             return requestLowerTask(self, .{ .discarded = .{ .expr = ExprSite.read(task.plan.forLoopSite().iterable) } });
                         }
+                        // The description step refused the `iter` call's
+                        // closing use, keyed by the loop's body, and
+                        // reported it: the call is that crash, and its
+                        // iterable is not evaluated.
+                        if (self.view.code_output.edgeTable(.{ .use = for_.body.node() })) |closing| if (closing == .refused) {
+                            return self.finishLoop(task, .{ .block = .{
+                                .statements = try self.addStmtSpan(&.{}),
+                                .final_expr = try self.addExprWithTypeCell(task.loop_cell, try self.refusedCodeData()),
+                            } });
+                        };
                         task.stage = .initial_iterator;
                         return self.iteratorDispatchStep(.{
                             .plan = task.plan.iter,
                             .pre_lowered = .{},
                             .expected_ret_ty = null,
+                            .use = for_.body.useNode(),
                         });
                     },
                     .condition => |condition| {
@@ -35176,6 +35759,9 @@ const BodyContext = struct {
         lookup: MethodLookup = undefined,
         callee: DraftFnSlot = undefined,
         ret_node: NodeId = undefined,
+        /// The body of the `for` loop whose `iter` call this is, which keys
+        /// it as a use (D1), or null for its `next` call.
+        use: ?CIR.Expr.Idx = null,
         arg_nodes: []const NodeId = &.{},
         /// Each lowered operand. Owned.
         args: []DraftExprId = &.{},
@@ -35246,6 +35832,7 @@ const BodyContext = struct {
             lookup,
             callable_node,
             self.iteratorTargetEvidenceSource(plan),
+            MethodInstances.of(if (task.use) |use| self.instancesForUse(use) else null),
         );
         const completed_callable_node = try self.draftFnSlotTypeNode(task.callee, callable_node);
         if (task.expected_ret_ty) |expected| {
@@ -35950,6 +36537,7 @@ const BodyContext = struct {
             .operand_at_type,
             .call_expr_at_node,
             .call_expr,
+            .bound_instance,
             => {},
         }
     }
@@ -35961,6 +36549,7 @@ const BodyContext = struct {
             .type_inner => |*task| return self.stepTypeInner(frame, task, input),
             .expr => |*task| return self.stepLowerExpr(frame, task, input),
             .expr_inner => |*task| return self.stepExprInner(frame, task, input),
+            .bound_instance => |*task| return self.stepBoundInstance(frame, task, input),
             .with_type => |*task| return self.stepWithType(frame, task, input),
             .record_at_type => |*task| return self.stepRecordAtType(task, input),
             .dispatch => |*task| return self.stepDispatchLower(frame, task, input),
@@ -36018,7 +36607,7 @@ const BodyContext = struct {
     fn stepInterpolationLower(self: *BodyContext, task: *InterpolationLowerTask, input: ?LowerResult) Allocator.Error!LowerStep {
         const interpolation = switch (checkedExpr(self.view, task.expr).data) {
             .interpolation => |value| value,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("interpolation lowering referenced a non-interpolation expression"),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("interpolation lowering referenced a non-interpolation expression"),
         };
         switch (task.stage) {
             .start => {
@@ -36284,6 +36873,8 @@ const BodyContext = struct {
             .sealed => Common.invariant("sealed expression reached graph-cell lowering"),
             .graph_node => {},
         }
+        if (self.closingUseRefused(checked_expr, expr.data)) return loweredExprStep(try self.addExprWithTypeCell(cell, try self.refusedCodeData()));
+        if (try self.boundInstanceStep(frame, checked_expr, 4)) |step| return step;
         if (try self.restoredHoistedExprAtNode(checked_expr, expected_node)) |restored| {
             return loweredExprStep(restored);
         }
@@ -36320,6 +36911,12 @@ const BodyContext = struct {
                 .ext = null,
             }, expected_node),
             .record => |record| return recordConstructorStep(self, checked_expr, record, expected_node),
+            // The description is in the code output, so the site restores it
+            // at the node the request carries. Restoring at a materialized
+            // type instead would ask the graph to resolve `Code(f)` here, and
+            // `f` may still hold a row the seal has yet to close to its
+            // default.
+            .code_site => return loweredExprStep(try self.restoreCodeSiteAtNode(checked_expr, expected_node)),
             .call => return requestLowerTask(self, .{ .call_expr_at_node = .{ .expr = checked_expr, .expected_node = expected_node } }),
             .numeral, .str_from_quote => |node| if (self.view.bodies.literalConversionRoot(node)) |root_id| {
                 return loweredExprStep(try self.lowerLiteralConversionAtNode(checked_expr, root_id, expected_node));
@@ -36332,13 +36929,13 @@ const BodyContext = struct {
                 try self.selectExprRepresentationAtNode(checked_expr, expected_node);
                 return requestLowerTask(self, .{ .interpolation = .{ .expr = checked_expr, .maybe_plan = self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), .value_node = expected_node } });
             },
-            .type_dispatch_call => |plan_node| {
+            .type_dispatch_call => |plan| {
                 try self.selectExprRepresentationAtNode(checked_expr, expected_node);
-                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_cell = cell } });
+                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_cell = cell } });
             },
-            .method_eq => |plan_node| {
+            .method_eq => |plan| {
                 try self.selectExprRepresentationAtNode(checked_expr, expected_node);
-                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_cell = cell } });
+                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_cell = cell } });
             },
             .block => |block| return requestLowerTask(self, .{ .block = try self.boxLowerTask(BlockTask, .{
                 .statements = block.statements,
@@ -36365,7 +36962,7 @@ const BodyContext = struct {
                     return loweredExprStep(try self.addExprWithTypeCell(cell, .{ .checked_error = try self.addStringLiteral("runtime error") }));
                 }
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
         try relateRequestComponent(
             self.graph,
@@ -36402,7 +36999,7 @@ const BodyContext = struct {
                 frame.cursor = 6;
                 return requestLowerChild(self, coerce.value, DraftTypeCell.fromGraphNode(try self.lowerExprTypeNode(coerce.value)));
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda => {},
         }
         frame.cursor = 4;
         return requestLowerTask(self, .{ .expr_inner = .{ .expr = checked_expr } });
@@ -36430,7 +37027,8 @@ const BodyContext = struct {
                 } else DraftTypeCell.fromGraphNode(try self.relateCheckedNodeToProducedValue(expected_node, ret_node));
                 return loweredExprStep(try self.addExprWithTypeCell(result_cell, lowered.data));
             },
-            // A dispatch lowered at the context type.
+            // A dispatch, or a generic bound call, lowered at the context
+            // type.
             3 => return .{ .ret = input.? },
             // An expression lowered with the context type.
             else => {
@@ -36439,12 +37037,14 @@ const BodyContext = struct {
                 if (@import("builtin").mode == .debug and !self.sameType(ty, lowered_ty)) {
                     switch (expr.data) {
                         .lambda, .closure => Common.invariant("checked function expression lowered at a type different from its context type"),
-                        .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("checked expression lowered at a type different from its call operand type"),
+                        .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("checked expression lowered at a type different from its call operand type"),
                     }
                 }
                 return loweredExprStep(lowered);
             },
         }
+        if (self.closingUseRefused(checked_expr, expr.data)) return loweredExprStep(try self.addExpr(.{ .ty = ty, .data = try self.refusedCodeData() }));
+        if (try self.boundInstanceStep(frame, checked_expr, 3)) |step| return step;
         switch (expr.data) {
             .call => |call| if (try self.inspectOnlyCallStep(
                 expr.ty,
@@ -36455,7 +37055,7 @@ const BodyContext = struct {
                 frame.cursor = 3;
                 return step;
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
         if (try self.restoredHoistedExprAtType(checked_expr, ty)) |restored| return loweredExprStep(restored);
         switch (expr.data) {
@@ -36487,13 +37087,13 @@ const BodyContext = struct {
                 frame.cursor = 3;
                 return requestLowerTask(self, .{ .interpolation = .{ .expr = checked_expr, .maybe_plan = self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), .value_node = try self.activeNodeFromType(ty) } });
             },
-            .type_dispatch_call => |plan_node| {
+            .type_dispatch_call => |plan| {
                 frame.cursor = 3;
-                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_cell = .{ .sealed = ty } } });
+                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_cell = .{ .sealed = ty } } });
             },
-            .method_eq => |plan_node| {
+            .method_eq => |plan| {
                 frame.cursor = 3;
-                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_cell = .{ .sealed = ty } } });
+                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_cell = .{ .sealed = ty } } });
             },
             .lookup_local => |lookup| {
                 frame.cursor = 3;
@@ -36524,7 +37124,7 @@ const BodyContext = struct {
                 } });
             },
             .lambda, .closure => {},
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .tuple_access, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => try self.constrainKnownType(expr.ty, ty),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .tuple_access, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => try self.constrainKnownType(expr.ty, ty),
         }
         frame.cursor = 4;
         return requestLowerTask(self, .{ .with_type = .{ .expr = checked_expr, .ty = ty } });
@@ -36538,10 +37138,15 @@ const BodyContext = struct {
             return .{ .ret = input.? };
         }
         task.saved = try self.saveSourceLocation(expr);
+        if (self.closingUseRefused(expr_id, expr.data)) {
+            const refused_node = try self.lowerExprTypeNode(expr_id);
+            return self.exprInnerDone(task, try self.addExprWithTypeCell(DraftTypeCell.fromGraphNode(refused_node), try self.refusedCodeData()));
+        }
         if (try self.divergentEffectExprStep(expr_id)) |step| {
             frame.cursor = 1;
             return step;
         }
+        if (try self.boundInstanceStep(frame, expr_id, 1)) |step| return step;
         switch (expr.data) {
             .call => |call| if (try self.inspectOnlyCallStep(
                 expr.ty,
@@ -36560,7 +37165,7 @@ const BodyContext = struct {
                 if (runtime_error.evaluated.len != 0) return divergentStep(self, expr_id, .{ .at_type = try self.unitType() });
                 return requestLowerTask(self, .{ .with_type = .{ .expr = expr_id, .ty = try self.unitType() } });
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
         switch (expr.data) {
             .call => |call| {
@@ -36571,7 +37176,7 @@ const BodyContext = struct {
                 frame.cursor = 1;
                 return requestLowerTask(self, .{ .call_expr = .{ .expr = expr_id, .checked_ret_ty = expr.ty, .call = call } });
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
         if (exprSourceNode(self.view, expr_id) != null and self.view.hoisted_constants.lookupByExpr(expr_id.node()) != null) {
             const expr_node = try self.lowerExprTypeNode(expr_id);
@@ -36685,7 +37290,7 @@ const BodyContext = struct {
                 frame.cursor = 1;
                 return requestLowerTask(self, .{ .field_access = .{ .expr = expr_id, .target = .{ .node = expr_node } } });
             },
-            .str_segment, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .match_, .if_, .call, .block, .closure, .lambda, .binop, .unary_minus, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .str_segment, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .match_, .if_, .call, .block, .closure, .lambda, .binop, .unary_minus, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
         const expr_node = try self.lowerExprTypeNode(expr_id);
         switch (expr.data) {
@@ -36699,15 +37304,15 @@ const BodyContext = struct {
                 frame.cursor = 1;
                 return requestLowerTask(self, .{ .interpolation = .{ .expr = expr_id, .maybe_plan = self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), .value_node = expr_node } });
             },
-            .type_dispatch_call => |plan_node| {
+            .type_dispatch_call => |plan| {
                 if (try self.restoredHoistedExprAtNode(expr_id, expr_node)) |restored| return self.exprInnerDone(task, restored);
                 frame.cursor = 1;
-                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_cell = DraftTypeCell.fromGraphNode(expr_node) } });
+                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_cell = DraftTypeCell.fromGraphNode(expr_node) } });
             },
-            .method_eq => |plan_node| {
+            .method_eq => |plan| {
                 if (try self.restoredHoistedExprAtNode(expr_id, expr_node)) |restored| return self.exprInnerDone(task, restored);
                 frame.cursor = 1;
-                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = self.view.bodies.dispatchPlan(plan_node), .expected_ret_cell = DraftTypeCell.fromGraphNode(expr_node) } });
+                return requestLowerTask(self, .{ .dispatch = .{ .checked_ret_ty = expr.ty, .maybe_plan = plan, .expected_ret_cell = DraftTypeCell.fromGraphNode(expr_node) } });
             },
             // A coercion's row can be open with nothing in this body to
             // close it, as when every use matches its error with `Err(_)`. It
@@ -36724,7 +37329,7 @@ const BodyContext = struct {
                     .diverges = false,
                 } });
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => {},
         }
         const expr_ty = try self.lowerExprType(expr_id);
         if (try self.restoredHoistedExprAtType(expr_id, expr_ty)) |restored| return self.exprInnerDone(task, restored);
@@ -36733,7 +37338,7 @@ const BodyContext = struct {
                 frame.cursor = 1;
                 return requestLowerTask(self, .{ .direct_structural = .{ .expr = expr_id, .ret = .{ .checked = expr.ty } } });
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
         frame.cursor = 1;
         return requestLowerTask(self, .{ .with_type = .{ .expr = expr_id, .ty = expr_ty } });
@@ -36804,11 +37409,12 @@ const BodyContext = struct {
                 } }),
                 .run_low_level => |low_level| try self.withTypeData(task, .{ .low_level = .{ .op = low_level.op, .args = child.spanValue() } }),
                 .match_, .if_, .block, .closure, .lambda, .record, .lookup_local, .lookup_external, .lookup_required, .runtime_error => self.withTypeDone(task, child.exprValue()),
-                .numeral, .str_from_quote, .str_segment, .bytes_literal, .empty_list, .call, .empty_record, .zero_argument_tag, .binop, .unary_minus, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .crash, .ellipsis, .anno_only, .break_, .hosted_lambda => unreachable, // these kinds finish at cursor 0 without requesting a child lowering
+                .numeral, .str_from_quote, .str_segment, .code_site, .bytes_literal, .empty_list, .call, .empty_record, .zero_argument_tag, .binop, .unary_minus, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .crash, .ellipsis, .anno_only, .break_, .hosted_lambda => unreachable, // these kinds finish at cursor 0 without requesting a child lowering
             };
         }
         task.saved = try self.saveSourceLocation(expr);
         frame.cursor = 1;
+        if (self.closingUseRefused(expr_id, expr.data)) return self.withTypeDone(task, try self.addExpr(.{ .ty = ty, .data = try self.refusedCodeData() }));
         const data: BodyExprData = switch (expr.data) {
             .anno_only,
             => Common.invariant("non-runtime checked expression reached Monotype lowering"),
@@ -36824,6 +37430,11 @@ const BodyContext = struct {
                 if (self.view.bodies.literalConversionRoot(node)) |root_id| return self.withTypeDone(task, try self.lowerLiteralConversionAtNode(expr_id, root_id, try self.graph.importMono(ty)));
                 return self.withTypeDone(task, try self.lowerQuoteExpr(expr_id, node, ty));
             },
+            // The description step wrote the description into the code
+            // output, so the site restores a constant rather than evaluating
+            // anything. A refused site was reported by that step, so it is a
+            // checked error and adds no second report.
+            .code_site => return self.withTypeDone(task, try self.restoreCodeSiteAtNode(expr_id, try self.graph.importMono(ty))),
             .str_segment => |str| .{ .str_lit = try self.lowerStringLiteral(str) },
             .bytes_literal => |str| blk: {
                 const literal = try self.lowerStringLiteral(str);
@@ -37506,7 +38117,7 @@ const BodyContext = struct {
             break :blk existing.slot;
         } else blk: {
             const template = lookup.view.templates.get(procedure.template.template);
-            const edge: EdgeEvidence = if (try self.directAliasTargetEdge(plan)) |alias_edge| alias_edge else edge: {
+            var edge: EdgeEvidence = if (try self.directAliasTargetEdge(plan)) |alias_edge| alias_edge else edge: {
                 const subst = (try self.directDispatchTargetSubstitution(plan, lookup, callable_node)) orelse
                     Common.invariant("closed direct procedure call had no checked substitution");
                 break :edge .{
@@ -37523,6 +38134,9 @@ const BodyContext = struct {
             if (edge.subst.len != template.scheme_vars.len) {
                 Common.invariant("closed direct procedure call substitution length differed from its scheme");
             }
+            // The target reads the table of the node's edge (design.md
+            // "Code Instance Tables").
+            edge.instances = self.evidenceEdgeInstances(self.view, task.evidence_id);
             const source_fn_ty = lookup.target.callable_ty;
             const created = try self.builder.lowerDraftTemplateFromContext(
                 self,
@@ -37998,7 +38612,7 @@ const BodyContext = struct {
                 const source_fn_ty = self.directCallInstantiationSourceFnType(target, call.sourceFnTy(self.view));
                 const source_fn_key = try self.view.types.rootKey(source_fn_ty);
                 if (args.len != 1) Common.invariant("Str.inspect call did not have exactly one lowered argument");
-                const callee = try self.fnTemplateForDirectCallAtNode(target, source_fn_ty, source_fn_key, task.fn_node);
+                const callee = try self.fnTemplateForDirectCallAtNode(target, source_fn_ty, source_fn_key, task.fn_node, .lookup);
                 const captures = try self.directCallCaptureSpan(target);
                 return self.callLowerDone(task, .{
                     .ret_ty = DraftTypeCell.fromGraphNode(task.fn_nodes.ret),
@@ -38064,7 +38678,7 @@ const BodyContext = struct {
         const expr = checkedExpr(self.view, checked_expr);
         const call = switch (expr.data) {
             .call => |call| call,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("call-at-node lowering received a non-call expression"),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("call-at-node lowering received a non-call expression"),
         };
         switch (frame.cursor) {
             0 => {},
@@ -38180,7 +38794,7 @@ const BodyContext = struct {
                     }
                 },
                 .zero_argument_tag, .crash, .runtime_error => {},
-                .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .record, .empty_record, .nominal, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return false,
+                .numeral, .str_from_quote, .code_site, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .record, .empty_record, .nominal, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return false,
             }
         }
         return true;
@@ -38351,6 +38965,7 @@ const BodyContext = struct {
                     request_node,
                     source_region,
                     .{ .module = self.view.key, .root = entry.root },
+                    null,
                 );
             },
             .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
@@ -38371,7 +38986,10 @@ const BodyContext = struct {
         ty: Type.TypeId,
     ) Allocator.Error!?DraftExprId {
         const entry = self.restoredHoistedConstEntry(expr_id) orelse return null;
-        return try self.restoredHoistedConstAtType(entry, ty);
+        // A call whose input binding the description step refused is that
+        // crash.
+        if (self.codeBindingOf(expr_id)) |binding| if (binding == .refused) return try self.addExpr(.{ .ty = ty, .data = try self.refusedCodeData() });
+        return try self.boundCodeValue(expr_id, try self.restoredHoistedConstAtType(entry, ty), ty);
     }
 
     fn restoredHoistedExprAtNode(
@@ -38380,6 +38998,16 @@ const BodyContext = struct {
         request_node: NodeId,
     ) Allocator.Error!?DraftExprId {
         const entry = self.restoredHoistedConstEntry(expr_id) orelse return null;
+        // A call that binds input slots is read at the one type hoisting
+        // fixed for it, with the slot values added.
+        if (self.codeBindingOf(expr_id)) |binding| {
+            const ty = try self.boundCodeType(entry);
+            try relateRequestComponent(self.graph, request_node, try self.graph.importMono(ty));
+            return switch (binding) {
+                .slots => try self.boundCodeValue(expr_id, try self.restoredHoistedConstAtType(entry, ty), ty),
+                .refused => try self.addExpr(.{ .ty = ty, .data = try self.refusedCodeData() }),
+            };
+        }
         return try self.restoredHoistedConstAtNode(entry, request_node);
     }
 
@@ -38403,6 +39031,767 @@ const BodyContext = struct {
     /// stored value. Its original expression and declaration lower in place.
     fn hoistedConstRunsAtRuntime(view: ModuleView, entry: checked.HoistedConstEntry) bool {
         return view.compile_time_roots.root(entry.root).payload == .runtime;
+    }
+
+    // Captured run-time inputs (roc-reify-proposal.md section 10.1).
+    //
+    // A call whose result is a `Code.Bound` is a compile-time root. The
+    // program reads the root's value with `inputs` set to one `Code.Value`
+    // per input slot, in slot order. Each slot is a run-time name read
+    // through its projections, as the description step recorded it, and its
+    // value is built by one generated helper per type, so a recursive type
+    // reaches its own helper again.
+
+    /// The Monotype type a call that binds input slots is read at.
+    fn boundCodeType(self: *BodyContext, entry: checked.HoistedConstEntry) Allocator.Error!Type.TypeId {
+        return switch (self.view.const_templates.get(entry.const_ref).state) {
+            .stored_const => |stored| try self.storedConstRootMonoType(self.view, stored, entry.checked_type),
+            // Publication refused a call whose type holds a type variable.
+            // An undetermined field kind takes its relation-freeze default
+            // (`required`) in this view, as for a selected hoisted const use
+            // (`selectedHoistedConstMonoType`), and the caller relates that
+            // type to the live request.
+            .eval_template => try self.graph.specializationTypeViewForNode(try self.instNode(entry.checked_type)),
+            .reserved => Common.invariant("reserved hoisted const template reached Monotype"),
+            .unimplemented => Common.invariant("declaration with no implementation reached hoisted const restoration"),
+        };
+    }
+
+    /// The types a `Code.Value` is built from, read off the `Code.Bound` the
+    /// call returns.
+    const CodeValueTypes = struct {
+        bound: Type.TypeId,
+        /// `Code.Value`.
+        value: Type.TypeId,
+        /// The tags of `Code.Value`'s backing.
+        tags: Type.Span,
+        /// `List(Code.Value)`.
+        list: Type.TypeId,
+        str: Type.TypeId,
+        i128: Type.TypeId,
+        f64: Type.TypeId,
+        u64: Type.TypeId,
+        bool: Type.TypeId,
+    };
+
+    /// A generated helper whose body is still to be built.
+    const PendingCodeValueDef = struct {
+        def_id: DraftDefId,
+        value_ty: Type.TypeId,
+        arg_local: DraftLocalId,
+    };
+
+    /// The input binding the description step recorded for the call at
+    /// `expr_id` (`CodeOutput.binding`), or null for a node that binds no
+    /// inputs.
+    fn codeBindingOf(self: *BodyContext, expr_id: ExprSite) ?code_output.Binding {
+        return self.view.code_output.binding(exprSourceNode(self.view, expr_id) orelse return null);
+    }
+
+    /// `restored`, the value of the call `call` at `bound_ty`, with the
+    /// values of the input slots the call binds, or `restored` itself when
+    /// the call binds none.
+    fn boundCodeValue(
+        self: *BodyContext,
+        call: ExprSite,
+        restored: DraftExprId,
+        bound_ty: Type.TypeId,
+    ) Allocator.Error!DraftExprId {
+        const binding = self.codeBindingOf(call) orelse return restored;
+        return switch (binding) {
+            .slots => |slots| try self.boundCodeValueWith(restored, bound_ty, .{ .slots = slots, .output = self.view.code_output, .generic = false }),
+            .refused => Common.invariant("a refused input binding was read as a value"),
+        };
+    }
+
+    /// The index of the generic bound call at `expr` among its module's
+    /// bound calls (`CodeInventories.boundCallIndex`), or null.
+    fn genericBoundCallIndex(self: *BodyContext, expr: ExprSite) ?u32 {
+        return codeInventories(self.view).boundCallIndex(expr.useNode() orelse return null);
+    }
+
+    /// Lower a generic bound call through `stepBoundInstance` when `expr` is
+    /// one: the call itself, then its value read with the inputs of the
+    /// instance table in force. `resume_cursor` is where `frame` takes the
+    /// result.
+    fn boundInstanceStep(self: *BodyContext, frame: *LowerFrame, expr: ExprSite, resume_cursor: u8) Allocator.Error!?LowerStep {
+        if (self.bound_call_lowering) |lowering| if (lowering == expr) {
+            self.bound_call_lowering = null;
+            return null;
+        };
+        if (self.genericBoundCallIndex(expr) == null) return null;
+        frame.cursor = resume_cursor;
+        return requestLowerTask(self, .{ .bound_instance = .{ .expr = expr } });
+    }
+
+    fn stepBoundInstance(self: *BodyContext, frame: *LowerFrame, task: anytype, input: ?LowerResult) Allocator.Error!LowerStep {
+        if (frame.cursor == 0) {
+            frame.cursor = 1;
+            self.bound_call_lowering = task.expr;
+            // The call and its chain run while the compiler runs.
+            self.draft.evaluation_depth += 1;
+            return requestLowerTask(self, .{ .expr_inner = .{ .expr = task.expr } });
+        }
+        self.draft.evaluation_depth -= 1;
+        return loweredExprStep(try self.boundInstanceValue(task.expr, input.?.exprValue()));
+    }
+
+    /// The value of the generic bound call `call`, lowered as `value` in
+    /// this specialization: a compile-time root of this program where the
+    /// program evaluates its roots, read with the input slots the table in
+    /// force recorded for the call (design.md "Bound Instance Roots").
+    fn boundInstanceValue(self: *BodyContext, call: ExprSite, value: DraftExprId) Allocator.Error!DraftExprId {
+        const index = self.genericBoundCallIndex(call) orelse
+            Common.invariant("a bound instance task names no generic bound call");
+        const table = self.evidence.instanceTable() orelse
+            Common.invariant("a generic bound call was lowered with no instance table in force");
+        const output = table.view.code_output;
+        const record = for (output.tableBoundEntries(table.table)) |record| {
+            if (record.call == index) break record;
+        } else Common.invariant("an instance table has no entry for a generic bound call of its template");
+        const bound_ty = try self.graph.specializationTypeViewForNode(try self.instNode(checkedExpr(self.view, call).ty));
+        const bound_node = try self.graph.importMono(bound_ty);
+        try relateRequestComponent(self.graph, try self.exprTypeCell(value).toGraphNode(self.graph), bound_node);
+        // The table of the closing use joins the root's identity: two
+        // closing uses can give the call one result type and different site
+        // types (design.md "Bound Instance Roots").
+        const read = if (self.builder.literal_roots) try self.literalRootReadWith(.{
+            .owner = self.builder.loweringModuleId(self.view.key),
+            .node = @backingInt(call.node()),
+            .kind = .bound_call,
+        }, value, bound_node, boundRootIdentity(self.view.key, call, table)) else value;
+        return try self.boundCodeValueWith(read, bound_ty, .{ .slots = output.boundEntry(record).slots, .output = output, .generic = true });
+    }
+
+    /// The input slots a bound call's value is read with: those the
+    /// description step recorded for the call, or those the table of a
+    /// closing use recorded for a generic bound call (design.md "Bound
+    /// Instance Roots").
+    const BoundSlots = struct {
+        slots: []const checked.CheckedCodeSlot,
+        /// The code output whose pools hold `slots`.
+        output: *const code_output.CodeOutput,
+        /// Whether the call is a generic bound call, whose types this
+        /// specialization fixes.
+        generic: bool,
+    };
+
+    fn boundSlotSteps(_: *BodyContext, slots: BoundSlots, slot: checked.CheckedCodeSlot) []const checked.CheckedCodeSlotStep {
+        return slots.output.slotSteps(slot);
+    }
+
+    fn boundSlotShape(_: *BodyContext, slots: BoundSlots, slot: checked.CheckedCodeSlot) []const u32 {
+        return slots.output.slotShape(slot);
+    }
+
+    /// The Monotype type of a checked type a bound call's inputs read: a
+    /// closed type, or, in a generic bound call, the type this
+    /// specialization gives it.
+    fn boundSlotType(self: *BodyContext, slots: BoundSlots, checked_ty: checked.CheckedTypeId) Allocator.Error!Type.TypeId {
+        if (!slots.generic) {
+            if (std.debug.runtime_safety) std.debug.assert(try self.checkedTypeIsClosed(checked_ty));
+            return try self.lowerType(checked_ty);
+        }
+        return try self.graph.specializationTypeViewForNode(try self.instNode(checked_ty));
+    }
+
+    fn boundCodeValueWith(
+        self: *BodyContext,
+        restored: DraftExprId,
+        bound_ty: Type.TypeId,
+        bound_slots: BoundSlots,
+    ) Allocator.Error!DraftExprId {
+        const slots = bound_slots.slots;
+        const bound_backing = nominalExprBackingType(self.typeStore(), bound_ty) orelse
+            Common.invariant("a call that binds input slots did not return a type built on Code.Bound");
+        const inputs_field = self.boundCodeField(bound_backing, "inputs");
+        const value_field = self.boundCodeField(bound_backing, "value");
+        const value_ty = switch (self.typeStore().get(inputs_field.ty)) {
+            .list => |elem| elem,
+            .primitive, .named, .record, .tuple, .tag_union, .box, .func, .erased, .zst, .hole => Common.invariant("Code.Bound inputs was not a list"),
+        };
+        const value_backing = nominalExprBackingType(self.typeStore(), value_ty) orelse
+            Common.invariant("Code.Value was not a nominal type");
+        const tags = switch (self.typeStore().get(value_backing)) {
+            .tag_union => |span| span,
+            .primitive, .named, .record, .tuple, .list, .box, .func, .erased, .zst, .hole => Common.invariant("Code.Value was not a tag union"),
+        };
+        const v = CodeValueTypes{
+            .bound = bound_ty,
+            .value = value_ty,
+            .tags = tags,
+            .list = inputs_field.ty,
+            .str = try self.primitiveType(.str),
+            .i128 = try self.primitiveType(.i128),
+            .f64 = try self.primitiveType(.f64),
+            .u64 = try self.primitiveType(.u64),
+            .bool = try self.primitiveType(.bool),
+        };
+        var pending = std.ArrayList(PendingCodeValueDef).empty;
+        defer pending.deinit(self.allocator);
+
+        const values = try self.allocator.alloc(DraftExprId, slots.len);
+        defer self.allocator.free(values);
+        for (slots, values) |slot, *out| out.* = try self.boundSlotValue(bound_slots, slot, v, &pending);
+        while (pending.pop()) |def| try self.buildCodeValueDef(def, v, &pending);
+
+        const inputs = try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(values) } });
+        const value = try self.addFieldAccessExpr(restored, value_field.name, value_field.ty);
+        const fields = recordFields(self.typeStore(), bound_backing);
+        const field_count = GuardedList.borrowLen(fields);
+        const field_exprs = try self.allocator.alloc(DraftFieldExpr, field_count);
+        defer self.allocator.free(field_exprs);
+        for (field_exprs, 0..) |*field_expr, index| {
+            const field = GuardedList.at(recordFields(self.typeStore(), bound_backing), index);
+            field_expr.* = .{
+                .name = field.name,
+                .value = if (field.name == inputs_field.name) inputs else if (field.name == value_field.name) value else Common.invariant("Code.Bound had a field other than value and inputs"),
+            };
+        }
+        return try self.addConstructorExpr(bound_ty, .{ .record = try self.addFieldExprSpan(field_exprs) });
+    }
+
+    fn boundCodeField(self: *BodyContext, record_ty: Type.TypeId, comptime text: []const u8) Type.Field {
+        const fields = recordFields(self.typeStore(), record_ty);
+        for (0..GuardedList.borrowLen(fields)) |index| {
+            const field = GuardedList.at(fields, index);
+            if (std.mem.eql(u8, self.nameStore().recordFieldLabelText(field.name), text)) return field;
+        }
+        Common.invariant("Code.Bound has no field " ++ text);
+    }
+
+    /// The `Code.Value` of one input slot: its run-time name read through
+    /// its projections, an unwrap binding the backing of a nominal value.
+    fn boundSlotValue(
+        self: *BodyContext,
+        bound_slots: BoundSlots,
+        slot: checked.CheckedCodeSlot,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!DraftExprId {
+        if (slot.valueSite()) |site| {
+            // The program evaluates the value where the call binds it.
+            const value_site = ExprSite.valueSite(site);
+            const site_ty = try self.boundSlotType(bound_slots, checkedExpr(self.view, value_site).ty);
+            const site_value = try self.lowerExprAtTypeCell(value_site, DraftTypeCell.fromSealed(site_ty));
+            return try self.slotCodeValue(bound_slots, slot, site_value, site_ty, v, pending);
+        }
+        const leaf = slot.binder().?;
+        var ty = try self.boundSlotType(bound_slots, checkedBinderType(self.view, leaf));
+        const local = self.binders.get(leaf) orelse
+            Common.invariant("an input slot read a name the body has not bound");
+        var value = try self.lowerLocalAtRequestedNode(local, self.localTypeCell(local), try self.graph.importMono(ty));
+        const Unwrap = struct { pat: DraftPatId, value: DraftExprId };
+        var unwraps = std.ArrayList(Unwrap).empty;
+        defer unwraps.deinit(self.allocator);
+        for (self.boundSlotSteps(bound_slots, slot)) |step| {
+            const shape_ty = self.codeValueShapeType(ty);
+            switch (step.kind) {
+                .field => {
+                    const text = self.view.names.recordFieldLabelText(@fromBackingInt(step.value));
+                    const fields = recordFields(self.typeStore(), shape_ty);
+                    const field = for (0..GuardedList.borrowLen(fields)) |index| {
+                        const field = GuardedList.at(fields, index);
+                        if (std.mem.eql(u8, self.nameStore().recordFieldLabelText(field.name), text)) break field;
+                    } else Common.invariant("an input slot read a field its record type does not have");
+                    value = try self.addFieldAccessExpr(value, field.name, field.ty);
+                    ty = field.ty;
+                },
+                .index => {
+                    const item_ty = GuardedList.at(tupleItemTypes(self.typeStore(), shape_ty), step.value);
+                    value = try self.addExpr(.{ .ty = item_ty, .data = .{ .tuple_access = .{ .tuple = value, .elem_index = step.value } } });
+                    ty = item_ty;
+                },
+                .unwrap => {
+                    const backing = nominalExprBackingType(self.typeStore(), shape_ty) orelse
+                        Common.invariant("an input slot unwrapped a value that is not nominal");
+                    const inner = try self.addLocal(self.builder.symbols.fresh(), backing);
+                    try unwraps.append(self.allocator, .{
+                        .pat = try self.addPat(.{ .ty = shape_ty, .data = .{ .nominal = try self.bindPat(inner, backing) } }),
+                        .value = value,
+                    });
+                    value = try self.localExpr(inner, backing);
+                    ty = backing;
+                },
+            }
+        }
+        var out = try self.slotCodeValue(bound_slots, slot, value, ty, v, pending);
+        while (unwraps.pop()) |unwrap| {
+            out = try self.addExpr(.{ .ty = v.value, .data = .{ .let_ = .{ .bind = unwrap.pat, .value = unwrap.value, .rest = out } } });
+        }
+        return out;
+    }
+
+    /// The `Code.Value` of a slot's value `value` of type `ty`: built by the
+    /// helper of its type, or, for a slot whose type holds an opaque type,
+    /// the bytes its recorded encoder writes.
+    fn slotCodeValue(
+        self: *BodyContext,
+        bound_slots: BoundSlots,
+        slot: checked.CheckedCodeSlot,
+        value: DraftExprId,
+        ty: Type.TypeId,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!DraftExprId {
+        if (slot.encoder.get()) |encoder| {
+            if (std.debug.runtime_safety) {
+                const shape = self.boundSlotShape(bound_slots, slot);
+                if (shape.len != 1 or shape[0] != @backingInt(checked.CodeValueShape.encoded)) {
+                    Common.invariant("an input slot with an encoder was not recorded as encoded");
+                }
+            }
+            return try self.encodedSlotValue(bound_slots, encoder, value, ty, v);
+        }
+        if (std.debug.runtime_safety) {
+            if (!try self.codeValueShapeMatches(ty, self.boundSlotShape(bound_slots, slot))) {
+                Common.invariant("an input slot's Monotype type differs from the shape of its slot type");
+            }
+        }
+        return try self.codeValueCall(value, ty, v, pending);
+    }
+
+    /// The `Code.Value` `Encoded(bytes)` of a slot whose type holds an opaque
+    /// type: the call `T.encoder_for(fmt.default())` that lowering builds
+    /// from the plans the checker made for `encoder`, the capture read the
+    /// slot is (`ExprSite.boundEncoder`), applied to the slot's value and
+    /// `[]`. Its error type is `[]`, so the `Ok` bytes are the only result.
+    fn encodedSlotValue(
+        self: *BodyContext,
+        bound_slots: BoundSlots,
+        encoder: CIR.Expr.Idx,
+        value: DraftExprId,
+        ty: Type.TypeId,
+        v: CodeValueTypes,
+    ) Allocator.Error!DraftExprId {
+        const encoder_expr = ExprSite.boundEncoder(encoder);
+        const encoder_ty = try self.boundSlotType(bound_slots, checkedExpr(self.view, encoder_expr).ty);
+        const function = functionShape(self.typeStore(), encoder_ty, "a bound capture's encoder was not a function");
+        if (function.args.len != 2) Common.invariant("a bound capture's encoder did not take a value and its bytes");
+        if (std.debug.runtime_safety) self.assertSameType(self.spanTypeAt(function.args, 0), ty, "a bound capture's encoder took a type other than its slot's");
+        const bytes_ty = self.spanTypeAt(function.args, 1);
+        const encode = try self.lowerExprAtTypeCell(encoder_expr, DraftTypeCell.fromSealed(encoder_ty));
+        const no_bytes = try self.addExpr(.{ .ty = bytes_ty, .data = .{ .list = try self.addExprSpan(&.{}) } });
+        const result = try self.addExpr(.{ .ty = function.ret, .data = .{ .call_value = .{
+            .callee = encode,
+            .args = try self.addExprSpan(&.{ value, no_bytes }),
+        } } });
+        const backing = nominalExprBackingType(self.typeStore(), function.ret) orelse
+            Common.invariant("a bound capture's encoder did not return a nominal Try");
+        const tags = switch (self.typeStore().get(backing)) {
+            .tag_union => |span| span,
+            .primitive, .named, .record, .tuple, .list, .box, .func, .erased, .zst, .hole => Common.invariant("a bound capture's encoder result was not a tag union"),
+        };
+        const inner = try self.addLocal(self.builder.symbols.fresh(), backing);
+        const inner_pat = try self.addPat(.{ .ty = function.ret, .data = .{ .nominal = try self.bindPat(inner, backing) } });
+        var branches = std.ArrayList(DraftBranch).empty;
+        defer branches.deinit(self.allocator);
+        for (0..tags.len) |index| {
+            const tag = GuardedList.at(self.typeStore().tagSpan(tags), index);
+            // `Err` carries `[]`, which no value has.
+            if (try self.tagHasProvenUninhabitedPayload(tag)) continue;
+            if (tag.payloads.len != 1) Common.invariant("a bound capture's encoder result had a tag other than Ok(bytes)");
+            const bytes_local = try self.addLocal(self.builder.symbols.fresh(), bytes_ty);
+            const tag_pat = try self.addPat(.{ .ty = backing, .data = .{ .tag = .{
+                .name = tag.name,
+                .payloads = try self.addPatSpan(&.{try self.bindPat(bytes_local, bytes_ty)}),
+            } } });
+            const encoded = try self.codeValueVariant(v, "Encoded", &.{try self.localExpr(bytes_local, bytes_ty)});
+            try branches.append(self.allocator, .{ .pat = tag_pat, .body = encoded });
+        }
+        if (branches.items.len != 1) Common.invariant("a bound capture's encoder result had more than its Ok case");
+        const matched = try self.addExpr(.{ .ty = v.value, .data = .{ .match_ = .{
+            .scrutinee = try self.localExpr(inner, backing),
+            .branches = try self.addBranchSpan(branches.items),
+        } } });
+        return try self.addExpr(.{ .ty = v.value, .data = .{ .let_ = .{ .bind = inner_pat, .value = result, .rest = matched } } });
+    }
+
+    /// `ty` with its transparent aliases read through: the type a
+    /// `Code.Value` follows.
+    fn codeValueShapeType(self: *BodyContext, ty: Type.TypeId) Type.TypeId {
+        var current = ty;
+        while (true) switch (self.typeStore().get(current)) {
+            .named => |named| switch (named.kind) {
+                .alias => current = (named.backing orelse Common.invariant("an alias in a slot type had no backing")).ty,
+                .nominal, .@"opaque" => return current,
+            },
+            .primitive, .record, .tuple, .tag_union, .list, .box, .func, .erased, .zst, .hole => return current,
+        };
+    }
+
+    /// A call of the helper that builds the `Code.Value` of a value of `ty`,
+    /// reserving the helper when the body has none yet.
+    fn codeValueCall(
+        self: *BodyContext,
+        value: DraftExprId,
+        ty: Type.TypeId,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!DraftExprId {
+        const address = GeneratedHelperDefAddress{ .value_ty = @backingInt(ty), .result_ty = @backingInt(v.value) };
+        const def_id = if (self.code_value_defs.get(address)) |entry| entry.id() else blk: {
+            const def_id = try self.draft.reserveDef(self.draft.current_owner);
+            try self.code_value_defs.put(address, .{ .reserved = def_id });
+            try pending.append(self.allocator, .{
+                .def_id = def_id,
+                .value_ty = ty,
+                .arg_local = try self.addLocal(self.builder.symbols.fresh(), ty),
+            });
+            break :blk def_id;
+        };
+        const callee = try self.addExprWithTypeCell(
+            .{ .sealed = try self.functionType(&.{ty}, v.value) },
+            .{ .def_ref = .{ .draft = def_id } },
+        );
+        return try self.addExpr(.{ .ty = v.value, .data = .{ .call_value = .{
+            .callee = callee,
+            .args = try self.addExprSpan(&.{value}),
+        } } });
+    }
+
+    fn buildCodeValueDef(
+        self: *BodyContext,
+        def: PendingCodeValueDef,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!void {
+        const arg = try self.localExpr(def.arg_local, def.value_ty);
+        const body = try self.codeValueBody(arg, def.value_ty, v, pending);
+        self.draft.setDef(def.def_id, .{
+            .symbol = self.builder.symbols.fresh(),
+            .fn_def = null,
+            .identity_seed = .{ .kind = "code-value-helper", .cells = .{ DraftTypeCell.fromSealed(def.value_ty), DraftTypeCell.fromSealed(v.value), null, null } },
+            .args = try self.addTypedLocalSpan(&.{.{ .local = def.arg_local, .ty = def.value_ty }}),
+            .body = .{ .roc = body },
+            .ret = try self.draftTypeCell(v.value),
+        });
+        try self.code_value_defs.put(.{ .value_ty = @backingInt(def.value_ty), .result_ty = @backingInt(v.value) }, .{ .ready = def.def_id });
+    }
+
+    /// The `Code.Value` variant `text` holding `payloads`.
+    fn codeValueVariant(self: *BodyContext, v: CodeValueTypes, comptime text: []const u8, payloads: []const DraftExprId) Allocator.Error!DraftExprId {
+        const tags = self.typeStore().tagSpan(v.tags);
+        const name = for (0..GuardedList.borrowLen(tags)) |index| {
+            const tag = GuardedList.at(self.typeStore().tagSpan(v.tags), index);
+            if (std.mem.eql(u8, self.nameStore().tagLabelText(tag.name), text)) break tag.name;
+        } else Common.invariant("Code.Value has no variant " ++ text);
+        return try self.addConstructorExpr(v.value, .{ .tag = .{ .name = name, .payloads = try self.addExprSpan(payloads) } });
+    }
+
+    /// One layer of the `Code.Value` of `value`, a value of `ty`: each
+    /// component's value is a call of its type's helper.
+    fn codeValueBody(
+        self: *BodyContext,
+        value: DraftExprId,
+        ty: Type.TypeId,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!DraftExprId {
+        const shape_ty = self.codeValueShapeType(ty);
+        // `Bool` lowers as a nominal tag union, and its `Code.Value` is `Bool`, not `Wrap`.
+        if (self.typeHasBuiltinOwner(shape_ty, .bool)) return try self.codeValueVariant(v, "Bool", &.{value});
+        switch (self.typeStore().get(shape_ty)) {
+            .primitive => |primitive| return switch (primitive) {
+                .bool => try self.codeValueVariant(v, "Bool", &.{value}),
+                .str => try self.codeValueVariant(v, "Str", &.{value}),
+                .u128 => try self.codeValueVariant(v, "U128", &.{value}),
+                .i128 => try self.codeValueVariant(v, "Int", &.{value}),
+                inline .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64 => |int| try self.codeValueVariant(v, "Int", &.{
+                    try self.lowLevelExpr(@field(can.CIR.Expr.LowLevel, @tagName(int) ++ "_to_i128"), &.{value}, v.i128),
+                }),
+                .f32 => try self.codeValueVariant(v, "Frac", &.{try self.lowLevelExpr(.f32_to_f64, &.{value}, v.f64)}),
+                .f64 => try self.codeValueVariant(v, "Frac", &.{value}),
+                .dec => try self.codeValueVariant(v, "Dec", &.{value}),
+                .u8x16, .i8x16, .u16x8, .i16x8, .u32x4, .i32x4, .u64x2, .i64x2 => Common.invariant("a slot type held a vector, which the walk refuses"),
+            },
+            .named => {
+                const backing = nominalExprBackingType(self.typeStore(), shape_ty) orelse
+                    Common.invariant("a nominal type in a slot type had no backing");
+                const inner = try self.addLocal(self.builder.symbols.fresh(), backing);
+                const pat = try self.addPat(.{ .ty = shape_ty, .data = .{ .nominal = try self.bindPat(inner, backing) } });
+                const wrapped = try self.codeValueVariant(v, "Wrap", &.{try self.codeValueCall(try self.localExpr(inner, backing), backing, v, pending)});
+                return try self.addExpr(.{ .ty = v.value, .data = .{ .let_ = .{ .bind = pat, .value = value, .rest = wrapped } } });
+            },
+            .record => |span| {
+                const items = try self.allocator.alloc(DraftExprId, span.len);
+                defer self.allocator.free(items);
+                for (items, 0..) |*item, index| {
+                    const field = self.spanFieldAt(span, index);
+                    const read = try self.addFieldAccessExpr(value, field.name, field.ty);
+                    item.* = if (field.value_ty.get()) |payload_ty|
+                        try self.optionalFieldCodeValue(read, field.ty, payload_ty, v, pending)
+                    else
+                        try self.codeValueCall(read, field.ty, v, pending);
+                }
+                return try self.codeValueVariant(v, "Record", &.{try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(items) } })});
+            },
+            .zst => return try self.codeValueVariant(v, "Record", &.{try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(&.{}) } })}),
+            .tuple => |span| {
+                const items = try self.allocator.alloc(DraftExprId, span.len);
+                defer self.allocator.free(items);
+                for (items, 0..) |*item, index| {
+                    const item_ty = self.spanTypeAt(span, index);
+                    const read = try self.addExpr(.{ .ty = item_ty, .data = .{ .tuple_access = .{ .tuple = value, .elem_index = @intCast(index) } } });
+                    item.* = try self.codeValueCall(read, item_ty, v, pending);
+                }
+                return try self.codeValueVariant(v, "Tuple", &.{try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(items) } })});
+            },
+            .tag_union => |span| {
+                var branches = std.ArrayList(DraftBranch).empty;
+                defer branches.deinit(self.allocator);
+                for (0..span.len) |index| {
+                    const tag = GuardedList.at(self.typeStore().tagSpan(span), index);
+                    if (try self.tagHasProvenUninhabitedPayload(tag)) continue;
+                    const pats = try self.allocator.alloc(DraftPatId, tag.payloads.len);
+                    defer self.allocator.free(pats);
+                    const payloads = try self.allocator.alloc(DraftExprId, tag.payloads.len);
+                    defer self.allocator.free(payloads);
+                    for (pats, payloads, 0..) |*pat, *payload, payload_index| {
+                        const payload_ty = self.spanTypeAt(tag.payloads, payload_index);
+                        const local = try self.addLocal(self.builder.symbols.fresh(), payload_ty);
+                        pat.* = try self.bindPat(local, payload_ty);
+                        payload.* = try self.codeValueCall(try self.localExpr(local, payload_ty), payload_ty, v, pending);
+                    }
+                    const tag_pat = try self.addPat(.{ .ty = shape_ty, .data = .{ .tag = .{
+                        .name = tag.name,
+                        .payloads = try self.addPatSpan(pats),
+                    } } });
+                    const name = try self.stringExpr(self.nameStore().tagLabelText(tag.name), v.str);
+                    const list = try self.addExpr(.{ .ty = v.list, .data = .{ .list = try self.addExprSpan(payloads) } });
+                    try branches.append(self.allocator, .{ .pat = tag_pat, .body = try self.codeValueVariant(v, "Tag", &.{ name, list }) });
+                }
+                return try self.addExpr(.{ .ty = v.value, .data = .{ .match_ = .{
+                    .scrutinee = value,
+                    .branches = try self.addBranchSpan(branches.items),
+                } } });
+            },
+            .list => |elem_ty| {
+                // let len = list_len(value)
+                // loop (i = 0, out = with_capacity(len))
+                //   if i == len then break out
+                //   else continue (i + 1, append_unsafe(out, value_of(get_unsafe(value, i))))
+                const len_local = try self.addLocal(self.builder.symbols.fresh(), v.u64);
+                const len_value = try self.lowLevelExpr(.list_len, &.{value}, v.u64);
+                const index_local = try self.addLocal(self.builder.symbols.fresh(), v.u64);
+                const out_local = try self.addLocal(self.builder.symbols.fresh(), v.list);
+                const index = try self.localExpr(index_local, v.u64);
+                const done = try self.lowLevelExpr(.num_is_eq, &.{ index, try self.localExpr(len_local, v.u64) }, v.bool);
+                const finish = try self.addExpr(.{ .ty = v.list, .data = .{ .break_ = try self.localExpr(out_local, v.list) } });
+                const item = try self.lowLevelExpr(.list_get_unsafe, &.{ value, try self.localExpr(index_local, v.u64) }, elem_ty);
+                const appended = try self.lowLevelExpr(.list_append_unsafe, &.{ try self.localExpr(out_local, v.list), try self.codeValueCall(item, elem_ty, v, pending) }, v.list);
+                const next_index = try self.lowLevelExpr(.num_plus, &.{ try self.localExpr(index_local, v.u64), try self.intLiteralExpr(1, v.u64) }, v.u64);
+                const step = try self.addExpr(.{ .ty = v.list, .data = .{ .continue_ = .{ .values = try self.addExprSpan(&.{ next_index, appended }) } } });
+                const params = [_]BodyTypedLocal{
+                    .{ .local = index_local, .ty = v.u64 },
+                    .{ .local = out_local, .ty = v.list },
+                };
+                const initial_values = [_]DraftExprId{
+                    try self.intLiteralExpr(0, v.u64),
+                    try self.lowLevelExpr(.list_with_capacity, &.{try self.localExpr(len_local, v.u64)}, v.list),
+                };
+                const loop = try self.addExpr(.{ .ty = v.list, .data = .{ .loop_ = .{
+                    .params = try self.addTypedLocalSpan(&params),
+                    .initial_values = try self.addExprSpan(&initial_values),
+                    .body = try self.ifExpr(done, finish, step, v.list),
+                } } });
+                const items = try self.addExpr(.{ .ty = v.list, .data = .{ .let_ = .{
+                    .bind = try self.bindPat(len_local, v.u64),
+                    .value = len_value,
+                    .rest = loop,
+                } } });
+                return try self.codeValueVariant(v, "List", &.{items});
+            },
+            .box, .func, .erased, .hole => Common.invariant("a slot type held a shape no Code.Value expresses, which publication refuses"),
+        }
+    }
+
+    /// The `Code.Value` of an optional field, read as `slot`, its presence
+    /// slot of type `slot_ty`: `Absent` when the record does not hold the
+    /// field, and a call of the helper of `payload_ty`, the field's value
+    /// type, when it does.
+    fn optionalFieldCodeValue(
+        self: *BodyContext,
+        slot: DraftExprId,
+        slot_ty: Type.TypeId,
+        payload_ty: Type.TypeId,
+        v: CodeValueTypes,
+        pending: *std.ArrayList(PendingCodeValueDef),
+    ) Allocator.Error!DraftExprId {
+        const info = try self.optionalSlotInfo(slot_ty);
+        self.assertSameType(info.payload_ty, payload_ty, "an optional field's presence slot held a type other than the field's value type");
+        const missing_pat = try self.addPat(.{ .ty = slot_ty, .data = .{ .tag = .{
+            .name = info.missing_tag.name,
+            .payloads = try self.addPatSpan(&.{}),
+        } } });
+        const payload = try self.addLocal(self.builder.symbols.fresh(), payload_ty);
+        const present_pat = try self.addPat(.{ .ty = slot_ty, .data = .{ .tag = .{
+            .name = info.present_tag.name,
+            .payloads = try self.addPatSpan(&.{try self.bindPat(payload, payload_ty)}),
+        } } });
+        const branches = [_]DraftBranch{
+            .{ .pat = missing_pat, .body = try self.codeValueVariant(v, "Absent", &.{}) },
+            .{ .pat = present_pat, .body = try self.codeValueCall(try self.localExpr(payload, payload_ty), payload_ty, v, pending) },
+        };
+        return try self.addExpr(.{ .ty = v.value, .data = .{ .match_ = .{
+            .scrutinee = slot,
+            .branches = try self.addBranchSpan(&branches),
+        } } });
+    }
+
+    /// Whether `ty` has the shape `words` (`checked.CodeValueShape`) say,
+    /// which the reifier wrote from the slot's type. Debug builds only.
+    fn codeValueShapeMatches(self: *BodyContext, ty: Type.TypeId, words: []const u32) Allocator.Error!bool {
+        const S = checked.CodeValueShape;
+        // `opt_field` holds the value type of an optional field.
+        const Item = union(enum) { ty: Type.TypeId, opt_field: Type.TypeId, field: names.RecordFieldNameId, tag: Type.Tag };
+        var pending = std.ArrayList(Item).empty;
+        defer pending.deinit(self.allocator);
+        try pending.append(self.allocator, .{ .ty = ty });
+        var at: usize = 0;
+        while (pending.pop()) |item| {
+            if (at >= words.len) return false;
+            const word = words[at];
+            at += 1;
+            const current = switch (item) {
+                .field => |name| {
+                    if (!std.mem.eql(u8, self.view.names.recordFieldLabelText(@fromBackingInt(word)), self.nameStore().recordFieldLabelText(name))) return false;
+                    continue;
+                },
+                .tag => |tag| {
+                    if (!std.mem.eql(u8, self.view.names.tagLabelText(@fromBackingInt(word)), self.nameStore().tagLabelText(tag.name))) return false;
+                    if (at >= words.len or words[at] != tag.payloads.len) return false;
+                    at += 1;
+                    continue;
+                },
+                .opt_field => |payload_ty| {
+                    if (word != @backingInt(S.opt_field)) return false;
+                    try pending.append(self.allocator, .{ .ty = payload_ty });
+                    continue;
+                },
+                .ty => |current| self.codeValueShapeType(current),
+            };
+            const shape = std.enums.fromInt(S, word) orelse return false;
+            const content = self.typeStore().get(current);
+            switch (shape) {
+                .int => {
+                    if (at >= words.len) return false;
+                    const want = words[at];
+                    at += 1;
+                    const got: u32 = switch (content) {
+                        .primitive => |primitive| switch (primitive) {
+                            .u8, .i8, .u16, .i16, .u32, .i32, .u64, .i64, .u128, .i128 => @backingInt(primitive) - @backingInt(Type.Primitive.u8),
+                            .bool,
+                            .str,
+                            .f32,
+                            .f64,
+                            .dec,
+                            .u8x16,
+                            .i8x16,
+                            .u16x8,
+                            .i16x8,
+                            .u32x4,
+                            .i32x4,
+                            .u64x2,
+                            .i64x2,
+                            => return false,
+                        },
+                        .named,
+                        .record,
+                        .tuple,
+                        .tag_union,
+                        .list,
+                        .box,
+                        .func,
+                        .erased,
+                        .zst,
+                        .hole,
+                        => return false,
+                    };
+                    if (got != want) return false;
+                },
+                .frac => {
+                    if (at >= words.len) return false;
+                    const want: Type.Primitive = if (words[at] == 1) .f64 else .f32;
+                    at += 1;
+                    if (content != .primitive or content.primitive != want) return false;
+                },
+                .dec => if (content != .primitive or content.primitive != .dec) return false,
+                .bool_ => if (!self.typeHasBuiltinOwner(current, .bool) and (content != .primitive or content.primitive != .bool)) return false,
+                .str => if (content != .primitive or content.primitive != .str) return false,
+                .list => switch (content) {
+                    .list => |elem| try pending.append(self.allocator, .{ .ty = elem }),
+                    .primitive,
+                    .named,
+                    .record,
+                    .tuple,
+                    .tag_union,
+                    .box,
+                    .func,
+                    .erased,
+                    .zst,
+                    .hole,
+                    => return false,
+                },
+                .wrap => try pending.append(self.allocator, .{ .ty = nominalExprBackingType(self.typeStore(), current) orelse return false }),
+                .recursive => if (content != .named) return false,
+                // An encoded slot's whole shape; its value comes from its encoder.
+                .encoded => return false,
+                // Only the field of a record that is optional has this shape.
+                .opt_field => return false,
+                .tuple => {
+                    if (at >= words.len or content != .tuple or content.tuple.len != words[at]) return false;
+                    at += 1;
+                    var index = content.tuple.len;
+                    while (index > 0) {
+                        index -= 1;
+                        try pending.append(self.allocator, .{ .ty = self.spanTypeAt(content.tuple, index) });
+                    }
+                },
+                .record => {
+                    if (at >= words.len) return false;
+                    const span: Type.Span = switch (content) {
+                        .record => |span| span,
+                        .zst => .empty(),
+                        .primitive,
+                        .named,
+                        .tuple,
+                        .tag_union,
+                        .list,
+                        .box,
+                        .func,
+                        .erased,
+                        .hole,
+                        => return false,
+                    };
+                    if (span.len != words[at]) return false;
+                    at += 1;
+                    var index = span.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const field = self.spanFieldAt(span, index);
+                        try pending.append(self.allocator, if (field.value_ty.get()) |payload_ty| .{ .opt_field = payload_ty } else .{ .ty = field.ty });
+                        try pending.append(self.allocator, .{ .field = field.name });
+                    }
+                },
+                .tag_union => {
+                    if (at >= words.len or content != .tag_union or content.tag_union.len != words[at]) return false;
+                    at += 1;
+                    var index = content.tag_union.len;
+                    while (index > 0) {
+                        index -= 1;
+                        const tag = GuardedList.at(self.typeStore().tagSpan(content.tag_union), index);
+                        var payload = tag.payloads.len;
+                        while (payload > 0) {
+                            payload -= 1;
+                            try pending.append(self.allocator, .{ .ty = self.spanTypeAt(tag.payloads, payload) });
+                        }
+                        try pending.append(self.allocator, .{ .tag = tag });
+                    }
+                },
+            }
+        }
+        return at == words.len;
     }
 
     fn selectedHoistedConstEntry(
@@ -38474,7 +39863,7 @@ const BodyContext = struct {
         if (demand != .runtime_value) return lowered;
         switch (expr.data) {
             .runtime_error, .crash, .ellipsis => return lowered,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .dbg, .expect_err, .expect, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .dbg, .expect_err, .expect, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
         const expr_proof = self.exprImpossibilityProof(lowered);
         const entry_guard_proof = if (self.function_entry_demand_guards.len != 0)
@@ -38899,7 +40288,7 @@ const BodyContext = struct {
             .field_names_iter => try self.lowerFieldNamesIter(task.checked_expr_id, task.source_fn_ty, args, arg_tys, ret_ty, .all, lowered_args),
             .field_names_for_size => try self.lowerFieldNamesIter(task.checked_expr_id, task.source_fn_ty, args, arg_tys, ret_ty, .for_size, lowered_args),
             .field_name => try self.lowerFieldName(args, arg_tys, ret_ty, lowered_args),
-            .str_inspect, .structural_eq => unreachable, // call-site intrinsic tasks carry only intrinsics with a callsiteArity, which excludes these
+            .str_inspect, .structural_eq, .code_prim, .code_type_id, .code_ty_of => unreachable, // call-site intrinsic tasks carry only intrinsics with a callsiteArity, which excludes these
         };
         if (task.deferred_body == null) {
             const callable = try self.graph.functionNodes(task.callable_node);
@@ -38934,7 +40323,7 @@ const BodyContext = struct {
         const maybe_ref: ?ResolvedUse = switch (expr.data) {
             .lookup_local => |lookup| lookup.resolved,
             .lookup_external, .lookup_required => |ref_id| ref_id,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
         };
         if (maybe_ref) |ref_id| {
             if (try self.currentLocalForResolvedValue(ref_id)) |local_id| {
@@ -39053,6 +40442,9 @@ const BodyContext = struct {
         }
         const template = view.callable_eval_templates.templates[raw];
         const root = view.compile_time_roots.root(template.root);
+        // A stored function has no type variable, so the wrapper of a binding
+        // that computes it has no inventory and its use gives no table.
+        std.debug.assert(root.payload != .fn_value or template.forwarded_lookup != null or self.binding_instances == null);
         const restored = switch (root.payload) {
             .fn_value => |fn_id| try self.restoreConstFnAt(view, fn_id, .{ .node = request_fn_node }, null),
             .const_node => |node| try self.restoreConstNodeAtNode(view, view, node, request_fn_node),
@@ -39077,12 +40469,23 @@ const BodyContext = struct {
 
         var body_ctx = try BodyContext.init(self.allocator, self.builder, view, wrapper.template, self.graph, self.draft);
         defer body_ctx.deinit();
+        // An exact alias hands the use's table to its lookup. A binding that
+        // computes a function is computed by its wrapper, whose inventory
+        // holds the binding's uses at its own variables: the use's table is
+        // the wrapper's, on the root frame (design.md "Code Instance Tables").
+        const wrapper_instances: ?InstanceTableId = if (template.forwarded_lookup == null) blk: {
+            const binding = self.binding_instances orelse break :blk null;
+            std.debug.assert(binding.forwarded_lookup == null);
+            break :blk binding.table;
+        } else null;
+        if (template.forwarded_lookup != null) body_ctx.binding_instances = self.binding_instances;
         const entry_template = view.templates.get(wrapper.template.template);
         const schema = templateSchemaIn(view, &entry_template);
         const subst = try body_ctx.substitutionFromCheckedTypes(view, schema.scheme_vars);
         body_ctx.evidence = rootEvidenceWithSubstitution(wrapper.template, schema, .{
             .subst = subst,
             .vector = self.restore_evidence.vector,
+            .instances = wrapper_instances,
         });
         try body_ctx.seedSubstitution(schema, subst);
         body_ctx.frozen_sealed_emission = self.frozen_sealed_emission;
@@ -40944,7 +42347,7 @@ const BodyContext = struct {
         return switch (expr.data) {
             .closure => |closure| try self.closureArgumentEvidenceDigest(expr_id, closure),
             .lambda => |lambda| self.lambdaArgumentEvidenceDigest(expr_id, lambda.args.len),
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
         };
     }
 
@@ -45805,7 +47208,7 @@ const BodyContext = struct {
             .lookup_external,
             .lookup_required,
             => try self.localCalleeMonoType(checked_func, checked_args, expected_ret_ty),
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
         };
     }
 
@@ -45819,7 +47222,7 @@ const BodyContext = struct {
         const maybe_ref = switch (expr.data) {
             .lookup_local => |lookup| lookup.resolved,
             .lookup_external, .lookup_required => |resolved| resolved,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return null,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return null,
         };
         const ref_id = maybe_ref orelse Common.invariant("checked callee lookup reached Monotype without resolved value ref");
         const local_id = (try self.currentLocalForResolvedValue(ref_id)) orelse return null;
@@ -46349,6 +47752,7 @@ const BodyContext = struct {
             source_fn_ty,
             try self.view.types.rootKey(source_fn_ty),
             fn_node,
+            .lookup,
         );
         const completed = CompletedDirectCallee{
             .callee = callee,
@@ -46376,12 +47780,17 @@ const BodyContext = struct {
         source_fn_ty: checked.CheckedTypeId,
         source_fn_key: names.TypeDigest,
         request_fn_node: NodeId,
+        instances_from: InstancesFrom,
     ) Allocator.Error!DraftFnSlot {
         const raw = @backingInt(target);
         if (raw >= self.view.resolved_refs.records.len) {
             Common.invariant("checked direct call target is outside resolved value table");
         }
         const record = self.view.resolved_refs.records[raw];
+        const instances = switch (instances_from) {
+            .lookup => self.instancesForUse(record.expr),
+            .forwarded => |forwarded| forwarded,
+        };
         return switch (record.ref) {
             .local_proc => |local| if (local.is_alias)
                 try self.forwardedLocalAliasCalleeAtNode(local, record.expr, request_fn_node)
@@ -46402,23 +47811,25 @@ const BodyContext = struct {
             .hosted_proc,
             .promoted_top_level_proc,
             => |proc| if (self.builder.forwardingCallableEvalForProcedureUse(proc)) |alias|
-                try self.forwardedCallableEvalCalleeAtNode(alias, record.expr, request_fn_node)
+                try self.forwardedCallableEvalCalleeAtNode(alias, record.expr, request_fn_node, instances)
             else
                 try self.draftFnSlotForProcedureUseAtNode(
                     proc,
                     source_fn_key,
                     request_fn_node,
                     try self.evidenceForProcedureUseAtNode(proc, record.expr, null, request_fn_node, .body_lowering),
+                    instances,
                     record.recursive_reference,
                 ),
             .platform_required_proc => |proc| if (self.builder.forwardingCallableEvalForProcedureUse(proc.procedure)) |alias|
-                try self.forwardedCallableEvalCalleeAtNode(alias, record.expr, request_fn_node)
+                try self.forwardedCallableEvalCalleeAtNode(alias, record.expr, request_fn_node, instances)
             else
                 try self.draftFnSlotForProcedureUseAtNode(
                     proc.procedure,
                     source_fn_key,
                     request_fn_node,
                     try self.evidenceForProcedureUseAtNode(proc.procedure, record.expr, proc.root_evidence, request_fn_node, .body_lowering),
+                    instances,
                     record.recursive_reference,
                 ),
             .local_param, .local_value, .local_mutable_version, .pattern_binder, .selected_hoisted_const, .top_level_const, .imported_const, .platform_required_declaration, .platform_required_checked_error, .platform_required_const => Common.invariant("checked direct call target was not a procedure"),
@@ -46451,7 +47862,7 @@ const BodyContext = struct {
         }
         try self.seedSubstitution(evidence.schema.?, edge.subst);
         try relateFunctionRequestInterface(self.graph, try self.instNode(scope.scheme_root), request_fn_node);
-        return try self.forwardedLookupCalleeAtNode(alias.expr, request_fn_node);
+        return try self.forwardedLookupCalleeAtNode(alias.expr, request_fn_node, .lookup);
     }
 
     /// A call through a top-level exact procedure alias calls the alias's
@@ -46462,6 +47873,9 @@ const BodyContext = struct {
         alias: Builder.CallableEvalUse,
         use_expr: CIR.Expr.Idx,
         request_fn_node: NodeId,
+        /// The Code instance table of the use (D1): the alias's lookup is
+        /// that use, so the table goes on to the procedure it names.
+        instances: ?InstanceTableId,
     ) Allocator.Error!DraftFnSlot {
         const view = alias.view;
         const template = view.callable_eval_templates.templates[@backingInt(alias.template)];
@@ -46501,7 +47915,7 @@ const BodyContext = struct {
         try self.graph.unify(try body_ctx.instNode(wrapper.checked_fn_root), wrapper_fn_node);
         try self.graph.unify(try body_ctx.instNode(template.checked_fn_root), request_fn_node);
         try self.graph.unify(try body_ctx.instNode(root.checked_type), request_fn_node);
-        return try body_ctx.forwardedLookupCalleeAtNode(lookup, request_fn_node);
+        return try body_ctx.forwardedLookupCalleeAtNode(lookup, request_fn_node, .{ .forwarded = instances });
     }
 
     /// The direct callee an alias's lookup names, requested at the alias
@@ -46510,6 +47924,7 @@ const BodyContext = struct {
         self: *BodyContext,
         lookup: CIR.Expr.Idx,
         request_fn_node: NodeId,
+        instances_from: InstancesFrom,
     ) Allocator.Error!DraftFnSlot {
         const target = self.view.resolved_refs.lookupIdByExpr(lookup) orelse
             Common.invariant("forwarded procedure alias lookup had no resolved value");
@@ -46520,6 +47935,7 @@ const BodyContext = struct {
             lookup_ty,
             try self.view.types.rootKey(lookup_ty),
             request_fn_node,
+            instances_from,
         );
     }
 
@@ -46578,10 +47994,14 @@ const BodyContext = struct {
         proc: checked.ProcedureUseTemplate,
         source_fn_key: names.TypeDigest,
         request_fn_node: NodeId,
-        edge: EdgeEvidence,
+        edge_in: EdgeEvidence,
+        /// The Code instance table of the use (D1), or null.
+        instances: ?InstanceTableId,
         recursive_reference: bool,
     ) Allocator.Error!DraftFnSlot {
         const template_ref = self.builder.templateRefForProcedureUse(proc);
+        var edge = edge_in;
+        edge.instances = instances;
         return try self.builder.lowerDraftTemplateFromContext(
             self,
             template_ref,
@@ -47567,6 +48987,7 @@ const BodyContext = struct {
                         expected_node,
                         (try self.evidenceForUseSite(record.lookupExpr())).vector,
                         .{ .hoisted = entry },
+                        null,
                     );
                 }
             },
@@ -47577,6 +48998,7 @@ const BodyContext = struct {
                     expected_node,
                     (try self.evidenceForUseSite(record.lookupExpr())).vector,
                     .declared,
+                    self.instancesForExpr(checked_expr),
                 );
             },
             .imported_const => |const_use| {
@@ -47586,6 +49008,7 @@ const BodyContext = struct {
                     expected_node,
                     (try self.evidenceForUseSite(record.lookupExpr())).vector,
                     .declared,
+                    self.instancesForExpr(checked_expr),
                 );
             },
             .platform_required_const => |required| {
@@ -47595,6 +49018,7 @@ const BodyContext = struct {
                     expected_node,
                     (try self.evidenceForUseSite(record.lookupExpr())).vector,
                     .declared,
+                    self.instancesForExpr(checked_expr),
                 );
             },
             .local_proc => |local| {
@@ -47661,6 +49085,7 @@ const BodyContext = struct {
         expected_node: NodeId,
         use_evidence: []const SpecEvidence,
         provenance: DraftConstUseProvenance,
+        instances: ?InstanceTableId,
     ) Allocator.Error!DraftExprId {
         switch (provenance) {
             .declared => switch (const_use.const_ref.owner) {
@@ -47706,6 +49131,7 @@ const BodyContext = struct {
             .provenance = provenance,
             .context_evidence = self.evidence,
             .use_evidence = use_evidence,
+            .instances = instances,
             .current_fn_key = self.current_fn_key,
             .active_const_binding = .of(self.active_const_binding),
             .lexical = lexical,
@@ -47724,6 +49150,12 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         if (self.builder.callableEvalForProcedureUse(proc)) |callable_eval| {
             const edge = try self.evidenceForUseSiteAtNode(site_expr, request_fn_node);
+            const saved_binding = self.binding_instances;
+            defer self.binding_instances = saved_binding;
+            self.binding_instances = if (self.instancesForUse(site_expr)) |table| .{
+                .table = table,
+                .forwarded_lookup = callable_eval.view.callable_eval_templates.templates[@backingInt(callable_eval.template)].forwarded_lookup,
+            } else null;
             return try self.lowerCallableEvalBindingValueAtNode(
                 callable_eval.view,
                 callable_eval.template,
@@ -47737,6 +49169,7 @@ const BodyContext = struct {
             try procedureUseSourceFnKey(self.view, proc),
             request_fn_node,
             edge,
+            self.instancesForUse(site_expr),
             recursive_reference,
         );
         const fn_id = try self.requireLocalDraftSlot(slot);
@@ -48030,6 +49463,9 @@ const BodyContext = struct {
                 break :blk try self.lowerConstEvalTemplateUse(store_view, eval, const_use.const_ref, ty, null, null);
             },
             .unimplemented => |declaration| blk: {
+                // Invariant 1: checking poisons each reference to an
+                // intrinsic that runs (design.md "Reify-Only Definitions").
+                std.debug.assert(!declaration.intrinsic);
                 try self.constrainTypeToMono(requested_ty, ty);
                 const saved_loc = self.builder.current_loc;
                 defer self.builder.current_loc = saved_loc;
@@ -48050,6 +49486,7 @@ const BodyContext = struct {
         const_use: checked.ConstUseTemplate,
         request_node: NodeId,
         use_evidence: []const SpecEvidence,
+        instances: ?InstanceTableId,
     ) Allocator.Error!DraftExprId {
         const requested_ty = const_use.requested_source_ty_payload orelse
             Common.invariant("checked const use reached Monotype without a requested checked type");
@@ -48094,9 +49531,13 @@ const BodyContext = struct {
                     request_node,
                     null,
                     null,
+                    instances,
                 );
             },
             .unimplemented => |declaration| blk: {
+                // Invariant 1: checking poisons each reference to an
+                // intrinsic that runs (design.md "Reify-Only Definitions").
+                std.debug.assert(!declaration.intrinsic);
                 try self.graph.unify(try self.instNode(requested_ty), request_node);
                 const saved_loc = self.builder.current_loc;
                 defer self.builder.current_loc = saved_loc;
@@ -48188,6 +49629,7 @@ const BodyContext = struct {
             try self.activeNodeFromType(ty),
             source_region_override,
             current_entry_root,
+            null,
         );
     }
 
@@ -48199,6 +49641,7 @@ const BodyContext = struct {
         request_node: NodeId,
         source_region_override: ?base.Region,
         current_entry_root: ?EntryRoot,
+        instances: ?InstanceTableId,
     ) Allocator.Error!DraftExprId {
         const body = store_view.checked_const_bodies.get(eval.body);
         if (self.builder.comptimeValueReadDeclared(store_view, body.root)) {
@@ -48217,13 +49660,16 @@ const BodyContext = struct {
         defer body_ctx.deinit();
         try body_ctx.inheritActiveConstBinding(self);
         const schema = templateSchemaIn(store_view, &entry_template);
-        const root_evidence: EdgeEvidence = if (self.restore_evidence.vector.len < entry_template.evidence_params.len)
+        var root_evidence: EdgeEvidence = if (self.restore_evidence.vector.len < entry_template.evidence_params.len)
             try body_ctx.rootEdgeEvidence(store_view, eval.entry_template, entry_template)
         else
             .{
                 .subst = try body_ctx.substitutionFromCheckedTypes(store_view, schema.scheme_vars),
                 .vector = self.restore_evidence.vector,
             };
+        // The entry template's inventory holds the constant's uses at its
+        // own variables, which the use's table closes (D1, Q16).
+        if (instances) |table| root_evidence.instances = table;
         body_ctx.evidence = rootEvidenceWithSubstitution(eval.entry_template, schema, root_evidence);
         try body_ctx.seedSubstitution(schema, root_evidence.subst);
         body_ctx.source_region_override = source_region_override;
@@ -48556,6 +50002,128 @@ const BodyContext = struct {
             .storage = constStaticDataStorage(store_view, node),
             .value = value,
         } });
+    }
+
+    /// The instance table a use hands the template it names (D1): the table
+    /// the description step recorded for a closing use of this module, or,
+    /// for a forward use, the entry of the table in force that the use's
+    /// index in its holder's inventory names. Null for any other use. A
+    /// refused closing use is lowered as a crash (`closingUseRefused`), so
+    /// it never reaches here.
+    fn instancesForUse(self: *BodyContext, use: CIR.Expr.Idx) ?InstanceTableId {
+        if (self.view.code_output.edgeTable(.{ .use = use })) |closing| return switch (closing) {
+            .table => |table| .{ .view = self.view, .table = table },
+            .refused => Common.invariant("a refused closing use reached its template"),
+        };
+        // A platform's use of a function it requires reads the table of the
+        // requirement's closing use in the app (design.md "Code Instance
+        // Tables").
+        if (self.view.resolved_refs.lookupIdByExpr(use)) |id| switch (self.view.resolved_refs.records[@backingInt(id)].ref) {
+            .platform_required_proc => |required| if (required.instances) |table| return self.builder.requirementInstances(table),
+            .local_param, .local_value, .local_mutable_version, .pattern_binder, .local_proc, .selected_hoisted_const, .top_level_const, .imported_const, .top_level_proc, .imported_proc, .hosted_proc, .platform_required_declaration, .platform_required_checked_error, .platform_required_const, .promoted_top_level_proc => {},
+        };
+        if (self.binding_instances) |binding| if (binding.forwarded_lookup) |lookup| if (lookup == use) return binding.table;
+        const index = codeInventories(self.view).forwardIndex(.{ .use = use }) orelse return null;
+        const in_force = self.evidence.instanceTable() orelse
+            Common.invariant("a forward use was lowered with no instance table in force");
+        return switch (in_force.view.code_output.entry(in_force.table, index)) {
+            .forward => |table| .{ .view = in_force.view, .table = table },
+            .node, .refused => Common.invariant("a forward use's table entry is not a table"),
+        };
+    }
+
+    /// The instance table the use `ref` hands its template, for a body node
+    /// read in place.
+    fn instancesForExpr(self: *BodyContext, ref: ExprSite) ?InstanceTableId {
+        return self.instancesForUse(ref.useNode() orelse return null);
+    }
+
+    /// Whether the description step refused the closing use that lowering
+    /// `ref` makes, and reported it (design.md "Code Instance Tables"). The
+    /// expression is then a crash in place of the use, and its operands are
+    /// not evaluated: a call whose callee is the use, the use itself, or a
+    /// platform's use of a requirement whose closing use the app refused.
+    fn closingUseRefused(self: *BodyContext, ref: ExprSite, data: ExprData) bool {
+        const node = ref.useNode() orelse return false;
+        return switch (data) {
+            .call => |call| self.useRefusedAt(call.func),
+            .lookup_local, .lookup_external, .lookup_required, .dispatch_call, .method_eq, .type_dispatch_call => self.useRefusedAt(node),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .interpolation, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => false,
+        };
+    }
+
+    fn useRefusedAt(self: *BodyContext, use: CIR.Expr.Idx) bool {
+        if (self.view.code_output.edgeTable(useEdge(self.view, use))) |closing| return closing == .refused;
+        const id = self.view.resolved_refs.lookupIdByExpr(use) orelse return false;
+        return switch (self.view.resolved_refs.records[@backingInt(id)].ref) {
+            .platform_required_proc => |required| self.builder.requirementUseRefused(required.instances),
+            .local_param, .local_value, .local_mutable_version, .pattern_binder, .local_proc, .selected_hoisted_const, .top_level_const, .imported_const, .top_level_proc, .imported_proc, .hosted_proc, .platform_required_declaration, .platform_required_checked_error, .platform_required_const, .promoted_top_level_proc => false,
+        };
+    }
+
+    /// The crash a refused `Code` site, identity call, input binding or
+    /// closing use lowers as. The description step reported the refusal, so
+    /// it is a checked error: evaluation that reaches it reports nothing
+    /// more.
+    fn refusedCodeData(self: *BodyContext) Allocator.Error!BodyExprData {
+        return .{ .checked_error = try self.addStringLiteral("runtime error") };
+    }
+
+    /// A `Code` site's or identity call's value, restored as a constant at
+    /// `request_node`, or a crash where the description step refused it. A
+    /// site also reads the conversion roots of the literals its walk met, so
+    /// a rejected literal is evaluated and reported though nothing runs the
+    /// function it is in.
+    fn restoreCodeSiteAtNode(
+        self: *BodyContext,
+        expr: ExprSite,
+        request_node: NodeId,
+    ) Allocator.Error!DraftExprId {
+        const node = expr.node();
+        const output = self.view.code_output;
+        // An instance site (D1): the table of the closing use that reached
+        // this specialization holds its description, in the module of that
+        // use.
+        if (codeInventories(self.view).siteIndex(node)) |index| {
+            const table = self.evidence.instanceTable() orelse
+                Common.invariant("an instance site was lowered with no instance table in force");
+            return switch (table.view.code_output.entry(table.table, index)) {
+                .node => |described| try self.restoreCodeValueAtNode(table.view, described.value, described.reads, request_node),
+                .refused => try self.addExprWithTypeCell(DraftTypeCell.fromGraphNode(request_node), try self.refusedCodeData()),
+                .forward => Common.invariant("an instance site's table entry is not a description"),
+            };
+        }
+        if (self.view.module_env.store.codeReificationSiteForNode(can.ModuleEnv.nodeIdxFrom(node))) |site| {
+            // The lambda a template returns stands for every call of the
+            // template, and each call is a site described on its own. No
+            // body that lowers runs it (`template_call` sites are leaves),
+            // so it has no description of its own.
+            if (site.kind == .template) Common.invariant("a template's returned lambda was lowered");
+            return switch (output.site(node)) {
+                .described => |described| try self.restoreCodeValueAtNode(self.view, described.value, described.reads, request_node),
+                .refused => try self.addExprWithTypeCell(DraftTypeCell.fromGraphNode(request_node), try self.refusedCodeData()),
+            };
+        }
+        return switch (output.identity(node)) {
+            .value => |value| try self.restoreCodeValueAtNode(self.view, value, &.{}, request_node),
+            .refused => try self.addExprWithTypeCell(DraftTypeCell.fromGraphNode(request_node), try self.refusedCodeData()),
+        };
+    }
+
+    /// A description in `store_view`'s const store, restored at
+    /// `request_node`, with the literal roots it reads.
+    fn restoreCodeValueAtNode(
+        self: *BodyContext,
+        store_view: ModuleView,
+        value: checked.ConstNodeId,
+        reads: []const checked.CheckedCodeRead,
+        request_node: NodeId,
+    ) Allocator.Error!DraftExprId {
+        const restored = try self.restoreConstNodeAtNode(store_view, self.view, value, request_node);
+        for (reads) |read| {
+            try self.draft.recordRestoredRootRead(restored, .{ .bytes = read.module }, read.rootId());
+        }
+        return restored;
     }
 
     fn restoreConstNodeAtNode(
@@ -49357,7 +50925,7 @@ const BodyContext = struct {
                     template_ref,
                     source_fn_key,
                     request_fn_node,
-                    .{ .subst = subst, .vector = retained_evidence.vector },
+                    .{ .subst = subst, .vector = retained_evidence.vector, .instances = retained_evidence.instanceTable() },
                     .instantiation,
                     .independent_roots,
                     .inherit,
@@ -49449,7 +51017,7 @@ const BodyContext = struct {
                     .inherit,
                 );
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("stored capturing function did not reference a checked lambda"),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("stored capturing function did not reference a checked lambda"),
         };
 
         const capture_values = try self.allocator.alloc(DraftFnDefCapture, captures.len);
@@ -51981,7 +53549,7 @@ const BodyContext = struct {
         self.builder.countBodyDiagnostic("nested_callable_checks");
         return switch (checkedExpr(self.view, expr_id).data) {
             .lambda, .closure => true,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => false,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => false,
         };
     }
 
@@ -51999,7 +53567,7 @@ const BodyContext = struct {
                 self.builder.countBodyDiagnostic("nested_closures_prepared");
                 _ = try self.ensureClosureAtNode(expr_id, closure, request_fn_node);
             },
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
         }
     }
 
@@ -52360,13 +53928,25 @@ const BodyContext = struct {
         value: DraftExprId,
         value_node: NodeId,
     ) Allocator.Error!DraftExprId {
+        return try self.literalRootReadWith(site, value, value_node, literalRootIdentity(self.view.key, expr_id));
+    }
+
+    /// `literalRootRead` with `identity`, the content-derived bytes that
+    /// name the root next to its value type.
+    fn literalRootReadWith(
+        self: *BodyContext,
+        site: Common.LiteralRejectionSite,
+        value: DraftExprId,
+        value_node: NodeId,
+        identity: [32]u8,
+    ) Allocator.Error!DraftExprId {
         const value_cell = DraftTypeCell.fromGraphNode(value_node);
         const def_id = try self.draft.reserveDef(self.draft.current_owner);
         self.draft.setDef(def_id, .{
             .symbol = self.builder.symbols.fresh(),
             .fn_def = null,
             .fn_id = null,
-            .identity_seed = .{ .kind = "literal-root", .extra = literalRootIdentity(self.view.key, expr_id) },
+            .identity_seed = .{ .kind = "literal-root", .extra = identity },
             .args = try self.addTypedLocalSpan(&.{}),
             .body = .{ .roc = value },
             .ret = value_cell,
@@ -52397,7 +53977,7 @@ const BodyContext = struct {
                 .numeral => .numeral,
                 .str_from_quote => .quote,
                 .interpolation => .interpolation,
-                .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("literal rejection site did not point at a literal conversion expression"),
+                .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("literal rejection site did not point at a literal conversion expression"),
             },
         };
     }
@@ -52407,7 +53987,8 @@ const BodyContext = struct {
         return switch (checkedExpr(self.view, expr_id).data) {
             .numeral => |node| self.view.bodies.numeralPlan(node),
             .str_from_quote => |node| self.view.bodies.quotePlan(node),
-            .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("literal conversion did not point at a conversion expression"),
+            .interpolation => |interpolation| self.view.bodies.dispatchPlan(@backingInt(interpolation.node)),
+            .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("literal conversion did not point at a conversion expression"),
         };
     }
 
@@ -52431,7 +54012,20 @@ const BodyContext = struct {
         const try_ty = self.literalConversionTryType(plan);
         const try_node = try self.instNode(try_ty);
         const value = try self.lowerDispatchExprAtType(try_ty, plan, DraftTypeCell.fromGraphNode(try_node));
-        return try self.unwrapLiteralConversionAtNode(value, try_node, try ret_cell.toGraphNode(self.graph), self.literalRejectionSite(expr_id));
+        const site = self.literalRejectionSite(expr_id);
+        if (site.kind != .interpolation) {
+            return try self.unwrapLiteralConversionAtNode(value, try_node, try ret_cell.toGraphNode(self.graph), site);
+        }
+        // An interpolation's first stage yields the assembler, a function no
+        // root can store: the root only runs the stage, so a rejection is
+        // reported, and its value is `{}`.
+        const assembler_node = (try self.graphTryPayloads(try_node)).ok;
+        const assembler = try self.unwrapLiteralConversionAtNode(value, try_node, assembler_node, site);
+        const checked_stage = try self.addStmt(.{ .expr = assembler });
+        return try self.addExprWithTypeCell(ret_cell, .{ .block = .{
+            .statements = try self.addStmtSpan(&.{checked_stage}),
+            .final_expr = try self.addExprWithTypeCell(ret_cell, .unit),
+        } });
     }
 
     /// Lower one use of a literal whose conversion checking selected, as that
@@ -52472,6 +54066,7 @@ const BodyContext = struct {
         const expected_kind: Common.LiteralRejectionKind = switch (kind) {
             .numeral => .numeral,
             .quote => .quote,
+            .interpolation => Common.invariant("an interpolation root reached a literal use"),
         };
         if (site.kind != expected_kind) Common.invariant("literal conversion root kind differed from its literal");
         const value = try self.unwrapLiteralConversionAtNode(try_value, try_node, request_node, site);
@@ -52716,7 +54311,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         const interpolation = switch (checkedExpr(self.view, expr_id).data) {
             .interpolation => |value| value,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("interpolation segments operand referenced a non-interpolation expression"),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("interpolation segments operand referenced a non-interpolation expression"),
         };
         const str_ty = switch (shapeContent(self.typeStore(), list_ty)) {
             .list => |elem| elem,
@@ -52737,7 +54332,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftExprId {
         return switch (checkedExpr(self.view, expr_id).data) {
             .str_segment => |literal| try self.addExpr(.{ .ty = str_ty, .data = .{ .str_lit = try self.lowerStringLiteral(literal) } }),
-            .numeral, .str_from_quote, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("interpolation segment was not a checked string segment"),
+            .numeral, .str_from_quote, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => Common.invariant("interpolation segment was not a checked string segment"),
         };
     }
 
@@ -53228,9 +54823,9 @@ const BodyContext = struct {
         const expr = checkedExpr(self.view, expr_id);
         const plan_id = switch (expr.data) {
             .dispatch_call => |plan_node| self.view.bodies.dispatchPlan(plan_node),
-            .type_dispatch_call, .method_eq => |plan_node| self.view.bodies.dispatchPlan(plan_node),
+            .type_dispatch_call, .method_eq => |plan| plan,
             // An interpolation's value is its conversion result's `Ok` payload.
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .interpolation, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return null,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .interpolation, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => return null,
         } orelse return null;
         const plan = self.view.static_dispatch_plans.plans[@backingInt(plan_id)];
         return try self.closedDirectGraphFreeResultType(expr.ty, plan);
@@ -53346,6 +54941,14 @@ const BodyContext = struct {
                 }
                 restored[local] = rootEvidence(owner, vector);
                 restored[local].origin = .stored_function;
+                // The function's own chain carries the table the function was
+                // stored with, or, for a binding stored at its own type
+                // variables, the table of its use (Q16).
+                if (first == 0) {
+                    if (fn_value.instances) |stored| {
+                        restored[local].instances = .{ .view = self.builder.moduleForDigest(stored.module), .table = @fromBackingInt(stored.table) };
+                    } else if (self.binding_instances) |binding| restored[local].instances = binding.table;
+                }
                 continue;
             }
             if (scope == .root or frame.parent.get() == null or frame.parent.get().? != index - 1) {
@@ -53613,6 +55216,7 @@ const BodyContext = struct {
                 .procedure, .structural, .callable_binding => null,
             },
             .nested = nested,
+            .instances = if (target.instances) |stored| .{ .view = self.builder.moduleForDigest(stored.module), .table = @fromBackingInt(stored.table) } else null,
         };
     }
 
@@ -54256,12 +55860,13 @@ const BodyContext = struct {
         self: *BodyContext,
         site_view: ModuleView,
         ref: static_dispatch.CheckedEvidence,
+        params_view: ModuleView,
         param: static_dispatch.EvidenceParamRecord,
         purpose: EvidenceMaterializationPurpose,
     ) Allocator.Error!SpecEvidence {
         const refs = [_]static_dispatch.CheckedEvidence{ref};
         var out: [1]SpecEvidence = undefined;
-        try self.runCheckedEvidenceRefs(site_view, .{ .refs = &refs, .params = .{ .same = param }, .out = &out, .owner = .root }, purpose);
+        try self.runCheckedEvidenceRefs(site_view, .{ .refs = &refs, .params_view = params_view, .params = .{ .same = param }, .out = &out, .owner = .root }, purpose);
         return out[0];
     }
 
@@ -54311,11 +55916,14 @@ const BodyContext = struct {
     /// A checked target whose nested references are materializing. Nested
     /// target nodes follow type nesting, so each is a frame of its own.
     const EvidenceTargetFrame = struct {
+        node_id: static_dispatch.EvidenceNodeId,
         node: static_dispatch.EvidenceNode,
         retain_instantiation: bool,
         lookup: MethodLookup,
         target: *SpecEvidenceTarget,
         refs: []const static_dispatch.CheckedEvidence,
+        /// The module whose names `params` are in.
+        params_view: ModuleView,
         params: []const static_dispatch.EvidenceParamRecord,
         nested: []SpecEvidence,
     };
@@ -54327,6 +55935,8 @@ const BodyContext = struct {
     /// depth.
     const CheckedRefsFrame = struct {
         refs: []const static_dispatch.CheckedEvidence,
+        /// The module whose names `params` are in.
+        params_view: ModuleView,
         params: union(enum) {
             each: []const static_dispatch.EvidenceParamRecord,
             /// Every callable contract materializes under its owner's
@@ -54387,15 +55997,22 @@ const BodyContext = struct {
                 const ref = frame.refs[frame.next];
                 switch (ref.resolution) {
                     .direct => |node_id| {
+                        // A refused method (Q17) is a rejected declaration,
+                        // as the evidence derived from a type reads it.
+                        if (self.checkedEvidenceRefused(site_view, ref, frame.params_view, frame.param())) {
+                            _ = try self.beginCheckedEvidenceContracts(site_view, &frames, .checked_error);
+                            continue;
+                        }
                         const target = try self.enterEvidenceTarget(
                             site_view,
-                            site_view.static_dispatch_plans.evidenceNode(node_id),
+                            node_id,
                             evidenceParamRequiresConstraintRelation(frame.param()),
                             purpose,
                         );
                         frame.awaiting = .primary;
                         try frames.append(self.allocator, .{
                             .refs = target.refs,
+                            .params_view = target.params_view,
                             .params = .{ .each = target.params },
                             .out = target.nested,
                             .owner = .{ .target = target },
@@ -54445,6 +56062,7 @@ const BodyContext = struct {
                 const contracts = site_view.static_dispatch_plans.evidence_refs[ref.callable_contracts.start..][0..ref.callable_contracts.len];
                 const contract_frame: CheckedRefsFrame = .{
                     .refs = contracts,
+                    .params_view = frame.params_view,
                     .params = .{ .same = frame.param() },
                     .out = try arena.alloc(SpecEvidence, contracts.len),
                     .owner = .{ .contracts = primary },
@@ -54462,10 +56080,11 @@ const BodyContext = struct {
     fn enterEvidenceTarget(
         self: *BodyContext,
         site_view: ModuleView,
-        node: static_dispatch.EvidenceNode,
+        node_id: static_dispatch.EvidenceNodeId,
         retain_instantiation: bool,
         purpose: EvidenceMaterializationPurpose,
     ) Allocator.Error!EvidenceTargetFrame {
+        const node = site_view.static_dispatch_plans.evidenceNode(node_id);
         const base_lookup: MethodLookup = switch (node.target.kind) {
             .procedure => |procedure| .{
                 .view = self.builder.moduleForDigest(names.procTemplateModuleDigest(procedure.template)),
@@ -54482,31 +56101,35 @@ const BodyContext = struct {
                 break :blk templateSchemaIn(lookup.view, &template);
             },
             .local_proc => |local| self.scopeSchema(lookup.view, local.dispatch_scope),
-            .callable_binding => emptySchema(lookup.view),
+            .callable_binding => |binding| callableBindingSchema(lookup.view, binding),
             .structural => unreachable, // methodLookupForEvidencePurpose keeps the target, whose structural kind was rejected above
         };
         const target = try self.builder.evidence_arena.allocator().create(SpecEvidenceTarget);
         var frame: EvidenceTargetFrame = .{
+            .node_id = node_id,
             .node = node,
             .retain_instantiation = retain_instantiation,
             .lookup = lookup,
             .target = target,
             .refs = &.{},
+            .params_view = schema.view,
             .params = &.{},
             .nested = &.{},
         };
-        const refs, const params = switch (node.nested) {
-            .from_callable => .{ &[_]static_dispatch.CheckedEvidence{}, schema.params },
-            .resolved => .{ site_view.static_dispatch_plans.nestedEvidence(node), schema.params },
+        const refs, const params_schema = switch (node.nested) {
+            .from_callable => .{ &[_]static_dispatch.CheckedEvidence{}, schema },
+            .resolved => .{ site_view.static_dispatch_plans.nestedEvidence(node), schema },
             // The edge resolved the requirements of the alias the target was
             // reached through; the target's own vector composes through the
             // alias when the frame finishes.
             .through_alias => .{
                 site_view.static_dispatch_plans.aliasScopeEvidence(node),
                 self.aliasScopeSchema(self.builder.targetAlias(node.target.alias orelse
-                    Common.invariant("alias-scope evidence named a target with no alias binding"))).params,
+                    Common.invariant("alias-scope evidence named a target with no alias binding"))),
             },
         };
+        const params = params_schema.params;
+        frame.params_view = params_schema.view;
         if (node.nested != .from_callable and refs.len != params.len) {
             Common.invariant("checked target nested evidence length differed from its requirement schema");
         }
@@ -54546,14 +56169,56 @@ const BodyContext = struct {
                 .{ .resolved = nested }
             else
                 .synthesize,
+            .instances = self.evidenceEdgeInstances(site_view, frame.node_id),
         };
         return frame.target;
+    }
+
+    /// The Code instance table of evidence edge `node_id` of `site_view`
+    /// (design.md "Code Instance Tables"): a closed edge's own table, or,
+    /// for an edge at the variables of the template whose body holds it, the
+    /// entry of the table in force that its index in the template's
+    /// inventory names. Null where the node's target has no inventory.
+    fn evidenceEdgeInstances(self: *BodyContext, site_view: ModuleView, node_id: static_dispatch.EvidenceNodeId) ?InstanceTableId {
+        if (site_view.code_output.edgeTable(.{ .node = node_id })) |closing| return switch (closing) {
+            .table => |table| .{ .view = site_view, .table = table },
+            // The edge's target lowers as a crash where it is reached.
+            .refused => .{ .view = site_view, .table = code_output.refused_table },
+        };
+        const index = codeInventories(site_view).forwardIndex(.{ .node = node_id }) orelse return null;
+        const in_force = self.evidence.instanceTable() orelse
+            Common.invariant("a forward evidence edge was materialized with no instance table in force");
+        return switch (in_force.view.code_output.entry(in_force.table, index)) {
+            .forward => |table| .{ .view = in_force.view, .table = table },
+            .node, .refused => Common.invariant("a forward evidence edge's table entry is not a table"),
+        };
+    }
+
+    /// Whether the method a `direct` checked evidence reference selects was
+    /// refused (Q17): the key is the method of requirement `param`, whose
+    /// names are `params_view`'s, at the owner of the reference's
+    /// dispatcher. Evidence derived from a type reads the same refusal
+    /// (`findMethodTargetByNameFromStore`), so both give `checked_error`.
+    fn checkedEvidenceRefused(
+        self: *BodyContext,
+        site_view: ModuleView,
+        ref: static_dispatch.CheckedEvidence,
+        params_view: ModuleView,
+        param: static_dispatch.EvidenceParamRecord,
+    ) bool {
+        // A dispatcher with no nominal head has no owner whose registry a
+        // refusal names, as for evidence derived from a type
+        // (`methodOwnerFromNode`).
+        const owner = checkedMethodOwner(site_view, ref.dispatcher_ty) orelse return false;
+        return self.builder.declaredMethodRefused(site_view.names, owner, params_view.names.methodNameText(param.method));
     }
 
     fn evidenceVectorCarriesCheckedContract(vector: []const SpecEvidence) bool {
         for (vector) |entry| switch (entry) {
             .target => |target| {
                 if (target.instantiation != null or target.callable_contracts.len != 0) return true;
+                // A table exists only where an edge selected the target.
+                if (target.instances != null) return true;
                 // A local procedure's declaration context exists only where
                 // this evidence was materialized; synthesis elsewhere does not
                 // have it.
@@ -54588,11 +56253,12 @@ const BodyContext = struct {
                     {
                         Common.invariant("substitution-derived target differed from checked target contract");
                     }
-                    if (contract_target.nested == .synthesize and contract_target.substitution == null and contract_target.callable_contracts.len == 0) break :blk derived;
+                    if (contract_target.nested == .synthesize and contract_target.substitution == null and contract_target.callable_contracts.len == 0 and contract_target.instances == null) break :blk derived;
                     const merged = try self.builder.evidence_arena.allocator().create(SpecEvidenceTarget);
                     merged.* = derived_target.*;
                     merged.instantiation = null;
                     merged.substitution = contract_target.substitution;
+                    merged.instances = contract_target.instances;
                     switch (contract_target.nested) {
                         .synthesize => {},
                         .resolved => |resolved| merged.nested = .{ .resolved = resolved },
@@ -54756,14 +56422,14 @@ const BodyContext = struct {
                 entry.* = if (ref.resolution == .from_scheme)
                     .{ .from_scheme = @intCast(k) }
                 else
-                    try self.materializeCheckedEvidenceRef(site_view, ref, param, purpose);
+                    try self.materializeCheckedEvidenceRef(site_view, ref, schema.view, param, purpose);
                 continue;
             }
             if (param.slot.get().? >= subst.len) Common.invariant("requirement receiver slot was outside the request substitution");
             entry.* = switch (ref.resolution) {
                 .from_callable => .{ .from_callable = .{ .independent_callable = false } },
                 .from_scheme => Common.invariant("abstract scheme evidence named an ordinary callable parameter"),
-                .direct, .constraint, .structural, .unreachable_value, .checked_error => try self.materializeCheckedEvidenceRef(site_view, ref, param, purpose),
+                .direct, .constraint, .structural, .unreachable_value, .checked_error => try self.materializeCheckedEvidenceRef(site_view, ref, schema.view, param, purpose),
             };
             if (subst[param.slot.get().?] == .checked_error) {
                 entry.* = switch (ref.resolution) {
@@ -55575,7 +57241,7 @@ const BodyContext = struct {
         return switch (lookup.target.kind) {
             .procedure => |procedure| templateSchemaIn(lookup.view, &lookup.view.templates.get(procedure.template.template)),
             .local_proc => |local| self.scopeSchema(lookup.view, local.dispatch_scope),
-            .callable_binding => emptySchema(lookup.view),
+            .callable_binding => |binding| callableBindingSchema(lookup.view, binding),
             .structural => Common.invariant("structural method registry result has no quantified scheme"),
         };
     }
@@ -55865,22 +57531,56 @@ const BodyContext = struct {
         return wrapper.template;
     }
 
+    /// The scheme of a method bound to a computed callable: its entry
+    /// wrapper's, as a use of the binding by name reads it. The binding is a
+    /// value, so a use in its own module instantiates nothing. A use in
+    /// another module instantiates each variable that the value's type leaves
+    /// open, and its edge records a substitution of this scheme.
+    fn callableBindingSchema(view: ModuleView, binding: static_dispatch.CallableBindingTarget) SchemeRequirements {
+        return templateSchemaIn(view, &view.templates.get(callableBindingOwnerTemplate(view, binding.template).template));
+    }
+
     /// The callee of a dispatch to a method bound to a computed callable:
     /// its function value, restored at the request node when the call
-    /// materializes it. The binding is monomorphic, so its type relates
-    /// to the request directly.
+    /// materializes it. Its type, at the edge's substitution, relates to
+    /// the request directly.
     fn callableBindingMethodCallee(
         self: *BodyContext,
         lookup: MethodLookup,
         binding: static_dispatch.CallableBindingTarget,
         request_fn_node: NodeId,
+        instances: ?InstanceTableId,
     ) Allocator.Error!DraftFnSlot {
         const source_fn_ty = lookup.target.callable_ty;
         var target_ctx = try self.substitutedMethodTargetContext(lookup);
         defer target_ctx.deinit();
         const target_root_node = try target_ctx.instNode(source_fn_ty);
         try self.relateEvidenceTargetRootToRequest(lookup.view, source_fn_ty, target_root_node, request_fn_node);
-        return .{ .callable_binding = .{ .module = binding.module, .template = binding.template, .fn_node = request_fn_node } };
+        return .{ .callable_binding = .{ .module = binding.module, .template = binding.template, .fn_node = request_fn_node, .instances = instances } };
+    }
+
+    /// The table of a call the compiler makes of `lookup`'s target by the
+    /// type of a value (Q17): the description step's table of `method` at
+    /// the request's first parameter, or null where the target has no
+    /// inventory.
+    fn implicitInstanceTable(
+        self: *BodyContext,
+        lookup: MethodLookup,
+        method: code_analyses.DescriptorMethod,
+        request_fn_node: NodeId,
+    ) Allocator.Error!?InstanceTableId {
+        const template: names.ProcTemplate = switch (lookup.target.kind) {
+            .procedure => |procedure| procedure.template,
+            .callable_binding => |binding| callableBindingOwnerTemplate(lookup.view, binding.template),
+            .local_proc, .structural => return null,
+        };
+        const template_view = self.builder.moduleForDigest(names.procTemplateModuleDigest(template));
+        if (codeInventories(template_view).inventoryOf(template.template) == null) return null;
+        const request_fn = try self.graph.functionNodes(request_fn_node);
+        if (request_fn.args.len == 0) Common.invariant("a descriptor method's request takes no owner");
+        const owner = (try self.specializationLookupTypeForNode(request_fn.args[0])) orelse
+            Common.invariant("the owner type of a call the compiler makes of a descriptor method is open at the call");
+        return self.builder.implicitInstanceTable(method, self.typeStore().equalityDigest(self.nameStore(), owner));
     }
 
     /// The procedure callee a call of `slot` names. A computed callable's
@@ -55888,12 +57588,19 @@ const BodyContext = struct {
     fn draftProcCalleeForSlot(self: *BodyContext, slot: DraftFnSlot) Allocator.Error!DraftProcCallee {
         return switch (slot) {
             .local => .{ .func = slot },
-            .callable_binding => |binding| .{ .value = try self.lowerCallableEvalBindingValueAtNode(
-                self.builder.moduleForDigest(binding.module),
-                binding.template,
-                binding.fn_node,
-                &.{},
-            ) },
+            .callable_binding => |binding| blk: {
+                // The binding's entry wrapper takes the table of the call
+                // the compiler makes (Q17).
+                const saved_binding = self.binding_instances;
+                defer self.binding_instances = saved_binding;
+                self.binding_instances = if (binding.instances) |table| .{ .table = table, .forwarded_lookup = null } else null;
+                break :blk .{ .value = try self.lowerCallableEvalBindingValueAtNode(
+                    self.builder.moduleForDigest(binding.module),
+                    binding.template,
+                    binding.fn_node,
+                    &.{},
+                ) };
+            },
         };
     }
 
@@ -56018,6 +57725,7 @@ const BodyContext = struct {
                 .generated_quote,
                 .literal_pattern_value,
                 .literal_pattern_conversion,
+                .bound_capture_default,
                 => {
                     self.allocator.free(checked_args);
                     return null;
@@ -56240,12 +57948,13 @@ const BodyContext = struct {
         self: *BodyContext,
         lookup: MethodLookup,
         callable_mono_ty: Type.TypeId,
+        instances: MethodInstances,
     ) Allocator.Error!DraftFnSlot {
         if (self.frozen_sealed_emission) {
             return try self.methodTargetCalleeWithClosedMono(lookup, callable_mono_ty);
         }
         const callable_node = try self.activeNodeFromType(callable_mono_ty);
-        return try self.methodTargetCalleeAtNode(lookup, callable_node, null);
+        return try self.methodTargetCalleeAtNode(lookup, callable_node, null, instances);
     }
 
     fn methodTargetCalleeWithClosedMono(
@@ -56383,12 +58092,14 @@ const BodyContext = struct {
         raw_lookup: MethodLookup,
         request_fn_node: NodeId,
         contract: ?EvidenceContract,
+        instances: MethodInstances,
     ) Allocator.Error!DraftFnSlot {
         return try self.methodTargetCalleeAtNodeInner(
             raw_lookup,
             request_fn_node,
             if (contract) |checked_contract| .{ .checked = checked_contract } else .derive,
             .inherit,
+            instances,
         );
     }
 
@@ -56397,12 +58108,15 @@ const BodyContext = struct {
         raw_lookup: MethodLookup,
         request_fn_node: NodeId,
         evidence_source: TargetEvidenceSource,
+        /// Where the target finds its Code instance table (D1).
+        instances: MethodInstances,
     ) Allocator.Error!DraftFnSlot {
         return try self.methodTargetCalleeAtNodeInner(
             raw_lookup,
             request_fn_node,
             evidence_source,
             .inherit,
+            instances,
         );
     }
 
@@ -56418,7 +58132,29 @@ const BodyContext = struct {
             request_fn_node,
             .{ .checked = contract },
             .{ .anchored = codec_contract_anchor },
+            contractCallInstances(codec_contract_anchor),
         );
+    }
+
+    /// The Code instance table of the contract call `anchor` names
+    /// (design.md "Code Instance Tables"): the table of its edge, keyed by
+    /// the call's own contract and node. A contract call is closed, so the
+    /// table is the edge's own.
+    fn contractCallInstances(anchor: CheckedCodecContractAnchor) MethodInstances {
+        const plans = anchor.view.static_dispatch_plans;
+        const call = plans.generated_codec_derivations[@backingInt(anchor.derivation)].callsSlice(plans)[anchor.call_index];
+        const node = switch (call.resolution) {
+            .callable => |node| node,
+            .structural, .pending, .checked_error => Common.invariant("a codec call's target is no evidence node"),
+        };
+        const closing = anchor.view.code_output.edgeTable(.{ .derivation_call = .{ .derivation = anchor.derivation, .node = node } }) orelse return .none;
+        return .{
+            .table = switch (closing) {
+                .table => |table| .{ .view = anchor.view, .table = table },
+                // The target lowers as a crash where it is reached.
+                .refused => .{ .view = anchor.view, .table = code_output.refused_table },
+            },
+        };
     }
 
     /// Format methods with ordinary values and callable arguments need no
@@ -56430,8 +58166,9 @@ const BodyContext = struct {
         lookup: MethodLookup,
         request_fn_node: NodeId,
         contract: EvidenceContract,
+        anchor: CheckedCodecContractAnchor,
     ) Allocator.Error!DraftFnSlot {
-        return try self.methodTargetCalleeAtNodeInner(lookup, request_fn_node, .{ .checked = contract }, .independent);
+        return try self.methodTargetCalleeAtNodeInner(lookup, request_fn_node, .{ .checked = contract }, .independent, contractCallInstances(anchor));
     }
 
     fn methodTargetCalleeAtNodeInner(
@@ -56440,9 +58177,15 @@ const BodyContext = struct {
         request_fn_node: NodeId,
         evidence_source: TargetEvidenceSource,
         codec_contract_selection: CodecContractSelection,
+        method_instances: MethodInstances,
     ) Allocator.Error!DraftFnSlot {
         const lookup = try self.withLocalProcContext(raw_lookup);
         const source_fn_ty = lookup.target.callable_ty;
+        const instances: ?InstanceTableId = switch (method_instances) {
+            .none => null,
+            .table => |table| table,
+            .implicit => |method| try self.implicitInstanceTable(lookup, method, request_fn_node),
+        };
         const source_fn_key = try lookup.view.types.rootKey(source_fn_ty);
         // A target reached through an alias takes the substitution and the
         // evidence composed through that alias together, so the context the
@@ -56468,7 +58211,8 @@ const BodyContext = struct {
                 defer target_ctx.deinit();
                 const target_root_node = try target_ctx.instNode(template.checked_fn_root);
                 try self.relateEvidenceTargetRootToRequest(lookup.view, template.checked_fn_root, target_root_node, request_fn_node);
-                const edge = alias_edge orelse try self.deriveTargetEdge(&target_ctx, schema, evidence_source);
+                var edge = alias_edge orelse try self.deriveTargetEdge(&target_ctx, schema, evidence_source);
+                edge.instances = instances;
                 break :blk try self.builder.lowerDraftTemplateFromContext(
                     self,
                     procedure.template,
@@ -56507,7 +58251,7 @@ const BodyContext = struct {
             },
             .callable_binding => |binding| blk: {
                 if (alias_edge != null) Common.invariant("a method alias reached a computed callable target");
-                break :blk try self.callableBindingMethodCallee(lookup, binding, request_fn_node);
+                break :blk try self.callableBindingMethodCallee(lookup, binding, request_fn_node, instances);
             },
             .structural => Common.invariant("structural method registry result has no callable procedure body"),
         };
@@ -56639,10 +58383,11 @@ const BodyContext = struct {
                     Common.invariant("direct dispatch target substitution length differed from its scheme");
                 }
                 const schema = templateSchemaIn(lookup.view, &template);
-                const edge: EdgeEvidence = alias_edge orelse .{
+                var edge: EdgeEvidence = alias_edge orelse .{
                     .subst = subst,
                     .vector = try self.deriveEvidenceVector(schema, subst, self.view, contract, .body_lowering),
                 };
+                edge.instances = self.directDispatchInstances(plan);
                 break :blk try self.builder.lowerDraftTemplateFromContext(
                     self,
                     procedure.template,
@@ -56683,10 +58428,23 @@ const BodyContext = struct {
             },
             .callable_binding => |binding| blk: {
                 if (alias_edge != null) Common.invariant("a method alias reached a computed callable target");
-                if (subst.len != 0) Common.invariant("a computed callable target had a scheme substitution");
-                break :blk try self.callableBindingMethodCallee(lookup, binding, request_fn_node);
+                if (subst.len != callableBindingSchema(lookup.view, binding).scheme_vars.len) {
+                    Common.invariant("direct computed callable target substitution length differed from its entry wrapper's scheme");
+                }
+                // The entry wrapper is described at the dispatch's use
+                // (design.md "Code Instance Tables").
+                break :blk try self.callableBindingMethodCallee(lookup, binding, request_fn_node, self.directDispatchInstances(plan));
             },
             .structural => Common.invariant("direct checked call targeted a structural derivation"),
+        };
+    }
+
+    /// The Code instance table a direct dispatch passes its target: the
+    /// table of its node's edge (design.md "Code Instance Tables").
+    fn directDispatchInstances(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) ?InstanceTableId {
+        return switch (plan.resolution) {
+            .direct_closed, .direct_parametric => |direct| self.evidenceEdgeInstances(self.view, direct.evidence),
+            .direct_pending, .evidence_dependent, .structural, .checked_error, .@"unreachable" => Common.invariant("a direct dispatch's plan names no direct target"),
         };
     }
 
@@ -56729,8 +58487,31 @@ const BodyContext = struct {
                 lookup,
                 request_fn_node,
                 self.dispatchTargetEvidenceSource(plan),
+                self.evidenceDispatchInstances(plan),
             );
         return try self.draftFnSlotTypeNode(slot, request_fn_node);
+    }
+
+    /// Where a dispatch through a `where` clause's evidence finds the Code
+    /// instance table of its target (design.md "Code Instance Tables"): the
+    /// table of the edge that selected the target. A target no edge selected
+    /// was selected from a type, so a descriptor method then takes the
+    /// table its owner type's occurrence recorded, as the compiler's own
+    /// call does (Q17).
+    fn evidenceDispatchInstances(self: *BodyContext, plan: static_dispatch.StaticDispatchCallPlan) MethodInstances {
+        return switch (plan.resolution) {
+            .evidence_dependent => |dependent| blk: {
+                const entry = self.evidence.at(dependent.index) orelse
+                    Common.invariant("dispatch target evidence was absent from its lexical chain");
+                const target = switch (entry) {
+                    .target => |target| target,
+                    .structural, .from_callable, .from_scheme, .unreachable_value, .checked_error => Common.invariant("dispatch target evidence was not a callable target"),
+                };
+                if (target.instances) |table| break :blk .{ .table = table };
+                break :blk if (code_analyses.DescriptorMethod.fromMethodName(self.view.names, plan.method)) |method| .{ .implicit = method } else .none;
+            },
+            .direct_closed, .direct_parametric, .direct_pending, .structural, .checked_error, .@"unreachable" => .none,
+        };
     }
 
     fn resolvedDispatchCallData(
@@ -56746,6 +58527,7 @@ const BodyContext = struct {
                 contextual_lookup,
                 callable_node,
                 self.dispatchTargetEvidenceSource(plan),
+                self.evidenceDispatchInstances(plan),
             )),
             .args = args,
             .iterator_procedure = self.iteratorProcedureForMethodTarget(contextual_lookup.target),
@@ -60670,7 +62452,7 @@ const BodyContext = struct {
         shape_node: NodeId,
         exact: anytype,
     ) Allocator.Error!void {
-        const callee = try self.methodTargetCalleeAtNodeForFormat(exact.lookup, exact.callable_node, exact.contract);
+        const callee = try self.methodTargetCalleeAtNodeForFormat(exact.lookup, exact.callable_node, exact.contract, exact.anchor);
         try self.draft.prepared_codec_calls.append(self.allocator, .{
             .boundary_expr = boundary_expr,
             .kind = kind,
@@ -61123,7 +62905,7 @@ const BodyContext = struct {
             &.{ encoding_node, fields_node, state_node },
             result_node,
         );
-        const callee = try self.methodTargetCalleeAtNodeForFormat(lookup, request_node, exact.contract);
+        const callee = try self.methodTargetCalleeAtNodeForFormat(lookup, request_node, exact.contract, exact.anchor);
         try self.draft.prepared_codec_calls.append(self.allocator, .{
             .boundary_expr = boundary_expr,
             .kind = .parser,
@@ -62437,7 +64219,7 @@ const BodyContext = struct {
                         task.stage = .hash_value;
                         return requestLowerChild(self, ExprSite.read(h.value), self.directStructuralOperandCell(task));
                     },
-                    .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("direct structural task reached a non-structural expression"),
+                    .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("direct structural task reached a non-structural expression"),
                 }
             },
             .discriminant => {
@@ -62662,11 +64444,11 @@ const BodyContext = struct {
             .call => |call| try self.callResultTypeNode(expr_id, expr.ty, call, null),
             .dispatch_call => |plan_node| try self.dispatchResultTypeNode(expr.ty, self.view.bodies.dispatchPlan(plan_node), null),
             .interpolation => |interpolation| try self.interpolationResultTypeNode(self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), null),
-            .type_dispatch_call, .method_eq => |plan_node| try self.dispatchResultTypeNode(expr.ty, self.view.bodies.dispatchPlan(plan_node), null),
+            .type_dispatch_call, .method_eq => |plan| try self.dispatchResultTypeNode(expr.ty, plan, null),
             .lookup_local => |lookup| try self.lookupExprTypeNode(expr.ty, lookup.resolved),
             .lookup_external, .lookup_required => |resolved| try self.lookupExprTypeNode(expr.ty, resolved),
             .field_access => |field| try self.fieldAccessTypeNode(expr.ty, field, null),
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
         };
     }
 
@@ -62817,7 +64599,13 @@ const BodyContext = struct {
             .tag_discriminant => Common.invariant("tag-discriminant equality requested a structural method call"),
             .hash => try self.graphFunctionNode(&.{ node, ret_node }, ret_node),
         };
-        const callee = try self.methodTargetCalleeAtNode(lookup, callable_node, null);
+        const callee = try self.methodTargetCalleeAtNode(lookup, callable_node, null, .{
+            .implicit = switch (mode) {
+                .equality => .is_eq,
+                .hash => .to_hash,
+                .tag_discriminant => unreachable, // the switch above refuses it
+            },
+        });
         try self.draft.structural_eq_method_calls.append(self.allocator, .{
             .boundary = @intCast(boundary_index),
             .node = node,
@@ -63341,7 +65129,7 @@ const BodyContext = struct {
             }
             const arg_tys = D.methodArgTypes(ty, ctx.result_ty);
             const callable_mono_ty = try self.methodTargetMonoTypeFromArgs(lookup, &arg_tys, ctx.result_ty);
-            break :planned try self.methodTargetCalleeWithMono(lookup, callable_mono_ty);
+            break :planned try self.methodTargetCalleeWithMono(lookup, callable_mono_ty, D.method_instances);
         };
         const args = D.callArgs(operand);
         return try self.addExpr(.{ .ty = ctx.result_ty, .data = .{ .call_proc = .{
@@ -64501,7 +66289,7 @@ const BodyContext = struct {
             .method_eq,
             => (try self.exprCallResultEvidenceNode(checked_expr, null)) orelse
                 try self.lowerExprTypeNode(checked_expr),
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .structural_eq, .structural_hash, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => try self.lowerExprTypeNode(checked_expr),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .structural_eq, .structural_hash, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => try self.lowerExprTypeNode(checked_expr),
         };
     }
 
@@ -64912,7 +66700,7 @@ const BodyContext = struct {
                     checked_value = ExprSite.read(block.final_expr);
                     continue;
                 },
-                .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
+                .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => {},
             }
             break;
         }
@@ -64944,15 +66732,15 @@ const BodyContext = struct {
                 .expression_lowering,
             ),
             .interpolation => |interpolation| try self.interpolationResultTypeNode(self.view.bodies.dispatchPlan(@backingInt(interpolation.node)), expected_node),
-            .type_dispatch_call => |plan_node| try self.dispatchResultTypeNodeInPhase(
+            .type_dispatch_call => |plan| try self.dispatchResultTypeNodeInPhase(
                 expr.ty,
-                self.view.bodies.dispatchPlan(plan_node),
+                plan,
                 expected_node,
                 .expression_lowering,
             ),
-            .method_eq => |plan_node| try self.dispatchResultTypeNodeInPhase(
+            .method_eq => |plan| try self.dispatchResultTypeNodeInPhase(
                 expr.ty,
-                self.view.bodies.dispatchPlan(plan_node),
+                plan,
                 expected_node,
                 .expression_lowering,
             ),
@@ -64972,7 +66760,7 @@ const BodyContext = struct {
                 try self.exprProducedValueEvidenceNode(checked_value, expected_node)
             else
                 null,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .empty_list, .match_, .if_, .empty_record, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .empty_list, .match_, .if_, .empty_record, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => null,
         };
     }
 
@@ -65043,9 +66831,9 @@ const BodyContext = struct {
     /// root's match reassigns none: a top-level pattern binds no vars.
     fn exprStateMergeBinders(self: *BodyContext, expr_id: ExprSite) Allocator.Error![]const BinderId {
         return switch (expr_id.kind()) {
-            .read, .coerced_value => try self.view.bodies.stateMergeBinders(expr_id.node()),
+            .read, .coerced_value, .value_site => try self.view.bodies.stateMergeBinders(expr_id.node()),
             .hoisted_root => &.{},
-            .hoisted_result, .literal_guard, .literal_value, .literal_conversion => Common.invariant("state merge binders requested for an expression that is not control flow"),
+            .hoisted_result, .literal_guard, .literal_value, .literal_conversion, .bound_default, .bound_encoder => Common.invariant("state merge binders requested for an expression that is not control flow"),
         };
     }
 
@@ -65585,7 +67373,7 @@ const BodyContext = struct {
         self.builder.current_region = statement.source_region;
         const merge_binders: []MergeBinder = switch (checkedExpr(self.view, ExprSite.read(decl.expr)).data) {
             .if_, .match_, .for_ => try self.stateMergeBinders(try self.exprStateMergeBinders(ExprSite.read(decl.expr))),
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .hosted_lambda, .run_low_level, .row_coerce => try self.allocator.alloc(MergeBinder, 0),
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .hosted_lambda, .run_low_level, .row_coerce => try self.allocator.alloc(MergeBinder, 0),
         };
         defer self.allocator.free(merge_binders);
         if (merge_binders.len == 0 and self.view.bodies.pattern(decl.pattern).data == .assign) {
@@ -65739,7 +67527,7 @@ const BodyContext = struct {
     ) Allocator.Error!?LowerStep {
         switch (checkedExpr(self.view, expr_id).data) {
             .if_, .match_, .for_ => {},
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => return null,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .hosted_lambda, .run_low_level => return null,
         }
 
         task.expanded_merge_binders = try self.stateMergeBinders(try self.exprStateMergeBinders(expr_id));
@@ -66013,7 +67801,7 @@ const BodyContext = struct {
                 // A dangling annotation carries diagnostics and checked type
                 // information but has no runtime value to bind.
                 .anno_only => false,
-                .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => !self.hoistedBindingRestored(decl.pattern) and
+                .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => !self.hoistedBindingRestored(decl.pattern) and
                     !self.view.compile_time_roots.validationResolvedByPattern(decl.pattern),
             },
             .var_,
@@ -66084,7 +67872,7 @@ const BodyContext = struct {
     /// when its own dispatch cannot run or its conversion diverges.
     fn checkedExprDivergesInLoweredRuntime(self: *BodyContext, expr_ref: ExprSite) Allocator.Error!bool {
         const expr_id = switch (expr_ref.kind()) {
-            .read, .coerced_value => expr_ref.node(),
+            .read, .coerced_value, .value_site => expr_ref.node(),
             .hoisted_root => blk: {
                 const root = self.view.compile_time_roots.root(expr_ref.root());
                 const body = root.hoisted_body orelse Common.invariant("hoisted root construct had no hoisted root body");
@@ -66105,6 +67893,19 @@ const BodyContext = struct {
                 const guard = self.view.bodies.literalPatternGuard(pattern) orelse Common.invariant("a literal guard belonged to a pattern compared directly");
                 return self.patternPlanCrashes(guard.equality_plan) or
                     try self.checkedExprDivergesInLoweredRuntime(ExprSite.literalConversion(pattern));
+            },
+            // A bound capture call diverges when its dispatch cannot run; an
+            // encoder call also diverges when its format operand does.
+            .bound_default => return self.patternPlanCrashes(self.view.static_dispatch_plans.boundCaptureDefaultPlan(expr_ref.boundNode())),
+            .bound_encoder => {
+                const plan_id = self.view.static_dispatch_plans.boundCaptureEncoderPlan(expr_ref.boundNode()) orelse
+                    Common.invariant("a bound capture read had no encoder plan");
+                if (self.patternPlanCrashes(plan_id)) return true;
+                for (self.view.static_dispatch_plans.plans[@backingInt(plan_id)].argsSlice(self.view.static_dispatch_plans)) |operand| switch (operand) {
+                    .bound_capture_default => |site| if (try self.checkedExprDivergesInLoweredRuntime(ExprSite.boundDefault(site))) return true,
+                    .checked_expr, .generated_interpolation_segments, .generated_numeral, .generated_quote, .literal_pattern_value, .literal_pattern_conversion => Common.invariant("a bound capture encoder plan had an operand other than its site's format"),
+                };
+                return false;
             },
         };
         var timing_scope = BodyWorkTimingScope.begin(self.builder.timing, .reachability);
@@ -66871,7 +68672,7 @@ const BodyContext = struct {
         if (!self.view.bodies.binder(binder).reassignable) return false;
         const captures = switch (checkedExpr(self.view, ExprSite.read(expr)).data) {
             .closure => |closure| closure.captures,
-            .lambda, .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => return false,
+            .lambda, .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level, .row_coerce => return false,
         };
         for (captures) |capture_idx| {
             if (self.view.bodies.capture(capture_idx).pattern == binder) return true;
@@ -67058,7 +68859,7 @@ const BodyContext = struct {
         if (self.view.bodies.binder(pattern_id).is_scheme_alias) return true;
         return switch (checkedExpr(self.view, ExprSite.read(expr_id)).data) {
             .lambda, .closure => true,
-            .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => false,
+            .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => false,
         };
     }
 
@@ -70179,6 +71980,9 @@ const EqDeriver = struct {
 
     const missing_component_method_msg = "checked method registry is missing List equality target";
 
+    /// A component's own `is_eq` is a call the compiler makes by type (Q17).
+    const method_instances: MethodInstances = .{ .implicit = .is_eq };
+
     fn methodArgTypes(ty: Type.TypeId, _: Type.TypeId) [2]Type.TypeId {
         return .{ ty, ty };
     }
@@ -70400,6 +72204,9 @@ const HashDeriver = struct {
 
     const missing_component_method_msg = "checked method registry is missing List to_hash target";
 
+    /// A component's own `to_hash` is a call the compiler makes by type (Q17).
+    const method_instances: MethodInstances = .{ .implicit = .to_hash };
+
     fn methodArgTypes(ty: Type.TypeId, result_ty: Type.TypeId) [2]Type.TypeId {
         return .{ ty, result_ty };
     }
@@ -70521,6 +72328,7 @@ fn moduleViewData(view: checked.ImportedModuleView) ModuleViewData {
         .const_store = view.const_store,
         .interface_capabilities = view.interface_capabilities,
         .compile_time_root_reads = view.compile_time_root_reads,
+        .code_output = view.code_output,
     };
 }
 
@@ -70886,7 +72694,7 @@ fn checkedLambdaExprIdForConstFn(view: ModuleView, fn_def: anytype) ExprSite {
             break :blk switch (expr.data) {
                 .lambda => ExprSite.read(expr_id),
                 .closure => |closure| ExprSite.read(closure.lambda),
-                .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("stored nested function site did not point at a lambda or closure"),
+                .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .field_access, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("stored nested function site did not point at a lambda or closure"),
             };
         },
         .local_template, .imported_template, .local_hosted, .imported_hosted, .checked_generated, .parser_runtime, .encoder_for_runtime => Common.invariant("capturing stored function must reference a checked nested function"),
@@ -71033,8 +72841,8 @@ fn dispatchPlanIdForRuntimeExpr(view: ModuleView, expr_id: CIR.Expr.Idx) static_
     const expr = checkedExpr(view, ExprSite.read(expr_id));
     const plan_id = switch (expr.data) {
         .dispatch_call => |node| view.bodies.dispatchPlan(node) orelse Common.invariant("stored serialization dispatch expression had no dispatch plan"),
-        .type_dispatch_call => |node| view.bodies.dispatchPlan(node) orelse Common.invariant("stored serialization type dispatch expression had no dispatch plan"),
-        .numeral, .str_from_quote, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .interpolation, .structural_eq, .structural_hash, .method_eq, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("stored serialization runtime function did not reference a dispatch expression"),
+        .type_dispatch_call => |plan| plan orelse Common.invariant("stored serialization type dispatch expression had no dispatch plan"),
+        .numeral, .str_from_quote, .str_segment, .str, .code_site, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .interpolation, .structural_eq, .structural_hash, .method_eq, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .row_coerce, .for_, .hosted_lambda, .run_low_level => Common.invariant("stored serialization runtime function did not reference a dispatch expression"),
     };
     const plan_raw = @backingInt(plan_id);
     if (plan_raw >= view.static_dispatch_plans.plans.len) Common.invariant("stored serialization dispatch plan is outside plan table");
@@ -71043,6 +72851,18 @@ fn dispatchPlanIdForRuntimeExpr(view: ModuleView, expr_id: CIR.Expr.Idx) static_
 
 fn moduleDigestFromId(key: checked.ModuleId) names.CheckedModuleDigest {
     return .{ .bytes = key.bytes };
+}
+
+/// The identity of the root of a generic bound call at the closing use
+/// whose instance table is `table`: the call and the table.
+fn boundRootIdentity(module: checked.ModuleId, call: ExprSite, table: InstanceTableId) [32]u8 {
+    var hasher = TypeDigestHasher.init();
+    hasher.update("roc.monotype.bound-root.v1");
+    hasher.update(&module.bytes);
+    hashU32(&hasher, call.rawNode() orelse Common.invariant("a generic bound call had no CIR node"));
+    hasher.update(&table.view.key.bytes);
+    hashU32(&hasher, @backingInt(table.table));
+    return hasher.finalResult();
 }
 
 /// Content bytes identifying a procedure-use root: the module it was
@@ -71101,6 +72921,20 @@ fn hostedTemplate(hosted: anytype) names.ProcTemplate {
     if (Hosted == names.ProcTemplate) return hosted;
     if (Hosted == Ast.HostedFn) return hosted.template;
     @compileError("unsupported hosted function payload");
+}
+
+/// The static-dispatch owner of checked type `ty` of `view`, in `view`'s
+/// names. Aliases are transparent, as in `BodyContext.methodOwnerFromNode`.
+fn checkedMethodOwner(view: ModuleView, ty: checked.CheckedTypeId) ?static_dispatch.MethodOwner {
+    var current = ty;
+    while (true) switch (view.types.payload(current)) {
+        .alias => |alias| current = alias.backing,
+        .nominal => |nominal| {
+            if (builtinOwner(nominal.builtin)) |owner| return .{ .builtin = owner };
+            return .{ .nominal = .{ .module = nominal.origin_module, .source_decl = nominal.source_decl } };
+        },
+        .pending, .err, .flex, .rigid, .record, .tuple, .function, .empty_record, .tag_union, .empty_tag_union, .field_kind => return null,
+    };
 }
 
 fn methodOwnerFromType(types: *const Type.Store, ty: Type.TypeId) ?static_dispatch.MethodOwner {

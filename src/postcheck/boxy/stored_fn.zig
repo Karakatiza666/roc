@@ -63,7 +63,7 @@ pub fn captureShape(program: *Program, id: WorkerId) CaptureShape {
         .lambda => .{
             .values = worker.capture_types,
             .descs = @intCast(worker.scheme_vars.len - worker.own_descs),
-            .dicts = worker.capturedDictionaryCount() + worker.capturedLiteralCount(),
+            .dicts = worker.capturedDictionaryCount() + worker.capturedLiteralCount() + worker.instanceWords(),
             .composed = false,
         },
         .adapter => .{ .values = worker.capture_types, .descs = @intCast(worker.scheme_vars.len), .dicts = 0, .composed = false },
@@ -72,19 +72,19 @@ pub fn captureShape(program: *Program, id: WorkerId) CaptureShape {
             break :blk .{
                 .values = &.{},
                 .descs = @intCast(target_worker.scheme_vars.len),
-                .dicts = @intCast(target_worker.dictionary_params.len + target_worker.literal_params),
+                .dicts = @intCast(target_worker.dictionary_params.len + target_worker.literal_params + target_worker.instanceWords()),
                 .composed = true,
             };
         },
         .structural, .structural_map => .{ .values = &.{}, .descs = worker.structural_descs, .dicts = 0, .composed = true },
-        .crash_dictionary, .literal_thunk, .root_slot, .callable_eval_entry => .{ .values = &.{}, .descs = 0, .dicts = 0, .composed = true },
+        .crash_dictionary, .literal_thunk, .root_slot, .callable_eval_entry, .code_bound, .code_instances => .{ .values = &.{}, .descs = 0, .dicts = 0, .composed = true },
         .codec => |index| .{
             .values = worker.capture_types,
             .descs = @intCast(worker.scheme_vars.len),
             .dicts = 0,
             .composed = program.codec.pieces.items[index].kind == .constructor,
         },
-        .template, .default, .root, .static_data, .convert => invariant("a worker that is no function value reached a stored function"),
+        .template, .default, .root, .static_data, .convert, .code_value, .code_description => invariant("a worker that is no function value reached a stored function"),
     };
 }
 
@@ -772,6 +772,11 @@ const MetadataReader = struct {
                 _ = try self.word();
                 return;
             },
+            .code_instances, .code_bound => {
+                try self.module();
+                _ = try self.word();
+                return;
+            },
             .structural => {
                 try self.module();
                 _ = try self.tag(@FieldType(lower.WorkerKey, "structural"));
@@ -920,8 +925,8 @@ pub fn encodeMetadata(retained: *Retained, result: *LirProgram.Result, compiled:
         const id = retained.workers.get(function.identity) orelse continue;
         const record = program.worker(id);
         switch (record.key) {
-            .template, .default, .root, .static_data, .convert => continue,
-            .lambda, .adapter, .method_entry, .structural, .structural_map, .crash_dictionary, .literal_thunk, .root_slot, .callable_eval_entry, .codec => {},
+            .template, .default, .root, .static_data, .convert, .code_value, .code_description => continue,
+            .lambda, .adapter, .method_entry, .structural, .structural_map, .crash_dictionary, .literal_thunk, .root_slot, .callable_eval_entry, .code_bound, .code_instances, .codec => {},
         }
         const shape = captureShape(program, id);
         try encoder.bytes.appendSlice(allocator, &function.identity.bytes);
@@ -998,6 +1003,8 @@ const Tag = enum(u8) {
     /// the module and template, then one byte naming the item type
     /// (`lower.ListIntItem`).
     template_list_int,
+    code_instances,
+    code_bound,
 };
 
 fn appendWord(allocator: Allocator, list: *std.ArrayList(u8), value: u32) Allocator.Error!void {
@@ -1243,6 +1250,10 @@ const Encoder = struct {
                 try self.module(input.module());
                 try self.word(input.word());
             },
+            .code_instances, .code_bound => {
+                try self.module(input.module());
+                try self.word(input.word());
+            },
             .structural, .crash_dictionary => {
                 try self.module(input.module());
                 try self.bytes.append(self.allocator, input.byte());
@@ -1379,7 +1390,19 @@ const Encoder = struct {
                 try self.typeOf(record.ret);
                 try self.typeSpan(record.capture_types);
             },
-            .root, .static_data, .convert => invariant("a worker that is no function value reached a stored function"),
+            .code_instances => |key| {
+                try self.tag(.code_instances);
+                try self.module(key.module);
+                try self.word(key.table);
+            },
+            .code_bound => |key| {
+                try self.tag(.code_bound);
+                try self.module(key.module);
+                try self.word(@backingInt(key.root));
+            },
+            // Only a table's worker composes a description thunk, so no
+            // function value captures one.
+            .root, .static_data, .convert, .code_value, .code_description => invariant("a worker that is no function value reached a stored function"),
         }
     }
 };
@@ -1614,6 +1637,14 @@ const Decoder = struct {
                 const ret = self.typeOf();
                 const captures = try self.typeSpan();
                 return try Codec.restorePiece(program, module_index, root, kind, a, b_operand, params, ret, captures);
+            },
+            .code_instances => {
+                const module_index = self.module();
+                return try program.codeInstancesWorker(module_index, self.word());
+            },
+            .code_bound => {
+                const module_index = self.module();
+                return try program.codeBoundWorker(module_index, @fromBackingInt(self.word()));
             },
         }
     }
@@ -1921,6 +1952,10 @@ pub fn encodeNeeds(allocator: Allocator, program: *Program, needs: Tables.Needs)
                 try encodeOperand(&encoder, plan.to);
             },
             .names_block => |block| try encodeOperand(&encoder, block.desc),
+            .instance_entry => |entry| {
+                try encodeOperand(&encoder, entry.table);
+                try encoder.word(entry.index);
+            },
         }
     }
     try encoder.word(@intCast(needs.slots.len));
@@ -2012,6 +2047,10 @@ pub fn decodeNeeds(program: *Program, bytes: []const u8) Allocator.Error!Tables.
                 break :blk .{ .adapt_plan = .{ .from = from, .to = try decodeOperand(&decoder) } };
             },
             .names_block => .{ .names_block = .{ .desc = try decodeOperand(&decoder) } },
+            .instance_entry => blk: {
+                const table = try decodeOperand(&decoder);
+                break :blk .{ .instance_entry = .{ .table = table, .index = decoder.word() } };
+            },
         };
     }
     const slots = try arena.alloc(Tables.RecipeId, decoder.word());

@@ -24,6 +24,7 @@ const NativeRootExport = @import("native_root_export.zig");
 const FrozenRootTranscode = @import("frozen_root_transcode.zig");
 const CompileTimeHost = @import("compile_time_host.zig");
 const checked_root_graph = @import("checked_root_graph.zig");
+const code_descriptions = @import("code_descriptions.zig");
 const Value = @import("value.zig").Value;
 const interpreter_mod = @import("interpreter.zig");
 const interpreter_static_data = @import("interpreter_static_data.zig");
@@ -983,6 +984,9 @@ pub fn finalizeProgram(
     defer if (unfiltered_options.timing) |timing| timing.finish(total_started_ns, .total);
     if (unfiltered_program_roots.source_modules.len != 0 and unfiltered_program_roots.source_modules.len != unfiltered_program_roots.requests.len)
         finalizationInvariant("program roots omitted their checked owners");
+    // The description step comes first: every root lowering reads a code
+    // site's description from its module's output.
+    try describeProgramModules(allocator, modules, lowering_modules, unfiltered_options.post_check_executor);
     if (unfiltered_options.strategy == .boxy) return finalizeProgramBoxy(allocator, modules, lowering_modules, unfiltered_program_roots, runtime_roots, runtime_target, unfiltered_options);
     // A literal argument root is the `.boxy` evaluator's: a Solved program
     // neither specializes nor discovers through it, and the `.boxy`
@@ -1203,6 +1207,27 @@ fn evaluateBoxyRoots(
     for (modules) |entry| {
         if (entry.problem_store) |store| try finishPendingExhaustiveness(entry.module, store);
     }
+/// Fill the code slots of every module, the cached ones included, then run
+/// the description step of each module this finalization completes whose
+/// code output is pending (design.md "Code Reification"). Every module the
+/// lowering sees is in reach.
+fn describeProgramModules(
+    allocator: Allocator,
+    modules: []const ProgramModule,
+    lowering_modules: lir.CheckedPipeline.CheckedModuleSet,
+    executor: ?base.post_check_task_executor.Executor,
+) FinalizeError!void {
+    const batch = try allocator.alloc(code_descriptions.BatchModule, modules.len);
+    defer allocator.free(batch);
+    for (modules, batch) |entry, *module| module.* = .{ .module = entry.module, .problem_store = entry.problem_store };
+    var reach = std.ArrayList(checked.ImportedModuleView).empty;
+    defer reach.deinit(allocator);
+    try reach.append(allocator, checked.importedView(lowering_modules.root.module));
+    try reach.appendSlice(allocator, lowering_modules.imports);
+    try reach.appendSlice(allocator, lowering_modules.root.relation_modules);
+    for (modules) |entry| try reach.append(allocator, checked.importedView(entry.module));
+    try code_descriptions.fillCodeInventories(allocator, reach.items, reach.items);
+    try code_descriptions.describeModules(allocator, batch, reach.items, executor);
 }
 
 /// Report destinations for a specialization whose literal roots an earlier
@@ -3727,7 +3752,7 @@ fn Evaluation(comptime ProgramPtr: type) type {
                 switch (entry) {
                     .own => |own| {
                         const lowered = program orelse finalizationInvariant("a literal root failed without running");
-                        try reportLiteralRootFailure(&self.owners, lowered, lowered.lir_result.literal_roots.items[self.literalPlanIn(lowered, index)], own.borrow(self.literal_failures.messages.items));
+                        try reportLiteralRootFailure(&self.owners, self.program.modules, lowered, lowered.lir_result.literal_roots.items[self.literalPlanIn(lowered, index)], own.borrow(self.literal_failures.messages.items));
                     },
                     .literal, .checked => {},
                 }
@@ -4104,6 +4129,16 @@ fn finalize(
         @as(*const Options, @ptrCast(@alignCast(raw))).*
     else
         .{};
+    {
+        var reach = std.ArrayList(checked.ImportedModuleView).empty;
+        defer reach.deinit(allocator);
+        for (imports) |import_artifact| try reach.append(allocator, import_artifact.view);
+        try reach.appendSlice(allocator, available_modules);
+        try reach.appendSlice(allocator, relation_modules);
+        if (module.code_output.state == .pending) try code_descriptions.describeModule(allocator, module, problem_store, reach.items);
+        try reach.append(allocator, checked.importedView(module));
+        try code_descriptions.fillCodeInventories(allocator, reach.items, reach.items);
+    }
     const requests = module.root_requests.compile_time_requests;
     const total_started_ns = if (requests.len != 0) if (options.timing) |timing| timing.start() else 0 else 0;
     if (requests.len != 0) {
@@ -4330,12 +4365,15 @@ const RootCompletionState = struct {
         // instantiates (design.md "Literal Arguments").
         if (self.module.compile_time_roots.root(request_root_id).literal_argument) |argument| switch (argument.edge) {
             .literal => {},
-            .node => |id| switch (self.module.static_dispatch_plans.evidenceNode(id).target.kind) {
-                .procedure => |procedure| try self.pending_templates.append(self.allocator, procedure.template),
-                .callable_binding => |binding| if (artifactMatches(binding.module, self.module.key)) {
-                    if (!self.rootDependencyComplete(self.module.callable_eval_templates.get(binding.template).root)) return false;
-                },
-                .local_proc, .structural => {},
+            inline .node, .derivation_call => |key, tag| {
+                const id = if (tag == .node) key else key.node;
+                switch (self.module.static_dispatch_plans.evidenceNode(id).target.kind) {
+                    .procedure => |procedure| try self.pending_templates.append(self.allocator, procedure.template),
+                    .callable_binding => |binding| if (artifactMatches(binding.module, self.module.key)) {
+                        if (!self.rootDependencyComplete(self.module.callable_eval_templates.get(binding.template).root)) return false;
+                    },
+                    .local_proc, .structural => {},
+                }
             },
             .use => |expr| {
                 if (self.module.resolved_value_refs.lookupIdByExpr(expr)) |ref_id| {
@@ -4344,6 +4382,11 @@ const RootCompletionState = struct {
                         .template => |dependency| try self.pending_templates.append(self.allocator, dependency),
                     }
                 }
+            },
+            .requirement => |requires_idx| {
+                const requirement = self.module.checked_procedure_templates.literalRequirementEdge(requires_idx) orelse
+                    finalizationInvariant("a literal argument root's requirement edge is not recorded");
+                try self.pending_templates.append(self.allocator, requirement.template);
             },
         };
         while (self.pending_templates.pop()) |next| {
@@ -4691,7 +4734,7 @@ fn evalInterpreterProgramRoots(
                 break :blk stored;
             }
 
-            const eval_result = try evalCompileTimeRoot(interpreter, problem_store, owners, root.owner, module, compile_time_root, &lowered.lir_result, program.slotEnvironment(), root.proc, root.ret_layout, options.retry);
+            const eval_result = try evalCompileTimeRoot(interpreter, problem_store, owners, root.owner, module, program.modules, compile_time_root, &lowered.lir_result, program.slotEnvironment(), root.proc, root.ret_layout, options.retry);
             switch (eval_result) {
                 .retry => continue,
                 .value => |value| {
@@ -4765,6 +4808,7 @@ const LiteralRootFailures = struct {
         meaning: ?lir.LIR.FailureMeaning,
         region: ?base.Region,
         loc: ?base.SourceLoc,
+        refusal: ?builtins.in_process_host.CodeRefusal,
 
         fn borrow(self: OwnedFailure, messages: []const u8) LiteralRootFailure {
             return .{
@@ -4772,6 +4816,7 @@ const LiteralRootFailures = struct {
                 .meaning = self.meaning,
                 .region = self.region,
                 .loc = self.loc,
+                .refusal = self.refusal,
             };
         }
     };
@@ -4818,6 +4863,7 @@ const LiteralRootFailures = struct {
                     .meaning = failure.meaning,
                     .region = failure.region,
                     .loc = failure.loc,
+                    .refusal = failure.refusal,
                 } };
             },
         };
@@ -5028,6 +5074,7 @@ fn reportEmbeddedFailure(
             .numeral => _ = try store.appendProblem(.{ .comptime_invalid_numeral = .{ .message = message_idx, .region = site.region, .origin = origin } }),
             .quote => _ = try store.appendProblem(.{ .comptime_invalid_quote = .{ .message = message_idx, .region = site.region, .origin = origin } }),
             .interpolation => _ = try store.appendProblem(.{ .comptime_invalid_interpolation = .{ .message = message_idx, .region = site.region, .origin = origin } }),
+            .bound_call => unreachable, // no conversion rejects a bound call's root (`LiteralRejectionKind.bound_call`)
         }
     } else {
         const message_idx = try store.putExtraString(embedded.message);
@@ -5088,6 +5135,9 @@ const LiteralRootFailure = struct {
     meaning: ?lir.LIR.FailureMeaning,
     region: ?base.Region,
     loc: ?base.SourceLoc,
+    /// The node a translator refused, where the root is a generic bound
+    /// call's (design.md "Bound Instance Roots") and its translator refused.
+    refusal: ?builtins.in_process_host.CodeRefusal = null,
 };
 
 /// Where a compile-time evaluation failed: the statement it stopped at, as
@@ -5144,12 +5194,19 @@ fn evalInterpreterLiteralRoot(
                 error.InvalidHostedFunctionSignature => finalizationInvariant("literal root reached an invalid hosted function signature"),
                 error.ExpectErr => unreachable, // expect_err statements occur only in top-level expect test roots, not literal roots
             };
+            // Only a crash can be a translator's refusal.
+            const refusal = switch (err) {
+                error.Crash => interpreter.getFailedRefusal(),
+                error.RuntimeError, error.DivisionByZero => null,
+                error.OutOfMemory, error.UnsupportedHostedFunction, error.InvalidHostedFunctionSignature, error.ExpectErr => unreachable, // the switch above returned or stopped
+            };
             const failed_at = interpreterFailedAt(&lowered.lir_result, interpreter, program.slotEnvironment());
             break :evaluated .{
                 .message = message,
                 .meaning = failed_at.meaning,
                 .region = failed_at.region,
                 .loc = failed_at.loc,
+                .refusal = refusal,
             };
         };
         defer interpreter.dropValue(result.value, plan.ret_layout);
@@ -5207,7 +5264,7 @@ fn evalDevLiteralRoot(
         .returned => null,
         .crashed => crashed: {
             const failed_at = native.failedAt(host.failure);
-            break :crashed .{ .message = host.crashMessage() orelse "Roc crashed", .meaning = failed_at.meaning, .region = failed_at.region, .loc = failed_at.loc };
+            break :crashed .{ .message = host.crashMessage() orelse "Roc crashed", .meaning = failed_at.meaning, .region = failed_at.region, .loc = failed_at.loc, .refusal = host.refusal };
         },
         .host_oom => return error.OutOfMemory,
     };
@@ -5259,6 +5316,7 @@ fn recordLiteralRootFailure(
 /// a crash of the conversion, reported at the literal.
 fn reportLiteralRootFailure(
     owners: *const ModuleOwners,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     lowered: *const lir.CheckedPipeline.LoweredProgram,
     plan: LirProgram.LiteralRootPlan,
     failure: LiteralRootFailure,
@@ -5271,6 +5329,11 @@ fn reportLiteralRootFailure(
     while (targets.nextTarget()) |owner| {
         const store = owner.problem_store orelse continue;
         const literal_region = literalSourceRegion(owner.module, plan.site.node);
+        // A translator's refusal is reported at the node it refused.
+        if (failure.refusal) |refused| {
+            try reportRefusal(store, owner.module, modules, literal_region, refused, failure.message);
+            continue;
+        }
         const site = comptimeFailureSiteFromLoc(owner.module, &lowered.lir_result.store, literal_region, failure.region, failure.loc);
         const message_idx = try store.putExtraString(failure.message);
         _ = try store.appendProblem(.{ .comptime_crash = .{
@@ -5599,6 +5662,9 @@ const InterpreterProgram = struct {
     /// so published values may reference them for the whole finalization.
     static_strings: Interpreter.StaticStrings.Table,
     interpreter: Interpreter,
+    /// The lowering's modules, any of which a refusal's site may come from
+    /// (I9c).
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     /// Owner named by the callable headers of every image this program's
     /// slot environment installs: its static callables run on `interpreter`.
     callable_owner: Interpreter.StaticCallableOwner = .unbound,
@@ -5620,6 +5686,7 @@ const InterpreterProgram = struct {
         self.allocator = allocator;
         self.timing_io = null;
         self.shared_slots = null;
+        self.modules = modules;
         self.callable_owner = .unbound;
         self.shared_callable_owner = null;
         self.callable_images = 0;
@@ -5668,6 +5735,7 @@ const InterpreterProgram = struct {
             .host = CompilerHost.init(allocator),
             .static_strings = undefined,
             .interpreter = undefined,
+            .modules = self.modules,
         };
         errdefer child.host.deinit();
         child.interpreter = try Interpreter.init(allocator, &lowered.lir_result.store, &lowered.lir_result.layouts, self.interpreter.static_strings, child.host.ops());
@@ -6218,6 +6286,9 @@ const DevProgram = struct {
     image_selection: BoxyLinkedImages.Selection,
     /// The program's LIR, whose source file table locations index.
     lir_store: *const lir.LirStore,
+    /// The lowering's modules, any of which a refusal's site may come from
+    /// (I9c).
+    modules: lir.CheckedPipeline.CheckedModuleSet,
 
     fn init(allocator: Allocator, modules: lir.CheckedPipeline.CheckedModuleSet, lowered: *lir.CheckedPipeline.LoweredProgram, options: Options) FinalizeError!DevProgram {
         const static_data_started_ns = if (options.timing) |timing| timing.start() else 0;
@@ -6375,6 +6446,7 @@ const DevProgram = struct {
             .linked_images = options.boxy_linked_images,
             .image_selection = image_selection,
             .lir_store = &lowered.lir_result.store,
+            .modules = modules,
         };
     }
 
@@ -6738,8 +6810,10 @@ fn evalDevProgramRoots(
                 break :crashed try devCrashedRootPayload(
                     problem_store,
                     module,
+                    native.modules,
                     job.compile_time_root,
                     job.root.request,
+                    job.host.refusal,
                     message,
                     failed_at,
                     owners,
@@ -6965,8 +7039,10 @@ fn devComptimeExhaustivenessRootPayload(
 fn devCrashedRootPayload(
     problem_store: ?*check.problem.Store,
     module: *checked.CheckedModuleArtifact,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     root: checked.CompileTimeRoot,
     request: checked.RootRequest,
+    refusal: ?builtins.in_process_host.CodeRefusal,
     message: []const u8,
     failed_at: FailedAt,
     owners: *const ModuleOwners,
@@ -6974,6 +7050,11 @@ fn devCrashedRootPayload(
     had_problem: *bool,
 ) FinalizeError!checked.CompileTimeRootPayload {
     const lir_store = &lir_result.store;
+    if (refusal) |refused| if (problem_store) |store| {
+        try reportRefusal(store, module, modules, devRootSourceRegion(module, root), refused, message);
+        had_problem.* = true;
+        return try failedRootPayload(module, root, message, .crash);
+    };
     switch (try reportEmbeddedFailure(problem_store, module, devRootSourceRegion(module, root), owners, lir_result, failed_at, message)) {
         .reported => {
             had_problem.* = true;
@@ -7004,6 +7085,148 @@ fn devCrashedRootPayload(
     } });
     had_problem.* = true;
     return try failedRootPayload(module, root, message, RootFailure.of(failed_at.meaning));
+}
+
+/// Report a translator's refusal (I9c) at each source of the node it
+/// refused, with the calls each source was inlined through.
+fn reportRefusal(
+    store: *check.problem.Store,
+    module: *const checked.CheckedModuleArtifact,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
+    root_region: base.Region,
+    refusal: builtins.in_process_host.CodeRefusal,
+    message: []const u8,
+) Allocator.Error!void {
+    const message_idx = try store.putExtraString(message);
+    const found = refusalSite(module, modules, refusal.site) orelse
+        finalizationInvariant("a refusal named a reification site that no module's provenance holds");
+    const chains = found.table.origins(found.site, refusal.row, refusal.node) orelse {
+        _ = try store.appendProblem(.{ .translation_refused = .{
+            .message = message_idx,
+            .region = root_region,
+            .path = try store.putRefusalCalls(&.{}),
+            .unplaced = true,
+        } });
+        return;
+    };
+    if (chains.len == 0) finalizationInvariant("a reified node has no source");
+    const named = found.table.intrinsicsOf(found.site, refusal.row, refusal.node) orelse
+        finalizationInvariant("a reified node with sources has no intrinsics entry");
+    const names = try store.gpa.alloc(check.problem.ExtraStringIdx, named.len);
+    defer store.gpa.free(names);
+    for (names, named) |*name, span| name.* = try store.putExtraString(found.table.intrinsicText(span));
+    const intrinsics = try store.putExtraStrings(names);
+    for (chains) |chain| {
+        const links = found.table.links[chain.start..][0..chain.len];
+        const place = refusalPlace(module, modules, found, links[0]);
+        // A foreign source is shown here at the innermost call in this module
+        // that reached it.
+        var region = if (place.foreign) root_region else place.region;
+        var placed = !place.foreign;
+        var path: std.ArrayList(check.problem.RefusalCall) = .empty;
+        defer path.deinit(store.gpa);
+        for (links[1..]) |link| {
+            const call = refusalPlace(module, modules, found, link);
+            if (!placed and !call.foreign) {
+                region = call.region;
+                placed = true;
+            }
+            try path.append(store.gpa, .{
+                .text = try store.putExtraString(call.text),
+                .place = if (call.foreign) .{ .foreign = .{
+                    .path = try store.putExtraString(call.path),
+                    .line = call.line,
+                    .column = call.column,
+                    .end_line = call.end_line,
+                    .end_column = call.end_column,
+                } } else .{ .local = call.region },
+            });
+        }
+        _ = try store.appendProblem(.{ .translation_refused = .{
+            .message = message_idx,
+            .region = region,
+            .origin = if (place.foreign) .{
+                .path = try store.putExtraString(place.path),
+                .line = place.line,
+                .column = place.column,
+                .end_line = place.end_line,
+                .end_column = place.end_column,
+            } else null,
+            .path = try store.putRefusalCalls(path.items),
+            .intrinsics = intrinsics,
+        } });
+    }
+}
+
+const RefusalSite = struct {
+    table: *const checked.CodeProvenanceTable,
+    site: checked.CodeProvenanceTable.Site,
+};
+
+/// The provenance of the site whose `Code` value carries `key`: the
+/// evaluated module's, or that of another module of the lowering when that
+/// module made the value. The evaluated module need not be the lowering's
+/// root, so the root and its relation modules are searched as well as its
+/// imports.
+fn refusalSite(
+    module: *const checked.CheckedModuleArtifact,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
+    key: u64,
+) ?RefusalSite {
+    if (module.code().provenance.site(key)) |site| return .{ .table = &module.code().provenance, .site = site };
+    if (modules.root.module.code().provenance.site(key)) |site| return .{ .table = &modules.root.module.code().provenance, .site = site };
+    for ([_][]const checked.ImportedModuleView{ modules.imports, modules.root.relation_modules }) |views| {
+        for (views) |view| if (view.code_output.provenance.site(key)) |site| return .{ .table = &view.code_output.provenance, .site = site };
+    }
+    return null;
+}
+
+const RefusalPlace = struct {
+    region: base.Region,
+    foreign: bool,
+    /// The path of the file that holds the source
+    /// (`ModuleEnv.diagnosticSourceName`).
+    path: []const u8,
+    text: []const u8,
+    line: u32,
+    column: u32,
+    end_line: u32,
+    end_column: u32,
+};
+
+/// The view of the module with `key` that this lowering sees: the root, an
+/// import or a relation module. Null when the lowering does not see it.
+fn loweringModuleView(lowering_modules: lir.CheckedPipeline.CheckedModuleSet, key: checked.ModuleId) ?checked.ImportedModuleView {
+    if (moduleKeyBytesEqual(key.bytes, lowering_modules.root.module.key.bytes)) return checked.importedView(lowering_modules.root.module);
+    for (lowering_modules.imports) |view| if (moduleKeyBytesEqual(view.key.bytes, key.bytes)) return view;
+    for (lowering_modules.root.relation_modules) |view| if (moduleKeyBytesEqual(view.key.bytes, key.bytes)) return view;
+    return null;
+}
+
+/// Where one source of a site is: its region, its module and its text.
+fn refusalPlace(
+    module: *const checked.CheckedModuleArtifact,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
+    found: RefusalSite,
+    link: u32,
+) RefusalPlace {
+    const src = found.table.source(found.site, link);
+    const key = found.table.modules[src.module];
+    const region = base.Region.from_raw_offsets(src.region_start, src.region_end);
+    const local = std.meta.eql(key, module.key);
+    const env = if (local) module.moduleEnvConst() else (loweringModuleView(modules, key.digest()) orelse
+        finalizationInvariant("a reification source names a module that finalization does not see")).module_env;
+    const info = env.calcRegionInfo(region);
+    return .{
+        .region = region,
+        .foreign = !local,
+        .path = env.diagnosticSourceName(),
+        .text = env.getSource(region),
+        .line = info.start_line_idx + 1,
+        .column = info.start_col_idx + 1,
+        .end_line = info.end_line_idx + 1,
+        .end_column = info.end_col_idx + 1,
+    };
 }
 
 fn reportDevHostEvents(
@@ -7121,6 +7344,7 @@ fn reportLiteralRejection(
                 .region = failure_site.region,
                 .origin = try comptimeFailureOrigin(store, failure_site),
             } }),
+            .bound_call => unreachable, // no conversion rejects a bound call's root (`LiteralRejectionKind.bound_call`)
         }
     }
 }
@@ -7132,6 +7356,7 @@ fn literalRejectionReported(store: *const check.problem.Store, kind: lir.LIR.Lit
             .numeral => if (problem == .comptime_invalid_numeral) problem.comptime_invalid_numeral.region else continue,
             .quote => if (problem == .comptime_invalid_quote) problem.comptime_invalid_quote.region else continue,
             .interpolation => if (problem == .comptime_invalid_interpolation) problem.comptime_invalid_interpolation.region else continue,
+            .bound_call => unreachable, // no conversion rejects a bound call's root (`LiteralRejectionKind.bound_call`)
         };
         if (regionsEqual(reported_region, region)) return true;
     }
@@ -7205,6 +7430,7 @@ fn evalCompileTimeRoot(
     owners: *const ModuleOwners,
     root_owner: lir.LIR.LoweringModuleId,
     module: *checked.CheckedModuleArtifact,
+    modules: lir.CheckedPipeline.CheckedModuleSet,
     root: checked.CompileTimeRoot,
     lir_result: *const lir.Program.Result,
     slots: *const StaticSlotEnvironment,
@@ -7233,6 +7459,10 @@ fn evalCompileTimeRoot(
                 if (exhaustivenessFailure(failed_at.meaning)) |failure| {
                     return .{ .failed = .{ .message = message, .payload = try reportCompileTimeExhaustiveness(problem_store, owners, root_owner, module, root, lir_result, failure, proc) } };
                 }
+                if (interpreter.getFailedRefusal()) |refused| if (problem_store) |store| {
+                    try reportRefusal(store, module, modules, devRootSourceRegion(module, root), refused, message);
+                    return .{ .failed = .{ .message = message, .payload = try failedRootPayload(module, root, message, .crash) } };
+                };
                 return .{ .failed = .{ .message = message, .payload = try reportCompileTimeCrash(problem_store, module, root, failed_at, owners, lir_result, message) } };
             },
             error.ExpectErr => finalizationInvariant("compile-time root reached an expect_err statement"),
@@ -7432,7 +7662,7 @@ fn failedRootPayload(
     if (root.guarded) return .runtime;
     return switch (root.kind) {
         .expect => .expect,
-        .hoisted_validation => .discarded,
+        .hoisted_validation, .interpolation_conversion => .discarded,
         .constant,
         .hoisted_constant,
         .callable_binding,
@@ -7638,7 +7868,7 @@ fn compileTimeRootForRequest(
     }
     const root = module.compile_time_roots.roots[raw];
     const kind_matches = switch (request.kind) {
-        .compile_time_constant => root.kind == .constant or root.kind == .hoisted_constant or root.kind == .hoisted_validation or root.kind == .numeral_conversion or root.kind == .quote_conversion or root.kind == .literal_argument,
+        .compile_time_constant => root.kind == .constant or root.kind == .hoisted_constant or root.kind == .hoisted_validation or root.kind == .numeral_conversion or root.kind == .quote_conversion or root.kind == .literal_argument or root.kind == .interpolation_conversion,
         .compile_time_callable => root.kind == .callable_binding,
         .repl_expr => root.kind == .repl_expr,
         .runtime_entrypoint,
@@ -7665,7 +7895,7 @@ fn storeRootValue(
     compile_time_root: checked.CompileTimeRoot,
     value: @import("value.zig").Value,
 ) ConstStoreWriter.Error!checked.CompileTimeRootPayload {
-    if (compile_time_root.kind == .hoisted_validation) return .discarded;
+    if (compile_time_root.kind == .hoisted_validation or compile_time_root.kind == .interpolation_conversion) return .discarded;
     if (compile_time_root.literal_argument) |argument| if (argument.validate_only) return .discarded;
     return writer.storeRoot(root, value);
 }
@@ -7697,6 +7927,7 @@ fn completeRoot(
         .expect,
         .numeral_conversion,
         .quote_conversion,
+        .interpolation_conversion,
         .repl_expr,
         .literal_argument,
         => null,
@@ -7764,6 +7995,7 @@ pub fn finishConstRoot(
         .expect,
         .numeral_conversion,
         .quote_conversion,
+        .interpolation_conversion,
         .repl_expr,
         .literal_argument,
         => unreachable, // finishConstRoot returned above for every kind other than constant and hoisted_constant

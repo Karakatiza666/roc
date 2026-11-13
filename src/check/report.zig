@@ -25,6 +25,7 @@ const CIR = can.CIR;
 const ModuleEnv = can.ModuleEnv;
 
 const Report = reporting.Report;
+const Location = reporting.Location;
 const Document = reporting.Document;
 const UnderlineRegion = reporting.UnderlineRegion;
 const SourceCodeDisplayRegion = reporting.SourceCodeDisplayRegion;
@@ -69,6 +70,7 @@ const ComptimeCondition = problem_mod.ComptimeCondition;
 // Type declaration errors
 const TypeApplyArityMismatch = problem_mod.TypeApplyArityMismatch;
 const RecursiveAlias = problem_mod.RecursiveAlias;
+const RecordExtensionNotRecord = problem_mod.RecordExtensionNotRecord;
 const NotAWhereAlias = problem_mod.NotAWhereAlias;
 const WhereAliasInTypePosition = problem_mod.WhereAliasInTypePosition;
 const RecursiveWhereAlias = problem_mod.RecursiveWhereAlias;
@@ -92,6 +94,7 @@ const HostBoundaryOpenRow = problem_mod.HostBoundaryOpenRow;
 const HostBoundaryOptionalField = problem_mod.HostBoundaryOptionalField;
 const AnnotationOnlyValue = problem_mod.AnnotationOnlyValue;
 const AnnotationOnlyValueUse = problem_mod.AnnotationOnlyValueUse;
+const ExistsOnlyInReifiedCode = problem_mod.ExistsOnlyInReifiedCode;
 const HostedWhereRequirement = problem_mod.HostedWhereRequirement;
 const DerivedMethodValueUse = problem_mod.DerivedMethodValueUse;
 const CapturingMethod = problem_mod.CapturingMethod;
@@ -109,7 +112,9 @@ const RedundantOpenTagUnion = problem_mod.RedundantOpenTagUnion;
 const ComptimeOrigin = problem_mod.ComptimeOrigin;
 const ComptimeCrash = problem_mod.ComptimeCrash;
 const ComptimeInvalidInterpolation = problem_mod.ComptimeInvalidInterpolation;
+const StagedCode = problem_mod.StagedCode;
 const ComptimeExpectFailed = problem_mod.ComptimeExpectFailed;
+const TranslationRefused = problem_mod.TranslationRefused;
 const ComptimeEvalError = problem_mod.ComptimeEvalError;
 
 // Number errors
@@ -1013,6 +1018,11 @@ pub const ReportBuilder = struct {
                 errdefer report.deinit();
                 try self.addStrConversionHint(&report, mismatch.str_conversion, false);
                 if (mismatch.host_fixed_row) try self.appendHostFixedRowHint(&report, mismatch.host_fixed_origin, mismatch.types.actual_snapshot);
+                if (mismatch.record_row) try self.appendRecordRowHint(&report);
+                if (try self.recordShorthandName(mismatch.types)) |name| try self.appendRecordShorthandHint(&report, name);
+                if (self.lambdaMetCodeAsFunction(mismatch.types.expected_snapshot, mismatch.types.actual_snapshot)) {
+                    try self.appendCodeLambdaHint(&report, mismatch.context);
+                }
                 return report;
             },
             .type_apply_mismatch_arities => |data| {
@@ -1044,6 +1054,9 @@ pub const ReportBuilder = struct {
             },
             .recursive_alias => |data| {
                 return self.buildRecursiveAliasReport(data);
+            },
+            .record_extension_not_record => |data| {
+                return self.buildRecordExtensionNotRecordReport(data);
             },
             .not_a_where_alias => |data| {
                 return self.buildNotAWhereAliasReport(data);
@@ -1102,6 +1115,9 @@ pub const ReportBuilder = struct {
             .annotation_only_value_use => |data| {
                 return self.buildAnnotationOnlyValueUseReport(data);
             },
+            .exists_only_in_reified_code => |data| {
+                return self.buildExistsOnlyInReifiedCodeReport(data);
+            },
             .hosted_where_requirement => |data| {
                 return self.buildHostedWhereRequirementReport(data);
             },
@@ -1148,7 +1164,9 @@ pub const ReportBuilder = struct {
             .comptime_invalid_numeral => |data| return self.buildComptimeInvalidLiteralReport(data, "Invalid Number", "The from_numeral implementation for this number literal's type rejected it."),
             .comptime_invalid_quote => |data| return self.buildComptimeInvalidLiteralReport(data, "Invalid String", "The from_quote implementation for this string literal's type rejected it."),
             .comptime_invalid_interpolation => |data| return self.buildComptimeInvalidInterpolationReport(data),
+            .staged_code => |data| return self.buildStagedCodeReport(data),
             .comptime_expect_failed => |data| return self.buildComptimeExpectFailedReport(data),
+            .translation_refused => |data| return self.buildTranslationRefusedReport(data),
             .comptime_eval_error => |data| return self.buildComptimeEvalErrorReport(data),
             .invalid_numeric_literal => |data| return self.buildInvalidNumericLiteralReport(data),
             .tuple_access_needs_annotation => |data| return self.buildTupleAccessNeedsAnnotationReport(data),
@@ -1261,6 +1279,22 @@ pub const ReportBuilder = struct {
                 &.{&.{D.bytes("A tag union in an output position is open for the callers of this definition, which may use the result at a wider union, but the annotation still bounds the definition itself: it may only produce the tags the annotation lists.")}},
             ),
             .record_destructure => return try self.buildRecordDestructureMismatch(mismatch.types),
+            .code_primitives_item => return try self.makeMismatchReport(
+                ProblemRegion{ .simple = regionIdxFrom(mismatch.types.actual_var) },
+                &.{D.bytes("This code_primitives item is not a list of primitive ids.")},
+                &.{D.bytes("It has the type:")},
+                mismatch.types.actual_snapshot,
+                &.{D.bytes("But a code_primitives item has the type:")},
+                mismatch.types.expected_snapshot,
+                &.{&.{
+                    D.bytes("Hint:").withAnnotation(.emphasized),
+                    D.bytes("Wrap each entry in"),
+                    D.bytes("Code.prim").withAnnotation(.inline_code),
+                    D.bytes("and write the entries as a list:"),
+                    D.bytes("[Code.prim(Vec3.scale), Code.prim(Vec3.plus)]").withAnnotation(.inline_code),
+                    D.bytes(".").withNoPrecedingSpace(),
+                }},
+            ),
             .none => return try self.buildGenericMismatch(mismatch.types),
         };
     }
@@ -2105,6 +2139,18 @@ pub const ReportBuilder = struct {
         const actual_arg_type = types.actual_snapshot;
         const expected_arg_type = types.expected_snapshot;
 
+        // A function named where a `Code` is expected is staged, and staging
+        // reaches a top-level definition or a lambda a block binds. Anywhere
+        // else the checker sees a function against a `Code`, which says
+        // nothing about staging, so the staged-code report replaces the
+        // mismatch.
+        if (self.stagedCodeArgMismatch(expected_arg_type, actual_arg_type)) {
+            return try self.buildStagedCodeReport(.{
+                .reason = .not_a_named_function,
+                .region = self.can_ir.store.getRegionAt(@fromBackingInt(@intCast(@backingInt(ctx.arg_var)))),
+            });
+        }
+
         if (ctx.fn_name) |fn_name_ident| {
             return try self.makeMismatchReport(
                 .{ .focused = .{
@@ -2409,6 +2455,52 @@ pub const ReportBuilder = struct {
         return report;
     }
 
+    /// Build a report for a type in a record extension slot that is not a
+    /// record row (design.md "Record Extension Well-Formedness").
+    fn buildRecordExtensionNotRecordReport(
+        self: *Self,
+        data: RecordExtensionNotRecord,
+    ) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Not A Record Extension", "", .runtime_error);
+        errdefer report.deinit();
+        try D.renderSliceInto(&.{
+            D.bytes("This type cannot extend a record."),
+        }, self, &report, &report.headline);
+
+        try self.addSourceRegionOf(&report.document, data.region, .error_highlight);
+        try report.document.addLineBreak();
+
+        try D.renderSlice(&.{
+            D.bytes("It is:"),
+        }, self, &report);
+        try report.document.addLineBreak();
+        const type_str = try report.addOwnedString(self.getFormattedString(data.snapshot));
+        try report.document.addCodeBlock(type_str);
+        try report.document.addLineBreaks(2);
+
+        if (data.is_opaque) {
+            try D.renderSlice(&.{
+                D.bytes("This is an opaque type, declared with"),
+                D.bytes("::").withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+                D.bytes("It hides its fields in every module, its own module too, so its fields cannot extend a record."),
+                D.bytes("Declare it with"),
+                D.bytes(":=").withAnnotation(.inline_code),
+                D.bytes("to make its fields visible, or write its fields in the record."),
+            }, self, &report);
+        } else {
+            try D.renderSlice(&.{
+                D.bytes("A record extension"),
+                D.bytes("..r").withAnnotation(.inline_code),
+                D.bytes("accepts a record, a type variable, a type alias of a record, or a"),
+                D.bytes(":=").withAnnotation(.inline_code),
+                D.bytes("nominal type whose backing is a record."),
+            }, self, &report);
+        }
+
+        return report;
+    }
+
     /// Build a report for when alias syntax is used in a where clause
     /// This syntax was used for abilities which have been removed
     fn buildNotAWhereAliasReport(
@@ -2673,6 +2765,8 @@ pub const ReportBuilder = struct {
                 .string_literal_region = data.string_literal_region,
                 .copied = data.copied,
             })) |report| return report;
+        } else if (data.bound_capture) |bound| {
+            return self.buildBoundCaptureMissingMethod(data, bound);
         } else if (data.row_extension_of) |row_extension| {
             return self.buildRowExtensionMissingMethod(data, row_extension);
         }
@@ -2728,6 +2822,64 @@ pub const ReportBuilder = struct {
             D.bytes("Hint:").withAnnotation(.emphasized),
             D.bytes("Giving that value a type annotation lets each call have its own type."),
         }, self, report);
+    }
+
+    /// A requirement of the rule "Bound Capture Encoding" failed: the
+    /// translator's format cannot encode a captured value the function reads,
+    /// or the format has no `default`. The report names the value's type and
+    /// the format, and the method that is missing (roc-reify-opaque-proposal.md
+    /// Q20).
+    fn buildBoundCaptureMissingMethod(
+        self: *Self,
+        data: DispatcherDoesNotImplMethod,
+        bound: DispatcherDoesNotImplMethod.BoundCapture,
+    ) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Cannot Bind Captured Value", "", .runtime_error);
+        errdefer report.deinit();
+        const format_str = try report.addOwnedString(self.getFormattedString(bound.format_snapshot));
+        const dispatcher_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const value_snapshot = bound.value_snapshot orelse {
+            try D.renderSliceInto(&.{
+                D.bytes("This translator binds the values the function captures in its format,"),
+                D.bytes(format_str).withAnnotation(.type_variable),
+                D.bytes(", and the program builds that format with").withNoPrecedingSpace(),
+                D.bytes("default").withAnnotation(.inline_code),
+                D.bytes(", which the format does not have.").withNoPrecedingSpace(),
+            }, self, &report, &report.headline);
+            try self.addConstraintFailureHighlight(&report, data.owner_region, data.fn_var);
+            try D.renderSlice(&.{
+                D.bytes("Hint:").withAnnotation(.emphasized),
+                D.bytes("The package of the translator gives its format the method"),
+                D.bytes("default : () -> fmt").withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report);
+            return report;
+        };
+        const value_str = try report.addOwnedString(self.getFormattedString(value_snapshot));
+        try D.renderSliceInto(&.{
+            D.bytes("This translator cannot bind a captured value of type"),
+            D.bytes(value_str).withAnnotation(.type_variable),
+            D.bytes(": its format,").withNoPrecedingSpace(),
+            D.bytes(format_str).withAnnotation(.type_variable),
+            D.bytes(", cannot encode it.").withNoPrecedingSpace(),
+        }, self, &report, &report.headline);
+        try self.addConstraintFailureHighlight(&report, data.owner_region, data.fn_var);
+        try D.renderSlice(&.{
+            D.bytes("Encoding this value needs the method"),
+            D.ident(data.method_name).withAnnotation(.inline_code),
+            D.bytes("of"),
+            D.bytes(dispatcher_str).withAnnotation(.type_variable),
+            D.bytes(", which it does not have.").withNoPrecedingSpace(),
+        }, self, &report);
+        try report.document.addLineBreak();
+        try report.document.addLineBreak();
+        try D.renderSlice(&.{
+            D.bytes("Hint:").withAnnotation(.emphasized),
+            D.bytes("The function reads this value from around itself, so the program passes it to the translator, encoded in the translator's format. Read a part of it the format can encode, or give the type an"),
+            D.bytes("encoder_for").withAnnotation(.inline_code),
+            D.bytes("written with the methods the format has."),
+        }, self, &report);
+        return report;
     }
 
     /// A derived `is_eq`/`to_hash` over a record or tag union whose `..`
@@ -3332,6 +3484,19 @@ pub const ReportBuilder = struct {
             }, self, &report);
         }
 
+        // A number where a `Code` is expected is a call-site slip that the type
+        // text alone does not explain, because a `Code` stands for a function.
+        if (self.isCodeType(data.dispatcher_var)) {
+            try report.document.addLineBreak();
+            try D.renderSlice(&.{
+                D.bytes("A"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("describes a function. Write the name of a function, or a lambda, where the"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("is expected."),
+            }, self, &report);
+        }
+
         return report;
     }
 
@@ -3418,6 +3583,14 @@ pub const ReportBuilder = struct {
             return null;
         }
         return null;
+    }
+
+    /// Whether `var_` is a `Code`, a `Code.Inlined`, a `Code.Outlined` or a `Code.Lawful`.
+    fn isCodeType(self: *Self, var_: Var) bool {
+        const nominal = self.module_env.types.resolveVar(var_).desc.content.unwrapNominalType() orelse return false;
+        if (!nominal.originIsBuiltin()) return false;
+        const ident = nominal.ident.ident_idx;
+        return ident.eql(self.module_env.idents.builtin_code) or ident.eql(self.module_env.idents.builtin_code_inlined) or ident.eql(self.module_env.idents.builtin_code_outlined) or ident.eql(self.module_env.idents.builtin_code_lawful);
     }
 
     fn buildInvalidNumericLiteralReport(
@@ -5603,6 +5776,192 @@ pub const ReportBuilder = struct {
     /// A value whose tag row a host-boundary annotation wrote cannot be used
     /// as part of a wider union (design.md "Row Joins"): the hint says to
     /// write the value again, with the cases spelled out for its own tags.
+    /// Whether two function types differ where one takes a `Code(f)` and the
+    /// other a plain function: a lambda passed to a method whose receiver
+    /// type was not known when the lambda was checked, so it was checked as
+    /// a plain function (structural proposal Q10).
+    fn lambdaMetCodeAsFunction(self: *Self, a: SnapshotContentIdx, b: SnapshotContentIdx) bool {
+        const snapshots = self.snapshots orelse return false;
+        const a_fn = snapshotFunction(snapshots, a) orelse return false;
+        const b_fn = snapshotFunction(snapshots, b) orelse return false;
+        const a_args = snapshots.sliceVars(a_fn.args);
+        const b_args = snapshots.sliceVars(b_fn.args);
+        if (a_args.len != b_args.len) return false;
+        for (a_args, b_args) |a_arg, b_arg| {
+            if (self.isSnapshotCode(a_arg) and snapshotFunction(snapshots, b_arg) != null) return true;
+            if (self.isSnapshotCode(b_arg) and snapshotFunction(snapshots, a_arg) != null) return true;
+        }
+        return false;
+    }
+
+    fn snapshotFunction(snapshots: *const snapshot.Store, idx: SnapshotContentIdx) ?snapshot.SnapshotFunc {
+        const content = snapshots.getContentUnwrapAlias(idx);
+        if (content != .structure) return null;
+        return switch (content.structure) {
+            .fn_pure, .fn_effectful, .fn_unbound => |func| func,
+            .box, .tuple, .nominal_type, .record, .empty_record, .tag_union, .empty_tag_union => null,
+        };
+    }
+
+    /// Whether a snapshot is one of the builtin `Code` views.
+    fn isSnapshotCode(self: *Self, idx: SnapshotContentIdx) bool {
+        const content = self.snapshots.?.getContentUnwrapAlias(idx);
+        if (content != .structure or content.structure != .nominal_type) return false;
+        const ident = content.structure.nominal_type.ident.ident_idx;
+        const idents = self.can_ir.idents;
+        return ident.eql(idents.builtin_code) or ident.eql(idents.builtin_code_inlined) or
+            ident.eql(idents.builtin_code_outlined) or ident.eql(idents.builtin_code_lawful) or
+            ident.eql(idents.builtin_code_bound);
+    }
+
+    fn appendCodeLambdaHint(self: *Self, report: *Report, context: Context) Allocator.Error!void {
+        try report.document.addLineBreaks(2);
+        try D.renderSlice(&.{
+            D.bytes("Hint:").withAnnotation(.emphasized),
+            D.bytes("One of these types takes a"),
+            D.bytes("Code").withAnnotation(.inline_code),
+            D.bytes("where the other takes a function. A lambda becomes a"),
+            D.bytes("Code").withAnnotation(.inline_code),
+            D.bytes("only where the type of the method it is passed to is known when the lambda is checked. Here the receiver's type is not known yet, so the lambda is checked as a plain function, and a"),
+            D.bytes("where").withAnnotation(.inline_code),
+            D.bytes("requirement cannot take a"),
+            D.bytes("Code").withAnnotation(.inline_code),
+            D.bytes("either."),
+        }, self, report);
+        try report.document.addLineBreaks(2);
+        switch (context) {
+            .method_type => |method| try D.renderSlice(&.{
+                D.bytes("Annotate the receiver's type, or call the method on its type directly, such as"),
+                D.typeIdent(method.dispatcher_name).withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+                D.ident(method.method_name).withAnnotation(.inline_code).withNoPrecedingSpace(),
+                D.bytes("(receiver, ..)").withAnnotation(.inline_code).withNoPrecedingSpace(),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, report),
+            .none,
+            .fn_call_arity,
+            .fn_call_non_function,
+            .fn_call_arg,
+            .if_condition,
+            .if_branch,
+            .match_pattern,
+            .match_alt_binder,
+            .match_branch,
+            .list_entry,
+            .interpolation_part,
+            .type_annotation,
+            .tag_not_in_annotation,
+            .record_destructure,
+            .binop_lhs,
+            .binop_rhs,
+            .record_access,
+            .record_update,
+            .try_operator,
+            .try_operator_expr,
+            .try_operator_value,
+            .early_return,
+            .statement_value,
+            .nominal_constructor,
+            .fn_args_bound_var,
+            .platform_requirement,
+            .platform_requirement_return,
+            .expect,
+            .recursive_def,
+            .predeclared_use,
+            .code_primitives_item,
+            => try D.renderSlice(&.{
+                D.bytes("Annotate the receiver's type, or call the method on its type directly, such as"),
+                D.bytes("T.method(receiver, ..)").withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, report),
+        }
+    }
+
+    /// The name `name` where the value found is a block with no statements
+    /// that ends in a lookup of the local `name`, which is how `{ name }` is
+    /// written, and the type expected is a record with a field `name`. The
+    /// author most likely meant the record that holds `name`, which is
+    /// `{ name, }` or `{ name: name }`. The block is read from the found
+    /// expression, through a runtime error put in its place, and the name
+    /// is matched to the field names by identifier.
+    fn recordShorthandName(self: *Self, types: TypePair) Allocator.Error!?[]const u8 {
+        const store = &self.can_ir.store;
+        const found: CIR.Expr.Idx = @fromBackingInt(@intCast(@backingInt(types.actual_var)));
+        // The mismatch is reported on the block, or on the name it ends in
+        // when the block is a function body. Then the block is the one
+        // block that ends in that expression.
+        // A type variable that is not an expression has no node to read.
+        if (@backingInt(types.actual_var) >= store.nodes.len()) return null;
+        const found_tag = store.sourceNode(@fromBackingInt(@intCast(@backingInt(types.actual_var)))).tag;
+        if (found_tag != .expr_block and found_tag != .expr_var) return null;
+        const found_expr = store.getSourceExpr(found);
+        const block: @FieldType(CIR.Expr, "e_block") = if (found_tag == .expr_block)
+            found_expr.e_block
+        else blk: {
+            var raw: u32 = 0;
+            while (raw < store.nodes.len()) : (raw += 1) {
+                const node_idx: CIR.Node.Idx = @fromBackingInt(raw);
+                if (store.sourceNode(node_idx).tag != .expr_block) continue;
+                const candidate = store.getSourceExpr(@fromBackingInt(raw)).e_block;
+                if (candidate.final_expr == found) break :blk candidate;
+            }
+            return null;
+        };
+        if (store.sliceStatements(block.stmts).len != 0) return null;
+        const final_expr = store.getSourceExpr(block.final_expr);
+        if (final_expr != .e_lookup_local) return null;
+        const pattern = store.getSourcePattern(final_expr.e_lookup_local.pattern_idx);
+        if (pattern != .assign) return null;
+        const ident = pattern.assign.ident;
+        self.diff_fields.items.clearRetainingCapacity();
+        const range = switch (try self.snapshots.?.gatherRecordFields(types.expected_snapshot, self.gpa, &self.diff_fields)) {
+            .record => |range| range,
+            .empty_record, .not_a_record => return null,
+        };
+        for (self.diff_fields.sliceRange(range).items(.name)) |field| {
+            if (field.eql(ident)) return self.can_ir.getIdent(ident);
+        }
+        return null;
+    }
+
+    /// Text that `report` owns, formatted from `args`.
+    fn ownedText(report: *Report, comptime fmt: []const u8, args: anytype) Allocator.Error![]const u8 {
+        const text = try std.fmt.allocPrint(report.allocator, fmt, args);
+        defer report.allocator.free(text);
+        return report.addOwnedString(text);
+    }
+
+    fn appendRecordShorthandHint(self: *Self, report: *Report, text: []const u8) Allocator.Error!void {
+        try report.document.addLineBreaks(2);
+        try D.renderSlice(&.{
+            D.bytes("Hint:").withAnnotation(.emphasized),
+            D.bytes(try ownedText(report, "{{ {s} }}", .{text})).withAnnotation(.inline_code),
+            D.bytes("is a block whose value is"),
+            D.bytes(try report.addOwnedString(text)).withAnnotation(.inline_code),
+            D.bytes(", not a record.").withNoPrecedingSpace(),
+            D.bytes("A record with the field"),
+            D.bytes(try report.addOwnedString(text)).withAnnotation(.inline_code),
+            D.bytes("is"),
+            D.bytes(try ownedText(report, "{{ {s}, }}", .{text})).withAnnotation(.inline_code),
+            D.bytes("or"),
+            D.bytes(try ownedText(report, "{{ {s}: {s} }}", .{ text, text })).withAnnotation(.inline_code),
+            D.bytes(".").withNoPrecedingSpace(),
+        }, self, report);
+    }
+
+    fn appendRecordRowHint(self: *Self, report: *Report) Allocator.Error!void {
+        try report.document.addLineBreaks(2);
+        try D.renderSlice(&.{
+            D.bytes("Hint:").withAnnotation(.emphasized),
+            D.bytes("This type variable stands in a record extension"),
+            D.bytes("{ ..r }").withAnnotation(.inline_code),
+            D.bytes(",").withNoPrecedingSpace(),
+            D.bytes("so it accepts only a record, a type variable that also extends a record, a type alias of a record, or a"),
+            D.bytes(":=").withAnnotation(.inline_code),
+            D.bytes("nominal type whose backing is a record."),
+        }, self, report);
+    }
+
     fn appendHostFixedRowHint(self: *Self, report: *Report, origin: ?Ident.Idx, actual: SnapshotContentIdx) Allocator.Error!void {
         try report.document.addLineBreaks(2);
         if (origin) |hosted_origin| {
@@ -5762,6 +6121,57 @@ pub const ReportBuilder = struct {
         return self.buildHighlightedRegionReport("Reference Has No Value", "This refers to a declaration that has a type annotation but no implementation, so there is no value here to use.", .runtime_error, data.region, &.{
             D.bytes("Give that declaration a value body, or stop referring to it here."),
         });
+    }
+
+    /// Code that runs reaches an intrinsic. The report shows the reference,
+    /// then the chain of definitions from it to the intrinsic, one per line
+    /// with its place.
+    fn buildExistsOnlyInReifiedCodeReport(self: *Self, data: ExistsOnlyInReifiedCode) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Exists Only in Reified Code", "", .runtime_error);
+        errdefer report.deinit();
+
+        if (data.value_use) |name| {
+            const owned_name = try report.addOwnedString(self.problems.getExtraString(name));
+            try D.renderSliceInto(&.{
+                D.bytes(owned_name).withAnnotation(.inline_code),
+                D.bytes("is used here as a value, but it reaches an intrinsic, which has no Roc body."),
+            }, self, &report, &report.headline);
+        } else {
+            try D.renderSliceInto(&.{
+                D.bytes("This call runs when the program runs, but it reaches an intrinsic, which has no Roc body."),
+            }, self, &report, &report.headline);
+        }
+
+        try self.addSourceHighlightRegion(&report, data.region);
+        try report.document.addLineBreaks(2);
+
+        const document = &report.document;
+        try document.startAnnotation(.code_block);
+        for (self.problems.getRefusalCalls(data.chain), 0..) |frame, index| {
+            if (index != 0) try document.addLineBreak();
+            const text = self.problems.getExtraString(frame.text);
+            try document.addText(text);
+            try document.addText(" at ");
+            try report.addRelatedSourceLocation(self.refusalCallLocation(frame.place), text);
+        }
+        try document.endAnnotation();
+        try report.document.addLineBreaks(2);
+
+        const owned_intrinsic = try report.addOwnedString(self.problems.getExtraString(data.intrinsic));
+        try D.renderSlice(&.{
+            D.bytes("An intrinsic exists only inside a function that a translator describes. Pass the function where a"),
+            D.bytes("Code").withAnnotation(.inline_code),
+            D.bytes("is expected, or give"),
+            D.bytes(owned_intrinsic).withAnnotation(.inline_code),
+            D.bytes("a Roc body."),
+        }, self, &report);
+        if (data.in_value_site) {
+            try report.document.addLineBreaks(2);
+            try D.renderSlice(&.{
+                D.bytes("To evaluate it on the server, use a lambda."),
+            }, self, &report);
+        }
+        return report;
     }
 
     fn buildCapturingMethodReport(self: *Self, data: CapturingMethod) Allocator.Error!Report {
@@ -6038,6 +6448,632 @@ pub const ReportBuilder = struct {
         };
     }
 
+    /// Whether an argument mismatch is a function named where a `Code` was
+    /// expected. The expected side is the builtin `Code`, `Code.Inlined`, `Code.Outlined` or `Code.Lawful` and the actual side is
+    /// a function: the checker looked for a description and was handed the
+    /// function itself, which is what a staging site that did not trigger
+    /// leaves behind.
+    fn stagedCodeArgMismatch(
+        self: *Self,
+        expected: SnapshotContentIdx,
+        actual: SnapshotContentIdx,
+    ) bool {
+        const nominal = switch (self.snapshots.?.getContentUnwrapAlias(expected)) {
+            .structure => |structure| switch (structure) {
+                .nominal_type => |nominal_type| nominal_type,
+                .box,
+                .tuple,
+                .fn_pure,
+                .fn_effectful,
+                .fn_unbound,
+                .record,
+                .empty_record,
+                .tag_union,
+                .empty_tag_union,
+                => return false,
+            },
+            .flex, .rigid, .alias, .recursive, .err => return false,
+        };
+        if (!nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code) and
+            !nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code_inlined) and
+            !nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code_outlined) and
+            !nominal.ident.ident_idx.eql(self.can_ir.idents.builtin_code_lawful)) return false;
+
+        return switch (self.snapshots.?.getContentUnwrapAlias(actual)) {
+            .structure => |structure| switch (structure) {
+                .fn_pure, .fn_effectful, .fn_unbound => true,
+                .box,
+                .tuple,
+                .nominal_type,
+                .record,
+                .empty_record,
+                .tag_union,
+                .empty_tag_union,
+                => false,
+            },
+            .flex, .rigid, .alias, .recursive, .err => false,
+        };
+    }
+
+    /// Build a report for a function the compiler cannot reify.
+    fn buildStagedCodeReport(self: *Self, data: StagedCode) Allocator.Error!Report {
+        // One verb across the whole family: reifying is the act, and the
+        // description is what it produces. Each title names what the
+        // highlighted region is, and each summary says why that region stopped
+        // the compiler, so the first two lines answer the question on their
+        // own.
+        var report = switch (data.reason) {
+            .unsupported_construct => try Report.init(
+                self.gpa,
+                "Cannot Reify This Expression",
+                "Reifying turns a function into a description a translator reads, and a description has no form for this expression.",
+                .runtime_error,
+            ),
+            .unsupported_type => try Report.init(
+                self.gpa,
+                "Cannot Reify This Type",
+                "Reifying turns a function into a description a translator reads, and a description has no form for this type.",
+                .runtime_error,
+            ),
+            .unresolved_type => try Report.init(
+                self.gpa,
+                "Cannot Reify A Polymorphic Function",
+                "This function is polymorphic here, and the place it is used does not narrow every type variable to one type.",
+                .runtime_error,
+            ),
+            .captures_a_binding => try Report.init(
+                self.gpa,
+                "Reified Function Captures A Value",
+                "This function reads a value from the scope around it, and a description carries no scope.",
+                .runtime_error,
+            ),
+            .performs_an_effect => try Report.init(
+                self.gpa,
+                "Reified Function Performs An Effect",
+                "This function performs an effect, and a description is read while the compiler runs, where an effect has nowhere to happen.",
+                .runtime_error,
+            ),
+            .definition_not_reachable => try Report.init(
+                self.gpa,
+                "Cannot Reach This Definition",
+                "This name should lead to a function body the compiler can read, and it does not.",
+                .runtime_error,
+            ),
+            .not_a_named_function => try Report.init(
+                self.gpa,
+                "Cannot Reify This Function",
+                "Reifying reads the body a name is bound to, and no body stands behind this name.",
+                .runtime_error,
+            ),
+            .argument_not_constant => try Report.init(
+                self.gpa,
+                "Template Needs A Constant",
+                "A template's arguments are written into the description it produces, so each one is fixed while the compiler runs.",
+                .runtime_error,
+            ),
+            .exceeds_a_bound => try Report.init(
+                self.gpa,
+                "Cannot Normalize This Function",
+                "Bringing this function's description to its normal form reaches a bound the language sets.",
+                .runtime_error,
+            ),
+            .outside_staged_position => try Report.init(
+                self.gpa,
+                "Code Is Not Allowed Here",
+                "A Code can name a function's parameter, or what a function returns.",
+                .runtime_error,
+            ),
+            .input_not_bound => try Report.init(
+                self.gpa,
+                "Cannot Bind This Captured Value",
+                "This function reads a value that exists only when the program runs, and the site cannot give it to the translator's result as an input slot.",
+                .runtime_error,
+            ),
+            .value_not_bound => try Report.init(
+                self.gpa,
+                "Cannot Bind This Value",
+                "This value exists only when the program runs, and the site cannot give it to the translator's result as an input slot.",
+                .runtime_error,
+            ),
+            .value_not_computable => try Report.init(
+                self.gpa,
+                "Cannot Compute This Value",
+                "This value is written at a Code position, and it is fixed while the compiler runs, but the compiler cannot compute it into a literal for the description.",
+                .runtime_error,
+            ),
+            .reads_a_function_parameter => try Report.init(
+                self.gpa,
+                "Cannot Reify A Function Parameter",
+                "This function reads a function that the function around it takes as a parameter. Each call can pass a different function, so its body is known only when the program runs.",
+                .runtime_error,
+            ),
+            .value_typed_late => try Report.init(
+                self.gpa,
+                "Value Has No Type Where It Is Written",
+                "This value is written at a Code.Binds position, and its type is known only after this place. The compiler decides what such a value is where it is written.",
+                .runtime_error,
+            ),
+            .reads_a_code_value => try Report.init(
+                self.gpa,
+                "Cannot Reify A Code Value",
+                "This function reads a value built from Code: a description, a value computed from one, a Code.type_id or Code.prim identity, or a Code.ty_of type description. A description cannot hold one.",
+                .runtime_error,
+            ),
+            .bound_instance => try Report.init(
+                self.gpa,
+                "Cannot Bind Inputs In A Generic Function",
+                "This site gives its translator the values it reads when the program runs, and it is inside a function whose type variables each use fixes again.",
+                .runtime_error,
+            ),
+            .instance_through_derived_evidence => try Report.init(
+                self.gpa,
+                "Cannot Reify In A Method Selected From A Type",
+                "This use reaches a method that holds a Code site at the method's own type variables, and the compiler selects the method from a type alone.",
+                .runtime_error,
+            ),
+            .instance_in_local_generic => try Report.init(
+                self.gpa,
+                "Cannot Reify In A Local Generic Function",
+                "This use is inside a function that a block made generic, and the function it uses holds a Code site at its own type variables.",
+                .runtime_error,
+            ),
+            .requirement_constrained_variable => try Report.init(
+                self.gpa,
+                "Cannot Reify At An Open Platform Requirement",
+                "The platform requires this function at a type that leaves a type variable open with a constraint, and the function holds a Code site at its own type variables.",
+                .runtime_error,
+            ),
+            .bound_call_in_implicit_method => try Report.init(
+                self.gpa,
+                "Cannot Bind Inputs In A Method The Compiler Calls",
+                "This method needs a generic Code.Bound call to bind its inputs, and the compiler calls the method with no written use.",
+                .runtime_error,
+            ),
+            .primitive_not_a_function => try Report.init(
+                self.gpa,
+                "Not A Primitive",
+                "Each entry of code_primitives is Code.prim of a function or a constant the translator reads as a primitive, and this entry is not Code.prim of a top-level function or constant.",
+                .runtime_error,
+            ),
+            .primitives_not_a_list => try Report.init(
+                self.gpa,
+                "Cannot Read This Cut",
+                "The compiler reads a code_primitives item as it is written, and this item is not a list of Code.prim entries.",
+                .runtime_error,
+            ),
+            .prim_not_a_definition => try Report.init(
+                self.gpa,
+                "Not A Definition",
+                "Code.prim gives the identity of a top-level function or constant, and this argument does not name one.",
+                .runtime_error,
+            ),
+            .identity_not_called => try Report.init(
+                self.gpa,
+                "Call This Function",
+                "Code.prim, Code.type_id and Code.ty_of give a constant the compiler computes at each call, so they are only ever called.",
+                .runtime_error,
+            ),
+            .type_id_not_nominal => try Report.init(
+                self.gpa,
+                "Not A Nominal Type",
+                "Code.type_id gives the identity of a nominal type, and the type of this proxy is not one that this call fixes.",
+                .runtime_error,
+            ),
+            .ty_of_not_closed => try Report.init(
+                self.gpa,
+                "Type Not Fixed",
+                "Code.ty_of gives the description of a type, and this call leaves a type variable in the type of its proxy open.",
+                .runtime_error,
+            ),
+            .primitive_listed_twice => try Report.init(
+                self.gpa,
+                "Primitive Listed Twice",
+                "This function is already an entry of this code_primitives item.",
+                .runtime_error,
+            ),
+            .primitive_already_primitive => try Report.init(
+                self.gpa,
+                "Already A Primitive",
+                "This entry names a builtin, an intrinsic, or a function or constant of an opaque type that the type's module declares, and every description already names it as a primitive.",
+                .runtime_error,
+            ),
+        };
+        errdefer report.deinit();
+
+        // A refusal outside the site's own source is shown where it is, and
+        // the site is where the walk reached it from (F4, D9).
+        if (data.foreign) |place| {
+            const path = self.problems.getExtraString(place.path);
+            try report.document.addSourceExcerpt(.{
+                .line_text = self.problems.getExtraString(place.line_text),
+                .start_line = place.start_line,
+                .start_column = place.start_column,
+                .end_line = place.end_line,
+                .end_column = place.end_column,
+                .region_annotation = .error_highlight,
+                .filename = path,
+            });
+            try report.setPrimary(.{
+                .file = path,
+                .start_line = place.start_line,
+                .start_column = place.start_column,
+                .end_line = place.end_line,
+                .end_column = place.end_column,
+            });
+            try report.setReachedFrom(self.localLocation(data.region));
+            try report.document.addLineBreak();
+            try report.document.addText("The reified function reaches it from the site at ");
+            try report.document.addSourceLocation(self.module_env.calcRegionInfo(data.region), self.filename);
+            try report.document.addText(":");
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+        }
+        const region_info = self.module_env.calcRegionInfo(data.region);
+        try report.document.addSourceRegion(
+            region_info,
+            .error_highlight,
+            self.filename,
+            self.source,
+            self.module_env.getLineStarts(),
+        );
+        try report.document.addLineBreak();
+
+        switch (data.reason) {
+            .unsupported_construct => try D.renderSlice(&.{
+                D.bytes("A description covers a subset of Roc, so that a translator can match"),
+                D.bytes("every shape it might meet. Rewrite this expression using a form the"),
+                D.bytes("subset has, or move it out of the reified function."),
+            }, self, &report),
+            .unsupported_type => try D.renderSlice(&.{
+                D.bytes("A description covers a subset of Roc's types, so that a translator can"),
+                D.bytes("match every shape it might meet. Use a type the subset has, or move"),
+                D.bytes("this value out of the reified function."),
+            }, self, &report),
+            .unresolved_type => try self.renderOpenTypeHint(data.open, &report),
+            // A recorded chain stop says how a `Code.Bound` receives the value.
+            .captures_a_binding => if (data.chain_stop != .none) try D.renderSlice(&.{
+                D.bytes("A translator receives the description on its own, without the scope the"),
+                D.bytes("function was written in. Pass this value as a parameter instead."),
+            }, self, &report) else try D.renderSlice(&.{
+                D.bytes("A translator receives the description on its own, without the scope the"),
+                D.bytes("function was written in. Pass this value as a parameter instead."),
+                D.bytes("A translator whose result is a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes(", or a type built on it, receives such a value as an input slot.").withNoPrecedingSpace(),
+            }, self, &report),
+            .reads_a_code_value => try D.renderSlice(&.{
+                D.bytes("A translator receives the description, not the values the compiler"),
+                D.bytes("built from other descriptions. Keep"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("values and their results out of the values a reified function reads,"),
+                D.bytes("or build the value without one, such as a handle that holds only a name."),
+            }, self, &report),
+            .bound_instance => try D.renderSlice(&.{
+                D.bytes("Each use of the function runs the call that binds the inputs while"),
+                D.bytes("the compiler runs, at the types that use fixes. So the call and each"),
+                D.bytes("call of its chain can read a value known only when the program runs"),
+                D.bytes("only in a lambda at a `Code` place, such as `|_| n`. Read such a value"),
+                D.bytes("there, or move the call into a function whose annotation names"),
+                D.bytes("concrete types."),
+            }, self, &report),
+            .instance_through_derived_evidence => try D.renderSlice(&.{
+                D.bytes("The compiler describes a Code site in a generic function at the"),
+                D.bytes("place that selects the function at fixed types. Here the compiler"),
+                D.bytes("selects the method from a type while it specializes the program, and"),
+                D.bytes("no such place names the method. Call the method on its type directly,"),
+                D.bytes("such as"),
+                D.bytes("Q.method(value)").withAnnotation(.inline_code),
+                D.bytes(", where its types are fixed.").withNoPrecedingSpace(),
+            }, self, &report),
+            .instance_in_local_generic => try D.renderSlice(&.{
+                D.bytes("The compiler describes a Code site in a generic function at each use"),
+                D.bytes("that fixes the function's types, and a use inside a generic local"),
+                D.bytes("function does not fix them. Give the local function an annotation"),
+                D.bytes("with concrete types, or move it to the top level."),
+            }, self, &report),
+            .requirement_constrained_variable => try D.renderSlice(&.{
+                D.bytes("The compiler describes a Code site in a generic function at each use"),
+                D.bytes("that fixes the function's types. The platform's use fixes each type"),
+                D.bytes("its requirement leaves open to a type with no values, which does not"),
+                D.bytes("meet a constraint. Give the function an annotation that closes the"),
+                D.bytes("constrained type, or move the site into a function the program calls"),
+                D.bytes("at concrete types."),
+            }, self, &report),
+            .bound_call_in_implicit_method => try D.renderSlice(&.{
+                D.bytes("A Code.Bound call in a generic function binds its inputs at the"),
+                D.bytes("written call that fixes the function's types. The compiler calls this"),
+                D.bytes("method itself, for Str.inspect, for ==, or for hashing, so no written"),
+                D.bytes("call fixes its types. Move the call into a function that the program"),
+                D.bytes("calls by name, or give the call concrete types."),
+            }, self, &report),
+            .value_not_computable => try D.renderSlice(&.{
+                D.bytes("A value at a Code position is described as the literal it is fixed"),
+                D.bytes("to. To have the target evaluate it, use a lambda."),
+            }, self, &report),
+            .value_typed_late => try D.renderSlice(&.{
+                D.bytes("A value of an opaque type at a"),
+                D.bytes("Code.Binds").withAnnotation(.emphasized),
+                D.bytes("position is an input slot that the program computes, when its type"),
+                D.bytes("is known where the value is written. Here the translator's type"),
+                D.bytes("leaves it open, and only a later argument or the result fixes it."),
+                D.bytes("Write the type at the value, such as"),
+                D.bytes("41.Time").withAnnotation(.inline_code),
+                D.bytes("or"),
+                D.bytes("Time.zero()").withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report),
+            .reads_a_function_parameter => try D.renderSlice(&.{
+                D.bytes("The compiler builds one description for this place, before the"),
+                D.bytes("program runs, and the description holds the body of each function"),
+                D.bytes("it calls. Take the function as a"),
+                D.bytes("Code(f)").withAnnotation(.inline_code),
+                D.bytes("parameter instead, and pass it on to the translator. Or make the"),
+                D.bytes("function around it a template, which the compiler calls with a"),
+                D.bytes("fixed function, or call named functions and choose between them"),
+                D.bytes("with"),
+                D.bytes("if").withAnnotation(.inline_code),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report),
+            .value_not_bound => try D.renderSlice(&.{
+                D.bytes("The program computes this value when it runs, and gives it to the"),
+                D.bytes("translator's result as an input slot where it calls the translator."),
+            }, self, &report),
+            .input_not_bound => try D.renderSlice(&.{
+                D.bytes("The program gives each input slot its value where it calls the"),
+                D.bytes("translator, which runs once while the compiler runs. Pass this value"),
+                D.bytes("as a parameter instead, or read it where the call can supply it."),
+            }, self, &report),
+            .performs_an_effect => try D.renderSlice(&.{
+                D.bytes("A translator runs during"),
+                D.bytes("roc build").withAnnotation(.emphasized),
+                D.bytes("and produces a value from the description. Effects belong in the"),
+                D.bytes("program the translator produces, not in the function it describes."),
+            }, self, &report),
+            .definition_not_reachable => try D.renderSlice(&.{
+                D.bytes("Reifying reads the function's body. Name a function defined at the"),
+                D.bytes("top level of this module or of one it imports."),
+            }, self, &report),
+            .not_a_named_function => try D.renderSlice(&.{
+                D.bytes("A name leads to a body when a top-level definition binds it, or when"),
+                D.bytes("a block binds it to a lambda. Bind this name to the lambda itself, or"),
+                D.bytes("name a top-level function. A function picked or passed in when the"),
+                D.bytes("program runs can never be reified: there is no body to read until then."),
+            }, self, &report),
+            .argument_not_constant => try D.renderSlice(&.{
+                D.bytes("This argument is computed when the program runs. Write a literal"),
+                D.bytes("here, or take the value as a parameter of the reified function, where"),
+                D.bytes("the translator can read it as a name."),
+            }, self, &report),
+            .exceeds_a_bound => try D.renderSlice(&.{
+                D.bytes("The rules that normalize a description run in rounds, and each"),
+                D.bytes("round can enable the next. A fixed bound stops a function whose rules"),
+                D.bytes("keep enabling one another, so a build never runs without end. Split"),
+                D.bytes("the function into smaller helpers."),
+            }, self, &report),
+            .primitive_not_a_function => try D.renderSlice(&.{
+                D.bytes("The item"),
+                D.bytes("code_primitives").withAnnotation(.emphasized),
+                D.bytes("is a list of"),
+                D.bytes("Code.prim(f)").withAnnotation(.inline_code),
+                D.bytes("entries, each of a top-level function or constant."),
+                D.bytes("A translator receives each of them as a"),
+                D.bytes("Prim").withAnnotation(.emphasized),
+                D.bytes("by its qualified name, and receives the body of every other function it"),
+                D.bytes("reaches. Name a function defined with a lambda, or a constant, here."),
+            }, self, &report),
+            .primitives_not_a_list => try D.renderSlice(&.{
+                D.bytes("Write the item as a list of"),
+                D.bytes("Code.prim(f)").withAnnotation(.inline_code),
+                D.bytes("entries, such as"),
+                D.bytes("[Code.prim(Vec3.scale), Code.prim(Vec3.plus)]").withAnnotation(.inline_code),
+                D.bytes(", or as the name of a constant of this module that is one.").withNoPrecedingSpace(),
+            }, self, &report),
+            .prim_not_a_definition => try D.renderSlice(&.{
+                D.bytes("Write the name of the function or constant itself, such as"),
+                D.bytes("Code.prim(Time.is_before)").withAnnotation(.inline_code),
+                D.bytes(". A local value, a parameter or a computed function has no").withNoPrecedingSpace(),
+                D.bytes("identity of its own."),
+            }, self, &report),
+            .identity_not_called => try D.renderSlice(&.{
+                D.bytes("Call it where the identity is needed, such as"),
+                D.bytes("Code.prim(Time.is_before)").withAnnotation(.inline_code),
+                D.bytes(", instead of passing it as a value.").withNoPrecedingSpace(),
+            }, self, &report),
+            .type_id_not_nominal => try D.renderSlice(&.{
+                D.bytes("Give the proxy a type annotation that names the type, such as"),
+                D.bytes("time_proxy : Code.Proxy(Time)").withAnnotation(.inline_code),
+                D.bytes(". A type variable is fixed only where the function is used, and a").withNoPrecedingSpace(),
+                D.bytes("record, a tag union or a function type has no identity."),
+            }, self, &report),
+            .ty_of_not_closed => try D.renderSlice(&.{
+                D.bytes("Give the proxy a type annotation that names the whole type, such as"),
+                D.bytes("owner_proxy : Code.Proxy(Owner)").withAnnotation(.inline_code),
+                D.bytes(". In a generic function the call is described at each use of the").withNoPrecedingSpace(),
+                D.bytes("function, so that use must fix every type variable of the proxy."),
+            }, self, &report),
+            .primitive_listed_twice => try D.renderSlice(&.{
+                D.bytes("A function is in the translator's cut once. Remove this entry."),
+            }, self, &report),
+            .primitive_already_primitive => try D.renderSlice(&.{
+                D.bytes("The builtin module declares its own primitives. So does the module"),
+                D.bytes("of an opaque type: each of its functions and constants whose type"),
+                D.bytes("names that type. An intrinsic, a declaration with no body, is a"),
+                D.bytes("primitive wherever it is declared."),
+                D.bytes("A translator receives this one as a"),
+                D.bytes("Prim").withAnnotation(.emphasized),
+                D.bytes("without a cut, so"),
+                D.bytes("code_primitives").withAnnotation(.emphasized),
+                D.bytes("cannot list it. Remove this entry."),
+            }, self, &report),
+            .outside_staged_position => try D.renderSlice(&.{
+                D.bytes("A"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("exists only while the compiler runs, so it names a function"),
+                D.bytes("parameter, which takes a description, or what a function returns,"),
+                D.bytes("which makes that function a template the compiler calls. A value,"),
+                D.bytes("a record field and a list element have nothing to hold it. To"),
+                D.bytes("describe a function, write the function with its own type, and pass"),
+                D.bytes("it to a parameter of type"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes(".").withNoPrecedingSpace(),
+            }, self, &report),
+        }
+
+        if (data.chain_stop != .none) {
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+            try self.renderChainStop(data.chain_stop, self.problems.getExtraString(data.chain_end_type), &report);
+        }
+
+        // The walk names what stopped it, which the region alone does not: a
+        // rejected expression is often one operator inside a longer line.
+        const detail = self.problems.getExtraString(data.detail);
+        if (detail.len != 0) {
+            if (stagedCodeDetailLead(data.reason)) |lead| {
+                const owned_detail = try report.addOwnedString(detail);
+                try report.document.addLineBreak();
+                try report.document.addLineBreak();
+                try D.renderSlice(&.{
+                    D.bytes(lead),
+                    D.bytes(owned_detail).withAnnotation(.emphasized),
+                }, self, &report);
+            }
+        }
+
+        return report;
+    }
+
+    /// Why no call binds a lambda's run-time reads: what stopped the chain of
+    /// calls that carries it, and what to write instead.
+    /// `end_type` is the type of the expression the chain ended in, for a
+    /// stop at the end of the chain.
+    fn renderChainStop(self: *Self, stop: StagedCode.ChainStop, end_type: []const u8, report: *Report) Allocator.Error!void {
+        try D.renderSlice(&.{
+            D.bytes("A call whose result is a"),
+            D.bytes("Code.Bound").withAnnotation(.emphasized),
+            D.bytes("binds such a value when a chain of calls carries the lambda to it:"),
+            D.bytes("each call takes the lambda, or the call before it, as an argument or"),
+            D.bytes("as its receiver."),
+        }, self, report);
+        if (stop != .end) try report.document.addReflowingText(" ");
+        switch (stop) {
+            .none => unreachable, // the caller renders a stop only when one is recorded
+            .branch => try D.renderSlice(&.{
+                D.bytes("Here an"),
+                D.bytes("if").withAnnotation(.inline_code),
+                D.bytes("or a"),
+                D.bytes("match").withAnnotation(.inline_code),
+                D.bytes("holds the chain, and a branch stops it. If a call that returns a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes("reads the value of the branches, write the whole chain, up to that"),
+                D.bytes("call, in each branch."),
+            }, self, report),
+            .binding => try D.renderSlice(&.{
+                D.bytes("Here a name holds the result of the chain, and a name stops it. If a"),
+                D.bytes("call that returns a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes("reads the name, write the chain as one expression, up to that call."),
+            }, self, report),
+            .value => try D.renderSlice(&.{
+                D.bytes("Here a record, a tuple, a list or a tag holds the chain, and that"),
+                D.bytes("value stops it. If a call that returns a"),
+                D.bytes("Code.Bound").withAnnotation(.emphasized),
+                D.bytes("reads that value, give the chain to the call directly, as an"),
+                D.bytes("argument or as its receiver."),
+            }, self, report),
+            // The opt-in and the type the chain ended in each start a line.
+            .end => {
+                const owned_type = try report.addOwnedString(end_type);
+                try report.document.addLineBreak();
+                try D.renderSlice(&.{
+                    D.bytes("Here the chain ends, and no call in it returns a"),
+                    D.bytes("Code.Bound").withAnnotation(.emphasized),
+                    D.bytes(", or a type built on it. End the chain with such a call.").withNoPrecedingSpace(),
+                }, self, report);
+                try report.document.addLineBreak();
+                try D.renderSlice(&.{
+                    D.bytes("The chain ends in a value of type"),
+                    D.bytes(owned_type).withAnnotation(.inline_code),
+                    D.bytes(", which is neither.").withNoPrecedingSpace(),
+                }, self, report);
+            },
+        }
+    }
+
+    /// The fix a report of an open type variable gives, picked by why the
+    /// variable stayed open and where it stands.
+    fn renderOpenTypeHint(self: *Self, open: ?StagedCode.Open, report: *Report) Allocator.Error!void {
+        const lead = D.bytes("A description is built for one concrete type at a time.");
+        const known = open orelse return D.renderSlice(&.{
+            lead,
+            D.bytes("A type variable has no shape to describe. Use this function where its"),
+            D.bytes("types are already fixed, or write a type annotation that fixes them."),
+        }, self, report);
+        switch (known.cause) {
+            .use_leaves_open => try D.renderSlice(&.{
+                lead,
+                D.bytes("The annotation of this function writes a type variable, and the place"),
+                D.bytes("that uses the function does not fix it to one type. Use the function"),
+                D.bytes("where a call or a"),
+                D.bytes("Code").withAnnotation(.emphasized),
+                D.bytes("fixes it, for example from a function whose annotation"),
+                D.bytes("names the concrete type."),
+            }, self, report),
+            .annotation_leaves_open => try D.renderSlice(&.{
+                lead,
+                D.bytes("The annotation writes this type variable, and nothing that uses the"),
+                D.bytes("function fixes it. Name a function whose annotation fixes it, for"),
+                D.bytes("example one that calls this function at the type you need."),
+            }, self, report),
+            .inferred_use_leaves_open => try D.renderSlice(&.{
+                lead,
+                D.bytes("Checking inferred this function's type, and this use leaves one of"),
+                D.bytes("its type variables open. Write a type annotation for the function that"),
+                D.bytes("fixes it, or use the function where its types are already fixed."),
+            }, self, report),
+            .inferred => switch (known.place) {
+                .parameter => try D.renderSlice(&.{
+                    lead,
+                    D.bytes("Nothing fixes the type of this parameter. A parameter the function"),
+                    D.bytes("does not read takes its type only from the place that uses the"),
+                    D.bytes("function, and that place leaves it open. Fix the type of the value"),
+                    D.bytes("this parameter receives, or name a function whose annotation fixes it."),
+                }, self, report),
+                .use => try D.renderSlice(&.{
+                    lead,
+                    D.bytes("Checking inferred this function's type, and this use leaves one of"),
+                    D.bytes("its type variables open. Write a type annotation for the function that"),
+                    D.bytes("fixes it, or use the function where its types are already fixed."),
+                }, self, report),
+                .result, .expression => try D.renderSlice(&.{
+                    lead,
+                    D.bytes("Checking left this type open, because nothing in the function fixes"),
+                    D.bytes("it. Write a type annotation that fixes it, or use this function where"),
+                    D.bytes("its types are already fixed."),
+                }, self, report),
+            },
+        }
+    }
+
+    /// How a staged-code report introduces the name the walk recorded. Null for
+    /// a reason whose name says everything the detail would.
+    fn stagedCodeDetailLead(reason: StagedCode.Reason) ?[]const u8 {
+        return switch (reason) {
+            .unsupported_construct, .unsupported_type => "There is no description for:",
+            .unresolved_type => "What is left open (not fixed):",
+            .captures_a_binding => "It reads, from around itself:",
+            .performs_an_effect => "The effect is:",
+            .definition_not_reachable => "The compiler could not follow:",
+            .exceeds_a_bound => "The bound is:",
+            .input_not_bound, .value_not_bound => "The site cannot bind:",
+            .reads_a_code_value => "It reads the constant:",
+            .reads_a_function_parameter => "The parameter is:",
+            .bound_call_in_implicit_method => "The method is:",
+            .bound_instance, .instance_through_derived_evidence, .instance_in_local_generic, .requirement_constrained_variable, .value_not_computable, .value_typed_late => null,
+            .not_a_named_function, .outside_staged_position, .argument_not_constant, .primitive_not_a_function, .primitives_not_a_list, .primitive_listed_twice, .primitive_already_primitive, .prim_not_a_definition, .identity_not_called, .type_id_not_nominal, .ty_of_not_closed => null,
+        };
+    }
+
     /// Build a report for compile-time crash
     /// Build a report for a literal that its type's compile-time conversion
     /// (`from_numeral` or `from_quote`) rejected.
@@ -6115,6 +7151,7 @@ pub const ReportBuilder = struct {
     fn buildComptimeCrashReport(self: *Self, data: ComptimeCrash) Allocator.Error!Report {
         var report = try Report.init(self.gpa, "Compile Time Crash", "This definition crashed during compile-time evaluation.", .runtime_error);
         errdefer report.deinit();
+        report.kind = .compile_time_crash;
 
         const owned_message = try report.addOwnedString(
             self.problems.getExtraString(data.message),
@@ -6191,6 +7228,99 @@ pub const ReportBuilder = struct {
         try report.document.addCodeBlock(owned_message);
 
         return report;
+    }
+
+    /// Build a report for a translator's refusal of one source of a node.
+    fn buildTranslationRefusedReport(self: *Self, data: TranslationRefused) Allocator.Error!Report {
+        var report = try Report.init(self.gpa, "Translation Refused", "A translator refused code that this expression built.", .runtime_error);
+        errdefer report.deinit();
+        const owned_message = try report.addOwnedString(self.problems.getExtraString(data.message));
+        const path = self.problems.getRefusalCalls(data.path);
+
+        const region_info = self.module_env.calcRegionInfo(data.region);
+        try report.document.addSourceRegion(
+            region_info,
+            .error_highlight,
+            self.filename,
+            self.source,
+            self.module_env.getLineStarts(),
+        );
+        try report.document.addLineBreak();
+        if (data.unplaced) {
+            try D.renderSlice(&.{D.bytes("The translator named a node that the code of this definition does not have.")}, self, &report);
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+        } else if (data.origin) |place| {
+            try report.document.addText("The refused expression is at ");
+            try report.addRelatedSourceLocation(self.foreignLocation(place), "The refused expression.");
+            try report.document.addText(", outside this module.");
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+        }
+        if (path.len != 0) {
+            try D.renderSlice(&.{D.bytes("The translated code reached it through these calls:")}, self, &report);
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+            try self.addRefusalCalls(&report, path);
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+        }
+        try D.renderSlice(&.{D.bytes("The translator gave this reason:")}, self, &report);
+        try report.document.addLineBreak();
+        try report.document.addLineBreak();
+        try report.document.addCodeBlock(owned_message);
+        for (self.problems.getExtraStrings(data.intrinsics)) |name| {
+            try report.document.addLineBreak();
+            try report.document.addLineBreak();
+            const owned_name = try report.addOwnedString(self.problems.getExtraString(name));
+            try D.renderSlice(&.{
+                D.bytes(owned_name).withAnnotation(.inline_code),
+                D.bytes("is an intrinsic: it has no Roc body. A translator binds it by id, as it binds a builtin."),
+            }, self, &report);
+        }
+        return report;
+    }
+
+    /// The calls a refused source was reached through, one per line as a code
+    /// block, each with its place as `path:line:col`. A call in this module is
+    /// placed like any other region of it, so its line counts from the file the
+    /// author wrote; a call in another module names that module's file.
+    fn addRefusalCalls(self: *Self, report: *Report, calls: []const problem_mod.RefusalCall) Allocator.Error!void {
+        const document = &report.document;
+        try document.startAnnotation(.code_block);
+        for (calls, 0..) |call, index| {
+            if (index != 0) try document.addLineBreak();
+            const text = self.problems.getExtraString(call.text);
+            try document.addCodeLines(text);
+            try document.addText(" (");
+            try report.addRelatedSourceLocation(self.refusalCallLocation(call.place), text);
+            try document.addText(")");
+        }
+        try document.endAnnotation();
+    }
+
+    /// The location of `region` in this module's file.
+    fn localLocation(self: *const Self, region: Region) Location {
+        return .fromRegionInfo(self.filename, self.module_env.calcRegionInfo(region));
+    }
+
+    /// The location of a place in another module's file.
+    fn foreignLocation(self: *const Self, place: problem_mod.SourcePlace) Location {
+        return .{
+            .file = self.problems.getExtraString(place.path),
+            .start_line = place.line,
+            .start_column = place.column,
+            .end_line = place.end_line,
+            .end_column = place.end_column,
+        };
+    }
+
+    /// The location of one call of a refusal chain.
+    fn refusalCallLocation(self: *const Self, place: problem_mod.RefusalCall.Place) Location {
+        return switch (place) {
+            .local => |region| self.localLocation(region),
+            .foreign => |foreign| self.foreignLocation(foreign),
+        };
     }
 
     /// Build a report for compile-time evaluation error

@@ -88,7 +88,7 @@ pub fn forEachStaticDispatchTypeRoot(module_env: *const ModuleEnv, expr_idx: CIR
 }
 
 /// The roots of recorded codec requirements, scheme uses, platform invocations,
-/// and generated codec derivations.
+/// `Code` sites, and generated codec derivations.
 pub fn forEachRecordedTypeRoot(module_env: *const ModuleEnv, visitor: anytype) Allocator.Error!void {
     for (module_env.platform_requirement_solutions.items.items) |solution| {
         try forEachPlatformRequirementTypeRoot(solution.solved_var, module_env.platformRequirementIdentityVars(solution), visitor);
@@ -100,6 +100,10 @@ pub fn forEachRecordedTypeRoot(module_env: *const ModuleEnv, visitor: anytype) A
     }
     for (module_env.scheme_use_pairs.items.items) |pair| {
         try visitor.visit(@fromBackingInt(@intCast(pair.fresh_var)));
+    }
+    // The `f` of each `Code(f)` site, which the description step reads.
+    for (module_env.store.codeReificationSites()) |site| {
+        try visitor.visit(@fromBackingInt(site.fn_var));
     }
     for (module_env.generated_codec_derivations.items.items) |derivation| {
         inline for (.{
@@ -132,6 +136,9 @@ pub fn forEachRecordedTypeRoot(module_env: *const ModuleEnv, visitor: anytype) A
         const renamings = module_env.generated_codec_renamings.items.items[derivation.renamings_start..][0..derivation.renamings_len];
         for (renamings) |renaming| {
             try visitor.visit(@fromBackingInt(@intCast(renaming.copy_var)));
+            // The original: a contract call at its relation's own types
+            // reads it (`GeneratedCodecRenamedVar`).
+            try visitor.visit(@fromBackingInt(@intCast(renaming.source_var)));
         }
     }
 }
@@ -171,6 +178,24 @@ pub fn forEachForLoopDispatchTypeRoot(plan: ModuleEnv.ForLoopDispatchPlan, visit
     try visitor.visit(@fromBackingInt(@intCast(plan.next_fn_var)));
     try visitor.visit(@fromBackingInt(@intCast(plan.step_topology.one_payload_var)));
     try visitor.visit(@fromBackingInt(@intCast(plan.step_topology.skip_payload_var)));
+}
+
+/// The roots of the two dispatches of every capture read at a `Code.Binds`
+/// position: the format and its `default` callable, and the read's
+/// `encoder_for` callable and the encoder it returns.
+pub fn forEachBoundCaptureTypeRoot(module_env: *const ModuleEnv, visitor: anytype) Allocator.Error!void {
+    for (module_env.bound_capture_encodings.items.items) |encoding| {
+        try forEachBoundCaptureEncodingTypeRoot(encoding, visitor);
+    }
+}
+
+/// The roots of one capture read's two dispatches (`forEachBoundCaptureTypeRoot`).
+pub fn forEachBoundCaptureEncodingTypeRoot(encoding: ModuleEnv.BoundCaptureEncoding, visitor: anytype) Allocator.Error!void {
+    try visitor.visit(@fromBackingInt(@intCast(encoding.read_var)));
+    try visitor.visit(@fromBackingInt(@intCast(encoding.format_var)));
+    try visitor.visit(@fromBackingInt(@intCast(encoding.default_fn_var)));
+    try visitor.visit(@fromBackingInt(@intCast(encoding.encoder_fn_var)));
+    try visitor.visit(@fromBackingInt(@intCast(encoding.encoder_var)));
 }
 
 /// The roots of every literal conversion that dispatches to a custom or

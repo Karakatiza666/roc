@@ -11,34 +11,25 @@ import Json
 foo = Json.parse(data)
 ~~~
 # EXPECTED
-DUPLICATE DEFINITION - inline_ingested_file.md:2:1:2:12
+BUILTIN TYPE SHADOWED - inline_ingested_file.md:2:1:2:12
 FILE NOT FOUND - inline_ingested_file.md:1:1:1:34
 MOD NOT FOUND - inline_ingested_file.md:2:1:2:12
-MISSING METHOD - inline_ingested_file.md:4:7:4:17
+DOES NOT EXIST - inline_ingested_file.md:4:7:4:17
 # PROBLEMS
 ~~~clojure
 (reports
 	(report
 		(severity warning)
-		(title "Duplicate Definition")
+		(title "Builtin Type Shadowed")
 		(region (start 2 1) (end 2 12))
 		(headline
-			(reflow "The name ")
+			(text "The type ")
 			(annotated symbol-unqualified "Json")
-			(reflow " is being redeclared here."))
+			(text " shadows a builtin type."))
 		(document
-			(source-region (file "inline_ingested_file.md") (start 2 1) (end 2 12) (annotation error) (line-text "import Json"))
+			(reflow "This may make the builtin type inaccessible in this scope.")
 			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Json")
-			(reflow " was already defined in ")
-			(source-location
-				(file "inline_ingested_file.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "inline_ingested_file.md") (start 1 1) (end 1 1) (annotation dim) (line-text "import \"users.json\" as data : Str"))))
+			(source-region (file "inline_ingested_file.md") (start 2 1) (end 2 12) (annotation warning) (line-text "import Json"))))
 	(report
 		(severity runtime_error)
 		(title "File Not Found")
@@ -63,31 +54,13 @@ MISSING METHOD - inline_ingested_file.md:4:7:4:17
 			(source-region (file "inline_ingested_file.md") (start 2 1) (end 2 12) (annotation error) (line-text "import Json"))))
 	(report
 		(severity runtime_error)
-		(title "Missing Method")
+		(title "Does Not Exist")
 		(region (start 4 7) (end 4 17))
 		(headline
-			(reflow "This")
-			(reflow " ")
-			(annotated code "parser_for")
-			(reflow " ")
-			(reflow "call is on")
-			(reflow " ")
-			(reflow "a value of type")
-			(reflow " ")
-			(annotated code "a")
-			(reflow ",")
-			(reflow " ")
-			(reflow "which never resolved to a concrete type,")
-			(reflow " ")
-			(reflow "so it has no")
-			(reflow " ")
-			(annotated code "parser_for")
-			(reflow " ")
-			(reflow "method."))
+			(annotated symbol-unqualified "Json.parse")
+			(reflow " does not exist."))
 		(document
-			(source-region (file "inline_ingested_file.md") (start 4 7) (end 4 17) (annotation error) (line-text "foo = Json.parse(data)"))
-			(line-break)
-			(reflow "Using the value somewhere that requires a specific type, or annotating it, will give it one."))))
+			(source-region (file "inline_ingested_file.md") (start 4 7) (end 4 17) (annotation error) (line-text "foo = Json.parse(data)")))))
 ~~~
 # TOKENS
 ~~~zig
@@ -124,10 +97,8 @@ NO CHANGE
 		(e-runtime-error (tag "file_import_not_found")))
 	(d-let
 		(p-assign (ident "foo"))
-		(e-runtime-error (tag "erroneous_value_expr")
-			(e-runtime-error (tag "erroneous_value_expr"))
-			(e-runtime-error (tag "erroneous_value_expr"))))
-	(s-import (mod "Json")
+		(e-runtime-error (tag "erroneous_value_expr")))
+	(s-import (mod "Json") (alias "Json")
 		(exposes)))
 ~~~
 # TYPES

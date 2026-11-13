@@ -32,6 +32,7 @@ problems: []const problem.Problem = &.{},
 pending: []const problem.Store.PendingStaticExhaustiveness = &.{},
 extra_strings: []const u8 = &.{},
 missing_patterns: []const problem.ExtraStringIdx = &.{},
+refusal_calls: []const problem.RefusalCall = &.{},
 regions: []const base.Region = &.{},
 contents: []const snapshot.SnapshotContent = &.{},
 node_formats: []const snapshot.NodeFormat = &.{},
@@ -51,6 +52,7 @@ pub const Serialized = extern struct {
     pending: serde.SerializedSlice(problem.Store.PendingStaticExhaustiveness) = .{},
     extra_strings: serde.SerializedSlice(u8) = .{},
     missing_patterns: serde.SerializedSlice(problem.ExtraStringIdx) = .{},
+    refusal_calls: serde.SerializedSlice(problem.RefusalCall) = .{},
     regions: serde.SerializedSlice(base.Region) = .{},
     contents: serde.SerializedSlice(snapshot.SnapshotContent) = .{},
     node_formats: serde.SerializedSlice(snapshot.NodeFormat) = .{},
@@ -117,6 +119,7 @@ pub fn capture(allocator: Allocator, checker: anytype, scope: ?*const dependenci
         .pending = checker.problems.pending_static_exhaustiveness.items,
         .extra_strings = checker.problems.extra_strings_backing.items,
         .missing_patterns = checker.problems.missing_patterns_backing.items,
+        .refusal_calls = checker.problems.refusal_calls_backing.items,
         .regions = checker.regions.items.items,
         .contents = snapshots.contents.items.items,
         .node_formats = snapshots.node_formats.items,
@@ -159,6 +162,7 @@ pub fn installProblems(self: Self, store: *problem.Store) Allocator.Error!void {
     try store.pending_static_exhaustiveness.appendSlice(store.gpa, self.pending);
     try store.extra_strings_backing.appendSlice(self.extra_strings);
     try store.missing_patterns_backing.appendSlice(self.missing_patterns);
+    try store.refusal_calls_backing.appendSlice(store.gpa, self.refusal_calls);
 }
 
 /// Fill an empty snapshot store and region list with the snapshots and

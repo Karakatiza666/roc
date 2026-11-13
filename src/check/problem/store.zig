@@ -15,6 +15,8 @@ const CheckedExhaustivenessSiteId = checked_ids.CheckedExhaustivenessSiteId;
 const Problem = types.Problem;
 const ExtraStringIdx = types.ExtraStringIdx;
 const MissingPatternsRange = types.MissingPatternsRange;
+const RefusalCall = types.RefusalCall;
+const RefusalCallsRange = types.RefusalCallsRange;
 
 const ByteList = std.array_list.Managed(u8);
 
@@ -56,7 +58,8 @@ pub const Store = struct {
 
     /// Backing storage for formatted pattern strings
     extra_strings_backing: ByteList,
-    /// Backing storage for missing patterns index arrays
+    /// Backing storage for ranges of extra strings: missing patterns, and
+    /// the intrinsics a translation refusal names
     missing_patterns_backing: std.array_list.Managed(ExtraStringIdx),
     /// Whether compile-time evaluation reported a problem here that the
     /// store's module's checked cache entry cannot reproduce: a literal's
@@ -66,6 +69,8 @@ pub const Store = struct {
     /// that module's package-qualified name, which is workspace information
     /// rather than part of the entry's identity.
     unreproducible_reports: bool = false,
+    /// Backing storage for the calls a translation refusal was reached through
+    refusal_calls_backing: std.ArrayList(RefusalCall) = .empty,
 
     /// Allocation-free empty store, including after ownership transfer.
     pub fn initEmpty(gpa: Allocator) Self {
@@ -99,6 +104,7 @@ pub const Store = struct {
     pub fn deinit(self: *Self) void {
         self.extra_strings_backing.deinit();
         self.missing_patterns_backing.deinit();
+        self.refusal_calls_backing.deinit(self.gpa);
         self.pending_static_exhaustiveness.deinit(self.gpa);
         self.problems.deinit(self.gpa);
     }
@@ -119,6 +125,31 @@ pub const Store = struct {
     /// Get the slice of missing pattern indices by range
     pub fn getMissingPatterns(self: *const Self, range: MissingPatternsRange) []const ExtraStringIdx {
         return self.missing_patterns_backing.items[@as(usize, @intCast(range.start))..][0..@as(usize, @intCast(range.count))];
+    }
+
+    /// Put a range of extra strings in the backing store, returning its range.
+    pub fn putExtraStrings(self: *Self, strings: []const ExtraStringIdx) std.mem.Allocator.Error!types.ExtraStringsRange {
+        const start = self.missing_patterns_backing.items.len;
+        try self.missing_patterns_backing.appendSlice(strings);
+        return .{ .start = @intCast(start), .count = @intCast(strings.len) };
+    }
+
+    /// Get a range of extra strings `putExtraStrings` stored.
+    pub fn getExtraStrings(self: *const Self, range: types.ExtraStringsRange) []const ExtraStringIdx {
+        return self.getMissingPatterns(range);
+    }
+
+    /// Put the calls a translation refusal was reached through in the backing
+    /// store, returning their range.
+    pub fn putRefusalCalls(self: *Self, calls: []const RefusalCall) std.mem.Allocator.Error!RefusalCallsRange {
+        const start = self.refusal_calls_backing.items.len;
+        try self.refusal_calls_backing.appendSlice(self.gpa, calls);
+        return .{ .start = @intCast(start), .count = @intCast(calls.len) };
+    }
+
+    /// Get the calls a translation refusal was reached through by their range
+    pub fn getRefusalCalls(self: *const Self, range: RefusalCallsRange) []const RefusalCall {
+        return self.refusal_calls_backing.items[@as(usize, @intCast(range.start))..][0..@as(usize, @intCast(range.count))];
     }
 
     /// Create a deep snapshot from a Var, storing it in this SnapshotStore
@@ -202,6 +233,7 @@ pub const Store = struct {
                     .cannot_access_opaque_nominal,
                     .nominal_type_resolution_failed,
                     .recursive_alias,
+                    .record_extension_not_record,
                     .not_a_where_alias,
                     .where_alias_in_type_position,
                     .recursive_where_alias,
@@ -222,6 +254,7 @@ pub const Store = struct {
                     .effectful_function_name,
                     .annotation_only_value,
                     .annotation_only_value_use,
+                    .exists_only_in_reified_code,
                     .hosted_where_requirement,
                     .derived_method_value_use,
                     .capturing_method,
@@ -236,9 +269,11 @@ pub const Store = struct {
                     .platform_alias_not_found,
                     .comptime_crash,
                     .comptime_invalid_numeral,
+                    .staged_code,
                     .comptime_invalid_quote,
                     .comptime_invalid_interpolation,
                     .comptime_expect_failed,
+                    .translation_refused,
                     .comptime_eval_error,
                     .invalid_numeric_literal,
                     .tuple_access_needs_annotation,

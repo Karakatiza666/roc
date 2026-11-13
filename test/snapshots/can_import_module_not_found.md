@@ -50,7 +50,7 @@ NO CHANGE
 	(d-let
 		(p-assign (ident "main"))
 		(e-runtime-error (tag "qualified_ident_does_not_exist")))
-	(s-import (mod "nonexistent.Mod")
+	(s-import (mod "nonexistent.Mod") (alias "Mod")
 		(exposes)))
 ~~~
 # TYPES

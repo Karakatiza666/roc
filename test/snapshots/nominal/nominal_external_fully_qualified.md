@@ -152,7 +152,7 @@ handleTry = |result| {
 			(ty-fn (effectful false)
 				(ty-malformed)
 				(ty-lookup (name "Str") (builtin)))))
-	(s-import (mod "MyTryMod")
+	(s-import (mod "MyTryMod") (alias "MyTryMod")
 		(exposes)))
 ~~~
 # TYPES

@@ -2446,7 +2446,10 @@ fn classifyStatement(
         // are scalar presence words.
         .join => {},
         .ret => |stmt| try analysis.useWholeAt(stmt.value, current),
-        .crash => |stmt| if (stmt.msg.localId()) |message| try analysis.useWholeAt(message, current),
+        .crash => |stmt| {
+            if (stmt.msg.localId()) |message| try analysis.useWholeAt(message, current);
+            if (store.stmtRowOrDefault(stmt.extra).refusal) |refusal| for (refusal.locals()) |local| try analysis.useWholeAt(local, current);
+        },
         // Dynamic operations observe/consume whole operand values. Record
         // those program points, so a later field take can end their lifetime.
         .dyn => |stmt| {

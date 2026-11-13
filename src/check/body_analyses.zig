@@ -12,7 +12,8 @@
 //! slot holding its divergence, inspect-elision, state-merge and
 //! loop-mutation facts; the module has one slot for its diagnostic-error
 //! facts, whose recovery path follows constant references across units, and
-//! one for its single-source calls.
+//! one for its single-source calls. The module's code facts
+//! (`code_analyses.CodeAnalyses`) live beside them.
 
 const std = @import("std");
 const base = @import("base");
@@ -22,6 +23,7 @@ const collections = @import("collections");
 const canonical = @import("canonical_names.zig");
 const checked_artifact = @import("checked_artifact.zig");
 const checked_bodies = @import("checked_bodies.zig");
+const code_analyses = @import("code_analyses.zig");
 const static_dispatch = @import("static_dispatch_registry.zig");
 
 const Allocator = std.mem.Allocator;
@@ -57,7 +59,11 @@ pub const NodeFlags = packed struct(u8) {
     scheme_alias_binder: bool = false,
     /// A defaulted-field default expression.
     default: bool = false,
-    _: u1 = 0,
+    /// A `Code` site or a `Code.prim`, `Code.type_id` or `Code.ty_of` call
+    /// (`NodeStore.code_reification_sites`, `NodeStore.code_identity_uses`).
+    /// Its value is a compile-time description, so every body analysis reads
+    /// it as a leaf.
+    code_site: bool = false,
 };
 
 /// What owns a top-level unit's nodes.
@@ -210,6 +216,11 @@ pub const ModuleIndex = struct {
 
     pub fn isDefault(self: *const ModuleIndex, expr: ExprId) bool {
         return self.flags(@backingInt(expr)).default;
+    }
+
+    /// Whether the expression is a `Code` site or a `Code` identity call.
+    pub fn isCodeSite(self: *const ModuleIndex, expr: ExprId) bool {
+        return self.flags(@backingInt(expr)).code_site;
     }
 
     fn orderTopLevelDef(key: u32, item: TopLevelDef) std.math.Order {
@@ -371,6 +382,25 @@ pub const ModuleIndex = struct {
             }
 
             try self.indexDeclarations();
+            self.indexCodeSites();
+        }
+
+        /// The `Code` sites and identity calls checking recorded. A node
+        /// that checking replaced with a runtime error is not a site: it
+        /// keeps the error. An identity call is a site only while it is a
+        /// call.
+        fn indexCodeSites(self: *Builder) void {
+            const store = &self.env.store;
+            for (store.codeReificationSites()) |site| {
+                const expr: ExprId = @fromBackingInt(@intCast(site.node_idx));
+                if (store.getExpr(expr) == .e_runtime_error) continue;
+                self.node_flags[site.node_idx].code_site = true;
+            }
+            for (store.codeIdentityUses()) |use| {
+                const expr: ExprId = @fromBackingInt(@intCast(use.call));
+                if (store.getExpr(expr) != .e_call) continue;
+                self.node_flags[use.call].code_site = true;
+            }
         }
 
         fn beginUnit(self: *Builder, kind: UnitKind, root: u32) Allocator.Error!UnitId {
@@ -830,6 +860,8 @@ pub const BodyAnalyses = struct {
     dispatch_crashes: collections.OnceSlot(*NodeBits, .body_dispatch_crashes) = .empty,
     diagnostic_errors: collections.OnceSlot(*NodeBits, .body_diagnostic_errors) = .empty,
     single_source: collections.OnceSlot(*SingleSourceFacts, .body_single_source_calls) = .empty,
+    /// The module's code facts: cuts and instance inventories.
+    code: code_analyses.CodeAnalyses,
 
     /// The analyses of `env`'s bodies. `promoted` lists the module's
     /// promoted local procedures, each with its binding `pattern`.
@@ -848,6 +880,7 @@ pub const BodyAnalyses = struct {
             .io = io,
             .env = env,
             .promoted_patterns = promoted_patterns,
+            .code = code_analyses.CodeAnalyses.init(allocator, io),
         };
         return analyses;
     }
@@ -867,6 +900,7 @@ pub const BodyAnalyses = struct {
             }
         }
         if (self.single_source.peek()) |facts| facts.destroy(allocator);
+        self.code.deinit();
         allocator.free(self.promoted_patterns);
         allocator.destroy(self);
     }
@@ -1097,7 +1131,7 @@ fn appendDispatchOperands(bodies: CheckedBodies, raw_node: u32, out: anytype) Al
     const plan = plans.plans[@backingInt(plan_id)];
     for (plan.argsSlice(plans)) |operand| switch (operand) {
         .checked_expr => |expr| try out.add(expr),
-        .generated_interpolation_segments, .generated_numeral, .generated_quote, .literal_pattern_value, .literal_pattern_conversion => {},
+        .generated_interpolation_segments, .generated_numeral, .generated_quote, .literal_pattern_value, .literal_pattern_conversion, .bound_capture_default => {},
     };
 }
 
@@ -1184,6 +1218,7 @@ pub fn exprDivergence(kind: ExprKind) ExprDivergence {
         .closure,
         .lambda,
         .anno_only,
+        .code_site,
         .hosted_lambda,
         => .{ .evaluation = false, .dispatch_plan = false },
     };
@@ -1359,7 +1394,8 @@ const DivergenceScan = struct {
         if (raw < self.evidence_crashes.len and self.evidence_crashes[raw]) return .{ .value = diverges_both };
         if (self.crashes.isSet(raw)) return .{ .value = diverges_both };
         const bodies = self.bodies;
-        return switch (bodies.exprData(id)) {
+        // A value site a call binds runs its expression there.
+        return switch (bodies.exprDataRunning(id)) {
             .crash,
             .ellipsis,
             .break_,
@@ -1439,6 +1475,7 @@ const DivergenceScan = struct {
             .empty_record,
             .zero_argument_tag,
             .anno_only,
+            .code_site,
             => .{ .value = 0 },
         };
     }
@@ -1582,7 +1619,7 @@ const InspectElision = struct {
             switch (data) {
                 .lambda, .closure, .lookup_local, .lookup_external, .lookup_required => break true,
                 .field_access => {},
-                .numeral, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => break false,
+                .numeral, .str_segment, .str, .bytes_literal, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .binop, .unary_minus, .dispatch_call, .interpolation, .structural_eq, .structural_hash, .method_eq, .type_dispatch_call, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .code_site, .break_, .return_, .for_, .hosted_lambda, .run_low_level => break false,
             }
             const access = data.field_access;
             if (bodies.rowCoercion(access.receiver) != null) break false;
@@ -1907,7 +1944,8 @@ const ReassignmentPublisher = struct {
         const bodies = self.bodies;
         const children = self.beginChildren();
         defer self.endChildren(children);
-        switch (bodies.exprData(id)) {
+        // A value site a call binds runs its expression there.
+        switch (bodies.exprDataRunning(id)) {
             .str, .list, .tuple => |items| for (items) |item| try self.pushExpr(item),
             .interpolation => |interpolation| {
                 try self.pushExpr(interpolation.first);
@@ -1984,6 +2022,7 @@ const ReassignmentPublisher = struct {
             .crash,
             .ellipsis,
             .anno_only,
+            .code_site,
             .break_,
             => {},
             .dispatch_call, .method_eq, .type_dispatch_call => try appendDispatchOperands(bodies, @backingInt(id), self),
@@ -2304,7 +2343,8 @@ const DiagnosticScan = struct {
 
     fn pushExprItems(self: *DiagnosticScan, id: ExprId) Allocator.Error!void {
         const bodies = self.bodies;
-        switch (bodies.exprData(id)) {
+        // A value site holds the error of the expression written there.
+        switch (bodies.exprDataOpeningValueSite(id)) {
             .runtime_error => try self.pushItem(.diagnostic_error),
             .str, .list, .tuple => |items| try self.pushExprs(items),
             .match_ => |match| {
@@ -2387,6 +2427,7 @@ const DiagnosticScan = struct {
             .crash,
             .ellipsis,
             .anno_only,
+            .code_site,
             .break_,
             => {},
         }
@@ -2617,8 +2658,9 @@ const SourceCallShapes = struct {
                     const tag = bodies.nodeTag(raw);
                     if (tag != .expr_call and tag != .expr_var) continue;
                     const id: ExprId = @fromBackingInt(raw);
-                    // A retired call or lookup evaluates as a runtime error.
-                    if (bodies.exprIsRetired(id)) continue;
+                    // A retired call or lookup evaluates as a runtime error,
+                    // and a `Code` site is its description.
+                    if (bodies.exprIsRetired(id) or bodies.index().isCodeSite(id)) continue;
                     const data = store.getExpr(id);
                     if (data == .e_call) {
                         shapes.callees.set(@backingInt(data.e_call.func));

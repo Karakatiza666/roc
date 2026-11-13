@@ -37,6 +37,10 @@ pub const CheckedArtifact = @import("checked_artifact.zig");
 pub const CheckedBodies = @import("checked_bodies.zig");
 /// The body facts a checked module computes on first demand.
 pub const BodyAnalyses = @import("body_analyses.zig");
+/// The on-demand code facts of a checked module: cuts and instance inventories.
+pub const CodeAnalyses = @import("code_analyses.zig");
+/// The code descriptions column of a module's evaluation output.
+pub const CodeOutput = @import("code_output.zig");
 /// Import-facing checking identities and explicit binding to current owners.
 pub const CheckingDependencies = @import("checking_dependencies.zig");
 pub const CheckingInterface = @import("checking_interface.zig");
@@ -45,6 +49,11 @@ pub const CheckingInterface = @import("checking_interface.zig");
 pub const CheckedReports = @import("checked_reports.zig");
 /// Pre-evaluation inputs stored in the combined checking entry.
 pub const CheckingReuse = @import("checking_reuse.zig");
+/// **Staging reifier**: a checked function body as a `Code.Ir` const tree.
+pub const CodeReifier = @import("code_reifier.zig");
+pub const CodeEmit = @import("code_emit.zig");
+/// Compile-time roots of code reification sites that read run-time values.
+pub const CodeRoots = @import("code_roots.zig");
 /// Comptime layout fingerprint for a registered serialization root (recurses into
 /// nested aggregates and `SerializedElement`s), so every admitted blob invalidates on
 /// any layout change, not just a top-level one.
@@ -71,6 +80,9 @@ test "check tests" {
     std.testing.refAllDecls(@import("occurs.zig"));
     std.testing.refAllDecls(@import("problem.zig"));
     std.testing.refAllDecls(@import("problem/context.zig"));
+    std.testing.refAllDecls(@import("reify_only.zig"));
+    std.testing.refAllDecls(@import("code_roots.zig"));
+    std.testing.refAllDecls(@import("code_opacity.zig"));
     std.testing.refAllDecls(@import("problem/store.zig"));
     std.testing.refAllDecls(@import("problem/types.zig"));
     std.testing.refAllDecls(@import("report.zig"));
@@ -80,11 +92,15 @@ test "check tests" {
     std.testing.refAllDecls(@import("canonical_names.zig"));
     std.testing.refAllDecls(@import("canonical_type_keys.zig"));
     std.testing.refAllDecls(@import("codec_identity.zig"));
+    std.testing.refAllDecls(@import("code_reifier.zig"));
+    std.testing.refAllDecls(@import("code_emit.zig"));
     std.testing.refAllDecls(@import("const_store.zig"));
     std.testing.refAllDecls(@import("artifact_serialize.zig"));
     std.testing.refAllDecls(@import("checked_artifact.zig"));
     std.testing.refAllDecls(@import("checked_bodies.zig"));
     std.testing.refAllDecls(@import("body_analyses.zig"));
+    std.testing.refAllDecls(@import("code_analyses.zig"));
+    std.testing.refAllDecls(@import("code_output.zig"));
     std.testing.refAllDecls(@import("sealed_type_view.zig"));
     std.testing.refAllDecls(@import("checked_type_ids.zig"));
     std.testing.refAllDecls(@import("evaluation_diagnostics.zig"));
@@ -115,6 +131,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("dispatch_evidence.zig"));
     std.testing.refAllDecls(@import("test/range_test.zig"));
     std.testing.refAllDecls(@import("test/recursive_alias_test.zig"));
+    std.testing.refAllDecls(@import("test/record_extension_test.zig"));
     std.testing.refAllDecls(@import("test/generalize_redirect_test.zig"));
     std.testing.refAllDecls(@import("test/row_union_normalization_test.zig"));
     std.testing.refAllDecls(@import("test/exhaustiveness_test.zig"));
@@ -203,6 +220,7 @@ test "check tests" {
     std.testing.refAllDecls(@import("test/issue_12881_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12881_work_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12883_test.zig"));
+    std.testing.refAllDecls(@import("test/staged_code_where_test.zig"));
     std.testing.refAllDecls(@import("test/nominal_decl_growth_test.zig"));
     std.testing.refAllDecls(@import("test/frame_owned_judgment_test.zig"));
     std.testing.refAllDecls(@import("test/issue_12887_test.zig"));

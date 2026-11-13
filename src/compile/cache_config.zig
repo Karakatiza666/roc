@@ -358,7 +358,41 @@ pub const Constants = struct {
     ///      columns with body-local type context arguments, per-use anonymous
     ///      structure and generated-codec recurrences.
     /// 179: selected hoisted roots store their optional ids in four bytes.
-    pub const CACHE_VERSION = 179;
+    /// 244: code reification. Checked data records `Code` sites, identity
+    ///      calls and bound capture encodings; the evaluation output holds
+    ///      the code descriptions, instance tables and bound input slots.
+    /// 245: code reification on a base whose stored checking diagnostics
+    ///      include polymorphic recursion problems.
+    /// 246: a code reification site records the expression its chain ended
+    ///      in, and a nominal type built on `Code.Bound` is an opt-in.
+    /// 247: a code reification site records why the call that binds it is
+    ///      no compile-time root.
+    /// 248: a bound capture read gets its encoder requirement only when its
+    ///      type holds an opaque type or a type variable.
+    /// 250: Normal form 43: the number stage places each literal by the
+    ///      readers it has (N5), so described bodies change.
+    /// 251: Normal form 44: N15a flattens a checked `plus` chain only in
+    ///      the settle round, so described bodies change.
+    /// 252: Normal form 45: an earlier `And` or `Or` operand `Bool.not(x)`
+    ///      decides `x` (N13d), so described bodies change.
+    /// 253: the reify fork on the nightly 2026-11-09 base, whose
+    ///      compile-time strings store their own bytes.
+    /// 254: Code instance inventories gain `implicit` entries and code
+    ///      outputs the tables of descriptor methods at owner types (Q17).
+    /// 256: code outputs key each closing table by its Code edge
+    ///      (`edge_tables`), in place of the use and requirement columns.
+    /// 259: codec methods and methods `where` evidence selects get Code
+    ///      inventories and edge tables; the old refusals of both go.
+    /// 260: a generic bound call's requirement that mentions a scheme's
+    ///      variable forwards even where it also mentions a variable no
+    ///      scheme quantifies.
+    /// 261: a method call's table is keyed by the evidence node it targets;
+    ///      literal requirements and roots lose `dispatch_use`.
+    /// 262: a value at a `Code.Binds` position whose `a` is known is decided
+    ///      at its frame finish, and a site records `decided_late`.
+    /// 263: the reify fork on the nightly 2026-11-12 base, whose tables
+    ///      store optionals in compact zero-absent forms.
+    pub const CACHE_VERSION = 263;
 };
 
 /// Configuration for the Roc cache system.

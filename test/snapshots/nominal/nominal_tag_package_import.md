@@ -83,7 +83,7 @@ blue = CC.Color.RGB(0, 0, 255)
 		(e-runtime-error (tag "type_from_missing_mod"))
 		(annotation
 			(ty-malformed)))
-	(s-import (mod "styles.Color")
+	(s-import (mod "styles.Color") (alias "CC")
 		(exposes)))
 ~~~
 # TYPES

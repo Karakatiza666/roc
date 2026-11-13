@@ -276,6 +276,68 @@ pub fn constructorBackingActualIsNominal(types_store: *const types_mod.Store, ac
     return !types_store.nominalDeclIsInvalid(nominal);
 }
 
+/// What a record extension slot (`..r`) meets, read through aliases (design.md
+/// "Record Extension Well-Formedness").
+pub const RecordRowFit = enum {
+    /// A record, the empty record, a record-backed `:=` nominal, or an error.
+    record,
+    /// An unbound variable: it becomes a record row.
+    flex,
+    /// A rigid variable: a record row only when it is marked as one.
+    rigid,
+    /// A `::` opaque nominal, which hides its fields in every module.
+    opaque_nominal,
+    /// Anything else: a primitive, a tag union, a function, a tuple, or a
+    /// nominal whose backing is not a record.
+    not_record,
+};
+
+/// The fit of `start` in a record extension slot, and the var the alias walk
+/// stopped at.
+pub fn recordRowFit(types_store: *const types_mod.Store, start: Var) struct { fit: RecordRowFit, var_: Var } {
+    var current = start;
+    var remaining = types_store.len();
+    while (remaining > 0) : (remaining -= 1) {
+        const resolved = types_store.resolveVar(current);
+        switch (resolved.desc.content) {
+            .alias => |alias| current = types_store.getAliasBackingVar(alias),
+            .flex => return .{ .fit = .flex, .var_ = resolved.var_ },
+            .rigid => return .{ .fit = .rigid, .var_ = resolved.var_ },
+            .err => return .{ .fit = .record, .var_ = resolved.var_ },
+            .field_presence => return .{ .fit = .not_record, .var_ = resolved.var_ },
+            .structure => |flat_type| switch (flat_type) {
+                .record, .empty_record => return .{ .fit = .record, .var_ = resolved.var_ },
+                .nominal_type => |nominal| {
+                    // An application with no declaration entry is a hand-built
+                    // test type, and an invalid declaration already poisons its
+                    // uses: neither has a backing to judge.
+                    const decl_idx = types_store.lookupNominalDecl(nominal) orelse
+                        return .{ .fit = .record, .var_ = resolved.var_ };
+                    const decl = types_store.getNominalDecl(decl_idx);
+                    if (!decl.isValid()) return .{ .fit = .record, .var_ = resolved.var_ };
+                    if (nominal.isOpaque()) return .{ .fit = .opaque_nominal, .var_ = resolved.var_ };
+                    const backing = recordRowFit(types_store, decl.backing);
+                    return .{
+                        .fit = switch (backing.fit) {
+                            .record => .record,
+                            // A backing still being generated (a declaration in a
+                            // recursive group) is a flex var until it is filled.
+                            .flex => .record,
+                            // A backing that is a bare formal (`Id(a) := a`) is not
+                            // a record, whatever the application supplies.
+                            .rigid, .not_record => .not_record,
+                            .opaque_nominal => .opaque_nominal,
+                        },
+                        .var_ = resolved.var_,
+                    };
+                },
+                .tuple, .fn_pure, .fn_effectful, .fn_unbound, .tag_union, .empty_tag_union => return .{ .fit = .not_record, .var_ = resolved.var_ },
+            },
+        }
+    }
+    base.invariant("checker invariant violated: a record extension's alias chain is cyclic", .{});
+}
+
 /// Walking further than the store holds means the alias chain is cyclic, which
 /// is a shape no decision can be read from; each caller states what it does
 /// with that.
@@ -1131,6 +1193,28 @@ const Unifier = struct {
         base.invariant("checker invariant violated: a tag row's extension chain is cyclic", .{});
     }
 
+    /// A record extension slot accepts only a record row (design.md "Record
+    /// Extension Well-Formedness"). A flex var joins the slot unless it is the
+    /// type of a number or string literal: the rule keeps literals out of the
+    /// slot, so a literal's default (`Dec`, `Str`) never has to extend a
+    /// record. A rigid var joins it only when its own annotation put it in
+    /// one.
+    fn refuseNonRecordIntoRecordRow(self: *Self, row: ResolvedVarDesc, other: ResolvedVarDesc) Error!void {
+        if (!row.desc.flags.record_row or other.desc.flags.record_row) return;
+        const fit = recordRowFit(self.types_store, other.var_);
+        switch (fit.fit) {
+            .record => {},
+            .flex => {
+                const flex = self.types_store.resolveVar(fit.var_).desc.content.flex;
+                for (self.types_store.sliceStaticDispatchConstraints(flex.constraints)) |constraint| {
+                    if (constraint.origin.literalKind() != null) return error.TypeMismatch;
+                }
+            },
+            .rigid => if (!self.types_store.resolveVar(fit.var_).desc.flags.record_row) return error.TypeMismatch,
+            .opaque_nominal, .not_record => return error.TypeMismatch,
+        }
+    }
+
     /// A bounded extension may close or stay open, never gain a tag. Joining
     /// a tagless row hands the bound to that row's own extension.
     fn refuseTagsIntoBoundedExt(self: *Self, ext: ResolvedVarDesc, other: Var) Error!void {
@@ -1183,6 +1267,8 @@ const Unifier = struct {
 
         try self.refuseTagsIntoBoundedExt(vars.a, vars.b.var_);
         try self.refuseTagsIntoBoundedExt(vars.b, vars.a.var_);
+        try self.refuseNonRecordIntoRecordRow(vars.a, vars.b);
+        try self.refuseNonRecordIntoRecordRow(vars.b, vars.a);
 
         switch (vars.a.desc.content) {
             .flex => |flex| {
@@ -3679,6 +3765,7 @@ const Unifier = struct {
             try self.types_store.static_dispatch_relation_merges.append(self.types_store.gpa, .{
                 .dropped_fn_var = constraint.fn_var,
                 .retained_fn_var = existing.fn_var,
+                .dropped_runs = constraint.runs,
             });
             return;
         }
@@ -3907,16 +3994,27 @@ const Unifier = struct {
                         .b = b_constraints[b_indices[b_index]],
                     });
                 }
+                // The retained literal relation stands for every subsumed
+                // one, so it runs when any of them ran.
+                const retained_literal = &scratch.only_in_a_static_dispatch_constraints.items.items[retained_group_start];
+                for (a_indices[a_literal_end..a_group_end]) |constraint_index| {
+                    retained_literal.runs = retained_literal.runs or a_constraints[constraint_index].runs;
+                }
+                for (b_indices[b_literal_end..b_group_end]) |constraint_index| {
+                    retained_literal.runs = retained_literal.runs or b_constraints[constraint_index].runs;
+                }
                 for (a_indices[a_literal_end..a_group_end]) |constraint_index| {
                     try self.types_store.static_dispatch_relation_merges.append(self.types_store.gpa, .{
                         .dropped_fn_var = a_constraints[constraint_index].fn_var,
                         .retained_fn_var = representative.fn_var,
+                        .dropped_runs = a_constraints[constraint_index].runs,
                     });
                 }
                 for (b_indices[b_literal_end..b_group_end]) |constraint_index| {
                     try self.types_store.static_dispatch_relation_merges.append(self.types_store.gpa, .{
                         .dropped_fn_var = b_constraints[constraint_index].fn_var,
                         .retained_fn_var = representative.fn_var,
+                        .dropped_runs = b_constraints[constraint_index].runs,
                     });
                 }
             } else {
@@ -4012,7 +4110,7 @@ fn isFixedLiteralOrigin(origin: StaticDispatchConstraint.Origin) bool {
             .numeral, .quote => true,
             .interpolation => false,
         },
-        .desugared_binop, .desugared_unaryop, .method_call, .where_clause => false,
+        .desugared_binop, .desugared_unaryop, .method_call, .bound_capture, .where_clause => false,
     };
 }
 
@@ -4058,6 +4156,8 @@ fn mergeStaticDispatchConstraintMetadata(
     if (!merged.interpolation.isPresent()) {
         merged.interpolation = other.interpolation;
     }
+    // The retained relation runs when either one ran.
+    merged.runs = retained.runs or other.runs;
     return merged;
 }
 

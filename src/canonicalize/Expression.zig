@@ -62,8 +62,12 @@ pub const TypeDispatchOwner = union(enum) {
 
 /// Why an annotation-only expression has no Roc implementation.
 pub const AnnotationOnlyKind = enum(u8) {
+    /// The annotation has no body and is not yet classified.
     ordinary,
     unsupported_generated_method,
+    /// An annotated value binding without a body, outside the builtin module
+    /// and outside platform modules. It names a compiler-known operation.
+    intrinsic,
 };
 
 /// An expression in the Roc language.
@@ -169,6 +173,9 @@ pub const Expr = union(enum) {
     /// ```
     e_lookup_local: struct {
         pattern_idx: CIR.Pattern.Idx,
+        /// Where the member is written when the lookup has a qualifier, as `x`
+        /// in `Thing.x`. Null for an unqualified or compiler-written lookup.
+        member_region: ?Region = null,
     },
     /// Lookup defined in another module
     /// ```roc
@@ -202,6 +209,9 @@ pub const Expr = union(enum) {
         type_node_idx: u32,
         type_ident: Ident.Idx,
         item_ident: Ident.Idx,
+        /// Where the item is written, as `x` in `Alias.x`. Null for a
+        /// compiler-written lookup.
+        member_region: ?Region = null,
     },
     /// An associated value selected through an imported type declaration.
     /// Checking resolves transparent aliases and replaces this with

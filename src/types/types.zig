@@ -159,7 +159,14 @@ pub const DescriptorFlags = packed struct(u16) {
     /// rank, so instantiation does not carry the flag, and a merge keeps it
     /// only when both sides had it.
     per_use_structure: bool = false,
-    _padding: u6 = 0,
+    /// The class stands in a record's extension slot (`..r`), directly or
+    /// as the record-row argument of an alias or nominal application. It
+    /// accepts only a record row: a record, a row variable, an alias of one,
+    /// or a record-backed `:=` nominal (design.md "Record Extension
+    /// Well-Formedness"). A copy of the class is the same slot, so
+    /// instantiation carries the flag.
+    record_row: bool = false,
+    _padding: u5 = 0,
 
     /// The flags a copy of this class carries: those that describe its type.
     /// The others record what happened to this class itself—a rejection, a
@@ -173,6 +180,7 @@ pub const DescriptorFlags = packed struct(u16) {
             .empty_tag_union_is_default = self.empty_tag_union_is_default,
             .nominal_backing_structure = self.nominal_backing_structure,
             .host_fixed_row = self.host_fixed_row,
+            .record_row = self.record_row,
         };
     }
 
@@ -1194,6 +1202,20 @@ pub const StaticDispatchConstraint = struct {
     /// cross-module copying. It is metadata, not type identity: canonical
     /// type keys and constraint equivalence do not read it.
     interpolation: InterpolationMetadata.OptIdx = .none,
+    /// Whether some code that runs at run time uses this relation. It is
+    /// false when every use is in a description-only body (design.md
+    /// "The Runs Bit"): the body of a lambda
+    /// written at a `Code` place, a function name written as a `Code`
+    /// argument, or the body of a template. It has no default value, so each
+    /// creation site must choose it.
+    ///
+    /// - Creation sets it from the checker's description-only depth.
+    /// - Instantiation at a use ANDs it with the use's own bit.
+    /// - A merge that drops one of two equal relations ORs the two bits.
+    ///
+    /// This is METADATA, like `provenance`. Canonical type keys, constraint
+    /// equivalence and unification never read it, so it never changes typing.
+    runs: bool,
 
     /// The introducing site of a static dispatch constraint. `intro_expr` is the
     /// raw `CIR.Expr.Idx` of the expression that created the constraint, stored
@@ -1315,6 +1337,14 @@ pub const StaticDispatchConstraint = struct {
         desugared_binop: struct { negated: bool },
         desugared_unaryop, // From uniary operator desugaring (e.g., !)
         method_call, // From `.method()` syntax
+        /// From the typing rule "Bound Capture Encoding" (design.md "Code
+        /// Reification"): `fmt.default` and a capture read's `encoder_for` at
+        /// a `Code.Binds(code, fmt)` position. It checks as `method_call`,
+        /// except that an `encoder_for` whose dispatcher is a function is
+        /// satisfied: a captured function is described as code, not bound.
+        /// It rides the constraint through instantiation, so a copy of a
+        /// generic function reports its failure with the rule's own text.
+        bound_capture,
         /// From a where clause in a type annotation. `body_required` is true when
         /// the originating scheme's body provably forces this method: during the
         /// scheme's own check a body dispatch of this method matched and unified
@@ -1337,7 +1367,7 @@ pub const StaticDispatchConstraint = struct {
         pub fn literalKind(self: Origin) ?LiteralKind {
             return switch (self) {
                 .from_literal => |lit| lit,
-                .desugared_binop, .desugared_unaryop, .method_call, .where_clause => null,
+                .desugared_binop, .desugared_unaryop, .method_call, .bound_capture, .where_clause => null,
             };
         }
 
@@ -1345,7 +1375,7 @@ pub const StaticDispatchConstraint = struct {
         pub fn isOperator(self: Origin) bool {
             return switch (self) {
                 .desugared_binop, .desugared_unaryop => true,
-                .method_call, .where_clause, .from_literal => false,
+                .method_call, .bound_capture, .where_clause, .from_literal => false,
             };
         }
 
@@ -1354,7 +1384,7 @@ pub const StaticDispatchConstraint = struct {
         pub fn binopNegated(self: Origin) bool {
             return switch (self) {
                 .desugared_binop => |binop| binop.negated,
-                .desugared_unaryop, .method_call, .where_clause, .from_literal => false,
+                .desugared_unaryop, .method_call, .bound_capture, .where_clause, .from_literal => false,
             };
         }
     };

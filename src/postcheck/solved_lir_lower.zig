@@ -8718,6 +8718,16 @@ const Lowerer = struct {
             } }, where.source());
             return .{ .tail = try self.operandChain(where, lowered, null, null, crash_stmt) };
         }
+        if (op == .code_refuse) {
+            if (args.len != 4) Common.invariant("code_refuse low-level operation received the wrong number of arguments");
+            const lowered = try self.lowerExprsToTemps(args);
+            defer lowered.deinit(self.allocator);
+            const crash_stmt = try self.result.store.addCFStmt(.{ .crash = .{
+                .msg = .{ .local = lowered.ids[3] },
+                .extra = try self.result.store.addStmtRow(LIR.CrashExtra, .{ .refusal = .{ .site = lowered.ids[0], .row = lowered.ids[1], .node = lowered.ids[2] } }),
+            } }, where.source());
+            return .{ .tail = try self.operandChain(where, lowered, null, null, crash_stmt) };
+        }
         if (op == .dict_pseudo_seed and self.dict_seed_mode == .comptime_zero) {
             if (args.len != 0) Common.invariant("Dict seed low-level operation received arguments");
             return .{ .ret = try self.result.store.addCFStmt(.{ .assign_literal = .{
@@ -15500,6 +15510,7 @@ fn constFnTemplateForFn(self: *Lowerer, fn_id: Type.FnId) std.mem.Allocator.Erro
         .evidence = evidence,
         .evidence_frames = evidence_frames,
         .evidence_frame_head = template.const_evidence_frame_head,
+        .instances = template.const_instances,
     };
 }
 

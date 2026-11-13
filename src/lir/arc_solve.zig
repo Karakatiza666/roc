@@ -3067,7 +3067,9 @@ fn liftSharedStmtFacts(solver: *Solver, current: LIR.CFStmtId) SolveError!void {
                     try solver.unique_facts.append(allocator, .{ .consume = .{ .local = arg, .stmt = current } });
                     read_only = false;
                 }
-                if ((rc_effect.retain_args & bit) != 0) {
+                // A shared handle in the result is another holder of the
+                // argument's allocation, as a retain is.
+                if (((rc_effect.retain_args | rc_effect.result_shares_args) & bit) != 0) {
                     try solver.unique_facts.append(allocator, .{ .destroy = arg });
                     read_only = false;
                 }
@@ -6126,7 +6128,9 @@ fn computeUniquenessDetailed(
                         if (pass_through != position) try marks.consumeAt(allocator, &consumes, arg, @intCast(stmt_index));
                         read_only = false;
                     }
-                    if ((rc_effect.retain_args & bit) != 0) {
+                    // A shared handle in the result is another holder of
+                    // the argument's allocation, as a retain is.
+                    if (((rc_effect.retain_args | rc_effect.result_shares_args) & bit) != 0) {
                         marks.destroy(&destroyed, arg);
                         read_only = false;
                     }

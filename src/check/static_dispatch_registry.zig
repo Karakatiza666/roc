@@ -1258,7 +1258,6 @@ fn builtinOwnerForRegistryEntry(
     module_env: *const ModuleEnv,
     owner_stmt: CIR.Statement.Idx,
 ) ?BuiltinOwner {
-    const common = module_env.idents;
     if (module_env.module_role != .builtin) return null;
 
     const stmt = module_env.store.getStatement(owner_stmt);
@@ -1269,7 +1268,12 @@ fn builtinOwnerForRegistryEntry(
         module_env.store.getTypeHeader(stmt.s_alias_decl.header).name
     else
         return null;
+    return builtinOwnerForTypeIdent(&module_env.idents, type_ident);
+}
 
+/// The builtin owner a builtin type's name names, read with the idents of
+/// the module that holds the name. `Try` names no owner.
+pub fn builtinOwnerForTypeIdent(common: *const ModuleEnv.CommonIdents, type_ident: base.Ident.Idx) ?BuiltinOwner {
     if (type_ident.eql(common.bool) or type_ident.eql(common.bool_type)) return .bool;
     if (type_ident.eql(common.str) or type_ident.eql(common.builtin_str)) return .str;
     if (type_ident.eql(common.u8) or type_ident.eql(common.u8_type)) return .u8;
@@ -1447,6 +1451,10 @@ pub const StaticDispatchOperand = union(enum) {
     /// A custom literal pattern's literal converted at the pattern's type
     /// (`checked_bodies.CheckedBodies.literalConversion`).
     literal_pattern_conversion: CIR.Pattern.Idx,
+    /// The value of `fmt.default()` for the `Code.Binds` site at this node:
+    /// the call lowering builds from the site's default plan
+    /// (`StaticDispatchPlanTable.boundCaptureDefaultPlan`).
+    bound_capture_default: CIR.Expr.Idx,
 };
 
 /// Public `StructuralKind` declaration.
@@ -1580,6 +1588,15 @@ pub const CheckedEvidence = struct {
     /// runtime representation still needs an explicit descriptor).
     dispatcher_ty: CheckedTypeId,
     resolution: Resolution,
+    /// Whether the resolution is `direct` to a template no lowering emits
+    /// (`CheckedProcedureTemplate.description_only`: an intrinsic, a
+    /// reify-only definition, or a template returning `Code`), and the
+    /// callee's relation for this obligation has a clear runs bit, so only
+    /// description-only bodies of the callee use it (design.md "The Runs
+    /// Bit"). No run-time code reads a dictionary slot for it, so Boxy stores
+    /// a crashing slot in place of a worker. Descriptions still read the
+    /// direct target.
+    description_only_target: bool,
     /// Independent callable contracts in `evidence_refs`, sharing one target slot.
     callable_contracts: artifact_serialize.Span = .{},
 
@@ -1963,9 +1980,111 @@ pub const GeneratedCodecDerivation = struct {
     state_ty: CheckedTypeId,
     error_ty: CheckedTypeId,
     calls: artifact_serialize.Span = .{},
+    /// The variables the contract's snapshot renamed, each with the type of
+    /// the derived relation it renamed: a span of
+    /// `StaticDispatchPlanTable.generated_codec_renamed_vars`. Not part of
+    /// `content`: two contracts with one content rename the types of their
+    /// own relations.
+    renamed_vars: artifact_serialize.Span = .{},
 
     pub fn callsSlice(self: GeneratedCodecDerivation, table: *const StaticDispatchPlanTable) []const GeneratedCodecCall {
         return table.generated_codec_calls[self.calls.start .. self.calls.start + self.calls.len];
+    }
+
+    pub fn renamedVarsSlice(self: GeneratedCodecDerivation, table: *const StaticDispatchPlanTable) []const GeneratedCodecRenamedVar {
+        return table.generated_codec_renamed_vars[self.renamed_vars.start .. self.renamed_vars.start + self.renamed_vars.len];
+    }
+};
+
+/// A variable of a generated codec contract and the type of the derived
+/// relation it renames (`ModuleEnv.GeneratedCodecRenaming`). A call's
+/// substitution names the copy; the same substitution with each copy
+/// replaced by its original is the call at the relation's own types
+/// (design.md "Literal Arguments").
+pub const GeneratedCodecRenamedVar = struct {
+    copy: CheckedTypeId,
+    original: CheckedTypeId,
+};
+
+/// The instantiation edges that evidence reaches (design.md "Literal
+/// Arguments", "Code Instance Tables"): each `direct` node, then the
+/// evidence that node supplies its own target, and each call of each
+/// generated codec contract that a `structural` entry derives, through the
+/// contracts it nests. The literal requirement computation and the Code
+/// reifier both read the edges through this walk. `visitor` gets
+/// `evidenceNode(id, node)` for each node and
+/// `contractCall(derivation, callable_ty, node_id)` for each contract call,
+/// then the walk goes into the evidence of that node. A contract derives
+/// one relation, so the walk visits it once.
+pub const EvidenceEdgeWalk = struct {
+    allocator: Allocator,
+    plans: *const StaticDispatchPlanTable,
+    /// The nodes not yet visited.
+    stack: std.ArrayListUnmanaged(EvidenceNodeId) = .empty,
+    visited_derivations: collections.DenseMapUnmanaged(GeneratedCodecDerivationId, void) = .empty,
+
+    pub fn deinit(self: *EvidenceEdgeWalk) void {
+        self.stack.deinit(self.allocator);
+        self.visited_derivations.deinit(self.allocator);
+    }
+
+    /// The edges of `evidence`: each direct node goes on the stack, and the
+    /// walk visits the calls of each contract now.
+    pub fn entries(self: *EvidenceEdgeWalk, visitor: anytype, evidence: []const CheckedEvidence) Allocator.Error!void {
+        for (evidence) |entry| {
+            try self.resolution(visitor, entry.resolution);
+            const contracts = entry.callable_contracts;
+            for (self.plans.evidence_refs[contracts.start..][0..contracts.len]) |contract| try self.resolution(visitor, contract.resolution);
+        }
+    }
+
+    fn resolution(self: *EvidenceEdgeWalk, visitor: anytype, resolved: CheckedEvidence.Resolution) Allocator.Error!void {
+        switch (resolved) {
+            .direct => |node_id| try self.stack.append(self.allocator, node_id),
+            .structural => |structural| if (structural.generated_codec_derivation) |id| try self.derivation(visitor, id),
+            .constraint, .from_callable, .from_scheme, .checked_error, .unreachable_value => {},
+        }
+    }
+
+    /// The edges of the evidence `node` supplies its own target.
+    pub fn nested(self: *EvidenceEdgeWalk, visitor: anytype, node: EvidenceNode) Allocator.Error!void {
+        switch (node.nested) {
+            .resolved => try self.entries(visitor, self.plans.nestedEvidence(node)),
+            .through_alias => try self.entries(visitor, self.plans.aliasScopeEvidence(node)),
+            .from_callable => {},
+        }
+    }
+
+    /// Visit `first`, where it is set, and each node on the stack, with the
+    /// edges that the evidence of each one reaches.
+    pub fn nodes(self: *EvidenceEdgeWalk, visitor: anytype, first: ?EvidenceNodeId) Allocator.Error!void {
+        if (first) |id| try self.stack.append(self.allocator, id);
+        while (self.stack.pop()) |id| {
+            const node = self.plans.evidenceNode(id);
+            try visitor.evidenceNode(id, node);
+            try self.nested(visitor, node);
+        }
+    }
+
+    /// Visit each call of contract `first` and of the contracts it nests,
+    /// each contract once. The direct nodes of the evidence of each call go
+    /// on the stack.
+    pub fn derivation(self: *EvidenceEdgeWalk, visitor: anytype, first: GeneratedCodecDerivationId) Allocator.Error!void {
+        var pending: std.ArrayListUnmanaged(GeneratedCodecDerivationId) = .empty;
+        defer pending.deinit(self.allocator);
+        try pending.append(self.allocator, first);
+        while (pending.pop()) |id| {
+            if ((try self.visited_derivations.getOrPut(self.allocator, id)).found_existing) continue;
+            const contract = self.plans.generated_codec_derivations[@backingInt(id)];
+            for (contract.callsSlice(self.plans)) |call| switch (call.resolution) {
+                .callable => |node_id| {
+                    try visitor.contractCall(id, call.callable_ty, node_id);
+                    try self.nested(visitor, self.plans.evidenceNode(node_id));
+                },
+                .structural => |nested_id| try pending.append(self.allocator, nested_id),
+                .pending, .checked_error => {},
+            };
+        }
     }
 };
 
@@ -2143,6 +2262,13 @@ pub const StaticDispatchPlanTable = struct {
     iterator_topologies: []IteratorRepresentationTopology = &.{},
     /// `CIR.Node.Idx` -> `IteratorForPlanId`, sorted by key.
     iterator_for_by_node: []PlanKV = &.{},
+    /// The node of a lambda at a `Code.Binds` position -> the plan of its
+    /// format's `fmt.default()`, sorted by key (rule "Bound Capture
+    /// Encoding").
+    bound_default_by_node: []PlanKV = &.{},
+    /// The node of a capture read of such a lambda -> the plan of
+    /// `T.encoder_for(fmt.default())` at the read's type, sorted by key.
+    bound_encoder_by_node: []PlanKV = &.{},
     /// Build-time collection of every plan referenced by each template.
     /// CheckedModule construction consumes this to resolve evidence, then outputs the
     /// category-specific pools below for post-check consumers.
@@ -2175,6 +2301,8 @@ pub const StaticDispatchPlanTable = struct {
     generated_codec_derivations: []GeneratedCodecDerivation = &.{},
     /// Shared flat pool backing `GeneratedCodecDerivation.calls`.
     generated_codec_calls: []GeneratedCodecCall = &.{},
+    /// Shared flat pool backing `GeneratedCodecDerivation.renamed_vars`.
+    generated_codec_renamed_vars: []GeneratedCodecRenamedVar = &.{},
 
     pub const Serialized = extern struct {
         plans: SerializedSlice(StaticDispatchCallPlan) = .{},
@@ -2184,6 +2312,8 @@ pub const StaticDispatchPlanTable = struct {
         iterator_for_plans: SerializedSlice(IteratorForPlan) = .{},
         iterator_topologies: SerializedSlice(IteratorRepresentationTopology) = .{},
         iterator_for_by_node: SerializedSlice(PlanKV) = .{},
+        bound_default_by_node: SerializedSlice(PlanKV) = .{},
+        bound_encoder_by_node: SerializedSlice(PlanKV) = .{},
         template_refs: SerializedSlice(StaticDispatchPlanId) = .{},
         direct_template_refs: SerializedSlice(StaticDispatchPlanId) = .{},
         dispatch_relation_refs: SerializedSlice(StaticDispatchPlanId) = .{},
@@ -2196,11 +2326,12 @@ pub const StaticDispatchPlanTable = struct {
         template_root_evidence: SerializedSlice(?artifact_serialize.Span) = .{},
         generated_codec_derivations: SerializedSlice(GeneratedCodecDerivation) = .{},
         generated_codec_calls: SerializedSlice(GeneratedCodecCall) = .{},
+        generated_codec_renamed_vars: SerializedSlice(GeneratedCodecRenamedVar) = .{},
 
         comptime {
-            // 19 side lists → 19 base-pointer fixups on deserialize, never a
+            // 22 side lists → 22 base-pointer fixups on deserialize, never a
             // function of how many plans/operands the table holds.
-            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 19);
+            std.debug.assert(artifact_serialize.relocatablePointerCount(Serialized) == 22);
         }
 
         const Serde = artifact_serialize.SliceStoreSerde(StaticDispatchPlanTable, @This());
@@ -2235,12 +2366,18 @@ pub const StaticDispatchPlanTable = struct {
         defer numeral_by_node.deinit(allocator);
         var quote_by_node: std.ArrayListUnmanaged(PlanKV) = .empty;
         defer quote_by_node.deinit(allocator);
+        var bound_default_by_node: std.ArrayListUnmanaged(PlanKV) = .empty;
+        defer bound_default_by_node.deinit(allocator);
+        var bound_encoder_by_node: std.ArrayListUnmanaged(PlanKV) = .empty;
+        defer bound_encoder_by_node.deinit(allocator);
         var iterator_for_plans = std.ArrayList(IteratorForPlan).empty;
         errdefer iterator_for_plans.deinit(allocator);
         var generated_codec_derivations = std.ArrayList(GeneratedCodecDerivation).empty;
         errdefer generated_codec_derivations.deinit(allocator);
         var generated_codec_calls = std.ArrayList(GeneratedCodecCall).empty;
         errdefer generated_codec_calls.deinit(allocator);
+        var generated_codec_renamed_vars = std.ArrayList(GeneratedCodecRenamedVar).empty;
+        errdefer generated_codec_renamed_vars.deinit(allocator);
         const iterator_owners = comptime std.enums.values(IteratorOwner);
         const iterator_topologies = try allocator.alloc(IteratorRepresentationTopology, iterator_owners.len);
         errdefer allocator.free(iterator_topologies);
@@ -2531,6 +2668,22 @@ pub const StaticDispatchPlanTable = struct {
                 .state_ty = try checkedTypeIdForVar(allocator, module, checked_types, @fromBackingInt(@intCast(derivation.state_var))),
                 .error_ty = try checkedTypeIdForVar(allocator, module, checked_types, @fromBackingInt(@intCast(derivation.error_var))),
                 .calls = .{ .start = calls_start, .len = @intCast(source_calls.len) },
+                .renamed_vars = renamed: {
+                    const renamed_start: u32 = @intCast(generated_codec_renamed_vars.items.len);
+                    const renamings = module_env.generated_codec_renamings.items.items[derivation.renamings_start..][0..derivation.renamings_len];
+                    for (renamings) |renaming| {
+                        const copy = try checkedTypeIdForVar(allocator, module, checked_types, @fromBackingInt(@intCast(renaming.copy_var)));
+                        switch (checked_type_view.payload(copy)) {
+                            .flex, .rigid => {},
+                            .pending, .err, .alias, .record, .tuple, .nominal, .function, .empty_record, .tag_union, .empty_tag_union, .field_kind => continue,
+                        }
+                        try generated_codec_renamed_vars.append(allocator, .{
+                            .copy = copy,
+                            .original = try checkedTypeIdForVar(allocator, module, checked_types, @fromBackingInt(@intCast(renaming.source_var))),
+                        });
+                    }
+                    break :renamed .{ .start = renamed_start, .len = @as(u32, @intCast(generated_codec_renamed_vars.items.len)) - renamed_start };
+                },
             });
         }
         for (module_env.store.literalDispatchPlans()) |numeral_plan| {
@@ -2637,6 +2790,72 @@ pub const StaticDispatchPlanTable = struct {
             try by_node.append(allocator, .{ .key = @intCast(raw), .val = @backingInt(plan_id) });
         }
 
+        // The two requirements of each capture read at a `Code.Binds`
+        // position (rule "Bound Capture Encoding"): one `fmt.default()` plan
+        // per site, keyed by the site, and one `T.encoder_for` plan per
+        // read, keyed by the read, whose operand is the site's default.
+        // Lowering builds both calls in its workspace.
+        {
+            const default_method = try names.internMethodName("default");
+            const encoder_method = try names.internMethodIdent(module.identStoreConst(), module.commonIdents().encoder_for);
+            var planned_site: ?u32 = null;
+            var planned_default: ?ModuleEnv.BoundCaptureEncoding = null;
+            for (module_env.bound_capture_encodings.items.items) |encoding| {
+                const site: CIR.Expr.Idx = @fromBackingInt(@intCast(encoding.site_node));
+                const read: CIR.Expr.Idx = @fromBackingInt(@intCast(encoding.read_expr));
+                if (!bodies.index().reachesExpr(site) or !bodies.index().reachesExpr(read)) continue;
+                const format_var: Var = @fromBackingInt(@intCast(encoding.format_var));
+                const default_fn_var: Var = @fromBackingInt(@intCast(encoding.default_fn_var));
+                const encoder_fn_var: Var = @fromBackingInt(@intCast(encoding.encoder_fn_var));
+                const read_var: Var = @fromBackingInt(@intCast(encoding.read_var));
+                if (planned_site == null or planned_site.? != encoding.site_node) {
+                    // A site records its reads once, together
+                    // (`Check.introduceBoundCaptureEncoding`).
+                    std.debug.assert(for (bound_default_by_node.items) |planned| {
+                        if (planned.key == encoding.site_node) break false;
+                    } else true);
+                    const default_id: StaticDispatchPlanId = @fromBackingInt(@intCast(@as(u32, @intCast(plans.items.len))));
+                    try plans.append(allocator, .{
+                        .node = encoding.site_node,
+                        .method = default_method,
+                        .dispatcher = .type_only,
+                        .dispatcher_ty = try checkedTypeIdForVar(allocator, module, checked_types, format_var),
+                        .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, default_fn_var),
+                        .args = .{ .start = 0, .len = 0 },
+                        .result_mode = .value,
+                    });
+                    try plan_sources.append(allocator, .{
+                        .dispatcher_var = format_var,
+                        .constraint_fn_var = default_fn_var,
+                    });
+                    try bound_default_by_node.append(allocator, .{ .key = encoding.site_node, .val = @backingInt(default_id) });
+                    planned_site = encoding.site_node;
+                    planned_default = encoding;
+                } else {
+                    // Every read of a site shares the site's format and
+                    // its `default` dispatch.
+                    std.debug.assert(planned_default.?.format_var == encoding.format_var);
+                    std.debug.assert(planned_default.?.default_fn_var == encoding.default_fn_var);
+                }
+                const args = [_]StaticDispatchOperand{.{ .bound_capture_default = site }};
+                const encoder_id: StaticDispatchPlanId = @fromBackingInt(@intCast(@as(u32, @intCast(plans.items.len))));
+                try plans.append(allocator, .{
+                    .node = encoding.read_expr,
+                    .method = encoder_method,
+                    .dispatcher = .type_only,
+                    .dispatcher_ty = try checkedTypeIdForVar(allocator, module, checked_types, read_var),
+                    .callable_ty = try checkedTypeIdForVar(allocator, module, checked_types, encoder_fn_var),
+                    .args = try pushOperands(StaticDispatchOperand, &operand_pool, allocator, &args),
+                    .result_mode = try staticDispatchResultModeForCheckedValueCall(allocator, module, checked_types, &constraint_index, module.commonIdents().encoder_for, encoder_fn_var),
+                });
+                try plan_sources.append(allocator, .{
+                    .dispatcher_var = read_var,
+                    .constraint_fn_var = encoder_fn_var,
+                });
+                try bound_encoder_by_node.append(allocator, .{ .key = encoding.read_expr, .val = @backingInt(encoder_id) });
+            }
+        }
+
         for (module_env.for_loop_dispatch_plans.items.items) |for_plan| {
             const for_node_idx: CIR.Node.Idx = @fromBackingInt(@intCast(for_plan.node_idx));
             const pattern_idx: CIR.Pattern.Idx = @fromBackingInt(@intCast(for_plan.pattern_idx));
@@ -2722,6 +2941,10 @@ pub const StaticDispatchPlanTable = struct {
         errdefer allocator.free(quote_sorted);
         const iterator_for_sorted = try sortedPlanKVs(allocator, &iterator_for_by_node);
         errdefer allocator.free(iterator_for_sorted);
+        const bound_default_sorted = try sortedPlanKVs(allocator, &bound_default_by_node);
+        errdefer allocator.free(bound_default_sorted);
+        const bound_encoder_sorted = try sortedPlanKVs(allocator, &bound_encoder_by_node);
+        errdefer allocator.free(bound_encoder_sorted);
 
         build_data.* = .{
             .plan_sources = try plan_sources.toOwnedSlice(allocator),
@@ -2736,10 +2959,13 @@ pub const StaticDispatchPlanTable = struct {
             .iterator_for_plans = try iterator_for_plans.toOwnedSlice(allocator),
             .iterator_topologies = iterator_topologies,
             .iterator_for_by_node = iterator_for_sorted,
+            .bound_default_by_node = bound_default_sorted,
+            .bound_encoder_by_node = bound_encoder_sorted,
             .operand_pool = try operand_pool.toOwnedSlice(allocator),
             .iter_operand_pool = try iter_operand_pool.toOwnedSlice(allocator),
             .generated_codec_derivations = try generated_codec_derivations.toOwnedSlice(allocator),
             .generated_codec_calls = try generated_codec_calls.toOwnedSlice(allocator),
+            .generated_codec_renamed_vars = try generated_codec_renamed_vars.toOwnedSlice(allocator),
         };
     }
 
@@ -2762,6 +2988,20 @@ pub const StaticDispatchPlanTable = struct {
     /// The `from_quote` plan of the string literal at a CIR node.
     pub fn quotePlanForNode(self: *const StaticDispatchPlanTable, node: u32) ?StaticDispatchPlanId {
         return if (lookupPlanKV(self.quote_by_node, node)) |v| @fromBackingInt(@intCast(v)) else null;
+    }
+
+    /// The plan of `fmt.default()` for the lambda at a `Code.Binds`
+    /// position whose node is `site`, or null for a site that reads no
+    /// capture.
+    pub fn boundCaptureDefaultPlan(self: *const StaticDispatchPlanTable, site: CIR.Expr.Idx) ?StaticDispatchPlanId {
+        return if (lookupPlanKV(self.bound_default_by_node, @backingInt(site))) |v| @fromBackingInt(@intCast(v)) else null;
+    }
+
+    /// The plan of `T.encoder_for(fmt.default())` for the capture read
+    /// `read` of a lambda at a `Code.Binds` position, or null for a read
+    /// that needs no encoder.
+    pub fn boundCaptureEncoderPlan(self: *const StaticDispatchPlanTable, read: CIR.Expr.Idx) ?StaticDispatchPlanId {
+        return if (lookupPlanKV(self.bound_encoder_by_node, @backingInt(read))) |v| @fromBackingInt(@intCast(v)) else null;
     }
 
     /// The iterator plan of the `for` loop at a CIR node.
@@ -2798,6 +3038,13 @@ pub const StaticDispatchPlanTable = struct {
             },
         };
         return self.evidence_refs[span.start .. span.start + span.len];
+    }
+
+    /// The substitution this edge recorded for its target's scheme: one
+    /// checked type per quantified variable, in the target scheme's
+    /// `scheme_vars` order. Empty for a monomorphic target.
+    pub fn targetSubstitution(self: *const StaticDispatchPlanTable, node: EvidenceNode) []const CheckedTypeId {
+        return self.site_substitutions[node.subst.start .. node.subst.start + node.subst.len];
     }
 
     pub fn generatedCodecCallEvidence(self: *const StaticDispatchPlanTable, call: GeneratedCodecCall) []const CheckedEvidence {
@@ -2872,6 +3119,8 @@ pub const StaticDispatchPlanTable = struct {
         allocator.free(self.numeral_by_node);
         allocator.free(self.quote_by_node);
         allocator.free(self.iterator_for_by_node);
+        allocator.free(self.bound_default_by_node);
+        allocator.free(self.bound_encoder_by_node);
         allocator.free(self.plans);
         allocator.free(self.iterator_for_plans);
         allocator.free(self.iterator_topologies);
@@ -2884,6 +3133,7 @@ pub const StaticDispatchPlanTable = struct {
         allocator.free(@constCast(self.template_root_evidence));
         allocator.free(self.generated_codec_derivations);
         allocator.free(self.generated_codec_calls);
+        allocator.free(self.generated_codec_renamed_vars);
         self.* = .{};
     }
 };
@@ -3340,7 +3590,8 @@ const LiteralConversionKind = enum { numeral, quote };
 fn literalNodeConverts(bodies: anytype, node: u32, kind: LiteralConversionKind) bool {
     switch (bodies.index().nodeKind(node)) {
         .expr => {
-            const data = bodies.exprData(@fromBackingInt(@intCast(node)));
+            // A literal written as a whole value site is still a literal.
+            const data = bodies.exprDataOpeningValueSite(@fromBackingInt(@intCast(node)));
             return switch (kind) {
                 .numeral => data == .numeral,
                 .quote => data == .str and bodies.quoteIsCustom(node),
@@ -3438,7 +3689,7 @@ test "StaticDispatchPlanTable: relocates with a constant number of fixups, opera
     // The fixup count is fixed by the number of serialized base pointers, never
     // by how much data each pool holds. The two tables below differ in operand
     // count by three orders of magnitude yet relocate identically.
-    comptime std.debug.assert(@typeInfo(StaticDispatchPlanTable.Serialized).@"struct".field_names.len == 19);
+    comptime std.debug.assert(@typeInfo(StaticDispatchPlanTable.Serialized).@"struct".field_names.len == 22);
 
     inline for (.{ @as(u32, 4), @as(u32, 4000) }) |operand_count| {
         const operands = try gpa.alloc(StaticDispatchOperand, operand_count);
@@ -3469,12 +3720,12 @@ test "StaticDispatchPlanTable: relocates with a constant number of fixups, opera
             .nested = .{ .resolved = .{ .start = 0, .len = 1 } },
         }};
         var evidence_refs = [_]CheckedEvidence{
-            .{ .dispatcher_ty = @fromBackingInt(@intCast(14)), .resolution = .{ .structural = .{
+            .{ .dispatcher_ty = @fromBackingInt(@intCast(14)), .description_only_target = false, .resolution = .{ .structural = .{
                 .derivation = .encoder,
                 .dispatcher_ty = @fromBackingInt(@intCast(14)),
                 .callable_ty = @fromBackingInt(@intCast(15)),
             } } },
-            .{ .dispatcher_ty = @fromBackingInt(@intCast(12)), .resolution = .{ .direct = @fromBackingInt(@intCast(fixtureTableIndex(0))) } },
+            .{ .dispatcher_ty = @fromBackingInt(@intCast(12)), .description_only_target = false, .resolution = .{ .direct = @fromBackingInt(@intCast(fixtureTableIndex(0))) } },
         };
         var site_evidence = [_]SiteEvidenceEntry{.{
             .key = 16,

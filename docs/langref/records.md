@@ -226,6 +226,54 @@ themselves flexible at runtime. Every record that actually gets created still ha
 specific set of fields known at compile time, and the compiler makes a separate copy of
 `get_name` for each of those sets of fields.
 
+### What Can Extend a Record
+
+A type alias or a [nominal record](#nominal-records) can take the other fields as a type parameter, by writing its name after the `..`:
+
+```roc
+Labeled(r) := { label : Str, ..r }
+```
+
+Each use of `Labeled` has to give `r` some fields. These are all the types it accepts:
+
+- A record type, as in `Labeled({ id : U64 })`.
+- A type alias of a record type, as in `Labeled(Size)` with `Size : { w : F64, h : F64 }`.
+- A type variable, as in `Labeled(r)` in a function's type annotation.
+- A nominal record declared with `:=`, as in `Labeled(Point)` with `Point := { x : F64, y : F64 }`.
+
+The fields join the record's own fields, and that's also true for the nominal record. A `Labeled(Point)` has `label`, `x` and `y`, and you create it with one record literal:
+
+```roc
+Point := { x : F64, y : F64 }
+
+pin : Labeled(Point)
+pin = Labeled.{ label: "home", x: 1, y: 2 }
+
+answer = pin.x # This is 1.
+```
+
+A function that takes `Labeled(r)` accepts every one of these, because it only uses the fields that `Labeled` gives itself:
+
+```roc
+label_of : Labeled(r) -> Str
+label_of = |item| item.label
+
+tag : Labeled({ id : U64 })
+tag = Labeled.{ label: "tag", id: 7 }
+
+names = [label_of(pin), label_of(tag)] # This is ["home", "tag"].
+```
+
+Anything else gives an error at compile time, because it doesn't have fields:
+
+```roc
+word : Labeled(Str) # ERROR! Str cannot extend a record.
+```
+
+An [opaque](#opaque-nominal-records) record declared with `::` gives an error too, because it hides its fields. That's true even in the module that declares it, so that a type like `Labeled(Account)` means the same thing in every module. The error says to declare the type with `:=`, or to write its fields in the record.
+
+The same goes for a call. If `wrap : r -> { z : I64, ..r }` is called as `wrap("a")`, that's a type mismatch, with a hint that `r` stands for the other fields of a record.
+
 ## Optional Fields
 
 An _optional field_ is a field that might not be there at runtime. You write it with

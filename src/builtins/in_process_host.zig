@@ -53,10 +53,27 @@ pub const roc_checked_error_reached = shim_symbols.roc_checked_error_reached;
 /// Records that code checking rejected was reached before it crashes.
 pub const CheckedErrorRecorder = *const fn () callconv(.c) void;
 
+/// The symbol through which a `Code.refuse_at` records the node it refuses
+/// before it crashes.
+pub const roc_code_refused = shim_symbols.roc_code_refused;
+
+/// The node of a reification site a translator refused (plan I9c): the key
+/// of the site, the index of the row in the site's graph, and the index of
+/// the node in that row.
+pub const CodeRefusal = struct {
+    site: u64,
+    row: u32,
+    node: u32,
+};
+
+/// Records the refused node before the refusal crashes.
+pub const CodeRefusalRecorder = *const fn (u64, u32, u32) callconv(.c) void;
+
 threadlocal var current_ops: ?*RocOps = null;
 threadlocal var current_expect_observer: ?ExpectObserver = null;
 threadlocal var last_expect_err_region: ?ExpectErrRegion = null;
 threadlocal var checked_error_reached: bool = false;
+threadlocal var last_code_refusal: ?CodeRefusal = null;
 
 /// What `enter` displaced; `leave` restores it.
 pub const Saved = struct {
@@ -134,6 +151,24 @@ pub fn takeCheckedErrorReached() bool {
 pub fn checkedErrorRecorder() ?CheckedErrorRecorder {
     if (host_abi.host_role == .platform) return null;
     return &rocCheckedErrorReached;
+}
+
+/// Return and clear the node recorded by the most recent `roc_code_refused`
+/// call on this thread. The compile-time host reads it as the crash that
+/// follows the record reaches it, to report the refusal at the node's
+/// sources.
+pub fn takeCodeRefusal() ?CodeRefusal {
+    if (host_abi.host_role == .platform) return null;
+    const refusal = last_code_refusal;
+    last_code_refusal = null;
+    return refusal;
+}
+
+/// The in-process recorder compiled code calls before a refusal crashes. A
+/// platform never reads it back, so it has no recorder.
+pub fn codeRefusalRecorder() ?CodeRefusalRecorder {
+    if (host_abi.host_role == .platform) return null;
+    return &rocCodeRefused;
 }
 
 fn assertInProcessHost(comptime operation: []const u8) void {
@@ -245,6 +280,10 @@ fn rocCheckedErrorReached() callconv(.c) void {
     checked_error_reached = true;
 }
 
+fn rocCodeRefused(site: u64, row: u32, node: u32) callconv(.c) void {
+    last_code_refusal = .{ .site = site, .row = row, .node = node };
+}
+
 test "in-process host scopes restore ops and expect observers" {
     const TestEnv = @import("utils.zig").TestEnv;
     const Observer = struct {
@@ -276,8 +315,8 @@ test "in-process host scopes restore ops and expect observers" {
 }
 
 /// The runtime symbols an in-process host defines, in `runtime_set` order,
-/// followed by the test host's expect observer, the `?` region recorder, and
-/// the checked-error recorder.
+/// followed by the test host's expect observer, the `?` region recorder, the
+/// checked-error recorder, and the refusal recorder.
 pub const Symbol = enum(u8) {
     roc_alloc,
     roc_dealloc,
@@ -288,6 +327,7 @@ pub const Symbol = enum(u8) {
     roc_expect_observed,
     roc_expect_err_region,
     roc_checked_error_reached,
+    roc_code_refused,
 
     /// The symbol's name.
     pub fn name(self: Symbol) [:0]const u8 {
@@ -301,6 +341,7 @@ pub const Symbol = enum(u8) {
             .roc_expect_observed => roc_expect_observed,
             .roc_expect_err_region => roc_expect_err_region,
             .roc_checked_error_reached => roc_checked_error_reached,
+            .roc_code_refused => roc_code_refused,
         };
     }
 
@@ -316,6 +357,7 @@ pub const Symbol = enum(u8) {
             .roc_expect_observed => @intFromPtr(&rocExpectObserved),
             .roc_expect_err_region => @intFromPtr(&rocExpectErrRegion),
             .roc_checked_error_reached => @intFromPtr(&rocCheckedErrorReached),
+            .roc_code_refused => @intFromPtr(&rocCodeRefused),
         };
     }
 
@@ -346,5 +388,6 @@ comptime {
         @export(&rocExpectObserved, .{ .name = roc_expect_observed, .linkage = .weak });
         @export(&rocExpectErrRegion, .{ .name = roc_expect_err_region, .linkage = .weak });
         @export(&rocCheckedErrorReached, .{ .name = roc_checked_error_reached, .linkage = .weak });
+        @export(&rocCodeRefused, .{ .name = roc_code_refused, .linkage = .weak });
     }
 }

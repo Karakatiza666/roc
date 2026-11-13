@@ -24,31 +24,6 @@ const Region = base.Region;
 const pos = @import("position.zig");
 const module_lookup = @import("module_lookup.zig");
 
-fn statementAnnotation(statement: CIR.Statement) ?CIR.Annotation.Idx {
-    return switch (statement) {
-        inline .s_decl, .s_var, .s_var_uninitialized => |decl| decl.anno,
-        .s_reassign,
-        .s_crash,
-        .s_dbg,
-        .s_expr,
-        .s_expect,
-        .s_for,
-        .s_while,
-        .s_infinite_loop,
-        .s_breakable_loop,
-        .s_break,
-        .s_return,
-        .s_import,
-        .s_alias_decl,
-        .s_nominal_decl,
-        .s_where_alias_decl,
-        .s_type_anno,
-        .s_type_var_alias,
-        .s_runtime_error,
-        => null,
-    };
-}
-
 // Result Types
 
 /// Result of finding a type at an offset.
@@ -291,7 +266,7 @@ const FindTypeContext = struct {
     /// Pre-visit callback for statements (to check annotations).
     fn visitStmtPre(ctx: *FindTypeContext, _: CIR.Statement.Idx, stmt: CIR.Statement) VisitAction {
         // Check if cursor is in a type annotation
-        const anno_idx = statementAnnotation(stmt);
+        const anno_idx = module_lookup.statementAnnotation(stmt);
 
         if (anno_idx) |anno| {
             const annotation = ctx.store.getAnnotation(anno);
@@ -376,6 +351,8 @@ const CollectReferencesContext = struct {
     target_pattern: CIR.Pattern.Idx,
     allocator: std.mem.Allocator,
     results: *std.ArrayList(LspRange),
+    /// When set, a qualified lookup is reported as its member only.
+    member_only: bool = false,
 
     /// Records an OOM that occurred inside a visit callback. The CirVisitor
     /// callback signature returns `VisitAction` (no error channel), so OOM is
@@ -385,7 +362,8 @@ const CollectReferencesContext = struct {
     /// Pre-visit callback for expressions.
     fn visitExprPre(ctx: *CollectReferencesContext, expr_idx: CIR.Expr.Idx, expr: CIR.Expr) VisitAction {
         if (std.meta.activeTag(expr) == .e_lookup_local and @backingInt(expr.e_lookup_local.pattern_idx) == @backingInt(ctx.target_pattern)) {
-            const region = ctx.store.getExprRegion(expr_idx);
+            const whole = ctx.store.getExprRegion(expr_idx);
+            const region = if (ctx.member_only) expr.e_lookup_local.member_region orelse whole else whole;
             if (regionToRange(ctx.module_env, region)) |range| {
                 ctx.results.append(ctx.allocator, range) catch |err| {
                     ctx.oom = err;
@@ -415,7 +393,7 @@ const CollectDeclarationsContext = struct {
         const pattern_idx = module_lookup.getDeclarationPattern(stmt) orelse return .continue_traversal;
         if (@backingInt(pattern_idx) != @backingInt(ctx.target_pattern)) return .continue_traversal;
 
-        const anno_idx = statementAnnotation(stmt) orelse return .continue_traversal;
+        const anno_idx = module_lookup.statementAnnotation(stmt) orelse return .continue_traversal;
         ctx.appendAnnotationName(anno_idx) catch |err| {
             ctx.oom = err;
             return .stop;
@@ -900,6 +878,25 @@ pub fn collectReferences(
     target_pattern: CIR.Pattern.Idx,
     allocator: std.mem.Allocator,
 ) std.mem.Allocator.Error!std.ArrayList(LspRange) {
+    return collectReferenceRegions(module_env, target_pattern, allocator, false);
+}
+
+/// Like `collectReferences`, but a qualified use is reported as its member
+/// only, so a rename keeps the qualifier in front of it.
+pub fn collectMemberReferences(
+    module_env: *ModuleEnv,
+    target_pattern: CIR.Pattern.Idx,
+    allocator: std.mem.Allocator,
+) std.mem.Allocator.Error!std.ArrayList(LspRange) {
+    return collectReferenceRegions(module_env, target_pattern, allocator, true);
+}
+
+fn collectReferenceRegions(
+    module_env: *ModuleEnv,
+    target_pattern: CIR.Pattern.Idx,
+    allocator: std.mem.Allocator,
+    member_only: bool,
+) std.mem.Allocator.Error!std.ArrayList(LspRange) {
     var results: std.ArrayList(LspRange) = .empty;
     errdefer results.deinit(allocator);
 
@@ -917,6 +914,7 @@ pub fn collectReferences(
         .target_pattern = target_pattern,
         .allocator = allocator,
         .results = &results,
+        .member_only = member_only,
     };
 
     var visitor = CirVisitor(CollectReferencesContext).init(&ctx, .{
@@ -952,8 +950,8 @@ pub fn collectReferences(
 /// and delete the type.
 ///
 /// The region is therefore accepted only when the source there spells exactly
-/// the bound name. Callers that rewrite text must treat null as "do not touch
-/// this", not as "nothing to do".
+/// the declared name (`module_lookup.declaredName`). Callers that rewrite text
+/// must treat null as "do not touch this", not as "nothing to do".
 pub fn declarationNameRegion(module_env: *ModuleEnv, target_pattern: CIR.Pattern.Idx) ?LspRange {
     const pattern = module_env.store.getSourcePattern(target_pattern);
     const ident = if (pattern == .assign)
@@ -963,7 +961,7 @@ pub fn declarationNameRegion(module_env: *ModuleEnv, target_pattern: CIR.Pattern
     else
         return null;
 
-    const name = module_env.common.idents.getText(ident);
+    const name = module_lookup.declaredName(module_env, ident);
     const pattern_node_idx: CIR.Node.Idx = @fromBackingInt(@intCast(@backingInt(target_pattern)));
     const region = module_env.store.getRegionAt(pattern_node_idx);
 
@@ -1054,7 +1052,7 @@ const CollectBindingsContext = struct {
     fn visitStmtPre(ctx: *CollectBindingsContext, _: CIR.Statement.Idx, stmt: CIR.Statement) VisitAction {
         const pattern_idx = module_lookup.getDeclarationPattern(stmt) orelse return .continue_traversal;
         ctx.declared.insert(pattern_idx);
-        if (statementAnnotation(stmt) == null) return .continue_traversal;
+        if (module_lookup.statementAnnotation(stmt) == null) return .continue_traversal;
         ctx.annotated.insert(pattern_idx);
         return .continue_traversal;
     }
@@ -1320,17 +1318,23 @@ fn annotationNameContains(store: *const NodeStore, anno_idx: CIR.Annotation.Idx,
     return regionContainsOffset(name_region, offset);
 }
 
+/// A binding and the region of the name that its type annotation writes.
+pub const AnnotationName = struct {
+    pattern: CIR.Pattern.Idx,
+    region: Region,
+};
+
 /// Context for finding the binding whose block-level annotation names an offset.
 const FindAnnotationNameContext = struct {
     store: *const NodeStore,
     target_offset: u32,
-    result: ?CIR.Pattern.Idx = null,
+    result: ?AnnotationName = null,
 
     fn visitStmtPre(ctx: *FindAnnotationNameContext, _: CIR.Statement.Idx, stmt: CIR.Statement) VisitAction {
         const pattern_idx = module_lookup.getDeclarationPattern(stmt) orelse return .continue_traversal;
-        const anno_idx = statementAnnotation(stmt) orelse return .continue_traversal;
+        const anno_idx = module_lookup.statementAnnotation(stmt) orelse return .continue_traversal;
         if (annotationNameContains(ctx.store, anno_idx, ctx.target_offset)) {
-            ctx.result = pattern_idx;
+            ctx.result = .{ .pattern = pattern_idx, .region = ctx.store.getAnnotation(anno_idx).name_region.? };
             return .stop;
         }
         return .continue_traversal;
@@ -1342,12 +1346,14 @@ const FindAnnotationNameContext = struct {
 /// The name on a merged annotation is not a CIR node, only a region recorded on
 /// `Annotation`, so neither the pattern walk nor the lookup walk can reach it.
 /// Without this the token can be rewritten by a rename but cannot start one.
-fn findPatternByAnnotationName(module_env: *ModuleEnv, offset: u32) ?CIR.Pattern.Idx {
+pub fn findAnnotationNameAtOffset(module_env: *ModuleEnv, offset: u32) ?AnnotationName {
     const defs_slice = module_env.store.sliceDefs(module_env.all_defs);
     for (defs_slice) |def_idx| {
         const def = module_env.store.getDef(def_idx);
         const anno_idx = def.annotation orelse continue;
-        if (annotationNameContains(&module_env.store, anno_idx, offset)) return def.pattern;
+        if (annotationNameContains(&module_env.store, anno_idx, offset)) {
+            return .{ .pattern = def.pattern, .region = module_env.store.getAnnotation(anno_idx).name_region.? };
+        }
     }
 
     var ctx = FindAnnotationNameContext{
@@ -1393,7 +1399,7 @@ pub fn findWriteAtOffset(module_env: *const ModuleEnv, offset: u32) ?NodeStore.W
 pub fn resolveSymbolAtOffset(module_env: *ModuleEnv, offset: u32) ?CIR.Pattern.Idx {
     if (findWriteAtOffset(module_env, offset)) |write| return write.pattern_idx;
     if (findPatternAtOffset(module_env, offset)) |pattern_idx| return pattern_idx;
-    if (findPatternByAnnotationName(module_env, offset)) |pattern_idx| return pattern_idx;
+    if (findAnnotationNameAtOffset(module_env, offset)) |name| return name.pattern;
 
     const lookup = findLookupAtOffset(module_env, offset) orelse return null;
     return switch (lookup) {

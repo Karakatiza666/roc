@@ -2934,7 +2934,7 @@ pub fn completionHandlerReturnsModuleDefinitions() integration_spec.SpecError!vo
     defer allocator.free(combined);
 
     const reader_stream: std.Io.Reader = .fixed(combined);
-    var writer_buffer: [16384]u8 = undefined;
+    var writer_buffer: [65536]u8 = undefined;
     const writer_stream: std.Io.Writer = .fixed(&writer_buffer);
 
     const ReaderType = std.Io.Reader;
@@ -3389,7 +3389,7 @@ pub fn completionHandlerReturnsLocalVariablesInBlockScope() integration_spec.Spe
     defer allocator.free(combined);
 
     const reader_stream: std.Io.Reader = .fixed(combined);
-    var writer_buffer: [16384]u8 = undefined;
+    var writer_buffer: [65536]u8 = undefined;
     const writer_stream: std.Io.Writer = .fixed(&writer_buffer);
 
     const ReaderType = std.Io.Reader;
@@ -3530,7 +3530,7 @@ pub fn completionHandlerReturnsTopLevelDefinitions() integration_spec.SpecError!
     // Document with multiple top-level definitions
     // Request completion at beginning of third line (similar to the passing test)
     const open_body = try std.fmt.allocPrint(allocator,
-        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{s}","version":1,"text":"my_constant = 42\nmy_function = |x| x * 2\nmain! = |_| my_constant"}}}}}}
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{s}","version":1,"text":"my_constant = 42\nmy_function = |x| x * 2\nmain! = |_| Ok({{}})"}}}}}}
     , .{file_uri});
     defer allocator.free(open_body);
     const open_msg = try frame(allocator, open_body);

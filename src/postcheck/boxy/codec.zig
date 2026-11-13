@@ -55,10 +55,11 @@ const CallKey = struct { method: NameId, subject: ?TypeId };
 
 /// What a contract call resolved to.
 const Resolved = union(enum) {
-    /// A procedure, through its checked evidence edge. A local procedure
-    /// (a method of a type declared in a function body) is the family's
-    /// local value `local`.
-    callable: struct { node: static_dispatch.EvidenceNodeId, fn_ty: TypeId, checked_fn: checked.CheckedTypeId, local: ?u32 = null },
+    /// A procedure, through its checked evidence edge: the call `node` of
+    /// the contract `derivation`, the root's or a nested one's. A local
+    /// procedure (a method of a type declared in a function body) is the
+    /// family's local value `local`.
+    callable: struct { derivation: DerivationId, node: static_dispatch.EvidenceNodeId, fn_ty: TypeId, checked_fn: checked.CheckedTypeId, local: ?u32 = null },
     /// A nested generated derivation, walked structurally by this family.
     structural: DerivationId,
     /// A call checking rejected.
@@ -388,7 +389,7 @@ fn collectCalls(program: *Program, family_index: u32) Allocator.Error!void {
             const resolved: Resolved = switch (call.resolution) {
                 .pending => invariant("a generated codec contract retained an unlinked call"),
                 .checked_error => .{ .checked_error = try convertIn(program, env, call.callable_ty) },
-                .callable => |node| .{ .callable = .{ .node = node, .fn_ty = try convertIn(program, env, call.callable_ty), .checked_fn = call.callable_ty } },
+                .callable => |node| .{ .callable = .{ .derivation = id, .node = node, .fn_ty = try convertIn(program, env, call.callable_ty), .checked_fn = call.callable_ty } },
                 .structural => |nested| blk: {
                     if ((try visited.getOrPut(allocator, nested)).found_existing == false) try pending.append(allocator, nested);
                     break :blk .{ .structural = nested };
@@ -879,7 +880,7 @@ pub fn restoreRuntime(b: *Builder, source: lower.ConstSource, fn_id: check.Const
     const owner_view = program.moduleByKey(.{ .bytes = owner.artifact.bytes });
     const plan_id = switch (owner_view.bodies().exprData(expr)) {
         .dispatch_call, .type_dispatch_call => owner_view.bodies().dispatchPlan(@backingInt(expr)) orelse invariant("a stored generated codec runtime's dispatch has no plan"),
-        .numeral, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .interpolation, .structural_eq, .structural_hash, .method_eq, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => invariant("a stored generated codec runtime does not name a dispatch"),
+        .numeral, .str_segment, .str, .bytes_literal, .lookup_local, .lookup_external, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .interpolation, .structural_eq, .structural_hash, .method_eq, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .code_site, .break_, .return_, .for_, .hosted_lambda, .run_low_level => invariant("a stored generated codec runtime does not name a dispatch"),
     };
     const plan = owner_view.view.static_dispatch_plans.plans[@backingInt(plan_id)];
     // A dispatch on a constrained variable reaches its derivation through
@@ -954,6 +955,7 @@ pub fn lowerIntrinsic(b: *Builder, intrinsic: checked.IntrinsicId, params: []con
         .field_names_iter => try gen.fieldNamesIter(params[0], null, worker.ret),
         .field_names_for_size => try gen.fieldNamesIter(params[0], params[1], worker.ret),
         .field_name => (try gen.field(params[0], worker.params[0], "name")).value,
+        .code_prim, .code_type_id, .code_ty_of => invariant("Code.prim, Code.type_id and Code.ty_of lower as the constant the description step wrote for each call"),
         // The descriptor-guided walkers (design.md "Dynamic Values In LIR").
         .str_inspect => blk: {
             const text = try b.closedLocal(.str);
@@ -1309,7 +1311,11 @@ const Gen = struct {
                     // A method bound to a computed callable is a call of the
                     // function value its root evaluated.
                     .callable_binding => |binding| {
-                        const value = try b.callableBindingMethodValue(binding, callable.fn_ty);
+                        // The entry wrapper is described at the call's edge
+                        // (design.md "Code Instance Tables").
+                        const edge: checked.LiteralEdge = .{ .derivation_call = .{ .derivation = callable.derivation, .node = callable.node } };
+                        const entry = try program_.callableEvalEntryWorker(b.module, program_.callableEvalBinding(binding));
+                        const value = try b.callableBindingMethodValue(binding, callable.fn_ty, try b.contractCallInstanceWord(edge, entry));
                         const ret_ty = fnRet(program_, callable.fn_ty);
                         return .{ .value = try b.emitErasedCall(value, callable.fn_ty, args, ret_ty), .ty = ret_ty };
                     },
@@ -1326,13 +1332,23 @@ const Gen = struct {
                     .from_callable, .through_alias => invariant("a generated codec call's evidence is not resolved"),
                 };
                 const subst = table.site_substitutions[node.subst.start..][0..node.subst.len];
+                // The call's literal arguments are those of its edge in its
+                // own contract: module-level roots, or unread ones in a
+                // template's own instance. No argument is forwarded, as a
+                // relation that mentions a scheme's variable is validated at
+                // each use of the scheme (design.md "Literal Arguments").
+                // Content-equal contracts call at equal types, so the edge
+                // of the family's first contract serves every contract that
+                // shares the family.
+                const edge: checked.LiteralEdge = .{ .derivation_call = .{ .derivation = callable.derivation, .node = callable.node } };
+                if (b.module != self.fam().module) invariant("a generated codec piece is lowered outside its family's module");
+                // The target is described at the same edge (design.md "Code
+                // Instance Tables").
+                const instances = try b.contractCallInstanceWord(edge, callee);
                 const instance = switch (node.instantiation) {
-                    .alias => blk: {
-                        if (b.module != self.fam().module) invariant("a generated codec piece is lowered outside its family's module");
-                        break :blk try b.aliasTargetInstance(node, callee, .{ .node = callable.node });
-                    },
-                    .derived_from_callable => |callable_ty| try b.callableDerivedInstance(callee, &.{}, try b.convert(callable_ty)),
-                    .callable, .monomorphic => try b.callInstanceAt(callee, subst, nested, callable.fn_ty, .{ .node = callable.node }),
+                    .alias => try b.aliasTargetInstanceWith(node, callee, edge, instances),
+                    .derived_from_callable => |callable_ty| try b.callableDerivedInstance(callee, &.{}, try b.convert(callable_ty), instances),
+                    .callable, .monomorphic => try b.callInstanceAtWith(callee, subst, nested, callable.fn_ty, edge, instances),
                 };
                 defer b.allocator.free(instance.hidden);
                 const ret_ty = fnRet(program_, callable.fn_ty);

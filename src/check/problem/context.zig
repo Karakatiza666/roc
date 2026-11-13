@@ -132,6 +132,9 @@ pub const Context = union(enum) {
     /// relies on a type the definition's published scheme does not have
     /// (design.md "Predeclared Scheme Uses").
     predeclared_use: PredeclaredUseContext,
+    /// A `code_primitives` item, whose type is `List(Code.PrimId)`
+    /// (roc-reify-opaque-proposal.md D3).
+    code_primitives_item,
 
     /// Context for function call
     pub const FnCallArityContext = struct {

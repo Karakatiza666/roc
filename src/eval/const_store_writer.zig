@@ -566,6 +566,7 @@ pub const Writer = struct {
                     .evidence = template.evidence,
                     .evidence_frames = template.evidence_frames,
                     .evidence_frame_head = template.evidence_frame_head.get(),
+                    .instances = template.instances,
                 });
                 if (fn_value.node) |node| {
                     self.store.fill(node, .{ .fn_value = fn_id });

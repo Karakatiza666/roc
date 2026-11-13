@@ -17,6 +17,8 @@ const body_analyses = @import("body_analyses.zig");
 const canonical = @import("canonical_names.zig");
 const checked_artifact = @import("checked_artifact.zig");
 const checked_type_ids = @import("checked_type_ids.zig");
+const code_analyses = @import("code_analyses.zig");
+const code_reifier = @import("code_reifier.zig");
 const static_dispatch = @import("static_dispatch_registry.zig");
 
 const CIR = can.CIR;
@@ -261,6 +263,21 @@ pub const ExprData = union(enum) {
         op: CIR.Expr.LowLevel,
         args: []const ExprId,
     },
+    /// A `Code` site or a `Code` identity call (module-index bit). Its value
+    /// is a compile-time constant in the module's code output, so no reader
+    /// looks at its children. Only the description step reads the lambda of
+    /// a site (`codeSiteLambda`).
+    code_site,
+};
+
+/// The CIR lambda of an inline lambda or template `Code` site.
+pub const CodeSiteLambda = struct {
+    /// The lambda node: the site itself, or the lambda of a site closure.
+    lambda: ExprId,
+    args: []const PatternId,
+    body: ExprId,
+    /// The captures of a site closure, empty for a site lambda.
+    captures: []const CIR.Expr.Capture.Idx,
 };
 
 /// A `for` loop's binding pattern, iterable and body.
@@ -470,6 +487,72 @@ pub const CheckedBodies = struct {
     types: checked_artifact.CheckedTypeStoreView,
     analyses: *body_analyses.BodyAnalyses,
     tables: Tables = .{},
+    /// A value site (R12) this reader reads as the expression written there,
+    /// at the value's type, rather than as its description: the description
+    /// step walks a value site no call binds, and lowering evaluates one a
+    /// call binds where it binds its input slot (`openingValueSite`).
+    open_value_site: ?ExprId = null,
+
+    /// This reader with the value site `id` read as its expression.
+    pub fn openingValueSite(self: CheckedBodies, id: ExprId) CheckedBodies {
+        std.debug.assert(self.isValueSite(id));
+        var opened = self;
+        opened.open_value_site = id;
+        return opened;
+    }
+
+    /// Whether `id` is a value site (R12): a value written at a `Code(a)`
+    /// call argument.
+    pub fn isValueSite(self: CheckedBodies, id: ExprId) bool {
+        if (!self.index().isCodeSite(id)) return false;
+        const site = self.env.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(id)) orelse return false;
+        return site.kind == .value;
+    }
+
+    /// The type of the value a value site holds (its node holds the `Code`).
+    pub fn valueSiteType(self: CheckedBodies, id: ExprId) CheckedTypeId {
+        const site = self.env.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(id)) orelse
+            invariant("a value site type was requested for a node that is no site");
+        std.debug.assert(site.kind == .value);
+        return self.typeOf(@fromBackingInt(site.fn_var));
+    }
+
+    /// Whether `id` is a value site a call binds as an input slot: the
+    /// program evaluates its expression where the call stands.
+    pub fn valueSiteRuns(self: CheckedBodies, id: ExprId) bool {
+        if (!self.index().isCodeSite(id)) return false;
+        const site = self.env.codeReificationSiteForNode(ModuleEnv.nodeIdxFrom(id)) orelse return false;
+        return site.kind == .value and site.bound_call != can.NodeStore.CodeReificationSite.no_bound_call;
+    }
+
+    /// This reader as code that runs reads `id`: with `id` opened when it is
+    /// a value site a call binds (`exprDataRunning`).
+    pub fn running(self: CheckedBodies, id: ExprId) CheckedBodies {
+        if (self.valueSiteRuns(id)) return self.openingValueSite(id);
+        return self;
+    }
+
+    /// `exprData` as code that runs reads it: a value site a call binds reads
+    /// as the expression written there, which the program evaluates. A pass
+    /// over the code a body runs reads it so.
+    pub fn exprDataRunning(self: CheckedBodies, id: ExprId) ExprData {
+        if (self.valueSiteRuns(id)) return self.openingValueSite(id).exprData(id);
+        return self.exprData(id);
+    }
+
+    /// `exprType`, except that a value site has the type of its value, the
+    /// type a read of a name it is has.
+    pub fn exprTypeOpeningValueSite(self: CheckedBodies, id: ExprId) CheckedTypeId {
+        if (self.isValueSite(id)) return self.valueSiteType(id);
+        return self.exprType(id);
+    }
+
+    /// `exprData`, except that a value site reads as the expression written
+    /// there. A pass that asks what an expression's subtree holds reads it so.
+    pub fn exprDataOpeningValueSite(self: CheckedBodies, id: ExprId) ExprData {
+        if (self.isValueSite(id)) return self.openingValueSite(id).exprData(id);
+        return self.exprData(id);
+    }
 
     /// The module index (`body_analyses.ModuleIndex`), which the reader's
     /// consumer demanded (`demandIndex`) before reading the bodies.
@@ -520,6 +603,7 @@ pub const CheckedBodies = struct {
     }
 
     pub fn exprType(self: CheckedBodies, id: ExprId) CheckedTypeId {
+        if (self.open_value_site) |open| if (open == id) return self.valueSiteType(id);
         return self.typeOf(ModuleEnv.varFrom(id));
     }
 
@@ -626,6 +710,23 @@ pub const CheckedBodies = struct {
         return plans.lookupByNode(raw_node);
     }
 
+    /// The evidence node a static dispatch targets directly (a method call,
+    /// `T.method(..)`, or `==` on a written `is_eq`), which keys the Code
+    /// instance table of the call (design.md "Code Instance Tables"). Null
+    /// for any other expression, and for a dispatch with no direct target.
+    pub fn directDispatchNode(self: CheckedBodies, id: ExprId) ?static_dispatch.EvidenceNodeId {
+        const plans = self.tables.plans orelse return null;
+        const plan = plans.plans[@backingInt(plans.lookupByNode(@backingInt(id)) orelse return null)];
+        switch (self.exprData(id)) {
+            .dispatch_call, .method_eq, .type_dispatch_call => {},
+            .lookup_local, .lookup_external, .numeral, .code_site, .str_segment, .str, .bytes_literal, .lookup_required, .list, .empty_list, .tuple, .match_, .if_, .call, .record, .empty_record, .block, .tag, .nominal, .zero_argument_tag, .closure, .lambda, .binop, .unary_minus, .field_access, .interpolation, .structural_eq, .structural_hash, .tuple_access, .runtime_error, .crash, .dbg, .expect_err, .expect, .ellipsis, .anno_only, .break_, .return_, .for_, .hosted_lambda, .run_low_level => return null,
+        }
+        return switch (plan.resolution) {
+            .direct_closed, .direct_parametric => |direct| direct.evidence,
+            .direct_pending, .evidence_dependent, .structural, .checked_error, .@"unreachable" => null,
+        };
+    }
+
     /// A numeric literal's `from_numeral` plan, when its target is not
     /// builtin. Absent before plans exist.
     pub fn numeralPlan(self: CheckedBodies, raw_node: u32) ?StaticDispatchPlanId {
@@ -704,6 +805,10 @@ pub const CheckedBodies = struct {
         // Rejected binding uses and calls of retired callees evaluate as
         // runtime errors (`ResolvedValueRefTable.retired_exprs`).
         if (self.exprIsRetired(id)) return .{ .runtime_error = .{} };
+        // A `Code` site is its description (`NodeStore.code_reification_sites`,
+        // `NodeStore.code_identity_uses`), unless it is the value site this
+        // reader opened.
+        if (self.index().isCodeSite(id) and self.open_value_site != id) return .code_site;
         const node_store = self.store();
         return switch (node_store.getExpr(id)) {
             .e_num, .e_dec, .e_dec_small, .e_num_from_numeral, .e_typed_int, .e_typed_frac, .e_typed_num_from_numeral => .numeral,
@@ -781,6 +886,32 @@ pub const CheckedBodies = struct {
             .e_hosted_lambda => |hosted| .{ .hosted_lambda = .{ .symbol_name = hosted.symbol_name, .args = node_store.slicePatterns(hosted.args) } },
             .e_run_low_level => |run| .{ .run_low_level = .{ .op = run.op, .args = node_store.sliceExpr(run.args) } },
             .e_deferred_import_ref => invariant("a deferred import reference reached a checked body"),
+        };
+    }
+
+    /// The CIR lambda of an inline lambda or template `Code` site, read past
+    /// the `.code_site` shape that `exprData` gives the site. Only the
+    /// description step calls it: every other reader reads the site as its
+    /// description.
+    pub fn codeSiteLambda(self: CheckedBodies, id: ExprId) CodeSiteLambda {
+        if (!self.index().isCodeSite(id)) invariant("a code site lambda was requested for a node that is not a code site");
+        const node_store = self.store();
+        const site_expr = node_store.getExpr(id);
+        if (site_expr == .e_lambda) return .{
+            .lambda = id,
+            .args = node_store.slicePatterns(site_expr.e_lambda.args),
+            .body = site_expr.e_lambda.body,
+            .captures = &.{},
+        };
+        if (site_expr != .e_closure) invariant("a code site lambda was requested for a site that is not a lambda");
+        const closure = site_expr.e_closure;
+        const lambda = node_store.getExpr(closure.lambda_idx);
+        if (lambda != .e_lambda) invariant("a code site closure did not hold a lambda");
+        return .{
+            .lambda = closure.lambda_idx,
+            .args = node_store.slicePatterns(lambda.e_lambda.args),
+            .body = lambda.e_lambda.body,
+            .captures = node_store.sliceCaptures(closure.captures),
         };
     }
 
@@ -921,18 +1052,25 @@ pub const CheckedBodies = struct {
     pub fn literalConversion(self: CheckedBodies, raw_node: u32) LiteralConversion {
         const node: CIR.Node.Idx = @fromBackingInt(@intCast(raw_node));
         const plan = self.env.store.literalDispatchPlanForNode(node) orelse invariant("a literal conversion was requested for a node with no literal dispatch plan");
+        // A literal written as a whole value site converts at the value's
+        // type. Its node holds the `Code`.
+        const ty = switch (self.index().nodeKind(raw_node)) {
+            .expr => self.exprTypeOpeningValueSite(@fromBackingInt(raw_node)),
+            .pattern => self.typeOf(ModuleEnv.varFrom(node)),
+            .statement, .unreached => invariant("a literal conversion was requested for a node that is no expression or pattern"),
+        };
         return switch (plan.dispatchKind()) {
             .numeral => .{
                 .literal = .{ .numeral = self.numeralLiteral(raw_node) },
                 .plan = self.numeralPlan(raw_node),
                 .conversion_root = self.literalConversionRoot(raw_node),
-                .ty = self.typeOf(ModuleEnv.varFrom(node)),
+                .ty = ty,
             },
             .quote => .{
                 .literal = .{ .quote = self.quoteText(raw_node) },
                 .plan = self.quotePlan(raw_node),
                 .conversion_root = self.literalConversionRoot(raw_node),
-                .ty = self.typeOf(ModuleEnv.varFrom(node)),
+                .ty = ty,
             },
         };
     }
@@ -1050,6 +1188,40 @@ pub const CheckedBodies = struct {
     /// expression or a loop statement.
     pub fn loopMutationBinders(self: CheckedBodies, loop: u32) Allocator.Error![]const BinderId {
         return self.analyses.loopMutationBinders(self, loop);
+    }
+
+    /// The module's instance inventories (`code_analyses.CodeInventories`),
+    /// computed on first demand from `inputs`.
+    pub fn codeInventories(self: CheckedBodies, inputs: code_reifier.PlanInputs) Allocator.Error!*const code_analyses.CodeInventories {
+        return self.analyses.code.inventories(inputs);
+    }
+
+    /// The module's instance inventories, which compile-time evaluation
+    /// computed before lowering: the description step of a fresh module, or
+    /// finalization for a module from the cache. Lowering reads them here,
+    /// and has no inputs to compute them with.
+    pub fn computedCodeInventories(self: CheckedBodies) *const code_analyses.CodeInventories {
+        return self.analyses.code.inventories_slot.peek() orelse
+            invariant("lowering read the code inventories of a module before evaluation computed them");
+    }
+
+    /// The instance inventory of a local template, or null for a template
+    /// with none.
+    pub fn codeInventory(self: CheckedBodies, inputs: code_reifier.PlanInputs, template: canonical.CheckedProcedureTemplateId) Allocator.Error!?code_analyses.CodeInventories.Inventory {
+        return (try self.codeInventories(inputs)).inventoryOf(template);
+    }
+
+    /// Whether a `Code` site or identity call is described at each closing
+    /// use of its template, not in its own module.
+    pub fn isInstanceSite(self: CheckedBodies, inputs: code_reifier.PlanInputs, id: ExprId) Allocator.Error!bool {
+        std.debug.assert(self.index().isCodeSite(id));
+        return (try self.codeInventories(inputs)).isInstanceSite(id);
+    }
+
+    /// The module's translators' cuts (`code_analyses.CodeCuts`), computed
+    /// on first demand from `inputs`.
+    pub fn codeCuts(self: CheckedBodies, inputs: code_reifier.CutInputs) Allocator.Error!*const code_analyses.CodeCuts {
+        return self.analyses.code.cuts(inputs);
     }
 
     /// Whether every call of a local template, in every program, is the one

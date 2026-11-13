@@ -1048,6 +1048,7 @@ fn processSnapshotContent(
             var czer = try initSnapshotCan(allocator, can_ir, parse_ast, builtin_env, config);
             defer czer.deinit();
             try czer.canonicalizeFile();
+            can.HostedCompiler.markIntrinsicsByModuleHeader(can_ir);
         },
         .header => {
             // TODO: implement canonicalize_header when available
@@ -2732,6 +2733,7 @@ fn validateMonoOutput(allocator: Allocator, mono_source: []const u8, source_path
         std.log.err("MONO VALIDATION ERROR in {s}: Canonicalization failed: {}", .{ source_path, err });
         return false;
     };
+    can.HostedCompiler.markIntrinsicsByModuleHeader(&validation_env);
 
     // Check for canonicalization diagnostics (skip warnings, only fail on errors)
     const can_diagnostics = validation_env.getDiagnostics() catch |err| {
@@ -4663,6 +4665,7 @@ fn renderSnapshotReplTypeProblems(
         },
         .module => blk: {
             try czer.canonicalizeFile();
+            can.HostedCompiler.markIntrinsicsByModuleHeader(can_ir);
             break :blk null;
         },
     };

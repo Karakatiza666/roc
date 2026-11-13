@@ -1418,6 +1418,9 @@ pub const DocType = union(enum) {
     }
 };
 
+/// The badge that documentation shows on an intrinsic.
+pub const intrinsic_badge = "intrinsic: no Roc body";
+
 /// Documentation for a single exported definition.
 pub const DocEntry = struct {
     name: []const u8,
@@ -1433,6 +1436,9 @@ pub const DocEntry = struct {
     /// 1-based source line where `doc_comment`'s first `##` line begins.
     /// Zero when there is no doc comment or the line is unknown.
     doc_comment_start_line: u32 = 0,
+    /// Whether the entry is an intrinsic: a declaration with a type and no
+    /// Roc body. Canonicalization marks it; documentation only shows the mark.
+    intrinsic: bool = false,
 
     pub fn deinit(self: *DocEntry, gpa: Allocator) void {
         for (self.children) |*child| {
@@ -1491,6 +1497,10 @@ pub const DocEntry = struct {
                     try writer.writeAll(")\n");
                 },
             }
+        }
+        if (self.intrinsic) {
+            try writeIndent(writer, depth + 1);
+            try writer.writeAll("(badge \"" ++ intrinsic_badge ++ "\")\n");
         }
         if (self.doc_comment) |doc| {
             try writeIndent(writer, depth + 1);

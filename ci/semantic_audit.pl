@@ -545,6 +545,23 @@ for my $path (@postcheck_design_docs) {
         my $scannable = $line;
         $scannable =~ s/https?:\/\/\S+//g;
 
+        # Code reification is the feature in design.md "Code Reification"
+        # (describing a function for a translator). It is unrelated to the
+        # banned compile-time value term. Only its exact spellings are exempt:
+        # the phrase "code reification", the src/reify path, the roc-reify-*.md
+        # design files, the docs/langref/reifying.md page, and the design.md
+        # sentence that bans the term for compile-time values. The intrinsics
+        # feature adds two more exact spellings: "reify-only" (the name of its
+        # definitions, its ROC_REIFY_ONLY diagnostic output and its design.md
+        # section) and "reified code" (the user-facing error text).
+        $scannable =~ s/\bcode reification\b/code description/ig;
+        $scannable =~ s{\bsrc/reify\b}{src/describe}g;
+        $scannable =~ s{\broc-reify-[a-z-]+\.md\b}{roc-describe.md}g;
+        $scannable =~ s{\bdocs/langref/reifying\.md\b}{docs/langref/describing.md}g;
+        $scannable =~ s/\breify-only\b/describe-only/ig;
+        $scannable =~ s/\breified code\b/described code/ig;
+        $scannable =~ s/`reification` for compile-time values/`banned` for compile-time values/g;
+
         for my $rule (@postcheck_jargon_forbidden) {
             my ($pattern, $reason) = @$rule;
             if ($scannable =~ /$pattern/) {

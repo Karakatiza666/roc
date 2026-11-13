@@ -17,7 +17,7 @@ main! = |_| {
 }
 ~~~
 # EXPECTED
-DUPLICATE DEFINITION - external_decl_lookup.md:4:1:4:17
+BUILTIN TYPE SHADOWED - external_decl_lookup.md:4:1:4:17
 DOES NOT EXIST - external_decl_lookup.md:8:14:8:23
 DOES NOT EXIST - external_decl_lookup.md:9:5:9:17
 # PROBLEMS
@@ -25,25 +25,16 @@ DOES NOT EXIST - external_decl_lookup.md:9:5:9:17
 (reports
 	(report
 		(severity warning)
-		(title "Duplicate Definition")
+		(title "Builtin Type Shadowed")
 		(region (start 4 1) (end 4 17))
 		(headline
-			(reflow "The name ")
+			(text "The type ")
 			(annotated symbol-unqualified "Json")
-			(reflow " is being redeclared here."))
+			(text " shadows a builtin type."))
 		(document
-			(source-region (file "external_decl_lookup.md") (start 4 1) (end 4 17) (annotation error) (line-text "import json.Json"))
+			(reflow "This may make the builtin type inaccessible in this scope.")
 			(line-break)
-			(reflow "In this scope, ")
-			(annotated symbol-unqualified "Json")
-			(reflow " was already defined in ")
-			(source-location
-				(file "external_decl_lookup.md")
-				(line 1)
-				(column 1))
-			(reflow ".")
-			(line-break)
-			(source-region (file "external_decl_lookup.md") (start 1 1) (end 1 1) (annotation dim) (line-text "app [main!] { pf: platform \"../basic-cli/platform.roc\" }"))))
+			(source-region (file "external_decl_lookup.md") (start 4 1) (end 4 17) (annotation warning) (line-text "import json.Json"))))
 	(report
 		(severity runtime_error)
 		(title "Does Not Exist")
@@ -132,9 +123,9 @@ main! = |_| {
 			(e-block
 				(s-runtime-error (tag "erroneous_value_expr"))
 				(e-runtime-error (tag "erroneous_value_expr")))))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "Json")
 		(exposes)))
 ~~~
 # TYPES

@@ -60,6 +60,7 @@ pub fn constraintLiteralKind(
         .desugared_binop,
         .desugared_unaryop,
         .method_call,
+        .bound_capture,
         => null,
     };
 }
@@ -169,6 +170,7 @@ pub fn isDefaultableArithmeticConstraint(
         .desugared_unaryop => constraint.fn_name.eql(idents.negate),
         .from_literal,
         .method_call,
+        .bound_capture,
         .where_clause,
         => false,
     };
@@ -208,22 +210,26 @@ test "dominant kind precedence is numeral > quote > interpolation" {
     const numeral_constraint = StaticDispatchConstraint{
         .fn_name = Ident.Idx.NONE,
         .fn_var = undefined,
+        .runs = true,
         .origin = .{ .from_literal = .numeral },
         .numeral = .from(numeral_row),
     };
     const quote_constraint = StaticDispatchConstraint{
         .fn_name = Ident.Idx.NONE,
         .fn_var = undefined,
+        .runs = true,
         .origin = .{ .from_literal = .quote },
     };
     const interpolation_constraint = StaticDispatchConstraint{
         .fn_name = Ident.Idx.NONE,
         .fn_var = undefined,
+        .runs = true,
         .origin = .{ .from_literal = .interpolation },
     };
     const method_constraint = StaticDispatchConstraint{
         .fn_name = Ident.Idx.NONE,
         .fn_var = undefined,
+        .runs = true,
         .origin = .method_call,
     };
 
@@ -239,21 +245,25 @@ test "where-clause literal-conversion hooks carry their hook's literal kind" {
     const where_from_numeral = StaticDispatchConstraint{
         .fn_name = test_literal_idents.from_numeral,
         .fn_var = undefined,
+        .runs = true,
         .origin = .{ .where_clause = .{} },
     };
     const where_from_quote = StaticDispatchConstraint{
         .fn_name = test_literal_idents.from_quote,
         .fn_var = undefined,
+        .runs = true,
         .origin = .{ .where_clause = .{} },
     };
     const where_from_interpolation = StaticDispatchConstraint{
         .fn_name = test_literal_idents.from_interpolation,
         .fn_var = undefined,
+        .runs = true,
         .origin = .{ .where_clause = .{ .body_required = true } },
     };
     const where_plus = StaticDispatchConstraint{
         .fn_name = testIdent(4),
         .fn_var = undefined,
+        .runs = true,
         .origin = .{ .where_clause = .{} },
     };
     // A method-call constraint named like a hook is NOT a literal conversion:
@@ -261,6 +271,7 @@ test "where-clause literal-conversion hooks carry their hook's literal kind" {
     const method_call_from_numeral = StaticDispatchConstraint{
         .fn_name = test_literal_idents.from_numeral,
         .fn_var = undefined,
+        .runs = true,
         .origin = .method_call,
     };
 

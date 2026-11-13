@@ -366,8 +366,6 @@ const copied_statement_shapes = [_]CopiedShape{
 };
 
 const copied_expr_shapes = [_]CopiedShape{
-    .{ .cir = "e_lookup_local", .tag = .expr_var, .payload = "expr_var" },
-    .{ .cir = "e_lookup_associated_local", .tag = .expr_associated_lookup_local, .payload = "expr_associated_lookup_local" },
     .{ .cir = "e_lookup_associated", .tag = .expr_associated_lookup, .payload = "expr_associated_lookup" },
     .{ .cir = "e_lookup_associated_resolved", .tag = .expr_associated_lookup_resolved, .payload = "expr_associated_lookup_resolved" },
     .{ .cir = "e_lookup_required", .tag = .expr_required_lookup, .payload = "expr_required_lookup" },
@@ -781,6 +779,8 @@ write_occurrences: collections.SafeList(WriteOccurrence),
 int128_values: collections.SafeList(i128), // Typed storage for large numeric literals
 literal_dispatch_plans: collections.SafeList(LiteralDispatchPlan), // Checked literal dispatch metadata owned by literal nodes
 literal_pattern_contexts: collections.SafeList(LiteralPatternContext),
+code_reification_sites: collections.SafeList(CodeReificationSite), // Function expressions the checker reified into a `Code`
+code_identity_uses: collections.SafeList(CodeIdentityUse), // Calls of `Code.prim`, `Code.type_id` and `Code.ty_of` the checker accepted
 interpolation_data: collections.SafeList(InterpolationData), // Canonical and checked data owned by interpolation expressions
 span2_data: collections.SafeList(Span2), // Typed storage for (start, len) span pairs
 span_with_node_data: collections.SafeList(SpanWithNode), // Typed storage for (start, len, node) triples
@@ -901,6 +901,156 @@ pub const LiteralDispatchPlan = extern struct {
 pub const LiteralPatternContext = extern struct {
     failure_owner: u32,
     equality_fn_var_plus_one: u32 = 0,
+};
+
+/// A function expression the checker decided to reify into a `Code` value.
+///
+/// Unlike a literal conversion, this is not owned by the node's payload: the
+/// expressions that can be staged are ordinary lambdas and lookups, which have
+/// no spare field to hang a plan on.
+pub const CodeReificationSite = extern struct {
+    node_idx: u32,
+    /// The function type the expression was reified at, which is the argument
+    /// of the surrounding `Code(f)`. For a `value` site, the value's type.
+    fn_var: u32,
+    kind: Kind,
+    /// Which view of the normal form the site's declared type asks for.
+    view: View = .graph,
+    /// Where the calls that carry this lambda's run-time reads stopped with
+    /// no call that binds them, or `none`. The checker sets it when the
+    /// holder that stops them finishes checking (`code_roots.zig`).
+    chain_stop: ChainStop = .none,
+    /// What the call `bound_call` reads other than through its sites. The
+    /// checker sets it with `bound_call`.
+    bound_reads: BoundReads = .other,
+    /// Why the call `bound_call` is no compile-time root of its own, where
+    /// hoist selection leaves it none. The description step names it when it
+    /// refuses the call's inputs.
+    bound_root: BoundRoot = .other,
+    /// A `value` site at a `Code.Binds` position that the checker decided
+    /// after its frame finished, because the `a` of its `Code(a)` was still
+    /// a type variable there. Hoist selection was over, so the site stays
+    /// fixed whatever type it gets later (design.md "Value Code Positions").
+    decided_late: bool = false,
+    bound_root_padding: [2]u8 = .{ 0, 0 },
+    /// The expression the calls that carry this lambda ended in when
+    /// `chain_stop` is set: the last call of the chain, or the lambda when
+    /// no call carried it. The report of the refused read names its type.
+    chain_end: u32 = no_chain_end,
+    /// The node of the call that binds what this lambda reads at run time as
+    /// input slots (the call's result is a `Code.Bound`), or `no_bound_call`.
+    /// The checker sets it when the call finishes checking.
+    bound_call: u32 = no_bound_call,
+    /// The call this site is an argument of, a direct call or a method
+    /// call, or `no_translator`. The function that call names is the
+    /// translator: the callee of a direct call, the method a method call
+    /// dispatches to. The nominal type that owns it declares the site's cut
+    /// (`code_primitives`, roc-reify-normal-form.md 3.8).
+    translator: u32 = no_translator,
+
+    /// `bound_call` of a site no call binds inputs for.
+    pub const no_bound_call: u32 = std.math.maxInt(u32);
+
+    /// `chain_end` of a site whose chain no holder stopped.
+    pub const no_chain_end: u32 = std.math.maxInt(u32);
+
+    /// `translator` of a site that is no argument of a call.
+    pub const no_translator: u32 = std.math.maxInt(u32);
+
+    /// What holds a lambda with run-time reads, or the last call that
+    /// carried it, when no call whose result is a `Code.Bound` binds it.
+    /// The report of the refused read says it.
+    pub const ChainStop = enum(u8) {
+        /// No holder stopped the lambda: a call binds it, or it reads no
+        /// run-time value.
+        none,
+        /// An `if` or a `match`.
+        branch,
+        /// The right side of a binding: a name holds the call's result.
+        binding,
+        /// A record, a tuple, a list or a tag.
+        value,
+        /// Any other expression, or nothing: the chain ends with no call
+        /// whose result is a `Code.Bound`.
+        end,
+    };
+
+    /// What a call that binds a lambda's run-time reads reads besides them.
+    pub const BoundReads = enum(u8) {
+        /// A run-time value outside its sites, a local binding, a value of
+        /// the enclosing function, or a `Code.Bound` call no frame can root.
+        other,
+        /// Nothing at run time but through its sites, and no binding of the
+        /// enclosing function. Only its type can tie it to that function,
+        /// so a call in a generic function has one compile-time root per
+        /// closing use (design.md "Bound Instance Roots").
+        sites_only,
+    };
+
+    /// Why a call that binds a lambda's run-time reads is no compile-time
+    /// root of its own, as hoist selection decides it.
+    pub const BoundRoot = enum(u8) {
+        /// The call or a call of its chain reads a value known only at run
+        /// time outside its lambdas.
+        runtime_value,
+        /// The call's type holds a type variable that nothing fixes and no
+        /// scheme around it quantifies.
+        open_type,
+        /// Any other reason, or the call is a root.
+        other,
+    };
+
+    /// The view a site's declared type selects (plan 1.5): `Code(f)` holds
+    /// the `graph` view, `Code.Inlined(f)` the `inline` view,
+    /// `Code.Outlined(f)` the `outline` view, and `Code.Lawful(f)` the
+    /// `graph` view under layer L (normal-form 3.16).
+    pub const View = enum(u8) { graph, inline_, outline, lawful };
+
+    /// What the site's node is, which decides where the description comes from.
+    ///
+    /// No kind's node is compiled as the expression it is written as: the
+    /// value at a `Code(f)` position is a description, and each kind says
+    /// which walk writes it there.
+    pub const Kind = enum(u8) {
+        /// A name in a `Code(f)` position. The function it names is described.
+        named_function,
+        /// A lambda written at a `Code(f)` position. The lambda itself is
+        /// described, so nothing has to name it.
+        inline_lambda,
+        /// The lambda a template returns. Nothing describes it: it stands for
+        /// every call of the template, and each call describes its own.
+        template,
+        /// A call to a template. The template is described with this call's
+        /// compile-time arguments folded into it.
+        template_call,
+        /// The name a template call calls. The call replaced it, so nothing
+        /// reads it.
+        template_callee,
+        /// A value written at a `Code(a)` call argument whose `a` is no
+        /// function (R12). The program computes it: its description is a
+        /// literal when it is fixed while the compiler runs, else one input
+        /// slot that holds the whole value. `fn_var` is the value's type.
+        value,
+    };
+};
+
+/// A call of `Code.prim`, `Code.type_id` or `Code.ty_of` the checker
+/// accepted. Publication writes the constant the call computes in place of
+/// the call (design.md "Code Reification"), and `moduleCuts` reads the reference a
+/// `Code.prim` call names, never an evaluated value.
+pub const CodeIdentityUse = extern struct {
+    /// The call.
+    call: u32,
+    /// Its argument: the reference to the definition `Code.prim` names, which
+    /// checking did not instantiate, or the proxy `Code.type_id` or
+    /// `Code.ty_of` reads the type of.
+    arg: u32,
+    kind: Kind,
+    /// Written so the record's tail bytes are the same on every build: this
+    /// list is serialized into the module cache.
+    kind_padding: [3]u8 = .{ 0, 0, 0 },
+
+    pub const Kind = enum(u8) { prim, type_id, ty_of };
 };
 
 comptime {
@@ -1429,6 +1579,166 @@ fn setLiteralDispatchPlanPlusOne(store: *NodeStore, node_idx: Node.Idx, plan_plu
         },
     }
     store.nodes.set(node_idx, node);
+}
+
+/// Record that this expression is reified into a `Code` at `fn_var`.
+///
+/// The list is kept sorted by node index, so a lookup is a binary search and
+/// every consumer meets sites in one deterministic order whatever order the
+/// checker recorded them in.
+pub fn recordCodeReificationSite(
+    store: *NodeStore,
+    node_idx: Node.Idx,
+    fn_var: types.Var,
+    kind: CodeReificationSite.Kind,
+    view: CodeReificationSite.View,
+    translator: ?Node.Idx,
+) Allocator.Error!void {
+    const raw = @backingInt(node_idx);
+    const translator_raw = if (translator) |call| @backingInt(call) else CodeReificationSite.no_translator;
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    if (at < items.len and items[at].node_idx == raw) {
+        items[at].fn_var = @backingInt(fn_var);
+        items[at].kind = kind;
+        items[at].view = view;
+        items[at].bound_call = CodeReificationSite.no_bound_call;
+        items[at].bound_reads = .other;
+        items[at].bound_root = .other;
+        items[at].chain_stop = .none;
+        items[at].chain_end = CodeReificationSite.no_chain_end;
+        items[at].decided_late = false;
+        items[at].translator = translator_raw;
+        return;
+    }
+    const site: CodeReificationSite = .{
+        .node_idx = raw,
+        .fn_var = @backingInt(fn_var),
+        .kind = kind,
+        .view = view,
+        .translator = translator_raw,
+    };
+    const list = &store.code_reification_sites.items;
+    try list.insert(store.gpa, at, site);
+}
+
+/// Record that the call at `call_idx` binds what the lambda site at
+/// `node_idx` reads at run time as input slots.
+pub fn markCodeSiteBound(store: *NodeStore, node_idx: Node.Idx, call_idx: Node.Idx, reads: CodeReificationSite.BoundReads, root: CodeReificationSite.BoundRoot) void {
+    const raw = @backingInt(node_idx);
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    // The checker records a site when it opens the site's frame, before the
+    // call that holds it finishes.
+    std.debug.assert(at < items.len and items[at].node_idx == raw);
+    items[at].bound_call = @backingInt(call_idx);
+    items[at].bound_reads = reads;
+    items[at].bound_root = root;
+}
+
+/// Record that the value site at `node_idx` was decided after its frame
+/// finished (`CodeReificationSite.decided_late`).
+pub fn markCodeSiteDecidedLate(store: *NodeStore, node_idx: Node.Idx) void {
+    const raw = @backingInt(node_idx);
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    std.debug.assert(at < items.len and items[at].node_idx == raw);
+    std.debug.assert(items[at].kind == .value);
+    items[at].decided_late = true;
+}
+
+/// Record, on each site the call at `call_idx` binds, why the call is no
+/// compile-time root of its own.
+pub fn markBoundCallRoot(store: *NodeStore, call_idx: Node.Idx, root: CodeReificationSite.BoundRoot) void {
+    const raw = @backingInt(call_idx);
+    for (store.code_reification_sites.items.items) |*site| {
+        if (site.bound_call == raw) site.bound_root = root;
+    }
+}
+
+/// Record what stopped the calls that carry the lambda site at `node_idx`
+/// before a call that binds its run-time reads, and the expression `end` the
+/// chain ended in.
+pub fn markCodeSiteStopped(store: *NodeStore, node_idx: Node.Idx, stop: CodeReificationSite.ChainStop, end: Node.Idx) void {
+    const raw = @backingInt(node_idx);
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    std.debug.assert(at < items.len and items[at].node_idx == raw);
+    std.debug.assert(items[at].bound_call == CodeReificationSite.no_bound_call);
+    items[at].chain_stop = stop;
+    items[at].chain_end = @backingInt(end);
+}
+
+/// Whether the call at `call_idx` binds the run-time reads of a lambda site
+/// as input slots.
+pub fn codeSiteBindsCall(store: *const NodeStore, call_idx: Node.Idx) bool {
+    const raw = @backingInt(call_idx);
+    for (store.code_reification_sites.items.items) |site| {
+        if (site.bound_call == raw) return true;
+    }
+    return false;
+}
+
+/// Index of the first site whose node index is not below `raw`.
+fn codeReificationSiteLowerBound(items: []const CodeReificationSite, raw: u32) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (items[mid].node_idx < raw) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// Every expression this module reifies into a `Code`, in node order.
+pub fn codeReificationSites(store: *const NodeStore) []const CodeReificationSite {
+    return store.code_reification_sites.items.items;
+}
+
+/// The reification recorded for this expression, if it has one.
+pub fn codeReificationSiteForNode(store: *const NodeStore, node_idx: Node.Idx) ?CodeReificationSite {
+    const raw = @backingInt(node_idx);
+    const items = store.code_reification_sites.items.items;
+    const at = codeReificationSiteLowerBound(items, raw);
+    if (at < items.len and items[at].node_idx == raw) return items[at];
+    return null;
+}
+
+/// Record a call of `Code.prim`, `Code.type_id` or `Code.ty_of`. The checker records each
+/// call once, as it finishes checking it.
+pub fn recordCodeIdentityUse(store: *NodeStore, call: Node.Idx, arg: Node.Idx, kind: CodeIdentityUse.Kind) Allocator.Error!void {
+    for (store.code_identity_uses.items.items) |use| {
+        if (use.call == @backingInt(call)) return;
+    }
+    _ = try store.code_identity_uses.append(store.gpa, .{
+        .call = @backingInt(call),
+        .arg = @backingInt(arg),
+        .kind = kind,
+    });
+}
+
+/// Every call of `Code.prim` and `Code.type_id` the checker accepted, in the
+/// order it finished them.
+pub fn codeIdentityUses(store: *const NodeStore) []const CodeIdentityUse {
+    return store.code_identity_uses.items.items;
+}
+
+/// Whether the checker accepted the call at `call` as a call of `Code.prim`
+/// or `Code.type_id`.
+pub fn isCodeIdentityCall(store: *const NodeStore, call: Node.Idx) bool {
+    for (store.code_identity_uses.items.items) |use| {
+        if (use.call == @backingInt(call)) return true;
+    }
+    return false;
+}
+
+/// Whether `arg` is the argument of a call the checker accepted as a call of
+/// `Code.prim`.
+pub fn isCodePrimArgument(store: *const NodeStore, arg: Node.Idx) bool {
+    for (store.code_identity_uses.items.items) |use| {
+        if (use.kind == .prim and use.arg == @backingInt(arg)) return true;
+    }
+    return false;
 }
 
 /// Attach or update the checked dispatch evidence owned by a literal node.
@@ -2122,9 +2432,23 @@ fn exprFromNode(store: *const NodeStore, node_idx: Node.Idx, node: Node) CIR.Exp
                 .constraint_fn_var = @fromBackingInt(@intCast(p.constraint_fn_var)),
             } };
         },
-        inline .expr_var,
-        .expr_associated_lookup_local,
-        .expr_associated_lookup,
+        .expr_var => {
+            const p = payload.expr_var;
+            return CIR.Expr{ .e_lookup_local = .{
+                .pattern_idx = @fromBackingInt(@intCast(p.pattern_idx)),
+                .member_region = store.loadOptionalRegion(p.member_region_plus_one),
+            } };
+        },
+        .expr_associated_lookup_local => {
+            const p = payload.expr_associated_lookup_local;
+            return CIR.Expr{ .e_lookup_associated_local = .{
+                .type_node_idx = p.type_node_idx,
+                .type_ident = @bitCast(p.type_ident),
+                .item_ident = @bitCast(p.item_ident),
+                .member_region = store.loadOptionalRegion(p.member_region_plus_one),
+            } };
+        },
+        inline .expr_associated_lookup,
         .expr_associated_lookup_resolved,
         .expr_required_lookup,
         .expr_list,
@@ -2167,9 +2491,12 @@ pub fn replaceExprWithLocalLookup(
     pattern_idx: CIR.Pattern.Idx,
 ) void {
     const node_idx: Node.Idx = @fromBackingInt(@intCast(@backingInt(expr_idx)));
+    const replaced = store.nodes.get(node_idx);
+    std.debug.assert(replaced.tag == .expr_associated_lookup_local);
     var node = Node.init(.expr_var);
     node.setPayload(.{ .expr_var = .{
         .pattern_idx = @backingInt(pattern_idx),
+        .member_region_plus_one = replaced.getPayload().expr_associated_lookup_local.member_region_plus_one,
     } });
     store.nodes.set(node_idx, node);
 }
@@ -2823,6 +3150,7 @@ pub fn getWhereClause(store: *const NodeStore, whereClause: CIR.WhereClause.Idx)
             return CIR.WhereClause{ .w_method = .{
                 .var_ = @fromBackingInt(@intCast(p.var_idx)),
                 .method_name = @bitCast(p.name),
+                .method_name_region = store.loadRegion(p.name_region_span2_idx),
                 .anno = @fromBackingInt(@intCast(p.anno)),
             } };
         },
@@ -3112,6 +3440,7 @@ pub fn getAnnoRecordField(store: *const NodeStore, annoRecordField: CIR.TypeAnno
         const p = node.getPayload().ty_record_field;
         return .{
             .name = @bitCast(p.name),
+            .label_region = store.loadRegion(p.label_region_span2_idx),
             .ty = @fromBackingInt(@intCast(p.ty)),
             .is_optional = p.is_optional,
             .is_unnamed = p.is_unnamed,
@@ -3121,6 +3450,7 @@ pub fn getAnnoRecordField(store: *const NodeStore, annoRecordField: CIR.TypeAnno
     const p = node.getPayload().ty_record_field_defaulted;
     return .{
         .name = @bitCast(p.name),
+        .label_region = store.loadRegion(p.label_region_span2_idx),
         .ty = @fromBackingInt(@intCast(p.ty)),
         .is_optional = false,
         .is_unnamed = false,
@@ -3354,6 +3684,22 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
                 .module_idx = @backingInt(e.module_idx),
                 .target_node_idx = e.target_node_idx,
                 .ident_idx = @bitCast(e.ident_idx),
+            } });
+        },
+        .e_lookup_local => |e| {
+            node.tag = .expr_var;
+            node.setPayload(.{ .expr_var = .{
+                .pattern_idx = @backingInt(e.pattern_idx),
+                .member_region_plus_one = try store.storeOptionalRegion(e.member_region),
+            } });
+        },
+        .e_lookup_associated_local => |e| {
+            node.tag = .expr_associated_lookup_local;
+            node.setPayload(.{ .expr_associated_lookup_local = .{
+                .type_node_idx = e.type_node_idx,
+                .type_ident = @bitCast(e.type_ident),
+                .item_ident = @bitCast(e.item_ident),
+                .member_region_plus_one = try store.storeOptionalRegion(e.member_region),
             } });
         },
         .e_deferred_import_ref => |e| {
@@ -3650,8 +3996,6 @@ pub fn addExpr(store: *NodeStore, expr: CIR.Expr, region: base.Region) Allocator
         inline .e_frac_f32,
         .e_num_from_numeral,
         .e_typed_num_from_numeral,
-        .e_lookup_local,
-        .e_lookup_associated_local,
         .e_lookup_associated,
         .e_lookup_associated_resolved,
         .e_lookup_required,
@@ -3819,6 +4163,7 @@ pub fn addWhereClause(store: *NodeStore, whereClause: CIR.WhereClause, region: b
                 .var_idx = @backingInt(where_method.var_),
                 .name = @bitCast(where_method.method_name),
                 .anno = @backingInt(where_method.anno),
+                .name_region_span2_idx = try store.storeRegion(where_method.method_name_region),
             } });
         },
         .w_alias => |where_alias| {
@@ -4116,6 +4461,7 @@ pub fn addAnnoRecordField(store: *NodeStore, annoRecordField: CIR.TypeAnno.Recor
             .name = @bitCast(annoRecordField.name),
             .ty = @backingInt(annoRecordField.ty),
             .default_value = @backingInt(default_idx),
+            .label_region_span2_idx = try store.storeRegion(annoRecordField.label_region),
         } });
         break :blk defaulted_node;
     } else blk: {
@@ -4123,6 +4469,7 @@ pub fn addAnnoRecordField(store: *NodeStore, annoRecordField: CIR.TypeAnno.Recor
         plain_node.setPayload(.{ .ty_record_field = .{
             .name = @bitCast(annoRecordField.name),
             .ty = @backingInt(annoRecordField.ty),
+            .label_region_span2_idx = try store.storeRegion(annoRecordField.label_region),
             .is_optional = annoRecordField.is_optional,
             .is_unnamed = annoRecordField.is_unnamed,
         } });
@@ -4132,6 +4479,34 @@ pub fn addAnnoRecordField(store: *NodeStore, annoRecordField: CIR.TypeAnno.Recor
     const nid = try store.nodes.append(store.gpa, node);
     _ = try store.regions.append(store.gpa, region);
     return @fromBackingInt(@intCast(@backingInt(nid)));
+}
+
+/// Stores a source region in `span2_data` and returns its index.
+fn storeRegion(store: *NodeStore, region: base.Region) Allocator.Error!u32 {
+    const idx: u32 = @intCast(store.span2_data.len());
+    _ = try store.span2_data.append(store.gpa, .{
+        .start = region.start.offset,
+        .len = region.end.offset - region.start.offset,
+    });
+    return idx;
+}
+
+/// The region stored at `idx` by `storeRegion`.
+fn loadRegion(store: *const NodeStore, idx: u32) base.Region {
+    const span = store.span2_data.items.items[idx];
+    return base.Region.from_raw_offsets(span.start, span.start + span.len);
+}
+
+/// Stores an optional region as its `storeRegion` index plus one, or 0 for none.
+fn storeOptionalRegion(store: *NodeStore, region: ?base.Region) Allocator.Error!u32 {
+    const present = region orelse return 0;
+    return try store.storeRegion(present) + 1;
+}
+
+/// The region stored by `storeOptionalRegion`.
+fn loadOptionalRegion(store: *const NodeStore, plus_one: u32) ?base.Region {
+    if (plus_one == 0) return null;
+    return store.loadRegion(plus_one - 1);
 }
 
 /// Drop the `??` default from a defaulted annotation record field, degrading
@@ -4148,6 +4523,7 @@ pub fn dropAnnoRecordFieldDefault(store: *NodeStore, field_idx: CIR.TypeAnno.Rec
     node.setPayload(.{ .ty_record_field = .{
         .name = payload.name,
         .ty = payload.ty,
+        .label_region_span2_idx = payload.label_region_span2_idx,
         .is_optional = false,
         .is_unnamed = false,
     } });
@@ -5614,6 +5990,8 @@ pub const Serialized = extern struct {
     int128_values: collections.SafeList(i128).Serialized, // Must be first data field for 16-byte alignment
     literal_dispatch_plans: collections.SafeList(LiteralDispatchPlan).Serialized,
     literal_pattern_contexts: collections.SafeList(LiteralPatternContext).Serialized,
+    code_reification_sites: collections.SafeList(CodeReificationSite).Serialized,
+    code_identity_uses: collections.SafeList(CodeIdentityUse).Serialized,
     interpolation_data: collections.SafeList(InterpolationData).Serialized,
     nodes: Node.List.Serialized,
     replaced_source_nodes: Node.List.Serialized,
@@ -5916,6 +6294,43 @@ test "literal dispatch plans are retired with their owning nodes" {
 
     try store.replaceExprWithRuntimeError(numeral_expr, runtime_error_diagnostic);
     try testing.expectEqual(@as(usize, 0), store.literalDispatchPlans().len);
+}
+
+test "code reification sites are found by node and kept in node order" {
+    const testing = std.testing;
+    var store = try NodeStore.init(testing.allocator);
+    defer store.deinit();
+
+    const node = struct {
+        fn at(raw: u32) Node.Idx {
+            return @fromBackingInt(raw);
+        }
+    }.at;
+    const var_ = struct {
+        fn at(raw: u32) types.Var {
+            return @fromBackingInt(raw);
+        }
+    }.at;
+
+    try testing.expect(store.codeReificationSiteForNode(node(7)) == null);
+    try store.recordCodeReificationSite(node(9), var_(1), .named_function, .graph, node(8));
+    try store.recordCodeReificationSite(node(3), var_(2), .inline_lambda, .graph, null);
+    try store.recordCodeReificationSite(node(6), var_(3), .template, .inline_, null);
+    try store.recordCodeReificationSite(node(3), var_(4), .template_call, .inline_, null);
+
+    const sites = store.codeReificationSites();
+    try testing.expectEqual(@as(usize, 3), sites.len);
+    try testing.expectEqualSlices(u32, &.{ 3, 6, 9 }, &.{ sites[0].node_idx, sites[1].node_idx, sites[2].node_idx });
+
+    const updated = store.codeReificationSiteForNode(node(3)).?;
+    try testing.expectEqual(@as(u32, 4), updated.fn_var);
+    try testing.expectEqual(CodeReificationSite.Kind.template_call, updated.kind);
+    try testing.expectEqual(CodeReificationSite.View.inline_, updated.view);
+    try testing.expectEqual(@as(u32, 1), store.codeReificationSiteForNode(node(9)).?.fn_var);
+    try testing.expectEqual(@as(u32, 8), store.codeReificationSiteForNode(node(9)).?.translator);
+    try testing.expectEqual(CodeReificationSite.no_translator, updated.translator);
+    try testing.expect(store.codeReificationSiteForNode(node(4)) == null);
+    try testing.expect(store.codeReificationSiteForNode(node(10)) == null);
 }
 
 test "NodeStore multiple nodes CompactWriter roundtrip" {

@@ -14,7 +14,6 @@ Foo := [Whatever].{
 ~~~
 # EXPECTED
 NAME NOT IN SCOPE - canon_revamp_forward_ref_to_anno_only.md:3:14:3:20
-DECLARATION HAS NO VALUE - canon_revamp_forward_ref_to_anno_only.md:5:5:5:17
 # PROBLEMS
 ~~~clojure
 (reports
@@ -30,18 +29,7 @@ DECLARATION HAS NO VALUE - canon_revamp_forward_ref_to_anno_only.md:5:5:5:17
 			(reflow "Is it misspelled, or is there an import missing?")
 			(line-break)
 			(line-break)
-			(source-region (file "canon_revamp_forward_ref_to_anno_only.md") (start 3 14) (end 3 20) (annotation error) (line-text "    callMe = absent"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 5 5) (end 5 17))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "canon_revamp_forward_ref_to_anno_only.md") (start 5 5) (end 5 17) (annotation error) (line-text "    absent : Foo"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "canon_revamp_forward_ref_to_anno_only.md") (start 3 14) (end 3 20) (annotation error) (line-text "    callMe = absent")))))
 ~~~
 # TOKENS
 ~~~zig
@@ -91,7 +79,7 @@ Foo := [Whatever].{
 			(ty-lookup (name "Foo") (local))))
 	(d-let
 		(p-assign (ident "Foo.absent"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-lookup (name "Foo") (local))))
 	(s-nominal-decl

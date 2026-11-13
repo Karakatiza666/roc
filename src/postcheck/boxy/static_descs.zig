@@ -694,7 +694,13 @@ pub const StaticDescs = struct {
                     .desc, .scoped_desc, .table, .node, .zero, .int => types.invariant("an override scope's method is not a callable"),
                 } else null
             else if (overrides[index]) |override| switch (override) {
-                .procedure => |procedure| try self.staticCallable(owner, @intCast(4 + index), procedure),
+                .procedure => |procedure| blk: {
+                    // `Program.composedInBody` gives a type whose slot takes
+                    // a Code instance table a body's recipe, whose scope
+                    // supplies the slot (Q17).
+                    if (self.program().overrideTakesTable(procedure)) types.invariant("a static descriptor's slot takes a Code instance table outside the override scope that supplies it");
+                    break :blk try self.staticCallable(owner, @intCast(4 + index), procedure);
+                },
                 .local => types.invariant("a static descriptor's type holds a local-procedure override outside the override scope that supplies it"),
             } else null;
             if (callable) |node| try pointers.append(self.allocator, .{ .offset = methods_layout.of(field), .target = node, .addend = static_callable_header });
@@ -806,6 +812,9 @@ pub const StaticDescs = struct {
         for (tree, 0..) |node, position| {
             switch (node.kind) {
                 .target => |target| {
+                    // A dispatcher whose method takes a Code instance table
+                    // makes the type a body's recipe (Q17).
+                    if (program_.workerTakesTable(target.target)) types.invariant("a static descriptor's dictionary takes a Code instance table, which only a body's recipe supplies");
                     entries[position] = if (position == 0 and root_entry != null) root_entry.? else try program_.methodEntryWorker(target.target);
                     const entry = program_.worker(entries[position]).*;
                     modules[position] = entry.module;
@@ -837,6 +846,7 @@ pub const StaticDescs = struct {
                     .derived => types.invariant("a closed requirement tree names a derived codec or map, which checking records with its plan at the dispatch it serves"),
                     .scope_variable => types.invariant("a closed requirement tree names a scope variable"),
                     .callable_eval => |entry| {
+                        if (program_.workerTakesTable(entry)) types.invariant("a static descriptor's dictionary takes a Code instance table, which only a body composes");
                         self.extra_nodes += 1;
                         nodes[position] = try self.staticCallableOf(owner, 16 + self.extra_nodes, program_.worker(entry).proc, &.{});
                     },

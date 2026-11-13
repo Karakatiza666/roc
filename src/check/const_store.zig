@@ -412,6 +412,10 @@ pub const ConstFnTargetEvidence = struct {
     instantiation: ?ConstFnCallableInstantiation,
     nested: ConstFnNestedEvidence,
     callable_contracts: u32 = 0,
+    /// The Code instance table of the evidence edge that selected the
+    /// target, where the target has an inventory (design.md "Code Instance
+    /// Tables").
+    instances: ?ConstFnInstances = null,
 };
 
 /// Dispatch evidence selected for a stored compile-time function value. The
@@ -563,6 +567,13 @@ pub const ConstFnEvidenceFrame = struct {
 comptime {
     std.debug.assert(@sizeOf(ConstFnEvidenceFrame) == 20);
 }
+/// The Code instance table a stored function describes its instance sites
+/// from (D1 of roc-reify-structural-proposal.md): a `tables` index in the
+/// `CodeInstanceTable` of `module`.
+pub const ConstFnInstances = struct {
+    module: names.CheckedModuleDigest,
+    table: u32,
+};
 
 /// Function value stored by compile-time evaluation.
 pub const ConstFn = struct {
@@ -578,6 +589,7 @@ pub const ConstFn = struct {
     evidence: ConstFnEvidenceVector = .{},
     evidence_frames: []const ConstFnEvidenceFrame = &.{},
     evidence_frame_head: ?u32 = null,
+    instances: ?ConstFnInstances = null,
 };
 
 /// Named type owner for a stored nominal constant.
@@ -722,6 +734,7 @@ const StoredFn = struct {
     evidence_structurals: ConstRange = .{},
     evidence_frames: ConstRange = .{},
     evidence_frame_head: collections.OptionalU32 = .none,
+    instances: ?ConstFnInstances = null,
 };
 
 comptime {
@@ -1343,6 +1356,7 @@ pub const ConstStore = struct {
             .evidence_structurals = evidence_structurals,
             .evidence_frames = evidence_frames,
             .evidence_frame_head = .of(fn_value.evidence_frame_head),
+            .instances = fn_value.instances,
         });
         return id;
     }
@@ -1568,6 +1582,7 @@ pub const ConstStore = struct {
             },
             .evidence_frames = self.evidence_frame_pool.items[stored.evidence_frames.start .. stored.evidence_frames.start + stored.evidence_frames.len],
             .evidence_frame_head = stored.evidence_frame_head.get(),
+            .instances = stored.instances,
         };
     }
 

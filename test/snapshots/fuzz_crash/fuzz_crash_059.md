@@ -267,7 +267,7 @@ import B as G
 # CANONICALIZE
 ~~~clojure
 (can-ir
-	(s-import (mod "B")
+	(s-import (mod "B") (alias "G")
 		(exposes)))
 ~~~
 # TYPES

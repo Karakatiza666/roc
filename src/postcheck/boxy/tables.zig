@@ -84,6 +84,12 @@ pub const Recipe = union(enum) {
     /// (`StaticDescs.namesWord`): a node, or the null word for a type with
     /// no label in its reach.
     names_block: struct { desc: Operand },
+    /// Entry `index` of the Code instance table `table` (design.md "Code
+    /// Instance Tables"), read from the description step's output at the
+    /// instantiation (`Program.instanceEntryWord`): a node entry's
+    /// description thunk, a forward entry's nested table, or the refused
+    /// crash word. Every entry of a refused table is the refused crash word.
+    instance_entry: struct { table: Operand, index: u32 },
 };
 
 /// What a recipe reads: another recipe of the same worker, or a static word.
@@ -180,7 +186,7 @@ pub const Recipes = struct {
         std.debug.assert(self.items.items[@backingInt(id)] == .reserved);
         switch (recipe) {
             .callable, .table, .desc => {},
-            .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block => invariant("a reserved recipe is not a callable, a table, or a descriptor"),
+            .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block, .instance_entry => invariant("a reserved recipe is not a callable, a table, or a descriptor"),
         }
         if (self.interned.get(recipe)) |existing| {
             self.items.items[@backingInt(id)] = .{ .same = existing };
@@ -291,6 +297,7 @@ pub const Recipes = struct {
             .update_plan => |update| .{ .update_plan = .{ .base = renumber.operand(self, numbered_view, update.base), .result = renumber.operand(self, numbered_view, update.result), .names = try allocator.dupe(NameId, update.names) } },
             .adapt_plan => |plan| .{ .adapt_plan = .{ .from = renumber.operand(self, numbered_view, plan.from), .to = renumber.operand(self, numbered_view, plan.to) } },
             .names_block => |block| .{ .names_block = .{ .desc = renumber.operand(self, numbered_view, block.desc) } },
+            .instance_entry => |entry| .{ .instance_entry = .{ .table = renumber.operand(self, numbered_view, entry.table), .index = entry.index } },
         };
         const numbered_slots = try allocator.alloc(RecipeId, slots.len);
         for (numbered_slots, slots) |*out, slot| out.* = numbers.get(@backingInt(self.resolve(slot))).?;
@@ -306,7 +313,7 @@ pub const Recipes = struct {
             .args_desc => |args| .{ .args_desc = .{ .leading = args.leading, .elems = try arena.dupe(Operand, args.elems), .capture_record = args.capture_record } },
             .callable => |callable| .{ .callable = .{ .entry = callable.entry, .captures = try arena.dupe(Operand, callable.captures) } },
             .table => |table| .{ .table = .{ .worker = table.worker, .inputs = try arena.dupe(Operand, table.inputs) } },
-            .tag_index, .field_index, .adapt_plan, .names_block => recipe,
+            .tag_index, .field_index, .adapt_plan, .names_block, .instance_entry => recipe,
             .update_plan => |update| .{ .update_plan = .{ .base = update.base, .result = update.result, .names = try arena.dupe(NameId, update.names) } },
         };
     }
@@ -339,6 +346,7 @@ pub fn appendOperands(allocator: Allocator, out: *std.ArrayList(Operand), recipe
         .update_plan => |update| try out.appendSlice(allocator, &.{ update.base, update.result }),
         .adapt_plan => |plan| try out.appendSlice(allocator, &.{ plan.from, plan.to }),
         .names_block => |block| try out.append(allocator, block.desc),
+        .instance_entry => |entry| try out.append(allocator, entry.table),
     }
 }
 
@@ -542,7 +550,9 @@ pub const Evaluation = struct {
             .callable => |callable| blk: {
                 const words = try self.operandWords(callable.captures);
                 defer self.allocator.free(words);
-                break :blk .{ .callable = (try program.static_descs.dictionary(program.worker(callable.entry).proc, words)).node };
+                const node = (try program.static_descs.dictionary(program.worker(callable.entry).proc, words)).node;
+                try program.noteInstanceTableWord(callable.entry, node);
+                break :blk .{ .callable = node };
             },
             .table => |table| blk: {
                 const words = try self.operandWords(table.inputs);
@@ -554,6 +564,7 @@ pub const Evaluation = struct {
             .update_plan => |update| .{ .node = try program.static_descs.updatePlan(describedType(self.operandWord(update.base)), describedType(self.operandWord(update.result)), update.names) },
             .adapt_plan => |plan| .{ .node = try program.static_descs.adaptPlan(self.operandWord(plan.from), self.operandWord(plan.to)) },
             .names_block => |block| try program.static_descs.namesWord(self.operandWord(block.desc)),
+            .instance_entry => |entry| try program.instanceEntryWord(self.operandWord(entry.table), entry.index),
         };
     }
 
@@ -647,15 +658,15 @@ pub const Evaluation = struct {
         for (order) |member| switch (self.source.get(member)) {
             .callable => |callable| self.words.items[@backingInt(member)] = .{ .callable = try static_descs.reserveCallable(@intCast(callable.captures.len)) },
             .desc, .table => {},
-            .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block => invariant("only callables, descriptors, and tables lead back to themselves"),
+            .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block, .instance_entry => invariant("only callables, descriptors, and tables lead back to themselves"),
         };
         for (order) |member| switch (self.source.get(member)) {
             .desc => |desc| self.words.items[@backingInt(member)] = try self.descWord(desc.ty, desc.scoped, desc.substitute_inputs),
-            .callable, .table, .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block => {},
+            .callable, .table, .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block, .instance_entry => {},
         };
         for (order) |member| switch (self.source.get(member)) {
             .table => |table| self.words.items[@backingInt(member)] = try self.evaluateOne(.{ .table = table }),
-            .callable, .desc, .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block => {},
+            .callable, .desc, .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block, .instance_entry => {},
         };
         for (order) |member| switch (self.source.get(member)) {
             .callable => |callable| {
@@ -663,7 +674,7 @@ pub const Evaluation = struct {
                 defer self.allocator.free(words);
                 try static_descs.fillCallable(self.words.items[@backingInt(member)].?.callable, program.worker(callable.entry).proc, words);
             },
-            .desc, .table, .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block => {},
+            .desc, .table, .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block, .instance_entry => {},
         };
         const words = try self.allocator.alloc(StaticDescs.CaptureWord, order.len);
         defer self.allocator.free(words);
@@ -738,7 +749,7 @@ pub const Evaluation = struct {
                     try static_descs_file.appendKeyWord(allocator, key, @intCast(table.inputs.len));
                     for (table.inputs) |operand| try self.operandKey(order, operand, key);
                 },
-                .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block => invariant("only callables, descriptors, and tables lead back to themselves"),
+                .input, .args_desc, .tag_index, .field_index, .update_plan, .adapt_plan, .names_block, .instance_entry => invariant("only callables, descriptors, and tables lead back to themselves"),
             }
         }
     }
@@ -822,6 +833,10 @@ fn hashRecipe(hasher: *std.hash.Wyhash, recipe: Recipe) void {
             hashOperand(hasher, plan.to);
         },
         .names_block => |block| hashOperand(hasher, block.desc),
+        .instance_entry => |entry| {
+            hashOperand(hasher, entry.table);
+            hashWord(hasher, entry.index);
+        },
     }
 }
 
@@ -856,6 +871,7 @@ fn recipesEqual(a: Recipe, b: Recipe) bool {
         .update_plan => |update| operandEqual(update.base, b.update_plan.base) and operandEqual(update.result, b.update_plan.result) and std.mem.eql(NameId, update.names, b.update_plan.names),
         .adapt_plan => |plan| operandEqual(plan.from, b.adapt_plan.from) and operandEqual(plan.to, b.adapt_plan.to),
         .names_block => |block| operandEqual(block.desc, b.names_block.desc),
+        .instance_entry => |entry| entry.index == b.instance_entry.index and operandEqual(entry.table, b.instance_entry.table),
     };
 }
 

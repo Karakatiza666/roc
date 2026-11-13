@@ -226,7 +226,51 @@ fn assertValidTitleAndDescription(title: []const u8, description: []const u8) vo
     }
 }
 
+/// A span of a source file in 1-based display coordinates. Lines and byte
+/// columns count from 1. The end column is one past the span's last byte.
+pub const Location = struct {
+    /// The path of the file, as the report names it. Owned by the report.
+    file: []const u8,
+    start_line: u32,
+    start_column: u32,
+    end_line: u32,
+    end_column: u32,
+
+    /// The location of `region`, given in 0-based coordinates, in `file`.
+    pub fn fromRegionInfo(file: []const u8, region: RegionInfo) Location {
+        return .{
+            .file = file,
+            .start_line = region.start_line_idx + 1,
+            .start_column = region.start_col_idx + 1,
+            .end_line = region.end_line_idx + 1,
+            .end_column = region.end_col_idx + 1,
+        };
+    }
+
+    fn assertValid(self: Location) void {
+        std.debug.assert(self.start_line != 0 and self.start_column != 0);
+        std.debug.assert(self.end_line > self.start_line or
+            (self.end_line == self.start_line and self.end_column >= self.start_column));
+    }
+};
+
+/// A place other than the primary one that a report names, with a short
+/// message that says what is there.
+pub const RelatedLocation = struct {
+    location: Location,
+    /// Owned by the report.
+    message: []const u8,
+};
+
 /// A structured report containing error information and formatted content.
+///
+/// Besides the document, a report gives its places as data, so that a
+/// consumer such as the language server reads them and does not search the
+/// document for them:
+///   - `primaryLocation()` is the place the report is about;
+///   - `reached_from` is set when that place is in a file other than the file
+///     of the module that reports it;
+///   - `related` lists the other places the report names.
 pub const Report = struct {
     title: []const u8,
     /// One-sentence summary shown below the terminal header, below the title
@@ -235,13 +279,36 @@ pub const Report = struct {
     /// that need inline styling pass `""` and add to this document directly.
     headline: Document,
     severity: Severity,
+    /// The kind of problem the report is about, for a consumer that acts on
+    /// one kind of report. Builders set it after `init`.
+    kind: Kind,
     document: Document,
     /// The file a report is about as a whole, for a report that has no source
     /// region because nothing in the file's text is the problem (for example,
     /// a definition the file lacks). Renderers name it in place of a position.
     /// Owned by `owned_strings`.
     file: ?[]const u8,
+    /// The place the report is about, when a builder names it. When null, the
+    /// place is the report's first highlighted source region
+    /// (`primaryLocation`).
+    primary: ?Location,
+    /// When the primary place is in a file other than the file of the module
+    /// that reports it: the place in that module's file that reaches it. A
+    /// consumer that shows reports in the reporting module's file shows the
+    /// report here. Null when the primary place is in that file.
+    reached_from: ?Location,
+    /// The other places the report names, in the order the document names
+    /// them. Each one is also in the document, as prose or as source.
+    related: std.ArrayList(RelatedLocation),
     allocator: Allocator,
+
+    /// The kinds of problem that a consumer of reports must tell apart.
+    pub const Kind = enum {
+        /// A definition crashed during compile-time evaluation.
+        compile_time_crash,
+        /// Every other problem.
+        other,
+    };
 
     pub fn init(allocator: Allocator, title: []const u8, headline: []const u8, severity: Severity) Allocator.Error!Report {
         assertValidTitleAndDescription(title, headline);
@@ -249,8 +316,12 @@ pub const Report = struct {
             .title = title,
             .headline = Document.init(allocator),
             .severity = severity,
+            .kind = .other,
             .document = Document.init(allocator),
             .file = null,
+            .primary = null,
+            .reached_from = null,
+            .related = .empty,
             .allocator = allocator,
         };
         if (headline.len > 0) {
@@ -280,6 +351,7 @@ pub const Report = struct {
     pub fn deinit(self: *Report) void {
         self.headline.deinit();
         self.document.deinit();
+        self.related.deinit(self.allocator);
     }
 
     /// Add a string that the report will take ownership of.
@@ -293,6 +365,57 @@ pub const Report = struct {
     /// source region already names its file there, so it never has one.
     pub fn setFile(self: *Report, path: []const u8) Allocator.Error!void {
         self.file = try self.addOwnedString(path);
+    }
+
+    /// Copy `location`'s file into the report.
+    fn ownLocation(self: *Report, location: Location) Allocator.Error!Location {
+        location.assertValid();
+        var owned = location;
+        owned.file = try self.addOwnedString(location.file);
+        return owned;
+    }
+
+    /// Name the place the report is about, for a report whose first
+    /// highlighted source region is not that place.
+    pub fn setPrimary(self: *Report, location: Location) Allocator.Error!void {
+        self.primary = try self.ownLocation(location);
+    }
+
+    /// Name the place in the reporting module's file that reaches a primary
+    /// place in another file.
+    pub fn setReachedFrom(self: *Report, location: Location) Allocator.Error!void {
+        self.reached_from = try self.ownLocation(location);
+    }
+
+    /// Record `location` as a related place with `message`, without adding
+    /// anything to the document.
+    pub fn addRelated(self: *Report, location: Location, message: []const u8) Allocator.Error!void {
+        const owned = try self.ownLocation(location);
+        const owned_message = try self.addOwnedString(message);
+        try self.related.append(self.allocator, .{ .location = owned, .message = owned_message });
+    }
+
+    /// Name `location` in the document as `path:line:col`, inline with the
+    /// surrounding prose, and record it as a related place with `message`.
+    pub fn addRelatedSourceLocation(self: *Report, location: Location, message: []const u8) Allocator.Error!void {
+        try self.addRelated(location, message);
+        try self.document.addForeignSourceLocation(location.file, location.start_line, location.start_column);
+    }
+
+    /// The place the report is about: the place a builder named with
+    /// `setPrimary`, else the report's first highlighted source region. Null
+    /// for a report with no source region, or whose first region names no
+    /// file.
+    pub fn primaryLocation(self: *const Report) ?Location {
+        if (self.primary) |primary| return primary;
+        const region, const file = self.firstHighlightedRegion() orelse return null;
+        return .{
+            .file = file orelse return null,
+            .start_line = region.start_line_idx,
+            .start_column = region.start_col_idx,
+            .end_line = region.end_line_idx,
+            .end_column = region.end_col_idx,
+        };
     }
 
     /// Render the report to the specified writer and target format.
@@ -378,35 +501,42 @@ pub const Report = struct {
     /// or null if none exists. Context surrounding an underline is not part
     /// of the diagnostic location.
     pub fn getRegionInfo(self: *const Report) ?RegionInfo {
+        const region, _ = self.firstHighlightedRegion() orelse return null;
+        return region;
+    }
+
+    /// The first highlighted region in 1-based display coordinates, and the
+    /// file its source element names.
+    fn firstHighlightedRegion(self: *const Report) ?struct { RegionInfo, ?[]const u8 } {
         for (self.document.elements.items) |element| {
             switch (element) {
                 .source_code_region => |region_data| {
-                    return RegionInfo{
+                    return .{ RegionInfo{
                         .start_line_idx = region_data.start_line,
                         .start_col_idx = region_data.start_column,
                         .end_line_idx = region_data.end_line,
                         .end_col_idx = region_data.end_column,
-                    };
+                    }, region_data.filename };
                 },
                 .source_code_with_underlines => |underlines_data| {
                     if (underlines_data.underline_regions.len == 0) continue;
                     const region = underlines_data.underline_regions[0];
-                    return RegionInfo{
+                    return .{ RegionInfo{
                         .start_line_idx = region.start_line,
                         .start_col_idx = region.start_column,
                         .end_line_idx = region.end_line,
                         .end_col_idx = region.end_column,
-                    };
+                    }, underlines_data.display_region.filename };
                 },
                 .source_code_multi_region => |multi| {
                     if (multi.regions.len == 0) continue;
                     const region = multi.regions[0];
-                    return RegionInfo{
+                    return .{ RegionInfo{
                         .start_line_idx = region.start_line,
                         .start_col_idx = region.start_column,
                         .end_line_idx = region.end_line,
                         .end_col_idx = region.end_column,
-                    };
+                    }, multi.filename };
                 },
                 .text,
                 .annotated,
@@ -500,4 +630,61 @@ test "Report diagnostic location uses the underline rather than its context" {
     try testing.expectEqual(@as(u32, 5), region.start_col_idx);
     try testing.expectEqual(@as(u32, 4), region.end_line_idx);
     try testing.expectEqual(@as(u32, 9), region.end_col_idx);
+}
+
+test "Report primary location is the first highlighted region unless a builder names one" {
+    var report = try Report.init(testing.allocator, "Type Mismatch", "", .runtime_error);
+    defer report.deinit();
+    try testing.expectEqual(@as(?Location, null), report.primaryLocation());
+
+    const source = "x = 1\ny = 2\n";
+    try report.document.addSourceRegion(
+        .{ .start_line_idx = 1, .start_col_idx = 4, .end_line_idx = 1, .end_col_idx = 5 },
+        .error_highlight,
+        "Main.roc",
+        source,
+        &.{ 0, 6 },
+    );
+    const derived = report.primaryLocation().?;
+    try testing.expectEqualStrings("Main.roc", derived.file);
+    try testing.expectEqual(@as(u32, 2), derived.start_line);
+    try testing.expectEqual(@as(u32, 5), derived.start_column);
+    try testing.expectEqual(@as(u32, 2), derived.end_line);
+    try testing.expectEqual(@as(u32, 6), derived.end_column);
+
+    try report.setPrimary(.{ .file = "Other.roc", .start_line = 3, .start_column = 1, .end_line = 3, .end_column = 4 });
+    try report.setReachedFrom(derived);
+    const named = report.primaryLocation().?;
+    try testing.expectEqualStrings("Other.roc", named.file);
+    try testing.expectEqual(@as(u32, 3), named.start_line);
+    try testing.expectEqualStrings("Main.roc", report.reached_from.?.file);
+}
+
+test "Report related source location is data and renders as before" {
+    var report = try Report.init(testing.allocator, "Duplicate Tag", "", .runtime_error);
+    defer report.deinit();
+    const region: RegionInfo = .{ .start_line_idx = 2, .start_col_idx = 6, .end_line_idx = 2, .end_col_idx = 9 };
+    try report.document.addText("first defined in ");
+    try report.addRelatedSourceLocation(.fromRegionInfo("Main.roc", region), "The tag was first defined here.");
+
+    try testing.expectEqual(@as(usize, 1), report.related.items.len);
+    const related = report.related.items[0];
+    try testing.expectEqualStrings("Main.roc", related.location.file);
+    try testing.expectEqualStrings("The tag was first defined here.", related.message);
+    try testing.expectEqual(@as(u32, 3), related.location.start_line);
+    try testing.expectEqual(@as(u32, 7), related.location.start_column);
+    try testing.expectEqual(@as(u32, 3), related.location.end_line);
+    try testing.expectEqual(@as(u32, 10), related.location.end_column);
+
+    // The document holds the same element `Document.addSourceLocation` adds.
+    var expected = Document.init(testing.allocator);
+    defer expected.deinit();
+    try expected.addText("first defined in ");
+    try expected.addSourceLocation(region, "Main.roc");
+    try testing.expectEqual(expected.elements.items.len, report.document.elements.items.len);
+    const actual_location = report.document.elements.items[1].source_location;
+    const expected_location = expected.elements.items[1].source_location;
+    try testing.expectEqualStrings(expected_location.filename.?, actual_location.filename.?);
+    try testing.expectEqual(expected_location.line, actual_location.line);
+    try testing.expectEqual(expected_location.column, actual_location.column);
 }

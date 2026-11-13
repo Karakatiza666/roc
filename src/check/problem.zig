@@ -76,6 +76,7 @@ pub const ComptimeCondition = types.ComptimeCondition;
 // Type declaration errors
 pub const TypeApplyArityMismatch = types.TypeApplyArityMismatch;
 pub const RecursiveAlias = types.RecursiveAlias;
+pub const RecordExtensionNotRecord = types.RecordExtensionNotRecord;
 pub const NotAWhereAlias = types.NotAWhereAlias;
 pub const WhereAliasInTypePosition = types.WhereAliasInTypePosition;
 pub const RecursiveWhereAlias = types.RecursiveWhereAlias;
@@ -101,6 +102,8 @@ pub const HostBoundaryOptionalField = types.HostBoundaryOptionalField;
 pub const AnnotationOnlyValue = types.AnnotationOnlyValue;
 /// Public `AnnotationOnlyValueUse` re-export.
 pub const AnnotationOnlyValueUse = types.AnnotationOnlyValueUse;
+/// Public `ExistsOnlyInReifiedCode` re-export.
+pub const ExistsOnlyInReifiedCode = types.ExistsOnlyInReifiedCode;
 pub const HostedWhereRequirement = types.HostedWhereRequirement;
 pub const DerivedMethodValueUse = types.DerivedMethodValueUse;
 pub const CapturingMethod = types.CapturingMethod;
@@ -117,9 +120,14 @@ pub const EffectfulFunctionName = types.EffectfulFunctionName;
 pub const ComptimeOrigin = types.ComptimeOrigin;
 pub const ComptimeCrash = types.ComptimeCrash;
 pub const ComptimeInvalidNumeral = types.ComptimeInvalidNumeral;
+pub const StagedCode = types.StagedCode;
 pub const ComptimeInvalidQuote = types.ComptimeInvalidQuote;
 pub const ComptimeInvalidInterpolation = types.ComptimeInvalidInterpolation;
 pub const ComptimeExpectFailed = types.ComptimeExpectFailed;
+pub const TranslationRefused = types.TranslationRefused;
+pub const RefusalCall = types.RefusalCall;
+pub const RefusalCallsRange = types.RefusalCallsRange;
+pub const SourcePlace = types.SourcePlace;
 pub const ComptimeEvalError = types.ComptimeEvalError;
 
 // Generic errors
