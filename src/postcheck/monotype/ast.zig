@@ -382,11 +382,11 @@ pub const FnTemplate = struct {
     const_evidence_frame_head: collections.OptionalU32 = .none,
     /// The Code instance table the specialization describes its instance
     /// sites from (D1), retained for compile-time function values.
-    const_instances: ?check.ConstStore.ConstFnInstances = null,
+    const_instances: check.ConstStore.OptionalConstFnInstances = .none,
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(FnTemplate) == 464);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(FnTemplate) == 500);
 }
 
 /// Monotype function-specialization metadata.
@@ -714,7 +714,7 @@ fn writeFnEvidence(
                 writeU32(hasher, target.callable_contracts);
                 writeEvidenceModule(hasher, &target.view.bytes, site_names);
                 writeMethodTarget(hasher, target.method, target.method_callable_key, site_names);
-                if (target.instances) |instances| {
+                if (target.instances.get()) |instances| {
                     writeU8(hasher, 1);
                     writeEvidenceModule(hasher, &instances.module.bytes, site_names);
                     writeU32(hasher, instances.table);
@@ -816,10 +816,10 @@ fn fnEvidenceTargetEql(left: anytype, right: @TypeOf(left)) bool {
     if (left.callable_contracts != right.callable_contracts) return false;
     if (!keyBytesEql(left.view, right.view)) return false;
     if (!methodTargetIdentityEql(left.method, left.method_callable_key, right.method, right.method_callable_key)) return false;
-    if (left.instances) |left_instances| {
-        const right_instances = right.instances orelse return false;
+    if (left.instances.get()) |left_instances| {
+        const right_instances = right.instances.get() orelse return false;
         if (!keyBytesEql(left_instances.module, right_instances.module) or left_instances.table != right_instances.table) return false;
-    } else if (right.instances != null) return false;
+    } else if (right.instances.get() != null) return false;
     if (left.instantiation) |left_instantiation| {
         const right_instantiation = right.instantiation orelse return false;
         if (!keyBytesEql(left_instantiation.view, right_instantiation.view)) return false;
@@ -1771,7 +1771,7 @@ pub const Def = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(Def) == 532);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(Def) == 568);
 }
 
 /// Body availability for a top-level or generated Monotype definition.

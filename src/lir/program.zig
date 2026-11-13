@@ -155,11 +155,11 @@ pub const FnTemplate = struct {
     evidence_frames: []const const_store.ConstFnEvidenceFrame = &.{},
     evidence_frame_head: collections.OptionalU32 = .none,
     /// The Code instance table of the specialization (D1), or null.
-    instances: ?const_store.ConstFnInstances = null,
+    instances: const_store.OptionalConstFnInstances = .none,
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(FnTemplate) == 392);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(FnTemplate) == 424);
 }
 
 /// Capture field copied from a checked binding into a callable payload. `id`
@@ -193,7 +193,7 @@ pub const FnVariant = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(FnVariant) == 424);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(FnVariant) == 456);
 }
 
 /// Runtime tag-union encoding for a finite callable set.
@@ -212,7 +212,7 @@ pub const ErasedFn = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(ErasedFn) == 440);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(ErasedFn) == 472);
 }
 
 /// Runtime encoding for an erased callable value type.

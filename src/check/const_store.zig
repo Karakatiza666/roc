@@ -415,7 +415,7 @@ pub const ConstFnTargetEvidence = struct {
     /// The Code instance table of the evidence edge that selected the
     /// target, where the target has an inventory (design.md "Code Instance
     /// Tables").
-    instances: ?ConstFnInstances = null,
+    instances: OptionalConstFnInstances = .none,
 };
 
 /// Dispatch evidence selected for a stored compile-time function value. The
@@ -575,6 +575,9 @@ pub const ConstFnInstances = struct {
     table: u32,
 };
 
+/// An optional `ConstFnInstances` without a separate presence tag.
+pub const OptionalConstFnInstances = collections.OptionalStruct(ConstFnInstances, "table");
+
 /// Function value stored by compile-time evaluation.
 pub const ConstFn = struct {
     fn_def: FnDef,
@@ -589,7 +592,7 @@ pub const ConstFn = struct {
     evidence: ConstFnEvidenceVector = .{},
     evidence_frames: []const ConstFnEvidenceFrame = &.{},
     evidence_frame_head: ?u32 = null,
-    instances: ?ConstFnInstances = null,
+    instances: OptionalConstFnInstances = .none,
 };
 
 /// Named type owner for a stored nominal constant.
@@ -734,11 +737,11 @@ const StoredFn = struct {
     evidence_structurals: ConstRange = .{},
     evidence_frames: ConstRange = .{},
     evidence_frame_head: collections.OptionalU32 = .none,
-    instances: ?ConstFnInstances = null,
+    instances: OptionalConstFnInstances = .none,
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(StoredFn) == 232);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(StoredFn) == 268);
 }
 
 /// A type node as `ConstTypeStore` keeps it: `ConstType` with its two large

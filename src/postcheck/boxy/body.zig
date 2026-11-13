@@ -7306,7 +7306,7 @@ pub const Builder = struct {
     /// where the worker's template has an inventory, else none.
     fn storedInstanceWords(self: *Builder, stored: check.ConstStore.ConstFn, worker: lower.Worker) Allocator.Error![]const Word {
         if (worker.instances == null) return &.{};
-        const kept = stored.instances orelse invariant("a stored function of a template with an inventory keeps no instance table");
+        const kept = stored.instances.get() orelse invariant("a stored function of a template with an inventory keeps no instance table");
         const words = try self.program.arena.allocator().alloc(Word, 1);
         words[0] = try self.storedTableWord(kept);
         return words;
@@ -7623,7 +7623,7 @@ pub const Builder = struct {
                     // A target with an inventory takes the table of the edge
                     // that selected it, which the stored evidence keeps.
                     if (target_worker.instances != null) {
-                        const kept = evidence.target(target_index).instances orelse
+                        const kept = evidence.target(target_index).instances.get() orelse
                             invariant("stored evidence that selects a method with a Code inventory keeps no instance table");
                         hidden[hidden.len - 1] = try self.storedTableWord(kept);
                     }
@@ -7922,7 +7922,7 @@ pub const Builder = struct {
         // The app's edge for the requirement gives the literal arguments
         // where the requirement's solution was sealed (design.md "Literal
         // Arguments").
-        const literal_edge: checked.LiteralEdge, const edge_owner: ?*const types.ModuleView = if (required.literal_edge) |ref|
+        const literal_edge: checked.LiteralEdge, const edge_owner: ?*const types.ModuleView = if (required.literal_edge.get()) |ref|
             .{ .{ .requirement = ref.requires_idx }, self.program.moduleByKey(ref.checked_module) }
         else
             .{ edge, null };
@@ -7956,7 +7956,7 @@ pub const Builder = struct {
     /// binding has no inventory: every procedure requirement holds a ref,
     /// and the app has a closing use only for one with an inventory.
     fn requirementInstanceWord(self: *Builder, required: checked.PlatformRequiredProcedureResolvedRef) Allocator.Error!?Word {
-        const ref = required.instances orelse return null;
+        const ref = required.instances.get() orelse return null;
         const app = self.program.moduleByKey(ref.checked_module);
         const closing = app.code().edgeTable(.{ .requirement = ref.requires_idx }) orelse return null;
         return try self.closingUseWord(app.index, closing);
@@ -8713,7 +8713,7 @@ pub const Builder = struct {
     /// where its solution was sealed, which the chain's lookups then carry,
     /// else derived from the target's instantiation.
     fn requiredAliasLiterals(self: *Builder, alias_step: AliasStep, required: checked.PlatformRequiredProcedureResolvedRef) Allocator.Error!struct { args: []const Word, source: AliasLiterals } {
-        const ref = required.literal_edge orelse return .{ .args = &.{}, .source = .derived };
+        const ref = required.literal_edge.get() orelse return .{ .args = &.{}, .source = .derived };
         const args = try self.program.arena.allocator().alloc(Word, alias_step.literal_requirements.len);
         try self.fillLiteralArgsOf(self.program.moduleByKey(ref.checked_module), null, .{ .requirement = ref.requires_idx }, args);
         return .{ .args = args, .source = .scopes };

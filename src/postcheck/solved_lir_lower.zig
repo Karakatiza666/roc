@@ -426,7 +426,7 @@ const FnEntry = struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(FnEntry) == 540);
+    std.debug.assert(@sizeOf(FnEntry) == 576);
 }
 
 const LoweredFnBody = struct {

@@ -909,6 +909,9 @@ fn requirementFlagsOf(view: checked.ImportedModuleView, template: checked.Checke
             .numeral => .{ .dependent_numeral = true },
             .quote => .{ .dependent_quote = true },
             .interpolation => .{ .strict = true },
+            // A generic bound call registers a root of the program at each
+            // specialization.
+            .bound_call => .{ .strict = true },
         });
     }
     return flags;

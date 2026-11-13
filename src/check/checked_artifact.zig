@@ -1112,11 +1112,11 @@ pub const RootRequest = struct {
     root_evidence: ?CheckedEvidenceSpan = null,
     /// Where the app's code output holds a platform requirement's closing
     /// use (design.md "Code Instance Tables"), or null.
-    instances: ?CheckedInstanceTableRef = null,
+    instances: OptionalCheckedInstanceTableRef = .none,
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(RootRequest) == 248);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(RootRequest) == 284);
 }
 
 /// Public `RootRequestTable` declaration.
@@ -2591,7 +2591,7 @@ const RootRequestWithoutOrder = struct {
     root_evidence: ?CheckedEvidenceSpan = null,
     /// Where the app's code output holds a platform requirement's closing
     /// use (design.md "Code Instance Tables"), or null.
-    instances: ?CheckedInstanceTableRef = null,
+    instances: OptionalCheckedInstanceTableRef = .none,
 };
 
 fn appendRoot(
@@ -3752,8 +3752,8 @@ pub const StoredCheckedTypePayload = union(enum) {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(StoredTypeVariable) == 16);
-    std.debug.assert(@sizeOf(StoredCheckedTypePayload) == 20);
+    std.debug.assert(@sizeOf(StoredTypeVariable) == 20);
+    std.debug.assert(@sizeOf(StoredCheckedTypePayload) == 24);
 }
 
 /// A row of a type store's `alias_row_pool`. Alias and nominal payloads are
@@ -11561,7 +11561,7 @@ pub const CallableEvalTemplate = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(CallableEvalTemplate) == 28);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(CallableEvalTemplate) == 32);
 }
 
 /// Public `CallableEvalTemplateTableView` declaration.
@@ -11799,12 +11799,18 @@ pub const CheckedInstanceTableRef = struct {
     requires_idx: u32,
 };
 
+/// An optional `CheckedInstanceTableRef` without a separate presence tag.
+pub const OptionalCheckedInstanceTableRef = collections.OptionalStruct(CheckedInstanceTableRef, "requires_idx");
+
 /// The literal requirement edge (`LiteralRequirementEdge`) of platform
 /// requirement `requires_idx` in its app module.
 pub const CheckedLiteralRequirementEdgeRef = struct {
     checked_module: CheckedModuleDigest,
     requires_idx: u32,
 };
+
+/// An optional `CheckedLiteralRequirementEdgeRef` without a separate presence tag.
+pub const OptionalCheckedLiteralRequirementEdgeRef = collections.OptionalStruct(CheckedLiteralRequirementEdgeRef, "requires_idx");
 
 /// Public `LocalProcedureBinding` declaration.
 pub const LocalProcedureBinding = struct {
@@ -11857,10 +11863,10 @@ pub const PlatformRequiredProcedureResolvedRef = struct {
     /// Where the app's code output holds the requirement's closing use,
     /// which is absent when the app binding's template has no Code instance
     /// inventory (design.md "Code Instance Tables").
-    instances: ?CheckedInstanceTableRef = null,
+    instances: OptionalCheckedInstanceTableRef = .none,
     /// The requirement's literal argument edge in the app, where the
     /// requirement's solution was sealed (design.md "Literal Arguments").
-    literal_edge: ?CheckedLiteralRequirementEdgeRef = null,
+    literal_edge: OptionalCheckedLiteralRequirementEdgeRef = .none,
 };
 
 /// Public `SelectedHoistedConstUse` declaration.
@@ -20691,8 +20697,8 @@ pub const PlatformRequiredProcedureUse = struct {
     procedure: ProcedureUseTemplate,
     root_evidence: ?CheckedEvidenceSpan = null,
     /// See `PlatformRequiredProcedureResolvedRef.instances`.
-    instances: ?CheckedInstanceTableRef = null,
-    literal_edge: ?CheckedLiteralRequirementEdgeRef = null,
+    instances: OptionalCheckedInstanceTableRef = .none,
+    literal_edge: OptionalCheckedLiteralRequirementEdgeRef = .none,
     relation_template_closure: ImportedTemplateClosureView = .{},
 };
 
@@ -20722,8 +20728,8 @@ pub const PlatformRequiredValueUseKind = enum { const_value, procedure_value };
 pub const StoredPlatformRequiredProcedureUse = struct {
     procedure: ProcedureUseTemplate,
     root_evidence: ?CheckedEvidenceSpan = null,
-    instances: ?CheckedInstanceTableRef = null,
-    literal_edge: ?CheckedLiteralRequirementEdgeRef = null,
+    instances: OptionalCheckedInstanceTableRef = .none,
+    literal_edge: OptionalCheckedLiteralRequirementEdgeRef = .none,
     relation_template_closure: StoredImportedTemplateClosure = .{},
 };
 
@@ -24714,14 +24720,14 @@ fn buildPlatformAppRelationFromDeclarations(
                         .checked_module = app_artifact.key.digest(),
                         .span = solution.root_evidence,
                     },
-                    .instances = .{
+                    .instances = .some(.{
                         .checked_module = app_artifact.key.digest(),
                         .requires_idx = solution.requires_idx,
-                    },
-                    .literal_edge = if (app_artifact.checked_procedure_templates.literalRequirementEdge(solution.requires_idx) != null) .{
+                    }),
+                    .literal_edge = if (app_artifact.checked_procedure_templates.literalRequirementEdge(solution.requires_idx) != null) .some(.{
                         .checked_module = app_artifact.key.digest(),
                         .requires_idx = solution.requires_idx,
-                    } else null,
+                    }) else .none,
                     .relation_template_closure = template_closure,
                 } };
             } else blk: {
@@ -26401,7 +26407,7 @@ pub const CompileTimeRoot = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(CompileTimeRoot) == 148);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(CompileTimeRoot) == 164);
 }
 
 /// One literal's conversion root (`CompileTimeRootTable.literal_conversions`).
@@ -31057,7 +31063,7 @@ pub const ExportedProcedureTemplate = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(ExportedProcedureTemplate) == 296);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(ExportedProcedureTemplate) == 300);
 }
 
 /// Read-only view of a closure-bearing export table: its rows plus the pool

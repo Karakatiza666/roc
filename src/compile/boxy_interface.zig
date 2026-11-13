@@ -321,14 +321,14 @@ pub const Digests = struct {
         for (output.sites) |site| {
             hasher.update(std.mem.asBytes(&@as(u32, @backingInt(site.node))));
             hashTag(hasher, @tagName(site.outcome));
-            if (site.outcome == .value) try artifact.const_store.hashGraph(site.value, hasher, context);
+            if (site.outcome == .value) try artifact.const_store.hashGraph(self.gpa, site.value, hasher, context);
         }
         hashTag(hasher, "code_identities");
         hasher.update(std.mem.asBytes(&@as(u32, @intCast(output.identities.len))));
         for (output.identities) |identity| {
             hasher.update(std.mem.asBytes(&@as(u32, @backingInt(identity.node))));
             hashTag(hasher, @tagName(identity.outcome));
-            if (identity.outcome == .value) try artifact.const_store.hashGraph(identity.value, hasher, context);
+            if (identity.outcome == .value) try artifact.const_store.hashGraph(self.gpa, identity.value, hasher, context);
         }
         hashTag(hasher, "code_uses");
         hasher.update(std.mem.sliceAsBytes(output.edge_tables));
@@ -377,7 +377,7 @@ pub const Digests = struct {
                 const entry = output.entry(table, @intCast(position));
                 hashTag(hasher, @tagName(std.meta.activeTag(entry)));
                 switch (entry) {
-                    .node => |described| try artifact.const_store.hashGraph(described.value, hasher, context),
+                    .node => |described| try artifact.const_store.hashGraph(self.gpa, described.value, hasher, context),
                     .forward => |forward| hasher.update(std.mem.asBytes(&@as(u32, @backingInt(forward)))),
                     .refused => {},
                 }

@@ -2392,7 +2392,7 @@ const SpecEvidenceTarget = struct {
     /// target (design.md "Code Instance Tables"), or null where no edge
     /// selected it or its target has no inventory. Two tables give two
     /// specializations, as two written uses do.
-    instances: ?InstanceTableId = null,
+    instances: OptionalInstanceTableId = .none,
 };
 
 /// Whether materialized evidence selects a local procedure, as a target or
@@ -2897,7 +2897,7 @@ const EdgeEvidence = struct {
     /// The instance table the edge hands its template (D1): the table of a
     /// closing use, or the entry of the table in force that a forward use
     /// names. Null for a template with no inventory.
-    instances: ?InstanceTableId = null,
+    instances: OptionalInstanceTableId = .none,
 };
 
 /// The Code instance table a use of a binding gives (see
@@ -2950,9 +2950,9 @@ const InstanceTableId = struct {
     table: code_output.TableId,
 
     /// The table as a stored function keeps it (Q16).
-    fn stored(id: ?InstanceTableId) ?check.ConstStore.ConstFnInstances {
-        const table = id orelse return null;
-        return .{ .module = table.view.key, .table = @backingInt(table.table) };
+    fn stored(id: ?InstanceTableId) check.ConstStore.OptionalConstFnInstances {
+        const table = id orelse return .none;
+        return .some(.{ .module = table.view.key, .table = @backingInt(table.table) });
     }
 
     /// Whether the description step refused this table: a descriptor
@@ -2960,6 +2960,25 @@ const InstanceTableId = struct {
     /// a crash.
     fn refused(id: InstanceTableId) bool {
         return id.table == code_output.refused_table;
+    }
+};
+
+/// An optional `InstanceTableId` in the size of one: an absent table has no
+/// view.
+const OptionalInstanceTableId = struct {
+    view: ?ModuleView = null,
+    table: code_output.TableId = @fromBackingInt(0),
+
+    const none: OptionalInstanceTableId = .{};
+
+    fn of(id: ?InstanceTableId) OptionalInstanceTableId {
+        const present = id orelse return .none;
+        return .{ .view = present.view, .table = present.table };
+    }
+
+    fn get(self: OptionalInstanceTableId) ?InstanceTableId {
+        const view = self.view orelse return null;
+        return .{ .view = view, .table = self.table };
     }
 };
 
@@ -3002,13 +3021,13 @@ const EvidenceChain = struct {
     parent: ?*const EvidenceChain = null,
     /// The instance table of the specialization whose root frame this is
     /// (D1). Set on the root frame only.
-    instances: ?InstanceTableId = null,
+    instances: OptionalInstanceTableId = .none,
 
     /// The instance table in force: the one the root frame holds.
     fn instanceTable(self: *const EvidenceChain) ?InstanceTableId {
         var chain: *const EvidenceChain = self;
         while (chain.parent) |parent| chain = parent;
-        return chain.instances;
+        return chain.instances.get();
     }
 
     fn atScope(self: *const EvidenceChain, scope: EvidenceScope) ?EvidenceChain {
@@ -4376,7 +4395,7 @@ fn specEvidenceShallowEql(
                 if (!Ast.valueEql(a_target.view.key, b_target.view.key)) break :blk false;
                 if (!try specMethodTargetEql(a_target, b_target)) break :blk false;
                 if (a_target.local_proc_context != b_target.local_proc_context) break :blk false;
-                if (!instanceTablesEql(a_target.instances, b_target.instances)) break :blk false;
+                if (!instanceTablesEql(a_target.instances.get(), b_target.instances.get())) break :blk false;
                 if (a_target.instantiation) |a_instantiation| {
                     const b_instantiation = b_target.instantiation orelse break :blk false;
                     if (!Ast.valueEql(a_instantiation.view.key, b_instantiation.view.key)) break :blk false;
@@ -5374,7 +5393,7 @@ const PendingSpecJob = struct {
     signature_relation: Ast.SignatureRelation,
     codec_contract: ?SealedCodecContractContext,
     /// The Code instance table of the request (D1), or null.
-    instances: ?InstanceTableId = null,
+    instances: OptionalInstanceTableId = .none,
     /// Why the body is lowered. The coordinator restates it when it hands the
     /// job to a lane, since an upgrade may arrive while the job is queued.
     demand: Demand = .evaluation,
@@ -8409,7 +8428,7 @@ const Builder = struct {
         const draft = FinalBodyOutputGuard.begin(self);
         var body_timing_scope = ProcedureTimingScope.begin(self.timing, .body_lowering);
         defer body_timing_scope.end();
-        const body, const ret_cell = if (self.requirementUseRefused(request.instances)) blk: {
+        const body, const ret_cell = if (self.requirementUseRefused(request.instances.get())) blk: {
             // The description step refused the requirement's closing use
             // and reported it: the root crashes in place of the call.
             const ret = DraftTypeCell.fromGraphNode(initial_fn.ret);
@@ -8445,7 +8464,7 @@ const Builder = struct {
                     try procedureUseSourceFnKey(view, procedure),
                     root_node,
                     edge,
-                    self.requirementInstances(request.instances),
+                    self.requirementInstances(request.instances.get()),
                     false,
                 );
                 const callee_fn_node = try ctx.draftFnSlotTypeNode(selected, root_node);
@@ -9119,7 +9138,7 @@ const Builder = struct {
                 .callable_ty = instantiation.callable_ty,
             } else null,
             .nested = nested,
-            .instances = InstanceTableId.stored(target.instances),
+            .instances = InstanceTableId.stored(target.instances.get()),
         };
     }
 
@@ -9272,7 +9291,7 @@ const Builder = struct {
                                 null,
                                 job.signature_relation,
                                 job.codec_contract,
-                                job.instances,
+                                job.instances.get(),
                             );
                             return existing.def;
                         },
@@ -9401,7 +9420,7 @@ const Builder = struct {
                     .subst = subst,
                     .signature_relation = signature_relation,
                     .codec_contract = codec_contract,
-                    .instances = instances,
+                    .instances = .of(instances),
                     .demand = demand,
                 };
                 resolution_profile.enter(.discovery_dispatch);
@@ -10522,7 +10541,7 @@ const Builder = struct {
                 null,
                 job.signature_relation,
                 job.codec_contract,
-                job.instances,
+                job.instances.get(),
             );
             self.acceptSpecDispatch(job.dispatch_index);
             return;
@@ -10699,7 +10718,7 @@ const Builder = struct {
             null,
             job.signature_relation,
             job.codec_contract,
-            job.instances,
+            job.instances.get(),
         );
         const final_end = final_guard.end(self);
         try self.finalizeBodyDraftGraph(graph, &body_draft, final_guard, final_end);
@@ -10898,7 +10917,7 @@ const Builder = struct {
             // A retained topology is a stored compile-time function's, whose
             // root frame holds the table it was stored with (Q16).
             if (retained_topology != null) Common.invariant("a retained evidence topology received a second Code instance table");
-            body_ctx.evidence.instances = instances;
+            body_ctx.evidence.instances = .of(instances);
         }
 
         const graph_fn_ty = try body_ctx.importProgramType(lower_fn_ty);
@@ -11036,7 +11055,7 @@ const Builder = struct {
         edge.instances = partial_edge.instances;
         // A template with a Code instance inventory (D1) is reached only by
         // a closing or forward use, which carries its table.
-        if (edge.instances == null and codeInventories(view).inventoryOf(template_ref.template) != null) {
+        if (edge.instances.get() == null and codeInventories(view).inventoryOf(template_ref.template) != null) {
             Common.invariant("a template with a Code instance inventory was requested with no instance table");
         }
         edge.vector = try source_ctx.resolveCallableEvidenceAtNode(
@@ -11311,7 +11330,7 @@ const Builder = struct {
                 .const_evidence = try source_ctx.draft.addConstFnEvidence(stored_evidence.entries),
                 .const_evidence_frames = try source_ctx.draft.addConstFnEvidenceFrames(stored_evidence.frames),
                 .const_evidence_frame_head = .of(stored_evidence.head),
-                .instances = InstanceTableId.stored(edge.instances),
+                .instances = InstanceTableId.stored(edge.instances.get()),
             },
             .signature_relation = signature_relation,
         });
@@ -14774,7 +14793,7 @@ const Builder = struct {
                 boundary.const_use,
                 boundary.request_node,
                 boundary.use_evidence,
-                boundary.instances,
+                boundary.instances.get(),
             ),
             .hoisted => |entry| blk: {
                 const previous_restore_evidence = ctx.restore_evidence;
@@ -15491,7 +15510,7 @@ const Builder = struct {
                 body_scheduling,
                 codec_contract,
                 demand,
-                spec.instances,
+                spec.instances.get(),
             );
             break :blk .{ .local = self.defFnId(def) };
         };
@@ -17461,8 +17480,8 @@ const DraftFnTemplate = struct {
     const_evidence_frames: DraftSpan(check.ConstStore.ConstFnEvidenceFrame) = DraftSpan(check.ConstStore.ConstFnEvidenceFrame).empty(),
     const_evidence_frame_head: collections.OptionalU32 = .none,
     /// The Code instance table of the specialization (D1), as a stored
-    /// function keeps it (Q16), or null.
-    instances: ?check.ConstStore.ConstFnInstances = null,
+    /// function keeps it (Q16), or none.
+    instances: check.ConstStore.OptionalConstFnInstances = .none,
 
     fn sealTypeCellsInPlace(self: *DraftFnTemplate, graph: *InstGraph, sealer: *GraphTypeFinals) Allocator.Error!void {
         try self.mono_fn_ty.sealInPlace(graph, sealer);
@@ -17476,7 +17495,7 @@ const DraftFnTemplate = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftFnTemplate) == 272);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftFnTemplate) == 308);
 }
 
 const DraftFn = struct {
@@ -17579,7 +17598,7 @@ const DraftCallableBindingCallee = struct {
     fn_node: NodeId,
     /// The Code instance table the binding's entry wrapper takes (Q17), or
     /// null where it has no inventory.
-    instances: ?InstanceTableId = null,
+    instances: OptionalInstanceTableId = .none,
 };
 
 const ClosedDirectDraftSpecialization = struct {
@@ -18555,7 +18574,7 @@ const DraftTemplateSpec = struct {
     /// The substitution the request applied to the template's scheme.
     subst: SpecSubstitution,
     /// The instance table the request handed the template (D1), or null.
-    instances: ?InstanceTableId = null,
+    instances: OptionalInstanceTableId = .none,
     runtime_demand_guard_frames: []const RuntimeDemandGuardFrameAddress,
     /// Runtime-value demands recorded while this specialization's body (and
     /// any explicitly lexical-context-dependent procedure bodies it owns)
@@ -18587,7 +18606,7 @@ const DraftTemplateSpec = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftTemplateSpec) == 744);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftTemplateSpec) == 800);
 }
 
 /// Coordinator intent retained after the request graph is destroyed.
@@ -18605,7 +18624,7 @@ const SealedTemplateSpec = struct {
     /// Only deferred or globally committable requests retain dispatch evidence.
     evidence: ?[]const SpecEvidence,
     /// The Code instance table of the request (D1), or null.
-    instances: ?InstanceTableId = null,
+    instances: OptionalInstanceTableId = .none,
     /// The request's substitution sealed in the shard's store epoch.
     subst: SealedSubstitution,
     codec_contract: ?SealedCodecContractContext,
@@ -18628,7 +18647,7 @@ const SealedTemplateSpec = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(SealedTemplateSpec) == 304);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(SealedTemplateSpec) == 320);
 }
 
 /// Seal a draft request's substitution with the graph sealer that seals its
@@ -18671,7 +18690,7 @@ const DraftDeferredConstUse = struct {
     use_evidence: []const SpecEvidence,
     /// The Code instance table the use gives the constant's evaluation (D1,
     /// Q16), or null for a constant with no inventory.
-    instances: ?InstanceTableId,
+    instances: OptionalInstanceTableId,
     current_fn_key: names.TypeDigest,
     /// Durable ancestry of constant expansions active at the use site. The
     /// deferred expansion must restore this chain so a delayed recursive edge
@@ -18687,7 +18706,7 @@ const DraftDeferredConstUse = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftDeferredConstUse) == 880);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftDeferredConstUse) == 952);
 }
 
 /// A pending compile-time callable root currently being expanded into the
@@ -18886,7 +18905,7 @@ const DraftDeferredStoredCodecRestore = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftDeferredStoredCodecRestore) == 1272);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftDeferredStoredCodecRestore) == 1384);
 }
 
 const DraftCodecLocalProcContext = struct {
@@ -19627,7 +19646,7 @@ const DraftNestedSpec = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftNestedSpec) == 496);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(DraftNestedSpec) == 512);
 }
 
 /// Coordinator intent for one fully graph-sealed nested specialization.
@@ -29519,10 +29538,10 @@ const BodyContext = struct {
         // lowering does (design.md "Code Instance Tables"). A refused closing
         // use is lowered as a crash, so its callee's body is never lowered
         // and its interface reads the types alone.
-        edge.instances = if (self.view.code_output.edgeTable(.{ .use = record.expr })) |closing| switch (closing) {
+        edge.instances = .of(if (self.view.code_output.edgeTable(.{ .use = record.expr })) |closing| switch (closing) {
             .table => |table| .{ .view = self.view, .table = table },
             .refused => null,
-        } else self.instancesForUse(record.expr);
+        } else self.instancesForUse(record.expr));
         return try self.applyTemplateInterfaceRelations(
             template_ref,
             callee_view,
@@ -38136,7 +38155,7 @@ const BodyContext = struct {
             }
             // The target reads the table of the node's edge (design.md
             // "Code Instance Tables").
-            edge.instances = self.evidenceEdgeInstances(self.view, task.evidence_id);
+            edge.instances = .of(self.evidenceEdgeInstances(self.view, task.evidence_id));
             const source_fn_ty = lookup.target.callable_ty;
             const created = try self.builder.lowerDraftTemplateFromContext(
                 self,
@@ -40485,7 +40504,7 @@ const BodyContext = struct {
         body_ctx.evidence = rootEvidenceWithSubstitution(wrapper.template, schema, .{
             .subst = subst,
             .vector = self.restore_evidence.vector,
-            .instances = wrapper_instances,
+            .instances = .of(wrapper_instances),
         });
         try body_ctx.seedSubstitution(schema, subst);
         body_ctx.frozen_sealed_emission = self.frozen_sealed_emission;
@@ -48001,7 +48020,7 @@ const BodyContext = struct {
     ) Allocator.Error!DraftFnSlot {
         const template_ref = self.builder.templateRefForProcedureUse(proc);
         var edge = edge_in;
-        edge.instances = instances;
+        edge.instances = .of(instances);
         return try self.builder.lowerDraftTemplateFromContext(
             self,
             template_ref,
@@ -49131,7 +49150,7 @@ const BodyContext = struct {
             .provenance = provenance,
             .context_evidence = self.evidence,
             .use_evidence = use_evidence,
-            .instances = instances,
+            .instances = .of(instances),
             .current_fn_key = self.current_fn_key,
             .active_const_binding = .of(self.active_const_binding),
             .lexical = lexical,
@@ -49669,7 +49688,7 @@ const BodyContext = struct {
             };
         // The entry template's inventory holds the constant's uses at its
         // own variables, which the use's table closes (D1, Q16).
-        if (instances) |table| root_evidence.instances = table;
+        if (instances) |table| root_evidence.instances = .of(table);
         body_ctx.evidence = rootEvidenceWithSubstitution(eval.entry_template, schema, root_evidence);
         try body_ctx.seedSubstitution(schema, root_evidence.subst);
         body_ctx.source_region_override = source_region_override;
@@ -50019,7 +50038,7 @@ const BodyContext = struct {
         // requirement's closing use in the app (design.md "Code Instance
         // Tables").
         if (self.view.resolved_refs.lookupIdByExpr(use)) |id| switch (self.view.resolved_refs.records[@backingInt(id)].ref) {
-            .platform_required_proc => |required| if (required.instances) |table| return self.builder.requirementInstances(table),
+            .platform_required_proc => |required| if (required.instances.get()) |table| return self.builder.requirementInstances(table),
             .local_param, .local_value, .local_mutable_version, .pattern_binder, .local_proc, .selected_hoisted_const, .top_level_const, .imported_const, .top_level_proc, .imported_proc, .hosted_proc, .platform_required_declaration, .platform_required_checked_error, .platform_required_const, .promoted_top_level_proc => {},
         };
         if (self.binding_instances) |binding| if (binding.forwarded_lookup) |lookup| if (lookup == use) return binding.table;
@@ -50056,7 +50075,7 @@ const BodyContext = struct {
         if (self.view.code_output.edgeTable(useEdge(self.view, use))) |closing| return closing == .refused;
         const id = self.view.resolved_refs.lookupIdByExpr(use) orelse return false;
         return switch (self.view.resolved_refs.records[@backingInt(id)].ref) {
-            .platform_required_proc => |required| self.builder.requirementUseRefused(required.instances),
+            .platform_required_proc => |required| self.builder.requirementUseRefused(required.instances.get()),
             .local_param, .local_value, .local_mutable_version, .pattern_binder, .local_proc, .selected_hoisted_const, .top_level_const, .imported_const, .top_level_proc, .imported_proc, .hosted_proc, .platform_required_declaration, .platform_required_checked_error, .platform_required_const, .promoted_top_level_proc => false,
         };
     }
@@ -50925,7 +50944,7 @@ const BodyContext = struct {
                     template_ref,
                     source_fn_key,
                     request_fn_node,
-                    .{ .subst = subst, .vector = retained_evidence.vector, .instances = retained_evidence.instanceTable() },
+                    .{ .subst = subst, .vector = retained_evidence.vector, .instances = .of(retained_evidence.instanceTable()) },
                     .instantiation,
                     .independent_roots,
                     .inherit,
@@ -54946,9 +54965,9 @@ const BodyContext = struct {
                 // stored with, or, for a binding stored at its own type
                 // variables, the table of its use (Q16).
                 if (first == 0) {
-                    if (fn_value.instances) |stored| {
-                        restored[local].instances = .{ .view = self.builder.moduleForDigest(stored.module), .table = @fromBackingInt(stored.table) };
-                    } else if (self.binding_instances) |binding| restored[local].instances = binding.table;
+                    if (fn_value.instances.get()) |stored| {
+                        restored[local].instances = .of(.{ .view = self.builder.moduleForDigest(stored.module), .table = @fromBackingInt(stored.table) });
+                    } else if (self.binding_instances) |binding| restored[local].instances = .of(binding.table);
                 }
                 continue;
             }
@@ -55217,7 +55236,7 @@ const BodyContext = struct {
                 .procedure, .structural, .callable_binding => null,
             },
             .nested = nested,
-            .instances = if (target.instances) |stored| .{ .view = self.builder.moduleForDigest(stored.module), .table = @fromBackingInt(stored.table) } else null,
+            .instances = .of(if (target.instances.get()) |stored| .{ .view = self.builder.moduleForDigest(stored.module), .table = @fromBackingInt(stored.table) } else null),
         };
     }
 
@@ -56170,7 +56189,7 @@ const BodyContext = struct {
                 .{ .resolved = nested }
             else
                 .synthesize,
-            .instances = self.evidenceEdgeInstances(site_view, frame.node_id),
+            .instances = .of(self.evidenceEdgeInstances(site_view, frame.node_id)),
         };
         return frame.target;
     }
@@ -56219,7 +56238,7 @@ const BodyContext = struct {
             .target => |target| {
                 if (target.instantiation != null or target.callable_contracts.len != 0) return true;
                 // A table exists only where an edge selected the target.
-                if (target.instances != null) return true;
+                if (target.instances.get() != null) return true;
                 // A local procedure's declaration context exists only where
                 // this evidence was materialized; synthesis elsewhere does not
                 // have it.
@@ -56254,7 +56273,7 @@ const BodyContext = struct {
                     {
                         Common.invariant("substitution-derived target differed from checked target contract");
                     }
-                    if (contract_target.nested == .synthesize and contract_target.substitution == null and contract_target.callable_contracts.len == 0 and contract_target.instances == null) break :blk derived;
+                    if (contract_target.nested == .synthesize and contract_target.substitution == null and contract_target.callable_contracts.len == 0 and contract_target.instances.get() == null) break :blk derived;
                     const merged = try self.builder.evidence_arena.allocator().create(SpecEvidenceTarget);
                     merged.* = derived_target.*;
                     merged.instantiation = null;
@@ -57557,7 +57576,7 @@ const BodyContext = struct {
         defer target_ctx.deinit();
         const target_root_node = try target_ctx.instNode(source_fn_ty);
         try self.relateEvidenceTargetRootToRequest(lookup.view, source_fn_ty, target_root_node, request_fn_node);
-        return .{ .callable_binding = .{ .module = binding.module, .template = binding.template, .fn_node = request_fn_node, .instances = instances } };
+        return .{ .callable_binding = .{ .module = binding.module, .template = binding.template, .fn_node = request_fn_node, .instances = .of(instances) } };
     }
 
     /// The table of a call the compiler makes of `lookup`'s target by the
@@ -57594,7 +57613,7 @@ const BodyContext = struct {
                 // the compiler makes (Q17).
                 const saved_binding = self.binding_instances;
                 defer self.binding_instances = saved_binding;
-                self.binding_instances = if (binding.instances) |table| .{ .table = table, .forwarded_lookup = null } else null;
+                self.binding_instances = if (binding.instances.get()) |table| .{ .table = table, .forwarded_lookup = null } else null;
                 break :blk .{ .value = try self.lowerCallableEvalBindingValueAtNode(
                     self.builder.moduleForDigest(binding.module),
                     binding.template,
@@ -58213,7 +58232,7 @@ const BodyContext = struct {
                 const target_root_node = try target_ctx.instNode(template.checked_fn_root);
                 try self.relateEvidenceTargetRootToRequest(lookup.view, template.checked_fn_root, target_root_node, request_fn_node);
                 var edge = alias_edge orelse try self.deriveTargetEdge(&target_ctx, schema, evidence_source);
-                edge.instances = instances;
+                edge.instances = .of(instances);
                 break :blk try self.builder.lowerDraftTemplateFromContext(
                     self,
                     procedure.template,
@@ -58388,7 +58407,7 @@ const BodyContext = struct {
                     .subst = subst,
                     .vector = try self.deriveEvidenceVector(schema, subst, self.view, contract, .body_lowering),
                 };
-                edge.instances = self.directDispatchInstances(plan);
+                edge.instances = .of(self.directDispatchInstances(plan));
                 break :blk try self.builder.lowerDraftTemplateFromContext(
                     self,
                     procedure.template,
@@ -58508,7 +58527,7 @@ const BodyContext = struct {
                     .target => |target| target,
                     .structural, .from_callable, .from_scheme, .unreachable_value, .checked_error => Common.invariant("dispatch target evidence was not a callable target"),
                 };
-                if (target.instances) |table| break :blk .{ .table = table };
+                if (target.instances.get()) |table| break :blk .{ .table = table };
                 break :blk if (code_analyses.DescriptorMethod.fromMethodName(self.view.names, plan.method)) |method| .{ .implicit = method } else .none;
             },
             .direct_closed, .direct_parametric, .direct_pending, .structural, .checked_error, .@"unreachable" => .none,

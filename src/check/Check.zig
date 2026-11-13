@@ -2753,7 +2753,7 @@ const DispatchTargetInstantiation = struct {
     /// expression that the dispatch runs at. A derived edge has the site of
     /// the edge it was derived from. The reify-only pass maps this site to
     /// the top-level definition or `expect` that holds it.
-    site_expr: ?CIR.Expr.Idx,
+    site_expr: collections.OptionalId(CIR.Expr.Idx),
     /// The `runs` bit of the constraint this edge resolves.
     runs: bool,
 };
@@ -3610,7 +3610,7 @@ const HoistFrame = struct {
 };
 
 comptime {
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(HoistFrame) == 40);
+    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(HoistFrame) == 48);
 }
 
 const CompletedHoistResult = struct {
@@ -15417,7 +15417,7 @@ fn finalizeReifyOnlyDefinitions(self: *Self) Allocator.Error!void {
     var dispatches: std.ArrayListUnmanaged(reify_only.Dispatch) = .empty;
     defer dispatches.deinit(self.gpa);
     for (self.dispatch_target_instantiations.items) |target| {
-        const site_expr = target.site_expr orelse continue;
+        const site_expr = target.site_expr.get() orelse continue;
         try dispatches.append(self.gpa, .{
             .site_expr = site_expr,
             .runs = target.runs,
@@ -52136,7 +52136,7 @@ fn instantiateDispatchTargetMethodVar(
         .derivations_start = derivations_start,
         .derivations_end = derivations_end,
         .intro_expr = .of(constraintIntroExpr(constraint)),
-        .site_expr = site_expr,
+        .site_expr = .of(site_expr),
         .runs = constraint.runs,
     });
     self.dispatch_target_instantiation_by_fn_var.putAssumeCapacityNoClobber(constraint.fn_var, raw_index);
@@ -53817,7 +53817,7 @@ fn replayDispatchTarget(
         .method_name = constraint.fn_name,
         .method_var = method_var,
         .intro_expr = .of(constraintIntroExpr(constraint)),
-        .site_expr = site_expr,
+        .site_expr = .of(site_expr),
         .runs = constraint.runs,
     });
     self.dispatch_target_instantiation_by_fn_var.putAssumeCapacityNoClobber(constraint.fn_var, raw_index);
@@ -54370,7 +54370,7 @@ fn dispatchSiteExpr(self: *const Self, constraint: StaticDispatchConstraint, fai
     var current = constraint.fn_var;
     while (self.dispatchDerivationParent(current)) |parent| {
         if (self.dispatch_target_instantiation_by_fn_var.get(parent)) |raw_index| {
-            return self.dispatch_target_instantiations.items[raw_index].site_expr;
+            return self.dispatch_target_instantiations.items[raw_index].site_expr.get();
         }
         current = parent;
     }
@@ -54455,7 +54455,7 @@ fn closeRecursiveDispatch(
         .method_name = constraint.fn_name,
         .method_var = ancestor.method_var,
         .intro_expr = .of(constraintIntroExpr(constraint)),
-        .site_expr = site_expr,
+        .site_expr = .of(site_expr),
         .runs = constraint.runs,
     });
     self.dispatch_target_instantiation_by_fn_var.putAssumeCapacityNoClobber(constraint.fn_var, raw_index);
