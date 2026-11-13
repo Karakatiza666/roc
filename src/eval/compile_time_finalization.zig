@@ -1207,6 +1207,8 @@ fn evaluateBoxyRoots(
     for (modules) |entry| {
         if (entry.problem_store) |store| try finishPendingExhaustiveness(entry.module, store);
     }
+}
+
 /// Fill the code slots of every module, the cached ones included, then run
 /// the description step of each module this finalization completes whose
 /// code output is pending (design.md "Code Reification"). Every module the
@@ -5124,6 +5126,7 @@ fn reportForeignLiteralRejection(
         .numeral => _ = try store.appendProblem(.{ .comptime_invalid_numeral = .{ .message = message_idx, .region = failure_site.region, .origin = origin } }),
         .quote => _ = try store.appendProblem(.{ .comptime_invalid_quote = .{ .message = message_idx, .region = failure_site.region, .origin = origin } }),
         .interpolation => _ = try store.appendProblem(.{ .comptime_invalid_interpolation = .{ .message = message_idx, .region = failure_site.region, .origin = origin } }),
+        .bound_call => unreachable, // no conversion rejects a bound call's root (`LiteralRejectionKind.bound_call`)
     }
     return .reported;
 }

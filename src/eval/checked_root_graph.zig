@@ -523,9 +523,9 @@ const Walker = struct {
             .intrinsic_wrapper, .entry_wrapper, .unimplemented => return,
         };
         const artifact = self.modules[module];
-        const index = artifact.bodies().index();
+        const index = artifact.checked_bodies.index();
         const unit = index.unitOf(@backingInt(root_expr));
-        const output = artifact.code();
+        const output = artifact.code_output;
         for (output.sites) |site| {
             if (site.outcome != .value or index.unitOf(@backingInt(site.node)) != unit) continue;
             try self.readCodeReads(output.reads[site.reads.start..][0..site.reads.len]);
@@ -540,7 +540,7 @@ const Walker = struct {
         }
         // A method call's table is keyed by the node it targets, which
         // names no body: read the table of each call the unit holds.
-        const bodies = artifact.bodies();
+        const bodies = artifact.checked_bodies;
         for (index.unitNodeSlice(unit)) |raw_node| {
             if (index.nodeKind(raw_node) != .expr) continue;
             const node = bodies.directDispatchNode(@fromBackingInt(raw_node)) orelse continue;
@@ -572,7 +572,7 @@ const Walker = struct {
     /// the frame its edge enters, whose instance sites read the table of
     /// the edge's closing use: read the literal roots of that table.
     fn boundRootReads(self: *Walker, module: u32, root: checked.ComptimeRootId, argument: checked.LiteralArgumentRoot) Allocator.Error!void {
-        const output = self.modules[module].code();
+        const output = self.modules[module].code_output;
         if (output.rootBound(root) == null) return;
         const closing: ?check.CodeOutput.Use = switch (argument.edge) {
             .use, .requirement, .node => output.edgeTable(argument.edge),

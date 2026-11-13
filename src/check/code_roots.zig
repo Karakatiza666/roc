@@ -243,7 +243,7 @@ pub fn isValueSite(cir: *const ModuleEnv, expr: CIR.Expr.Idx) bool {
 /// site as input slots. The program reads such a call only through its root,
 /// so the root is part of what the program means, at any depth.
 pub fn rootBindsInputs(cir: *const ModuleEnv, root: hoist_roots.SelectedHoistedRoot) bool {
-    return root.body == .expr and root.pattern == null and exprBindsInputs(cir, root.expr);
+    return root.body == .expr and root.pattern.get() == null and exprBindsInputs(cir, root.expr);
 }
 
 /// Whether `expr` is a call that binds the run-time reads of a lambda site as

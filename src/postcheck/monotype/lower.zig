@@ -39413,7 +39413,7 @@ const BodyContext = struct {
         var current = ty;
         while (true) switch (self.typeStore().get(current)) {
             .named => |named| switch (named.kind) {
-                .alias => current = (named.backing orelse Common.invariant("an alias in a slot type had no backing")).ty,
+                .alias => current = (named.backing.get() orelse Common.invariant("an alias in a slot type had no backing")).ty,
                 .nominal, .@"opaque" => return current,
             },
             .primitive, .record, .tuple, .tag_union, .list, .box, .func, .erased, .zst, .hole => return current,
@@ -40444,7 +40444,7 @@ const BodyContext = struct {
         const root = view.compile_time_roots.root(template.root);
         // A stored function has no type variable, so the wrapper of a binding
         // that computes it has no inventory and its use gives no table.
-        std.debug.assert(root.payload != .fn_value or template.forwarded_lookup != null or self.binding_instances == null);
+        std.debug.assert(root.payload != .fn_value or template.forwarded_lookup.get() != null or self.binding_instances == null);
         const restored = switch (root.payload) {
             .fn_value => |fn_id| try self.restoreConstFnAt(view, fn_id, .{ .node = request_fn_node }, null),
             .const_node => |node| try self.restoreConstNodeAtNode(view, view, node, request_fn_node),
@@ -40473,12 +40473,12 @@ const BodyContext = struct {
         // computes a function is computed by its wrapper, whose inventory
         // holds the binding's uses at its own variables: the use's table is
         // the wrapper's, on the root frame (design.md "Code Instance Tables").
-        const wrapper_instances: ?InstanceTableId = if (template.forwarded_lookup == null) blk: {
+        const wrapper_instances: ?InstanceTableId = if (template.forwarded_lookup.get() == null) blk: {
             const binding = self.binding_instances orelse break :blk null;
             std.debug.assert(binding.forwarded_lookup == null);
             break :blk binding.table;
         } else null;
-        if (template.forwarded_lookup != null) body_ctx.binding_instances = self.binding_instances;
+        if (template.forwarded_lookup.get() != null) body_ctx.binding_instances = self.binding_instances;
         const entry_template = view.templates.get(wrapper.template.template);
         const schema = templateSchemaIn(view, &entry_template);
         const subst = try body_ctx.substitutionFromCheckedTypes(view, schema.scheme_vars);
@@ -49154,7 +49154,7 @@ const BodyContext = struct {
             defer self.binding_instances = saved_binding;
             self.binding_instances = if (self.instancesForUse(site_expr)) |table| .{
                 .table = table,
-                .forwarded_lookup = callable_eval.view.callable_eval_templates.templates[@backingInt(callable_eval.template)].forwarded_lookup,
+                .forwarded_lookup = callable_eval.view.callable_eval_templates.templates[@backingInt(callable_eval.template)].forwarded_lookup.get(),
             } else null;
             return try self.lowerCallableEvalBindingValueAtNode(
                 callable_eval.view,
@@ -53792,6 +53792,7 @@ const BodyContext = struct {
             .numeral => .numeral,
             .quote => .quote,
             .interpolation => Common.invariant("a specialized literal conversion pointed at an interpolation"),
+            .bound_call => Common.invariant("a specialized literal conversion pointed at a bound call"),
         };
         const candidates = self.builder.literalArgumentRootIndex().rootsOf(.{ .module = self.view.key.bytes, .node = site.node, .kind = kind });
         if (candidates.len == 0) return null;

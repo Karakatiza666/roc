@@ -2474,7 +2474,7 @@ pub const ReportBuilder = struct {
             D.bytes("It is:"),
         }, self, &report);
         try report.document.addLineBreak();
-        const type_str = try report.addOwnedString(self.getFormattedString(data.snapshot));
+        const type_str = try report.addOwnedString(try self.getFormattedString(data.snapshot));
         try report.document.addCodeBlock(type_str);
         try report.document.addLineBreaks(2);
 
@@ -2836,8 +2836,8 @@ pub const ReportBuilder = struct {
     ) Allocator.Error!Report {
         var report = try Report.init(self.gpa, "Cannot Bind Captured Value", "", .runtime_error);
         errdefer report.deinit();
-        const format_str = try report.addOwnedString(self.getFormattedString(bound.format_snapshot));
-        const dispatcher_str = try report.addOwnedString(self.getFormattedString(data.dispatcher_snapshot));
+        const format_str = try report.addOwnedString(try self.getFormattedString(bound.format_snapshot));
+        const dispatcher_str = try report.addOwnedString(try self.getFormattedString(data.dispatcher_snapshot));
         const value_snapshot = bound.value_snapshot orelse {
             try D.renderSliceInto(&.{
                 D.bytes("This translator binds the values the function captures in its format,"),
@@ -2855,7 +2855,7 @@ pub const ReportBuilder = struct {
             }, self, &report);
             return report;
         };
-        const value_str = try report.addOwnedString(self.getFormattedString(value_snapshot));
+        const value_str = try report.addOwnedString(try self.getFormattedString(value_snapshot));
         try D.renderSliceInto(&.{
             D.bytes("This translator cannot bind a captured value of type"),
             D.bytes(value_str).withAnnotation(.type_variable),

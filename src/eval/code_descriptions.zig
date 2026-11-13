@@ -449,7 +449,7 @@ fn bindCodeInputs(
                 .open_type => "a translator that receives captured inputs runs once while the compiler runs, at the one type the call has. The type of this call holds a type variable that neither its arguments nor its lambdas fix, so the call has no one type to run at. Fix the type so that the call's result has no type variable, such as with an annotation that names a concrete type",
                 .other => "a translator that receives captured inputs runs while the compiler runs, and so does each call of its chain, so the compiler must be able to compute the call then, from its lambdas and fixed values",
             };
-            std.debug.assert(entry.pattern == null);
+            std.debug.assert(entry.pattern.get() == null);
             if (builtin.mode == .debug) std.debug.assert(try boundRootTypeIsFixed(gpa, bodies.types, bodies.expr(call).ty));
             const slots_start: u32 = @intCast(builder.slots.items.len);
             for (outcomes[first_index..]) |site| {

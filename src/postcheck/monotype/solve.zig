@@ -5434,7 +5434,7 @@ pub const InstGraph = struct {
                 // (design.md "Record Extension Well-Formedness").
                 .named => |named| {
                     if (kind != .record) return false;
-                    const declared_backing = named.backing orelse return false;
+                    const declared_backing = named.backing.get() orelse return false;
                     if (declared_backing.use != .inspectable) return false;
                     if ((try seen.getOrPut(current)).found_existing) return false;
                     const backing = try self.findStructuralBackingNode(declared_backing.node, named);

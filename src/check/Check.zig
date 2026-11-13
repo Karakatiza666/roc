@@ -2697,7 +2697,7 @@ const InstantiationEvidence = union(enum) {
     fn runsMask(self: InstantiationEvidence, checker: *const Self) bool {
         return switch (self) {
             .none => true,
-            .value_use, .nested_function_use, .predeclared_use => checker.creationRuns(),
+            .value_use, .nested_function_use, .predeclared_use, .platform_requirement => checker.creationRuns(),
             .dispatch_target => |site| site.runs,
         };
     }
@@ -6552,7 +6552,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         null;
     // Allocate here too, so a failure leaves every hoist selection untouched.
     if (frame.reads_code_site and frame.binding_rhs) {
-        if (frame.binding_pattern) |pattern| try self.code_site_bindings.put(self.gpa, pattern, {});
+        if (frame.binding_pattern.get()) |pattern| try self.code_site_bindings.put(self.gpa, pattern, {});
     }
     if (code_selection.binds_inputs) {
         if (self.active_scheme_root) |owner| try self.bound_call_scheme_owners.put(self.gpa, expr, owner);
@@ -6638,7 +6638,7 @@ fn finishHoistFrame(self: *Self, expr: CIR.Expr.Idx, does_fx: bool) Allocator.Er
         &self.hoist_runtime_code_sites,
         frame.runtime_code_site_start,
         expr,
-        frame_index != 0 and can_be_root and selection_allowed and frame.promotion_dependency == null,
+        frame_index != 0 and can_be_root and selection_allowed and frame.promotion_dependency.get() == null,
     );
 
     if (builtin.mode == .debug and has_child_candidates) {
@@ -16356,8 +16356,8 @@ fn boundCallMentionsEnclosingSchemeVars(self: *Self, expr: CIR.Expr.Idx, fn_var:
     var current = self.bound_call_scheme_owners.get(expr);
     while (current) |owner| {
         if (try code_roots.typeMentionsSchemeVars(self.gpa, self.types, self.cir, fn_var, owner)) return true;
-        current = self.scheme_owner_parents.get(owner) orelse
-            base.invariant("a bound call's scheme owner was never activated", .{});
+        current = (self.scheme_owner_parents.get(owner) orelse
+            base.invariant("a bound call's scheme owner was never activated", .{})).get();
     }
     return false;
 }
@@ -54355,6 +54355,8 @@ const OpenRecursiveDispatch = struct {
 
 comptime {
     if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(OpenRecursiveDispatch) == 32);
+}
+
 /// The use site of a dispatch edge (`DispatchTargetInstantiation.site_expr`).
 /// An edge derived from another edge (a target's own requirement, or a
 /// component of a structural comparison or hash) runs where that edge runs,

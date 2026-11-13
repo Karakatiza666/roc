@@ -10418,7 +10418,6 @@ const TestImportViewTables = struct {
     callable_eval_templates: CallableEvalTemplateTable = .{},
     hoisted_constants: HoistedConstTable = .{},
     const_templates: ConstTemplateTable = .{},
-    top_level_values: TopLevelValueTable = .{},
     method_registry: static_dispatch.MethodRegistry = .{},
     interface_capabilities: ModuleInterfaceCapabilities = .{},
     const_store: ConstStore,
@@ -10485,7 +10484,6 @@ const TestImportViewTables = struct {
             .callable_eval_templates = self.callable_eval_templates.view(),
             .hoisted_constants = &self.hoisted_constants,
             .const_templates = &self.const_templates,
-            .top_level_values = &self.top_level_values,
             .method_registry = &self.method_registry,
             .interface_capabilities = &self.interface_capabilities,
             .const_store = &self.const_store,
@@ -12881,7 +12879,7 @@ pub fn exportedAlias(view: ImportedModuleView, lookup: code_reifier.ForeignLooku
             .callable_eval_template => |template| template,
             .direct_template, .checked_error => return null,
         };
-        const forwarded = view.callable_eval_templates.templates[@backingInt(template)].forwarded_lookup orelse
+        const forwarded = view.callable_eval_templates.templates[@backingInt(template)].forwarded_lookup.get() orelse
             return null;
         return .{ .module = foreignModule(view, lookup), .lookup = forwarded, .template = template };
     }
@@ -12899,7 +12897,7 @@ pub fn exportedComputed(view: ImportedModuleView, lookup: code_reifier.ForeignLo
             .direct_template, .checked_error => return null,
         };
         const template = view.callable_eval_templates.templates[@backingInt(template_id)];
-        if (template.forwarded_lookup != null) return null;
+        if (template.forwarded_lookup.get() != null) return null;
         return .{ .module = foreignModule(view, lookup), .body = template.body, .template = template_id };
     }
     return null;
@@ -22837,7 +22835,7 @@ fn publishLiteralArgumentRoots(
                 while (current) |id| {
                     const local_scope = &scopes[@backingInt(id)];
                     for (templates.scopeSchemeVars(local_scope)) |variable| try scope_vars.put(allocator, variable, {});
-                    current = local_scope.parent;
+                    current = local_scope.parent.get();
                 }
                 seen.clearRetainingCapacity();
                 if (try code_reifier.typeMentionsIn(allocator, store.view(), call_ty, &scope_vars, &seen)) continue;
@@ -23832,7 +23830,7 @@ fn mentionsQuantifiedVars(
     while (current) |id| {
         const local_scope = &templates.dispatch_scopes[id];
         for (templates.scopeSchemeVars(local_scope)) |variable| try vars.put(allocator, variable, {});
-        current = if (local_scope.parent) |parent| @backingInt(parent) else null;
+        current = if (local_scope.parent.get()) |parent| @backingInt(parent) else null;
     }
     if (vars.count() == 0) return false;
     var seen: code_reifier.MentionVars = .empty;
@@ -26767,7 +26765,7 @@ fn publishCompileTimeRootRequestEligibility(
                 .expr, .statement, .hoisted, .required_binding, .literal => false,
             },
             .hoisted_constant => switch (root.source) {
-                .hoisted => |hoisted| root.source_pattern == null and
+                .hoisted => |hoisted| root.source_pattern.get() == null and
                     code_roots.exprBindsInputs(module.moduleEnvConst(), hoisted.expr) and
                     try boundCaptureEncodersAreConcrete(allocator, module, checked_types, hoisted.expr),
                 .def, .expr, .statement, .required_binding, .literal => false,
@@ -34844,7 +34842,9 @@ pub const ImportedModuleView = struct {
     exported_procedure_bindings: ExportedProcedureBindingView,
     exported_const_templates: ExportedConstTemplateView,
     provided_exports: *const ProvidedExportTable,
-    /// Checked binding classification used by dependency walks across visible modules.
+    /// Checked binding classification used by dependency walks across visible
+    /// modules, and the definition each top-level value binds, which the walk
+    /// of a description reads to name a constant of this module.
     top_level_values: *const TopLevelValueTable,
     top_level_procedure_bindings: *const TopLevelProcedureBindingTable,
     platform_required_declarations: *const PlatformRequiredDeclarationTable,
@@ -34858,9 +34858,6 @@ pub const ImportedModuleView = struct {
     callable_eval_templates: CallableEvalTemplateTableView,
     hoisted_constants: *const HoistedConstTable,
     const_templates: *const ConstTemplateTable,
-    /// The definition each top-level value's pattern binds, which the walk of
-    /// a description reads to name a constant of this module.
-    top_level_values: *const TopLevelValueTable,
     method_registry: *const static_dispatch.MethodRegistry,
     interface_capabilities: *const ModuleInterfaceCapabilities,
     const_store: *const ConstStore,
@@ -34933,7 +34930,6 @@ pub fn importedView(artifact: *const CheckedModuleArtifact) ImportedModuleView {
         .callable_eval_templates = artifact.callable_eval_templates.view(),
         .hoisted_constants = &artifact.hoisted_constants,
         .const_templates = &artifact.const_templates,
-        .top_level_values = &artifact.top_level_values,
         .method_registry = &artifact.method_registry,
         .interface_capabilities = &artifact.interface_capabilities,
         .const_store = &artifact.const_store,
@@ -38267,7 +38263,6 @@ fn testVisibilityImportedView(
         .callable_eval_templates = undefined,
         .hoisted_constants = undefined,
         .const_templates = undefined,
-        .top_level_values = undefined,
         .method_registry = undefined,
         .interface_capabilities = undefined,
         .const_store = undefined,

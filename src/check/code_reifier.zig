@@ -4099,7 +4099,7 @@ pub const Reifier = struct {
                     .direct_template, .checked_error => return null,
                 };
                 const template = self.callable_eval_templates.templates[@backingInt(template_id)];
-                if (template.forwarded_lookup != null) return null;
+                if (template.forwarded_lookup.get() != null) return null;
                 return .{ .written = .{ .reader = self, .body = template.body } };
             },
             .imported => |imported| {
@@ -5724,11 +5724,11 @@ pub const Reifier = struct {
                                 return null;
                             },
                         };
-                        const def = self.names.procBase(template.proc_base).source_def_idx orelse return null;
+                        const def = self.names.procBase(template.proc_base).source_def_idx.get() orelse return null;
                         return .{ .reader = self, .body = body_id, .def = @fromBackingInt(def), .ty = template.checked_fn_root };
                     },
                     .callable_eval_template => |id| {
-                        const lookup = self.callable_eval_templates.templates[@backingInt(id)].forwarded_lookup orelse return null;
+                        const lookup = self.callable_eval_templates.templates[@backingInt(id)].forwarded_lookup.get() orelse return null;
                         const forwarded = self.value_refs.lookupIdByExpr(lookup) orelse
                             invariant("an alias forwards to a lookup with no resolved reference");
                         return self.cutMember(forwarded);
@@ -6027,7 +6027,7 @@ pub const Reifier = struct {
 
     /// Whether this reader's procedure template `template` is an intrinsic's.
     fn templateIsIntrinsic(self: *Reifier, template: checked.CheckedProcedureTemplate) bool {
-        const def = self.names.procBase(template.proc_base).source_def_idx orelse return false;
+        const def = self.names.procBase(template.proc_base).source_def_idx.get() orelse return false;
         return defIsIntrinsic(self.env, @fromBackingInt(def));
     }
 
@@ -6070,7 +6070,7 @@ pub const Reifier = struct {
                 };
                 const template = self.procedure_templates.templates.items[@backingInt(template_ref.template)];
                 if (template.body != .unimplemented) return null;
-                const def = self.names.procBase(template.proc_base).source_def_idx orelse return null;
+                const def = self.names.procBase(template.proc_base).source_def_idx.get() orelse return null;
                 return self.intrinsicAt(@fromBackingInt(def));
             },
             .imported => |imported| return self.intrinsicOfTemplate(imported.artifact, imported.def),
@@ -6487,7 +6487,7 @@ pub const Reifier = struct {
         for (evidence.scheme) |param| {
             const text = names.names.methodNameText(param.method);
             const method = try self.rt().name(text);
-            const slot = param.slot orelse return self.rejectError(.unsupported_expression, region, receiver_composite);
+            const slot = param.slot.get() orelse return self.rejectError(.unsupported_expression, region, receiver_composite);
             // `receiverInstantiation` binds every quantified variable or refuses.
             const dispatcher = instance.substitution.get(scheme_vars[slot]) orelse
                 invariant("a receiver instantiation left a quantified variable unbound");
@@ -6536,7 +6536,7 @@ pub const Reifier = struct {
                 return self.calleeEvidence(words, callee, false, region);
             },
             .record, .tuple, .tag_union, .empty_record, .empty_tag_union, .function => {
-                const kind = param.structural orelse return self.rejectError(.unsupported_type, region, receiver_structural);
+                const kind = param.structural.get() orelse return self.rejectError(.unsupported_type, region, receiver_structural);
                 return switch (static_dispatch.unpinnedDispatchResolution(kind)) {
                     .structural => words.appendSlice(self.gpa, &.{ @backingInt(ir.EvidenceKind.derived), method.index() }),
                     .unreachable_value => self.rejectError(.unsupported_type, region, receiver_structural),
@@ -7138,7 +7138,7 @@ pub const Reifier = struct {
             .hosted, .platform_required => return null,
         };
         const template = reader.callable_eval_templates.templates[@backingInt(template_id)];
-        if (template.forwarded_lookup != null) return null;
+        if (template.forwarded_lookup.get() != null) return null;
         const wrapper = reader.entry_wrappers.lookupByRoot(template.root) orelse
             invariant("a binding that computes a function has no entry wrapper");
         std.debug.assert(std.meta.eql(wrapper.template.artifact.bytes, reader.artifact.bytes));
@@ -7524,7 +7524,7 @@ pub const Reifier = struct {
         // instance table names no primitive and no cut.
         const primitive: ?Primitive = if (use_kind == .instance_table)
             null
-        else if (reader.names.procBase(reached.template.proc_base).source_def_idx) |def|
+        else if (reader.names.procBase(reached.template.proc_base).source_def_idx.get()) |def|
             try reader.primitiveOf(@fromBackingInt(def), reached.template.checked_fn_root)
         else if (reader.env.module_role == .builtin) .builtin else null;
         // A primitive's `where` requirements are its template's, which the
@@ -7621,7 +7621,7 @@ pub const Reifier = struct {
             // computes a function has none.
             .callable_eval_template => |id| {
                 const template = self.callable_eval_templates.templates[@backingInt(id)];
-                const lookup = template.forwarded_lookup orelse
+                const lookup = template.forwarded_lookup.get() orelse
                     return self.rejectError(.unsupported_expression, region, "a top-level constant that computes a function, named as the function to describe");
                 var reached = try self.forwardedProcedure(lookup, region);
                 reached.alias = self.bindingHop(template, lookup);
@@ -7734,7 +7734,7 @@ pub const Reifier = struct {
     /// module does not export has none.
     fn providedName(names: *const canonical.CanonicalNameStore, template: checked.CheckedProcedureTemplate) ?ProvidedName {
         const proc_base = names.procBase(template.proc_base);
-        const id = proc_base.export_name orelse return null;
+        const id = proc_base.export_name.get() orelse return null;
         return .{ .id = id, .text = names.exportNameText(id) };
     }
 
@@ -8380,7 +8380,7 @@ pub const Reifier = struct {
         if (target.alias == null) return target.def_idx;
         const reader = try self.templateReader(procedure.template.artifact) orelse return null;
         const template = reader.procedure_templates.templates.items[@backingInt(procedure.template.template)];
-        const def = reader.names.procBase(template.proc_base).source_def_idx orelse return null;
+        const def = reader.names.procBase(template.proc_base).source_def_idx.get() orelse return null;
         return @fromBackingInt(def);
     }
 
@@ -8426,7 +8426,7 @@ pub const Reifier = struct {
             .top_level => |pattern| {
                 for (self.callable_eval_templates.templates) |template| {
                     if (template.pattern != pattern) continue;
-                    return self.bindingHop(template, template.forwarded_lookup orelse invariant("a method alias binding is an exact procedure alias"));
+                    return self.bindingHop(template, template.forwarded_lookup.get() orelse invariant("a method alias binding is an exact procedure alias"));
                 }
                 invariant("a method alias binding has a callable-eval template");
             },
@@ -8464,7 +8464,7 @@ pub const Reifier = struct {
                     .direct_template, .checked_error => return null,
                 };
                 const template = reader.callable_eval_templates.templates[@backingInt(id)];
-                const lookup = template.forwarded_lookup orelse return null;
+                const lookup = template.forwarded_lookup.get() orelse return null;
                 return reader.bindingHop(template, lookup);
             },
             .imported => |imported| {
@@ -11754,7 +11754,7 @@ pub const Reifier = struct {
             if (target.reader.schemeVars(target.template).len != 0) continue;
             const target_fn: FramedType = .{ .reader = target.reader, .id = target.template.checked_fn_root, .frame = empty_frame };
             if (!self.fitsTarget(callable, target_fn)) {
-                if (node.dispatcher_ty) |dispatcher| try self.unfit.put(self.gpa, dispatcher, {});
+                if (node.dispatcher_ty.get()) |dispatcher| try self.unfit.put(self.gpa, dispatcher, {});
                 continue;
             }
             variables.clearRetainingCapacity();
@@ -14384,7 +14384,7 @@ const ModuleScan = struct {
             // at the wrapper's variables is a forward entry of its inventory.
             // An exact alias is no such binding: a use of it reaches the
             // procedure its lookup names.
-            if (eval_template.forwarded_lookup == null) {
+            if (eval_template.forwarded_lookup.get() == null) {
                 const wrapper = reifier.entry_wrappers.lookupByRoot(eval_template.root) orelse
                     invariant("a binding that computes a function has no entry wrapper");
                 const entry = wrapper.template.template;
@@ -14838,7 +14838,7 @@ fn refusedMethods(gpa: Allocator, reifier: *Reifier, scan: *ModuleScan) Allocato
         const target = entry.target orelse continue;
         const method = DescriptorMethod.fromMethodName(reifier.names, entry.key.method) orelse continue;
         // Inspection calls only an eligible `to_inspect`.
-        if (method == .to_inspect and entry.inspect_override == null) continue;
+        if (method == .to_inspect and entry.inspect_override.get() == null) continue;
         const implicit = try implicitTargetOf(reifier, target) orelse continue;
         const holder = try reifier.templateReader(.{ .bytes = implicit.artifact }) orelse
             invariant("a descriptor method's target is a template of a module the walk cannot read");
@@ -15245,7 +15245,7 @@ const OccurrenceScan = struct {
         const plan = s.r.plans.plans[@backingInt(plan_id)];
         switch (plan.resolution) {
             .direct_closed, .direct_parametric => |direct| try edges.walk.stack.append(edges.walk.allocator, direct.evidence),
-            .structural => if (plan.generated_codec_derivation) |derivation| try edges.walk.derivation(edges, derivation),
+            .structural => if (plan.generated_codec_derivation.get()) |derivation| try edges.walk.derivation(edges, derivation),
             .direct_pending, .evidence_dependent, .checked_error, .@"unreachable" => {},
         }
     }
@@ -15359,7 +15359,7 @@ const OccurrenceScan = struct {
                     },
                     // A written `encoder_for` or `parser_for` call's
                     // contract (design.md "Literal Arguments").
-                    .structural => if (dispatch.generated_codec_derivation) |derivation| try edges.walk.derivation(edges, derivation),
+                    .structural => if (dispatch.generated_codec_derivation.get()) |derivation| try edges.walk.derivation(edges, derivation),
                     .direct_pending, .evidence_dependent, .checked_error, .@"unreachable" => {},
                 }
                 try edges.walk.nodes(edges, null);
@@ -16196,7 +16196,7 @@ fn derivedNodesOfNode(reifier: *Reifier, node_id: static_dispatch.EvidenceNodeId
 /// `CodeInventories.refused_methods`): the target its registry records for
 /// the refused key.
 fn refusedTargetOf(reifier: *Reifier, node: static_dispatch.EvidenceNode) Allocator.Error!?Rejection {
-    const dispatcher = node.dispatcher_ty orelse return null;
+    const dispatcher = node.dispatcher_ty.get() orelse return null;
     const settled = Reifier.settledType(reifier.resolvedType(dispatcher));
     const nominal = settled.reader.nominalOf(settled.id) orelse return null;
     if (nominal.builtin != null) return null;
@@ -16972,7 +16972,7 @@ const TableBuilder = struct {
             .direct_template, .checked_error => return null,
         };
         const template = reifier.callable_eval_templates.templates[@backingInt(id)];
-        if (template.forwarded_lookup != null) return null;
+        if (template.forwarded_lookup.get() != null) return null;
         if (std.debug.runtime_safety) {
             const wrapper = reifier.entry_wrappers.lookupByRoot(template.root) orelse
                 invariant("a binding that computes a function has no entry wrapper");
@@ -17275,7 +17275,7 @@ fn templateOfBody(reader: *Reifier, body: ExprId) ?canonical.CheckedProcedureTem
         .stored_const, .reserved, .unimplemented => {},
     };
     for (reader.callable_eval_templates.templates) |template| {
-        if (template.forwarded_lookup != null or template.body != body) continue;
+        if (template.forwarded_lookup.get() != null or template.body != body) continue;
         const wrapper = reader.entry_wrappers.lookupByRoot(template.root) orelse
             invariant("a binding that computes a function has no entry wrapper");
         return wrapper.template.template;
