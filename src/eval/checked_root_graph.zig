@@ -523,6 +523,9 @@ const Walker = struct {
             .intrinsic_wrapper, .entry_wrapper, .unimplemented => return,
         };
         const artifact = self.modules[module];
+        // The body index is built on demand (design.md "On-Demand Analyses And
+        // Write-Once Slots").
+        try artifact.checked_bodies.demandIndex();
         const index = artifact.checked_bodies.index();
         const unit = index.unitOf(@backingInt(root_expr));
         const output = artifact.code_output;

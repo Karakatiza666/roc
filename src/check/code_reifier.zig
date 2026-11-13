@@ -13201,6 +13201,8 @@ pub const Walk = struct {
         for (self.readers.items) |existing| {
             if (std.meta.eql(existing.artifact.bytes, module.sources.artifact.bytes)) return existing;
         }
+        // The reader walks the module's bodies, whose index is built on demand.
+        try module.sources.bodies.demandIndex();
         const opened = try self.gpa.create(Reifier);
         errdefer self.gpa.destroy(opened);
         opened.* = Reifier.init(self, module);
