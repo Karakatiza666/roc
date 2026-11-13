@@ -14728,7 +14728,29 @@ fn planInstances(
     result.refused_methods = try gpa.dupe(code_analyses.CodeInventories.RefusedMethod, scan.refused_methods.items);
     result.implicits = try implicits.toOwnedSlice(gpa);
     result.terms = try scan.terms.toOwned(gpa);
+    result.closing_edges = try closingEdges(gpa, scan);
     return result;
+}
+
+/// The keys of the edges the description step can close (`closeUses`):
+/// the edge of each use the scan records and of each edge of a use's
+/// evidence, ascending, each once.
+fn closingEdges(gpa: Allocator, scan: *const ModuleScan) Allocator.Error![]const code_output.EdgeKey {
+    var keys = std.ArrayList(code_output.EdgeKey).empty;
+    defer keys.deinit(gpa);
+    for (scan.occurrences.items) |occurrence| {
+        if (occurrence.kind == .use) try keys.append(gpa, .of(occurrence.edge));
+    }
+    for (scan.edges.items) |occurrence| try keys.append(gpa, .of(occurrence.edge));
+    std.mem.sort(code_output.EdgeKey, keys.items, {}, code_output.EdgeKey.lessThan);
+    var kept: usize = 0;
+    for (keys.items) |key| {
+        if (kept > 0 and code_output.EdgeKey.order(keys.items[kept - 1], key) == .eq) continue;
+        keys.items[kept] = key;
+        kept += 1;
+    }
+    keys.shrinkRetainingCapacity(kept);
+    return try keys.toOwnedSlice(gpa);
 }
 
 /// Free the slices of a `CodeInventories` that `planInstances` is part way
@@ -14750,6 +14772,7 @@ fn freeInventories(gpa: Allocator, result: *code_analyses.CodeInventories) void 
     gpa.free(result.refused_methods);
     gpa.free(result.implicits);
     result.terms.deinit(gpa);
+    gpa.free(result.closing_edges);
 }
 
 /// Whether the template `use` names has an inventory. A template of this

@@ -16361,8 +16361,10 @@ which hold no site and no literal requirement
   changed (`boxy_unit.importedTablesCurrent`, test
   `code_instance_table_reads`).
 - Lowering reads the code output only where checked data says a read is
-  needed: a bound call of a recorded Code site (`isCodeBoundCall`), and a use
-  whose callee takes a table (`useTakesTable`). So a module whose code needs
+  needed: a bound call of a recorded Code site (`isCodeBoundCall`), and an
+  edge the module scan recorded as the edge of a use or of a use's evidence
+  (`CodeInventories.mayClose`), since the description step closes no other
+  edge. So a module whose code needs
   nothing from the description step lowers with that step pending, as an
   upstream lowering of pending compile-time roots does. A debug build checks
   at every other edge that the description step gave it no table.

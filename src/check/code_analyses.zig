@@ -182,6 +182,7 @@ pub const TypeTerms = struct {
 /// | `refused_methods` | method of this module the compiler calls with no written use, bound to a template of another module that has an inventory | the method's key and the refusal, which the description step reports |
 /// | `implicits` | `implicit` entry, in entry order | the descriptor method and its owner type's `terms` index |
 /// | `terms` | owner type of an `implicit` entry | the type with what its variables stand for |
+/// | `closing_edges` | edge of a use, or of a use's evidence, that the module scan records, ascending | its key: the description step can close only these edges |
 pub const CodeInventories = struct {
     pub const none: u32 = std.math.maxInt(u32);
 
@@ -328,6 +329,15 @@ pub const CodeInventories = struct {
     implicits: []const Implicit = &.{},
     /// The owner types of `implicits`, in this module's store.
     terms: TypeTerms = .{},
+    /// Ascending, each once.
+    closing_edges: []const code_output.EdgeKey = &.{},
+
+    /// Whether the description step can give `edge` a closing table: the
+    /// module scan recorded it as the edge of a use or of a use's evidence.
+    /// Lowering reads the code output at such an edge only.
+    pub fn mayClose(self: *const CodeInventories, edge: code_output.CodeEdge) bool {
+        return std.sort.binarySearch(code_output.EdgeKey, self.closing_edges, code_output.EdgeKey.of(edge), code_output.EdgeKey.order) != null;
+    }
 
     /// Whether the method `key` of this module is refused (Q17): every call
     /// the compiler makes by type treats it as a rejected declaration.
@@ -437,6 +447,7 @@ pub const CodeInventories = struct {
         allocator.free(self.refused_methods);
         allocator.free(self.implicits);
         self.terms.deinit(allocator);
+        allocator.free(self.closing_edges);
         allocator.destroy(self);
     }
 };

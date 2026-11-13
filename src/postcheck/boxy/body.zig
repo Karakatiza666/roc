@@ -4483,7 +4483,7 @@ pub const Builder = struct {
         // The root of a generic bound call at a closing use the description
         // step refused has no table to bind its inputs: it crashes, as the
         // use does (design.md "Bound Instance Roots").
-        if (argument.site.kind == .bound_call) if (self.view.view.compile_time_roots.root(root_id).expr.get()) |use| if (try self.useTakesTable(use)) if (self.code().edgeTable(self.useEdge(use))) |closing| if (closing == .refused) {
+        if (argument.site.kind == .bound_call) if (self.view.view.compile_time_roots.root(root_id).expr.get()) |use| if (try self.refusedEdge(self.useEdge(use))) {
             return try self.push(.{ .runtime_error = worker.ret });
         };
         try self.beginLiteralChain();
@@ -4972,65 +4972,34 @@ pub const Builder = struct {
     /// a call whose callee is one. Such a use crashes in place of the
     /// expression, and its operands are not evaluated.
     ///
-    /// Only a use whose callee takes a Code instance table has a closing
-    /// table, so only such a use reads the code output: a module whose code
-    /// needs nothing from the description step lowers with that step
-    /// pending.
+    /// Only an edge the module scan recorded can have a closing table
+    /// (`CodeInventories.mayClose`), so only such an edge reads the code
+    /// output: a module whose code needs nothing from the description step
+    /// lowers with that step pending.
     fn refusedUse(self: *Builder, expr_id: ExprId) Allocator.Error!bool {
-        if (try self.useTakesTable(expr_id)) {
-            if (self.code().edgeTable(self.useEdge(expr_id))) |closing| if (closing == .refused) return true;
-        } else self.assertNoClosingTable(self.useEdge(expr_id));
+        if (try self.refusedEdge(self.useEdge(expr_id))) return true;
         const data = self.bodies().exprData(expr_id);
         if (data != .call) return false;
-        const callee = data.call.func;
-        if (!try self.lookupTakesTable(callee)) {
-            self.assertNoClosingTable(.{ .use = callee });
+        return try self.refusedEdge(.{ .use = data.call.func });
+    }
+
+    /// Whether the description step refused the closing table of `edge`.
+    fn refusedEdge(self: *Builder, edge: checked.LiteralEdge) Allocator.Error!bool {
+        if (!(try self.program.modules.codeInventories(self.view.index)).mayClose(edge)) {
+            self.assertNoClosingTable(edge);
             return false;
         }
-        const closing = self.code().edgeTable(.{ .use = callee }) orelse return false;
+        const closing = self.code().edgeTable(edge) orelse return false;
         return closing == .refused;
     }
 
     /// In a debug build, with the code output complete: the description
-    /// step gave no table to `edge`, whose callee takes none.
+    /// step gave no table to `edge`, which the module scan did not record.
     fn assertNoClosingTable(self: *Builder, edge: checked.LiteralEdge) void {
         if (builtin.mode != .debug) return;
         const output = self.code();
         if (output.state != .complete) return;
-        std.debug.assert(output.edgeTable(edge) == null); // a closing table names a callee that takes one
-    }
-
-    /// Whether the callee of the use `use` takes a Code instance table, so
-    /// that the description step may have given the use's edge
-    /// (`useEdge`) a closing table: the target of a direct dispatch, or the
-    /// procedure a lookup names.
-    fn useTakesTable(self: *Builder, use: ExprId) Allocator.Error!bool {
-        if (self.bodies().directDispatchNode(use)) |node_id| {
-            const node = self.view.view.static_dispatch_plans.evidenceNode(node_id);
-            return switch (node.target.kind) {
-                .procedure => self.program.workerTakesTable(try self.methodTargetWorker(node.target)),
-                .callable_binding => |binding| try self.program.callableEvalHasInventory(self.program.callableEvalBinding(binding)),
-                .local_proc, .structural => false,
-            };
-        }
-        return try self.lookupTakesTable(use);
-    }
-
-    /// Whether the procedure the lookup `expr` names takes a Code instance
-    /// table; false for any expression that names no procedure.
-    fn lookupTakesTable(self: *Builder, expr: ExprId) Allocator.Error!bool {
-        const refs = self.view.view.resolved_value_refs;
-        const ref_id = refs.lookupIdByExpr(expr) orelse return false;
-        return switch (refs.records[@backingInt(ref_id)].ref) {
-            // A rejected binding is a checked error where it is used, and
-            // calls nothing that takes a table.
-            .top_level_proc, .imported_proc, .promoted_top_level_proc => |use| if (self.program.procedureBinding(use.binding).body == .checked_error) false else switch (try self.procedureUseCallee(use)) {
-                .worker => |worker_id| self.program.workerTakesTable(worker_id),
-                .alias => |alias| self.program.worker(alias.target).instances != null,
-                .callable_eval => |binding| try self.program.callableEvalHasInventory(.{ .module = binding.module, .template = binding.template }),
-            },
-            .local_proc, .hosted_proc, .platform_required_proc, .local_param, .local_value, .local_mutable_version, .pattern_binder, .selected_hoisted_const, .top_level_const, .imported_const, .platform_required_const, .platform_required_declaration, .platform_required_checked_error => false,
-        };
+        std.debug.assert(output.edgeTable(edge) == null); // the description step closes only edges the scan records
     }
 
     /// The edge that keys the Code instance table of the use `use`
