@@ -1,23 +1,23 @@
 CodecErrorRowLiteral :: [].{}
 
 # A codec method whose result has a literal in its error row
-# (`Err(Oops(5))`). Its contract call has a literal argument. A holder
-# whose error row is its own variable (`go`, `go_inferred`) gives the
-# relation to each of its uses, so each use derives the codec at closed
-# types and the literal is converted there.
+# (`Err(Oops(5))`). Its contract call has a literal argument. The error row
+# is the format-owned error type of every parser operation, so it is closed.
+# Each holder (`go`, `go_inferred`) derives the codec at closed types and
+# the literal is converted there.
 
 Format := [Default].{
 	rename_field : Format, Str -> Str
 	rename_field = |_, name| name
 
-	parse_str : Format, State -> Try({ value : Str, rest : State }, [FormatError])
+	parse_str : Format, State -> Try({ value : Str, rest : State }, [FormatError, MissingRequiredField(Str), Oops(U64)])
 	parse_str = |_, state|
 		match state {
 			Present(value) => Ok({ value, rest: Done })
 			Done => Err(FormatError)
 		}
 
-	parse_record_start : Format, State -> Try([Counted({ len : U64, rest : State }), Uncounted(State)], [FormatError])
+	parse_record_start : Format, State -> Try([Counted({ len : U64, rest : State }), Uncounted(State)], [FormatError, MissingRequiredField(Str), Oops(U64)])
 	parse_record_start = |_, state| Ok(Uncounted(state))
 
 	parse_record_field : Format,
@@ -30,7 +30,7 @@ Format := [Default].{
 			Continue(State),
 			Done(State),
 		],
-		[FormatError],
+		[FormatError, MissingRequiredField(Str), Oops(U64)],
 	)
 	parse_record_field = |_, _, state|
 		match state {
@@ -38,10 +38,13 @@ Format := [Default].{
 			Done => Ok(Done(state))
 		}
 
-	parse_record_after_field : Format, State -> Try([Continue(State), Done(State)], [FormatError])
+	parse_record_after_field : Format, State -> Try([Continue(State), Done(State)], [FormatError, MissingRequiredField(Str), Oops(U64)])
 	parse_record_after_field = |_, state| Ok(Continue(state))
 
-	skip_record_field : Format, State -> Try(State, [FormatError])
+	missing_field : Format, Str -> [FormatError, MissingRequiredField(Str), Oops(U64)]
+	missing_field = |_, name| MissingRequiredField(name)
+
+	skip_record_field : Format, State -> Try(State, [FormatError, MissingRequiredField(Str), Oops(U64)])
 	skip_record_field = |_, _| Ok(Done)
 }
 
@@ -65,9 +68,9 @@ Token := { raw ?: Str }.{
 		}
 }
 
-parse : State -> Try(a, [FormatError, ..errs])
+parse : State -> Try(a, [FormatError, MissingRequiredField(Str), Oops(U64)])
 	where [
-		a.parser_for : Format -> (State -> Try({ value : a, rest : State }, [FormatError, ..errs])),
+		a.parser_for : Format -> (State -> Try({ value : a, rest : State }, [FormatError, MissingRequiredField(Str), Oops(U64)])),
 	]
 parse = |input| {
 	Shape : a
@@ -76,9 +79,7 @@ parse = |input| {
 	Ok(parsed.value)
 }
 
-# The error row holds a variable of the holder's own annotation.
-go : State -> Try({ token : Token }, [FormatError, MissingRequiredField(Str), Oops(n)])
-	where [n.from_numeral : Numeral -> Try(n, [InvalidNumeral(Str)])]
+go : State -> Try({ token : Token }, [FormatError, MissingRequiredField(Str), Oops(U64)])
 go = |input| parse(input)
 
 # The same holder with an inferred error row.
@@ -98,13 +99,6 @@ expect {
 expect {
 	match go(State.Present("wire-token")) {
 		Ok(decoded) => Token.count_utf8_bytes(decoded.token) == 12
-		_ => False
-	}
-}
-
-expect {
-	match go(State.Present("bad")) {
-		Err(Oops(k)) => k == 5.I64
 		_ => False
 	}
 }

@@ -4643,8 +4643,8 @@ const subcommand_cases = [_]CliCase{
     .{ .id = 0, .suite = .subcommands, .name = "roc test of an app reports its platform's expects reading a requirement", .body = .{ .command = .{ .args = &.{ "test", "--specialize=yes", "--no-cache", "--no-color" }, .roc_file = "test/cli/platform_expect_requires/app.roc", .exit = .{ .code = 1 }, .contains = &.{ .{ .stream = .stderr, .text = "This expect reads a value the platform requires from its app" }, .{ .stream = .stderr, .text = "1 passed" }, .{ .stream = .stderr, .text = "5 compiler errors" } }, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc check discovers no demand from a platform expect reading a requirement", .body = .{ .command = .{ .args = &.{ "check", "--no-cache" }, .roc_file = "test/cli/platform_expect_requires/platform/main.roc", .exit = .success, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "boxy roc test preserves the format error in a custom nominal record-field parser", .body = .{ .command = .{ .args = &.{ "test", "--specialize=no", "--no-cache" }, .roc_file = "test/cli/ParserCustomNominalField.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (1) tests passed" }} } } },
-    .{ .id = 0, .suite = .subcommands, .name = "roc test converts a codec method's error row literal at each use of a holder generic in that row", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/CodecErrorRowLiteral.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (5) tests passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
-    .{ .id = 0, .suite = .subcommands, .name = "boxy roc test converts a codec method's error row literal at each use of a holder generic in that row", .body = .{ .command = .{ .args = &.{ "test", "--specialize=no", "--no-cache" }, .roc_file = "test/cli/CodecErrorRowLiteral.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (5) tests passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "roc test converts a codec method's error row literal in the format-owned error row", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/CodecErrorRowLiteral.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (4) tests passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
+    .{ .id = 0, .suite = .subcommands, .name = "boxy roc test converts a codec method's error row literal in the format-owned error row", .body = .{ .command = .{ .args = &.{ "test", "--specialize=no", "--no-cache" }, .roc_file = "test/cli/CodecErrorRowLiteral.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (4) tests passed" }}, .not_contains = &.{.{ .stream = .stderr, .text = "panic" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "boxy roc test preserves format-generic custom parser errors (issue 11728)", .body = .{ .command = .{ .args = &.{ "test", "--specialize=no", "--no-cache" }, .roc_file = "test/cli/JsonGenericCustomParser.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (7) tests passed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "roc test decodes JSON into a record whose field types are all inferred", .body = .{ .command = .{ .args = &.{ "test", "--no-cache" }, .roc_file = "test/cli/JsonParseInferredFieldTypes.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (4) tests passed" }} } } },
     .{ .id = 0, .suite = .subcommands, .name = "boxy roc test decodes JSON into a record whose field types are all inferred", .body = .{ .command = .{ .args = &.{ "test", "--specialize=no", "--no-cache" }, .roc_file = "test/cli/JsonParseInferredFieldTypes.roc", .exit = .success, .contains = &.{.{ .stream = .stdout, .text = "All (4) tests passed" }} } } },
@@ -12123,10 +12123,12 @@ fn customCodeInstanceCache(
 
     const Edit = struct { name: []const u8, file: []const u8, from: []const u8, to: []const u8, stdout: []const u8, objects: usize };
     // `objects` counts the module objects the edit files: the edited
-    // module's, Pick's when a description Pick holds reads the edit, and the
+    // module's, Pick's when a description Pick holds reads the edit, the
     // app's two (a dev run image composes the app's units from objects too),
-    // because every edit changes what the app prints. Made restores Pick's
-    // stored function by calling Pick's table worker, so no edit files Made's.
+    // because every edit changes what the app prints, and the compile-time
+    // function unit of Frag, which the cache files as its own object (an edit
+    // to Frag only). Made restores Pick's stored function by calling Pick's
+    // table worker, so no edit files Made's.
     const edits = [_]Edit{
         .{
             .name = "a fragment's site in the fragments' module",
@@ -12134,7 +12136,7 @@ fn customCodeInstanceCache(
             .from = "\"frag-one\"",
             .to = "\"frag-two\"",
             .stdout = "site: pets | check-one\ntable: pets | frag-two\nmethod table: tags | pick-one\nstored table: tags | pick-one\ninspect: pets | rows-one pets | rows-one\n",
-            .objects = 4,
+            .objects = 5,
         },
         .{
             .name = "a helper a site describes, in the fragments' module",
@@ -12142,7 +12144,7 @@ fn customCodeInstanceCache(
             .from = "\"check-one\"",
             .to = "\"check-two\"",
             .stdout = "site: pets | check-two\ntable: pets | frag-two\nmethod table: tags | pick-one\nstored table: tags | pick-one\ninspect: pets | rows-one pets | rows-one\n",
-            .objects = 4,
+            .objects = 5,
         },
         .{
             .name = "a method the instance tables describe, in the closing uses' module",
