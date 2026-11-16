@@ -5272,10 +5272,7 @@ pub const Builder = struct {
         }
         try self.pushValue(try self.buildStruct(worker.ret, callables));
         try self.run();
-        try self.finishProc(start.entry, body_start, &.{start.capture_ptr}, ret_layout);
-        const proc = self.store.getProcSpecPtr(worker.proc);
-        proc.erased_capture_arg = .of(start.capture_ptr);
-        proc.abi = .erased_record;
+        try self.finishErasedProc(start.entry, body_start, &.{}, ret_layout, start.capture_ptr);
     }
 
     /// The body of a description thunk (`WorkerKey.code_description`): the
@@ -5297,10 +5294,7 @@ pub const Builder = struct {
         try self.tasks.append(self.allocator, .ret);
         try self.push(.{ .restore = .{ .source = .{ .module = key.module }, .node = node, .ty = worker.ret } });
         try self.run();
-        try self.finishProc(start.entry, body_start, &.{start.capture_ptr}, ret_layout);
-        const proc = self.store.getProcSpecPtr(worker.proc);
-        proc.erased_capture_arg = .of(start.capture_ptr);
-        proc.abi = .erased_record;
+        try self.finishErasedProc(start.entry, body_start, &.{}, ret_layout, start.capture_ptr);
     }
 
     // -- Captured run-time inputs (design.md, the section on `Code` descriptions) --
@@ -5399,10 +5393,7 @@ pub const Builder = struct {
             inline .fn_value, .expect, .runtime => |_, tag| invariantFmt("a bound root holding {s} reached lowering", .{@tagName(tag)}),
         }
         try self.run();
-        try self.finishProc(start.entry, body_start, &.{ record, start.capture_ptr }, ret_layout);
-        const proc = self.store.getProcSpecPtr(worker.proc);
-        proc.erased_capture_arg = .of(start.capture_ptr);
-        proc.abi = .erased_record;
+        try self.finishErasedProc(start.entry, body_start, &.{record}, ret_layout, start.capture_ptr);
     }
 
     /// The `Code.Bound` value of `expr` rebuilt with the values of the
