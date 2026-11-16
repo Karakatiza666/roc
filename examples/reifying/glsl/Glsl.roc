@@ -345,7 +345,7 @@ Glsl :: {}.{
 
 	render_op : Code.Op, List(Code.Tree), Code.Ty, Scope -> Try(Str, Error)
 	render_op = |op, args, ty, scope| match op {
-		Lit(literal) => Glsl.literal(literal)
+		Lit(lit) => Glsl.literal(lit)
 		Prim(prim) => Glsl.call(prim.owner, prim.method, args.map_try(|arg| Glsl.render(arg, scope))?)
 		And(_) => Ok("(${Str.join_with(args.map_try(|arg| Glsl.render(arg, scope))?, " && ")})")
 		Or(_) => Ok("(${Str.join_with(args.map_try(|arg| Glsl.render(arg, scope))?, " || ")})")

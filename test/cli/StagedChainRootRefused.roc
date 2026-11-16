@@ -9,10 +9,10 @@ Q := [Q(Str)].{
 	from = |table| Q("FROM ${table}")
 
 	filter : Q, Code(U16 -> Bool) -> Q
-	filter = |Q(text), _code| Q("${text} WHERE")
+	filter = |Q(sql), _code| Q("${sql} WHERE")
 
 	ready : Q, Code(U16 -> Bool) -> Code.Bound(Str)
-	ready = |Q(text), code| code.bound(text)
+	ready = |Q(sql), code| code.bound(sql)
 
 	ready_in : { query : Q }, Code(U16 -> Bool) -> Code.Bound(Str)
 	ready_in = |args, code| code.bound(Q.text(args.query))

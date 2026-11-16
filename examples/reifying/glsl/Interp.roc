@@ -29,7 +29,7 @@ Interp :: {}.{
 				"false"
 			}
 			Text(text) => text
-			Vector(lanes) => "(${Str.join_with(lanes.map(|lane| lane.to_str()), ", ")})"
+			Vector(lanes) => "(${Str.join_with(lanes.map(|component| component.to_str()), ", ")})"
 			Fields(fields) => "{ ${Str.join_with(fields.map(|field| "${field.name}: ${field.value.to_str()}"), ", ")} }"
 		}
 	}
@@ -109,7 +109,7 @@ Interp :: {}.{
 		# order its type declares them in.
 		Wrap(name) => match (Interp.lanes_of(name), args) {
 			(Ok(lanes), [inner]) => match Interp.eval(inner, scope)? {
-				Fields(fields) => Ok(Value.Vector(lanes.map_try(|lane| Interp.float(Interp.named(fields, lane)?))?))
+				Fields(fields) => Ok(Value.Vector(lanes.map_try(|component| Interp.float(Interp.named(fields, component)?))?))
 				other => Ok(other)
 			}
 			(_, [inner]) => Interp.eval(inner, scope)

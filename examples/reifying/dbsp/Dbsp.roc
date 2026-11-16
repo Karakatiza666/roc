@@ -244,7 +244,7 @@ Dbsp :: {}.{
 		defined = Dbsp.define(graph, called, parent.helpers).map_err(|error| Dbsp.blame(error, place))?
 		scope = { row, params, locals: [], fns: defined.names }
 		body = Dbsp.render_block(tree, scope).map_err(|error| Dbsp.blame(error, place))?
-		named = names.map_with_index(|name, at| if (Dbsp.reads(tree, at.to_u32_wrap())) name else "_${name}")
+		named = names.map_with_index(|name, position| if (Dbsp.reads(tree, position.to_u32_wrap())) name else "_${name}")
 		settled = match (parent.source, row.params.first()) {
 			(Unread(name), Ok(ty)) => { ..parent, source: Read, ty, inputs: parent.inputs.append({ name, ty }) }
 			_ => parent
@@ -322,7 +322,7 @@ Dbsp :: {}.{
 	## and not by row id.
 	canon : Code.Graph, U32 -> Try(Str, Error)
 	canon = |graph, id| {
-		local = Dbsp.reach(graph, [id], []).map_with_index(|row, at| { row, name: "f${at.to_str()}" })
+		local = Dbsp.reach(graph, [id], []).map_with_index(|row, position| { row, name: "f${position.to_str()}" })
 		texts = local.map_try(|entry| Dbsp.render_fn(graph, graph.row(entry.row), entry.name, local))?
 		Ok(Str.join_with(texts, "\n"))
 	}
@@ -333,12 +333,12 @@ Dbsp :: {}.{
 	render_fn : Code.Graph, Code.Row, Str, List({ row : U32, name : Str }) -> Try(Str, Error)
 	render_fn = |graph, row, name, fns| {
 		tree = graph.to_tree(row.id)
-		names = row.params.map_with_index(|_, at| "p${at.to_str()}")
+		names = row.params.map_with_index(|_, position| "p${position.to_str()}")
 		scope = { row, params: names.map(Dbsp.atom), locals: [], fns }
 		body = Dbsp.render_block(tree, scope)?
-		typed = List.map2(row.params, names, |ty, param| Dbsp.rust_type(ty).map_ok(|rust| if (Dbsp.is_copy(ty)) rust else "&${rust}").map_ok(|rust| (param, rust)))
+		typed = List.map2(row.params, names, |ty, param_name| Dbsp.rust_type(ty).map_ok(|rust| if (Dbsp.is_copy(ty)) rust else "&${rust}").map_ok(|rust| (param_name, rust)))
 		declared = typed.map_try(|one| one)?
-		listed = declared.map_with_index(|(param, rust), at| "${if (Dbsp.reads(tree, at.to_u32_wrap())) param else "_${param}"}: ${rust}")
+		listed = declared.map_with_index(|(param_name, rust), position| "${if (Dbsp.reads(tree, position.to_u32_wrap())) param_name else "_${param_name}"}: ${rust}")
 		result = Dbsp.rust_type(row.result)?
 		Ok("fn ${name}(${Str.join_with(listed, ", ")}) -> ${result} {\n${Dbsp.indent(Str.join_with(body.lets.append(body.value), "\n"))}\n}")
 	}
