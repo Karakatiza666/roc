@@ -60,7 +60,7 @@ package [E.a.*, e] {}
 # CANONICALIZE
 ~~~clojure
 (can-ir
-	(s-import (mod "E")
+	(s-import (mod "E") (alias "E")
 		(exposes)))
 ~~~
 # TYPES

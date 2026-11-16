@@ -10,7 +10,6 @@ import u.R}g:r->R.a.E
 # EXPECTED
 UNEXPECTED STATEMENT - fuzz_crash_042.md:1:11:1:12
 MOD NOT FOUND - fuzz_crash_042.md:1:20:1:22
-DECLARATION HAS NO VALUE - fuzz_crash_042.md:1:12:1:22
 # PROBLEMS
 ~~~clojure
 (reports
@@ -51,18 +50,7 @@ DECLARATION HAS NO VALUE - fuzz_crash_042.md:1:12:1:22
 			(annotated code "u.R")
 			(reflow ", which does not exist."))
 		(document
-			(source-region (file "fuzz_crash_042.md") (start 1 20) (end 1 22) (annotation error) (line-text "import u.R}g:r->R.a.E"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 12) (end 1 22))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_042.md") (start 1 12) (end 1 22) (annotation error) (line-text "import u.R}g:r->R.a.E"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "fuzz_crash_042.md") (start 1 20) (end 1 22) (annotation error) (line-text "import u.R}g:r->R.a.E")))))
 ~~~
 # TOKENS
 ~~~zig
@@ -96,7 +84,7 @@ g : r -> R.a.E
 			(ty-fn (effectful false)
 				(ty-rigid-var (name "r"))
 				(ty-malformed))))
-	(s-import (mod "u.R")
+	(s-import (mod "u.R") (alias "R")
 		(exposes)))
 ~~~
 # TYPES

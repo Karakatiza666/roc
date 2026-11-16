@@ -94,9 +94,9 @@ main = {
 		(e-block
 			(s-runtime-error (tag "qualified_ident_does_not_exist"))
 			(e-runtime-error (tag "erroneous_value_expr"))))
-	(s-import (mod "json.Json")
+	(s-import (mod "json.Json") (alias "MyMod")
 		(exposes))
-	(s-import (mod "http.Client")
+	(s-import (mod "http.Client") (alias "MyMod")
 		(exposes)))
 ~~~
 # TYPES

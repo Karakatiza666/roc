@@ -11,6 +11,7 @@
 const std = @import("std");
 const can = @import("can");
 const types = @import("types");
+const record_row = @import("record_row.zig");
 
 const ModuleEnv = can.ModuleEnv;
 const CIR = can.CIR;
@@ -135,13 +136,11 @@ fn writeNestedPlaceholder(
                 try out.appendSlice(allocator, literal);
             },
             .empty_record => try out.appendSlice(allocator, "{}"),
-            .record => |record| try writeRecordPlaceholder(
-                allocator,
-                module_env,
-                module_env.types.getRecordFieldsSlice(record.fields),
-                out,
-                depth,
-            ),
+            .record => |record| {
+                const row = try record_row.gather(allocator, &module_env.types, &module_env.common.idents, record);
+                defer allocator.free(row);
+                try writeRecordPlaceholder(allocator, module_env, row, out, depth);
+            },
             .tuple => |tuple| {
                 try out.appendSlice(allocator, "(");
                 for (module_env.types.sliceVars(tuple.elems), 0..) |elem_var, index| {
@@ -170,7 +169,7 @@ fn writeNestedPlaceholder(
 fn writeRecordPlaceholder(
     allocator: Allocator,
     module_env: *const ModuleEnv,
-    fields: types.RecordField.SafeMultiList.Slice,
+    fields: []const types.RecordField,
     out: *std.ArrayList(u8),
     depth: usize,
 ) PlaceholderError!void {
@@ -180,11 +179,11 @@ fn writeRecordPlaceholder(
     }
 
     try out.appendSlice(allocator, "{ ");
-    for (fields.items(.name), fields.items(.presence), 0..) |name, presence, written| {
+    for (fields, 0..) |field, written| {
         if (written > 0) try out.appendSlice(allocator, ", ");
-        try out.appendSlice(allocator, module_env.common.idents.getText(name));
+        try out.appendSlice(allocator, module_env.common.idents.getText(field.name));
         try out.appendSlice(allocator, ": ");
-        try writeNestedPlaceholder(allocator, module_env, presence.typeVar(), out, depth + 1);
+        try writeNestedPlaceholder(allocator, module_env, field.presence.typeVar(), out, depth + 1);
     }
     try out.appendSlice(allocator, " }");
 }

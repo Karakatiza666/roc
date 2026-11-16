@@ -1526,6 +1526,8 @@ pub fn parseCheckModule(
     }
     if (hosted_transform) {
         try can.HostedCompiler.replaceAnnoOnlyWithHosted(module_env);
+    } else {
+        can.HostedCompiler.markAnnoOnlyAsIntrinsic(module_env);
     }
     const can_elapsed = can_timer.read();
 

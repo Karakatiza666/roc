@@ -21,7 +21,7 @@ const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 
 /// The entry format: bumped whenever `encode`'s layout changes.
-pub const format_version: u32 = 20;
+pub const format_version: u32 = 21;
 
 const magic = "RBXO";
 
@@ -183,6 +183,20 @@ pub const TestRootRecord = struct {
     symbol: u32,
 };
 
+/// A Code instance table of another module whose entries the object read
+/// while filling its type tables: the module's link name (the name the
+/// object gives the module's workers, which a body edit leaves alone), the
+/// table, and
+/// the digest of the table when the object was built
+/// (`postcheck.Boxy.TableDigest`). The object's key covers its imports'
+/// interfaces, not their code output, so a restore checks each digest
+/// against the table now (design.md "Code Instance Tables").
+pub const ImportedTableRecord = struct {
+    module: [32]u8,
+    table: u32,
+    digest: [32]u8,
+};
+
 /// One module's cached object. A wasm target's entry holds no pieces and no
 /// code locations: its code is its wasm unit image (`WasmUnitImage`).
 pub const Entry = struct {
@@ -205,6 +219,8 @@ pub const Entry = struct {
     expect_sites: []const ExpectSiteRecord = &.{},
     /// For a test unit: the wrapper of each top-level expect it exports.
     test_roots: []const TestRootRecord = &.{},
+    /// The imported Code instance tables the object read.
+    imported_tables: []const ImportedTableRecord = &.{},
     /// The module's code in pieces, encoded (`UnitPieces.encode`).
     pieces: []const u8,
     /// Where the unit image's code came from (`CodeLocations`, over offsets
@@ -265,6 +281,12 @@ pub fn encode(allocator: Allocator, entry: Entry) Allocator.Error![]u8 {
         try appendU32(&bytes, allocator, root.root_index);
         try appendU32(&bytes, allocator, root.symbol);
     }
+    try appendU32(&bytes, allocator, @intCast(entry.imported_tables.len));
+    for (entry.imported_tables) |read| {
+        try bytes.appendSlice(allocator, &read.module);
+        try appendU32(&bytes, allocator, read.table);
+        try bytes.appendSlice(allocator, &read.digest);
+    }
     try appendU64(&bytes, allocator, entry.pieces.len);
     try bytes.appendSlice(allocator, entry.pieces);
     try appendU64(&bytes, allocator, entry.code_locations.len);
@@ -295,6 +317,9 @@ const min_export_record_size = 32 + 4 * @sizeOf(u64) + 3 + 2 * @sizeOf(u32);
 
 /// The bytes of an expect-site or test-root record: a digest and two words.
 const table_record_size = 32 + 2 * @sizeOf(u32);
+
+/// The bytes of an imported table record: a key, a word, and a digest.
+const imported_table_record_size = 32 + @sizeOf(u32) + 32;
 
 /// Why cached bytes are not an entry: a file this compiler did not write
 /// (another entry format, or a truncated or altered file). The cache
@@ -396,6 +421,15 @@ pub fn decodeView(allocator: Allocator, bytes: []const u8) DecodeError!Entry {
         .root_index = try reader.word32(),
         .symbol = try reader.word32(),
     };
+    const read_count = try reader.word32();
+    if (read_count > (bytes.len - reader.at) / imported_table_record_size) return error.InvalidEntry;
+    const imported_tables = try allocator.alloc(ImportedTableRecord, read_count);
+    errdefer allocator.free(imported_tables);
+    for (imported_tables) |*read| read.* = .{
+        .module = (try reader.take(32))[0..32].*,
+        .table = try reader.word32(),
+        .digest = (try reader.take(32))[0..32].*,
+    };
     const pieces_len = try reader.word64();
     if (pieces_len > std.math.maxInt(usize)) return error.InvalidEntry;
     const pieces = try reader.take(@intCast(pieces_len));
@@ -418,6 +452,7 @@ pub fn decodeView(allocator: Allocator, bytes: []const u8) DecodeError!Entry {
         .host_boundary_digests = host_boundary_digests,
         .expect_sites = expect_sites,
         .test_roots = test_roots,
+        .imported_tables = imported_tables,
         .pieces = pieces,
         .code_locations = code_locations,
         .function_metadata = function_metadata,
@@ -468,6 +503,7 @@ pub fn deinitEntryView(allocator: Allocator, entry: Entry) void {
     allocator.free(entry.host_boundary_digests);
     allocator.free(entry.expect_sites);
     allocator.free(entry.test_roots);
+    allocator.free(entry.imported_tables);
 }
 
 const Reader = struct {
@@ -590,6 +626,7 @@ test "a Boxy object entry round-trips through its bytes" {
         .host_boundary_digests = &.{ @splat(7), @splat(8) },
         .expect_sites = &.{ .{ .module = @splat(4), .region_start = 10, .region_end = 30 }, .{ .module = @splat(5), .region_start = 2, .region_end = 3 } },
         .test_roots = &.{.{ .module = @splat(4), .root_index = 1, .symbol = 17 }},
+        .imported_tables = &.{.{ .module = @splat(6), .table = 2, .digest = @splat(9) }},
         .pieces = "not really pieces",
         .function_metadata = "portable function descriptions",
         .code_locations = "where the code came from",
@@ -608,6 +645,7 @@ test "a Boxy object entry round-trips through its bytes" {
     try std.testing.expectEqualDeep(entry.host_boundary_digests, decoded.host_boundary_digests);
     try std.testing.expectEqualDeep(entry.expect_sites, decoded.expect_sites);
     try std.testing.expectEqualDeep(entry.test_roots, decoded.test_roots);
+    try std.testing.expectEqualDeep(entry.imported_tables, decoded.imported_tables);
     try std.testing.expectEqualStrings(entry.pieces, decoded.pieces);
     try std.testing.expectEqualStrings(entry.function_metadata, decoded.function_metadata);
     try std.testing.expectEqualStrings(entry.code_locations, decoded.code_locations);

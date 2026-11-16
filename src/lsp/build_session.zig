@@ -13,6 +13,8 @@ const std = @import("std");
 const compile = @import("compile");
 const can = @import("can");
 const uri_util = @import("uri.zig");
+const BuildEnvHandle = @import("build_env_handle.zig").BuildEnvHandle;
+const StagedDocument = @import("staged_document.zig").StagedDocument;
 
 const BuildEnv = compile.BuildEnv;
 const CoreCtx = compile.CoreCtx;
@@ -23,12 +25,14 @@ const Allocator = std.mem.Allocator;
 /// Encapsulates URI conversion, BuildEnv setup, building, and module lookup.
 pub const BuildSession = struct {
     /// Errors that can occur while starting a build session.
-    pub const InitError = Allocator.Error || std.Io.Dir.RealPathFileAllocError;
+    pub const InitError = Allocator.Error || std.Io.Dir.RealPathFileAllocError || StagedDocument.Error;
 
     allocator: Allocator,
     /// Borrowed pointer to the BuildEnv for this build. Ownership stays with the
     /// caller (typically SyntaxChecker via BuildEnvHandle); deinit does NOT free it.
     env: *BuildEnv,
+    /// The handle that holds `env`.
+    handle: *BuildEnvHandle,
     absolute_path: [:0]const u8,
     build_succeeded: bool,
     drained_reports: ?[]BuildEnv.DrainedModuleReports = null,
@@ -43,16 +47,19 @@ pub const BuildSession = struct {
     /// This handles:
     /// - URI to path conversion
     /// - File override setup
+    /// - Default-platform staging, as `roc check` stages the same file
     /// - Building (with owning main.roc / workspace package aliases when needed)
     /// - Report draining
     pub fn init(
         allocator: Allocator,
         std_io: std.Io,
-        env: *BuildEnv,
+        handle: *BuildEnvHandle,
         uri: []const u8,
         override_text: ?[]const u8,
         workspace_root: ?[]const u8,
+        cache_config: compile.CacheConfig,
     ) InitError!BuildSession {
+        const env = handle.envPtr();
         // Convert URI to path
         const path = try uri_util.uriToPath(allocator, uri);
         defer allocator.free(path);
@@ -60,6 +67,24 @@ pub const BuildSession = struct {
         const absolute_path: [:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(std_io, path, allocator) catch
             try allocator.dupeSentinel(u8, path, 0);
         errdefer allocator.free(absolute_path);
+
+        // A document that runs on the default platform is checked as the app
+        // `roc check` stages from it. The staged app is a file of its own, so
+        // the override below never applies to it. A document that cannot be
+        // read is not staged; its build reports the read failure.
+        std.debug.assert(handle.staged_document == null);
+        const document_text: ?[]const u8 = override_text orelse env.filesystem.readFile(absolute_path, allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        defer if (override_text == null) if (document_text) |text| allocator.free(text);
+        if (document_text) |text| {
+            if (try StagedDocument.create(allocator, std_io, env.filesystem, cache_config, absolute_path, text)) |staged| {
+                handle.staged_document = staged;
+                staged.configure(env);
+            }
+        }
+        const build_path: []const u8 = if (handle.staged_document) |staged| staged.staged_path else absolute_path;
 
         // Set up file override if override text provided.
         // SAFETY: override lives on the stack and its address is stored in env.filesystem.
@@ -79,7 +104,7 @@ pub const BuildSession = struct {
 
         // Build. A canceled build has no result to report.
         const build_succeeded = blk: {
-            env.buildResolvingMain(absolute_path, preferred_main) catch |err| switch (err) {
+            env.buildResolvingMain(build_path, preferred_main) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => break :blk false,
             };
@@ -98,6 +123,7 @@ pub const BuildSession = struct {
         return BuildSession{
             .allocator = allocator,
             .env = env,
+            .handle = handle,
             .absolute_path = absolute_path,
             .build_succeeded = build_succeeded,
             .drained_reports = drained_reports,
@@ -150,7 +176,7 @@ pub const BuildSession = struct {
             return null;
         }
 
-        if (self.env.findModuleByPath(self.absolute_path)) |module_state| {
+        if (self.env.findModuleByPath(self.handle.modulePath(self.absolute_path))) |module_state| {
             if (module_state.moduleEnv()) |mod_env| {
                 self.cached_module_env = mod_env;
                 return mod_env;

@@ -92,6 +92,24 @@ test "InitializeParams parses fields" {
     try std.testing.expect(std.mem.find(u8, params.capabilities_json.?, "textDocumentSync") != null);
 }
 
+test "InitializeParams reads whether the client accepts related information" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { payload: []const u8, accepts: bool }{
+        .{ .payload = "{\"processId\":null,\"rootUri\":null,\"capabilities\":{\"textDocument\":{\"publishDiagnostics\":{\"relatedInformation\":true}}}}", .accepts = true },
+        .{ .payload = "{\"processId\":null,\"rootUri\":null,\"capabilities\":{\"textDocument\":{\"publishDiagnostics\":{\"relatedInformation\":false}}}}", .accepts = false },
+        .{ .payload = "{\"processId\":null,\"rootUri\":null,\"capabilities\":{\"textDocument\":{\"publishDiagnostics\":{}}}}", .accepts = false },
+        .{ .payload = "{\"processId\":null,\"rootUri\":null,\"capabilities\":{}}", .accepts = false },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.payload, .{});
+        defer parsed.deinit();
+        var params = try protocol.InitializeParams.fromJson(allocator, parsed.value);
+        defer params.deinit(allocator);
+        try std.testing.expectEqual(case.accepts, params.related_information);
+    }
+}
+
 test "InitializeParams rejects missing and malformed required fields" {
     const allocator = std.testing.allocator;
     const invalid_payloads = [_][]const u8{

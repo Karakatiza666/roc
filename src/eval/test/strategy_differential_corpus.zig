@@ -160,6 +160,69 @@ pub const cases = [_]Case{
         .inspects = &.{ .tag_union, .box, .function, .transparent, .dynamic },
     },
     .{
+        // Boxy stores a recursive type's recursion point in a box. That box
+        // is storage, not a source `Box`, so it renders as the value it
+        // holds; a source `Box` at a recursion point still renders as `Box`.
+        // `Code.Ty` is such a type: a description renders the same on both.
+        .name = "inspect shapes: a recursion point renders as its value, a source Box as Box",
+        .source =
+        \\{
+        \\    Tree := [Leaf, Node(Tree, U64, Tree)]
+        \\    Chain := [End, Link({ value : U64, next : Chain })]
+        \\    Boxed := [Nil, Cons(Box(Boxed))]
+        \\    show = |value| Str.inspect(value)
+        \\    k = {
+        \\        dbg 1.U64
+        \\        1.U64
+        \\    }
+        \\    tree : Tree
+        \\    tree = Node(Node(Leaf, k, Leaf), k + 1, Leaf)
+        \\    chain : Chain
+        \\    chain = Link({ value: k, next: Link({ value: k + 1, next: End }) })
+        \\    boxed : Boxed
+        \\    boxed = Cons(Box.box(Cons(Box.box(Nil))))
+        \\    ty : Code.Ty
+        \\    ty = if k == 1 Named("T", [], Fn([U64], Named("U", [], Str))) else Str
+        \\    [show(tree), show(chain), show(boxed), show(Box.box(tree)), show(ty), Str.inspect(tree)]
+        \\}
+        ,
+        .expected = "[\"Node(Node(Leaf, 1, Leaf), 2, Leaf)\", \"Link({ next: Link({ next: End, value: 2 }), value: 1 })\", \"Cons(Box(Cons(Box(Nil))))\", \"Box(Node(Node(Leaf, 1, Leaf), 2, Leaf))\", \"Named(\\\"T\\\", [], Fn([U64], Named(\\\"U\\\", [], Str)))\", \"Node(Node(Leaf, 1, Leaf), 2, Leaf)\"]",
+        .inspects = &.{ .nominal, .tag_union, .record, .box, .dynamic },
+    },
+    .{
+        // A value read out of a record, a tuple or a tag payload keeps its
+        // nominal's descriptor, so its own `to_inspect` renders it, also
+        // where the nominal shares its backing's storage.
+        .name = "override: a nominal read out of a record, tuple, or tag payload keeps its to_inspect",
+        .source =
+        \\{
+        \\    Name := Str.{
+        \\        to_inspect : Name -> Str
+        \\        to_inspect = |_name| "custom name"
+        \\    }
+        \\    Vector := U64x2.{
+        \\        to_inspect : Vector -> Str
+        \\        to_inspect = |_vector| "custom vector"
+        \\    }
+        \\    k = {
+        \\        dbg 1.U64
+        \\        1.U64
+        \\    }
+        \\    name = Name.("n${k.to_str()}")
+        \\    vector = Vector.(U64x2.splat(k))
+        \\    wrapped : [Wrap(Name), Other]
+        \\    wrapped = if k == 1 Wrap(name) else Other
+        \\    from_tag = match wrapped {
+        \\        Wrap(inner) => Str.inspect(inner)
+        \\        Other => "other"
+        \\    }
+        \\    [Str.inspect(({ m: vector }).m), Str.inspect(({ m: name }).m), Str.inspect((name, vector).1), from_tag]
+        \\}
+        ,
+        .expected = "[\"custom vector\", \"custom name\", \"custom vector\", \"custom name\"]",
+        .inspects = &.{ .nominal, .dynamic },
+    },
+    .{
         .name = "inspect shapes: optional fields render <missing> or their value",
         .source =
         \\{

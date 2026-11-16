@@ -33,6 +33,8 @@ pub const builtin_static = @import("can").BuiltinStatic;
 pub const BuiltinModules = @import("BuiltinModules.zig").BuiltinModules;
 /// Checked-artifact compile-time evaluation finalizer
 pub const CompileTimeFinalization = @import("compile_time_finalization.zig");
+/// The description step of compile-time evaluation (code reification)
+pub const CodeDescriptions = @import("code_descriptions.zig");
 pub const checked_root_graph = @import("checked_root_graph.zig");
 /// Compiler-owned RocOps environment for compile-time evaluation
 pub const CompilerHost = @import("compiler_host.zig");

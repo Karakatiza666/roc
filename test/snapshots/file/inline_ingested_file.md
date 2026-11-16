@@ -127,7 +127,7 @@ NO CHANGE
 		(e-runtime-error (tag "erroneous_value_expr")
 			(e-runtime-error (tag "erroneous_value_expr"))
 			(e-runtime-error (tag "erroneous_value_expr"))))
-	(s-import (mod "Json")
+	(s-import (mod "Json") (alias "Json")
 		(exposes)))
 ~~~
 # TYPES

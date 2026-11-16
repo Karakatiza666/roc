@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const base = @import("base");
 const ModuleEnv = @import("ModuleEnv.zig");
 const CIR = @import("CIR.zig");
+const BuiltinLowLevel = @import("BuiltinLowLevel.zig");
 
 /// Replace ordinary e_anno_only expressions in a Type Module with e_hosted_lambda operations (in-place).
 /// Compiler-derived associated methods have their own CIR tag and are not host declarations.
@@ -122,6 +123,41 @@ pub fn replaceAnnoOnlyWithHosted(env: *ModuleEnv) Allocator.Error!void {
     }
 
     env.hosted_defs = try env.store.defSpanFrom(hosted_defs_start);
+}
+
+/// Mark the bodyless declarations of a module that a tool canonicalizes
+/// without its package (the snapshot tool, the playground). The module's
+/// header is the only data such a tool has about the package: a `platform` or
+/// `hosted` module keeps its bodyless declarations ordinary, as an unrewritten
+/// platform module does, and the builtin module keeps its own. Every other
+/// module marks them as intrinsics, as the coordinator does
+/// (`markAnnoOnlyAsIntrinsic`).
+pub fn markIntrinsicsByModuleHeader(env: *ModuleEnv) void {
+    if (BuiltinLowLevel.isBuiltinModule(env)) return;
+    switch (env.module_kind) {
+        .platform, .hosted => return,
+        .type_module, .default_app, .app, .package, .module, .malformed => markAnnoOnlyAsIntrinsic(env),
+    }
+}
+
+/// Mark the ordinary annotation-only value bindings of a module as intrinsics.
+/// Call it for every module that is neither the builtin module nor a platform
+/// module, after the hosted rewrite had its chance. A bodyless declaration in a
+/// platform module is hosted and never reaches this function.
+pub fn markAnnoOnlyAsIntrinsic(env: *ModuleEnv) void {
+    for (0..env.value_binding_defs.span.len) |def_offset| {
+        const def_idx = env.store.defAt(env.value_binding_defs, def_offset);
+        const def = env.store.getDef(def_idx);
+        if (def.annotation == null) continue;
+        const expr = env.store.getExpr(def.expr);
+        if (expr != .e_anno_only or expr.e_anno_only.kind != .ordinary) continue;
+        const node_idx: @TypeOf(env.store.nodes).Idx = @fromBackingInt(@intCast(@backingInt(def.expr)));
+        var node = env.store.nodes.get(node_idx);
+        var payload = node.getPayload();
+        payload.expr_anno_only.kind = @backingInt(CIR.AnnotationOnlyKind.intrinsic);
+        node.setPayload(payload);
+        env.store.nodes.set(node_idx, node);
+    }
 }
 
 /// Information about a hosted function for sorting and indexing

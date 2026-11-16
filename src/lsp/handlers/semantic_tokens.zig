@@ -43,7 +43,7 @@ pub fn handler(comptime ServerType: type) type {
             defer if (checked_module) |module| module.deinit();
 
             const tokens = if (checked_module) |module|
-                try semantic_tokens.extractSemanticTokensFromChecked(self.allocator, doc.text, &info, module.module_env)
+                try module.view().semanticTokens(self.allocator, doc.text, &info)
             else
                 try semantic_tokens.extractSemanticTokens(self.allocator, doc.text, &info);
             defer self.allocator.free(tokens);

@@ -18,12 +18,6 @@ ASCII CONTROL CHARACTER - :0:0:0:0
 UNDECLARED TYPE - fuzz_crash_048.md:2:7:2:12
 UNDECLARED TYPE - fuzz_crash_048.md:6:14:6:20
 UNDECLARED TYPE - fuzz_crash_048.md:7:13:7:18
-DECLARATION HAS NO VALUE - fuzz_crash_048.md:1:1:1:10
-DECLARATION HAS NO VALUE - fuzz_crash_048.md:2:1:2:21
-DECLARATION HAS NO VALUE - fuzz_crash_048.md:3:1:3:16
-DECLARATION HAS NO VALUE - fuzz_crash_048.md:4:1:5:16
-DECLARATION HAS NO VALUE - fuzz_crash_048.md:6:1:6:35
-DECLARATION HAS NO VALUE - fuzz_crash_048.md:7:1:7:29
 # PROBLEMS
 ~~~clojure
 (reports
@@ -62,73 +56,7 @@ DECLARATION HAS NO VALUE - fuzz_crash_048.md:7:1:7:29
 			(annotated code "Value")
 			(reflow " is not declared in this scope."))
 		(document
-			(source-region (file "fuzz_crash_048.md") (start 7 13) (end 7 18) (annotation error) (line-text "tag_tuple : Value((a, b, c))"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 1) (end 1 10))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_048.md") (start 1 1) (end 1 10) (annotation error) (line-text "foo : U64"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 2 1) (end 2 21))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_048.md") (start 2 1) (end 2 21) (annotation error) (line-text "bar : Thing(a, b, _)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 3 1) (end 3 16))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_048.md") (start 3 1) (end 3 16) (annotation error) (line-text "biz : (a, b, c)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 4 1) (end 5 16))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_048.md") (start 4 1) (end 5 16) (annotation error) (line-text "add_one : (\u{11}\nU8, U16 -> U32)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 6 1) (end 6 35))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_048.md") (start 6 1) (end 6 35) (annotation error) (line-text "main! : List(String) -> Try({}, _)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 7 1) (end 7 29))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_048.md") (start 7 1) (end 7 29) (annotation error) (line-text "tag_tuple : Value((a, b, c))"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "fuzz_crash_048.md") (start 7 13) (end 7 18) (annotation error) (line-text "tag_tuple : Value((a, b, c))")))))
 ~~~
 # TOKENS
 ~~~zig
@@ -186,7 +114,7 @@ EndOfFile,
 (can-ir
 	(d-let
 		(p-assign (ident "foo"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-lookup (name "U64") (builtin))))
 	(d-let
@@ -196,7 +124,7 @@ EndOfFile,
 			(ty-malformed)))
 	(d-let
 		(p-assign (ident "biz"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-tuple
 				(ty-rigid-var (name "a"))
@@ -204,7 +132,7 @@ EndOfFile,
 				(ty-rigid-var (name "c")))))
 	(d-let
 		(p-assign (ident "add_one"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-parens
 				(ty-fn (effectful false)

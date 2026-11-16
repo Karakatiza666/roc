@@ -38,6 +38,22 @@ const TypeContext = enum {
     FunctionReturn,
 };
 
+/// Where a type stands in a comma-separated run: the arguments of an alias or a
+/// nominal, the payloads of a tag, or the elements of a tuple. The parser reads
+/// a comma before `->` as one more parameter of a function, so a function that
+/// stands in a run needs parentheses wherever its own parameters would merge
+/// with the run.
+const ListSlot = enum {
+    /// Not in a run.
+    alone,
+    /// The first member of an argument or payload run.
+    first,
+    /// A member after the first.
+    later,
+    /// An element of a tuple, where `(a -> b, c)` does not parse at all.
+    tuple_element,
+};
+
 /// Helper that accepts a `Var` and write it as a nice string.
 /// Entry point is `writeVar`
 const TypeWriter = @This();
@@ -655,7 +671,7 @@ fn writeVarWithContext(self: *TypeWriter, writer: *ByteWrite, var_: Var, context
         self.scratch_tags.shrinkRetainingCapacity(tags_base);
     }
 
-    if (!try self.requestVar(writer, var_, context, root_var)) {
+    if (!try self.requestVar(writer, var_, context, .alone, root_var)) {
         try self.driveFrames(writer, frames_base, root_var);
     }
 
@@ -685,7 +701,7 @@ fn driveFrames(self: *TypeWriter, writer: *ByteWrite, frames_base: usize, root_v
 /// Render one var's head: write every byte that precedes its children and
 /// either finish it outright (returning true) or push the frame that will
 /// render its children (returning false).
-fn requestVar(self: *TypeWriter, writer: *ByteWrite, var_: Var, context: TypeContext, root_var: Var) error{ OutOfMemory, WriteFailed }!bool {
+fn requestVar(self: *TypeWriter, writer: *ByteWrite, var_: Var, context: TypeContext, slot: ListSlot, root_var: Var) error{ OutOfMemory, WriteFailed }!bool {
     if (@import("builtin").is_test) self.test_work += 1;
     if (@backingInt(var_) >= self.types.len()) {
         // Variable is out of bounds - this can happen with corrupted type data
@@ -713,7 +729,7 @@ fn requestVar(self: *TypeWriter, writer: *ByteWrite, var_: Var, context: TypeCon
     }
 
     try self.pushSeen(resolved.var_);
-    if (try self.writeContentHead(writer, resolved.desc.content, var_, resolved.var_, context, root_var)) {
+    if (try self.writeContentHead(writer, resolved.desc.content, var_, resolved.var_, context, slot, root_var)) {
         return false;
     }
     self.popSeen();
@@ -730,6 +746,7 @@ fn writeContentHead(
     var_: Var,
     resolved_var: Var,
     context: TypeContext,
+    slot: ListSlot,
     root_var: Var,
 ) error{ OutOfMemory, WriteFailed }!bool {
     switch (content) {
@@ -764,7 +781,10 @@ fn writeContentHead(
             return false;
         },
         .structure => |flat_type| {
-            const should_wrap_in_parens = ((context == .FunctionArgument or context == .FunctionReturn) and (flat_type == .fn_effectful or flat_type == .fn_pure or flat_type == .fn_unbound));
+            const should_wrap_in_parens = switch (flat_type) {
+                .fn_pure, .fn_effectful, .fn_unbound => |func| functionNeedsParens(context, slot, func),
+                .tuple, .nominal_type, .record, .empty_record, .tag_union, .empty_tag_union => false,
+            };
             if (should_wrap_in_parens) {
                 try writer.writeAll("(");
             }
@@ -780,6 +800,18 @@ fn writeContentHead(
             return false;
         },
     }
+}
+
+/// Whether a function type written at `slot` in `context` needs parentheses to
+/// read back as one type.
+fn functionNeedsParens(context: TypeContext, slot: ListSlot, func: Func) bool {
+    if (context == .FunctionArgument or context == .FunctionReturn) return true;
+    return switch (slot) {
+        .alone => false,
+        // A lone parameter before the arrow parses as the whole run's member.
+        .first => func.args.len() > 1,
+        .later, .tuple_element => true,
+    };
 }
 
 fn writeVar(self: *TypeWriter, writer: *ByteWrite, var_: Var, root_var: Var) error{ OutOfMemory, WriteFailed }!void {
@@ -981,8 +1013,9 @@ fn stepArgs(self: *TypeWriter, writer: *ByteWrite, frame: *ArgsFrame, root_var: 
             if (frame.idx > 0) try writer.writeAll(", ");
             const child = self.varAt(frame.vars, frame.idx);
             const context = frame.context;
+            const slot: ListSlot = if (context == .TupleFieldContent) .tuple_element else if (frame.idx == 0) .first else .later;
             frame.idx += 1;
-            if (!try self.requestVar(writer, child, context, root_var)) return false;
+            if (!try self.requestVar(writer, child, context, slot, root_var)) return false;
             continue;
         }
         try writer.writeAll(")");
@@ -1001,7 +1034,7 @@ fn stepFunc(self: *TypeWriter, writer: *ByteWrite, frame: *FuncFrame, root_var: 
                     frame.idx += 1;
                     // Argument positions flip the surrounding polarity.
                     self.polarity = frame.saved_polarity.flip();
-                    if (!try self.requestVar(writer, arg, .FunctionArgument, root_var)) return false;
+                    if (!try self.requestVar(writer, arg, .FunctionArgument, .alone, root_var)) return false;
                     continue;
                 }
                 try writer.writeAll(frame.arrow);
@@ -1013,7 +1046,7 @@ fn stepFunc(self: *TypeWriter, writer: *ByteWrite, frame: *FuncFrame, root_var: 
                 frame.stage = .done;
                 // The return position keeps the surrounding polarity.
                 self.polarity = frame.saved_polarity;
-                if (!try self.requestVar(writer, ret, .FunctionReturn, root_var)) return false;
+                if (!try self.requestVar(writer, ret, .FunctionReturn, .alone, root_var)) return false;
             },
             .done => {
                 if (frame.wrap_in_parens) try writer.writeAll(")");
@@ -1074,7 +1107,7 @@ fn stepRecord(self: *TypeWriter, writer: *ByteWrite, frame: *RecordFrame, root_v
                     try writer.writeAll(self.getIdent(field.name));
                     try self.writeRecordFieldSeparator(writer, field.presence);
                     frame.stage = .after_field;
-                    if (!try self.requestVar(writer, field.presence.typeVar(), .RecordFieldContent, root_var)) return false;
+                    if (!try self.requestVar(writer, field.presence.typeVar(), .RecordFieldContent, .alone, root_var)) return false;
                     continue;
                 }
                 self.scratch_record_fields.shrinkRetainingCapacity(frame.fields_base);
@@ -1234,8 +1267,9 @@ fn stepTag(self: *TypeWriter, writer: *ByteWrite, frame: *TagFrame, root_var: Va
         if (frame.idx < frame.args.len()) {
             if (frame.idx > 0) try writer.writeAll(", ");
             const arg = self.varAt(frame.args, frame.idx);
+            const slot: ListSlot = if (frame.idx == 0) .first else .later;
             frame.idx += 1;
-            if (!try self.requestVar(writer, arg, .General, root_var)) return false;
+            if (!try self.requestVar(writer, arg, .General, slot, root_var)) return false;
             continue;
         }
         try writer.writeAll(")");
@@ -1972,7 +2006,7 @@ test "TypeWriter renders every shape the walk descends through" {
         try env.types.freshFromContent(try env.types.mkFuncEffectful(&.{}, empty_record)),
         "() => {}",
     );
-    try env.expectRender(try env.tuple(&.{inner_fn}), "({} -> [])");
+    try env.expectRender(try env.tuple(&.{inner_fn}), "(({} -> []))");
 
     // Aliases and nominals render their name plus their arguments.
     const alias_name = try env.ident("Al");
@@ -2001,6 +2035,43 @@ test "TypeWriter renders every shape the walk descends through" {
     try env.expectRender(cyclic, "(<RecursiveType>)");
 }
 
+test "TypeWriter parenthesises a function where it stands in a comma-separated run" {
+    var env = try TestEnv.init(testing.allocator, 64);
+    defer env.deinit();
+
+    const unit = try env.types.freshFromContent(.{ .structure = .empty_record });
+    const empty_tag_union = try env.types.freshFromContent(.{ .structure = .empty_tag_union });
+    const one_param = try env.types.freshFromContent(try env.types.mkFuncPure(&.{unit}, empty_tag_union));
+    const two_params = try env.types.freshFromContent(try env.types.mkFuncPure(&.{ unit, unit }, empty_tag_union));
+    const effectful = try env.types.freshFromContent(try env.types.mkFuncEffectful(&.{ unit, unit }, unit));
+
+    const box = try env.ident("Box");
+    const none = base.ModuleIdentity.Idx.NONE;
+
+    // A nominal argument run reads `Box(a, b -> c)` as two arguments, so a function
+    // with several parameters is wrapped. A lone parameter is not.
+    try env.expectRender(try env.types.freshFromContent(try env.types.mkNominal(.{ .ident_idx = box }, &.{one_param}, none, false)), "Box({} -> [])");
+    try env.expectRender(try env.types.freshFromContent(try env.types.mkNominal(.{ .ident_idx = box }, &.{two_params}, none, false)), "Box(({}, {} -> []))");
+    try env.expectRender(try env.types.freshFromContent(try env.types.mkNominal(.{ .ident_idx = box }, &.{effectful}, none, false)), "Box(({}, {} => {}))");
+
+    // After the first argument, even a lone parameter would merge with the run.
+    try env.expectRender(try env.types.freshFromContent(try env.types.mkNominal(.{ .ident_idx = box }, &.{ unit, one_param }, none, false)), "Box({}, ({} -> []))");
+    try env.expectRender(try env.types.freshFromContent(try env.types.mkNominal(.{ .ident_idx = box }, &.{ one_param, unit }, none, false)), "Box({} -> [], {})");
+
+    // An alias argument run follows the same rule.
+    const alias_name = try env.ident("Al");
+    try env.expectRender(try env.types.freshFromContent(try env.types.mkAlias(.{ .ident_idx = alias_name }, unit, &.{two_params}, none)), "Al(({}, {} -> []))");
+
+    // A tuple element is always wrapped, because `(a -> b, c)` does not parse.
+    try env.expectRender(try env.tuple(&.{ one_param, unit }), "(({} -> []), {})");
+
+    // A tag payload run is read the same way as an argument run.
+    const tag_name = try env.ident("Foo");
+    const tags = try env.types.appendTags(&.{.{ .name = tag_name, .args = try env.types.appendVars(&.{two_params}) }});
+    const tag_union = try env.types.freshFromContent(.{ .structure = .{ .tag_union = .{ .tags = tags, .ext = empty_tag_union } } });
+    try env.expectRender(tag_union, "[Foo(({}, {} -> []))]");
+}
+
 test "TypeWriter names a flex var consistently once it occurs more than once" {
     var env = try TestEnv.init(testing.allocator, 32);
     defer env.deinit();
@@ -2025,6 +2096,7 @@ test "TypeWriter renders a where clause for the constraints it collects" {
     const method = try env.ident("plus");
     const fn_var = try env.types.freshFromContent(try env.types.mkFuncPure(&.{empty_record}, empty_record));
     const constraints = try env.types.appendStaticDispatchConstraints(&.{.{
+        .runs = true,
         .fn_name = method,
         .fn_var = fn_var,
         .origin = .{ .from_literal = .quote },

@@ -328,3 +328,87 @@ test "a copied literal conversion still fails at the use that copied it (issue 1
     try std.testing.expect(wrap == .e_lambda);
     try std.testing.expect(store.getExpr(wrap.e_lambda.body) != .e_runtime_error);
 }
+
+// A record update is an occurrence of its base's type. Its mismatch with an
+// annotation poisons only the update, never the class of the binding that the
+// base reads, which an earlier constant already used.
+test "a record update that mismatches its annotation leaves its base binding intact" {
+    const source =
+        \\Vet : { years : U8 }
+        \\
+        \\label : Vet -> Str
+        \\label = |_vet| "vet"
+        \\
+        \\ruth : Vet
+        \\ruth = { years: 12 }
+        \\
+        \\ruth_label = label(ruth)
+        \\
+        \\old_vet : { years : I64 }
+        \\old_vet = { ..ruth, years: 30 }
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+
+    try test_env.assertOneTypeError("Type Mismatch");
+    try test_env.assertDefTypeOptions("ruth", "Vet", .{ .allow_type_errors = true });
+    try test_env.assertDefTypeOptions("ruth_label", "Str", .{ .allow_type_errors = true });
+}
+
+test "a record update that mismatches its annotation leaves a base used by Str.inspect intact" {
+    const source =
+        \\ruth : { years : U8 }
+        \\ruth = { years: 12 }
+        \\
+        \\ruth_label = Str.inspect(ruth)
+        \\
+        \\old_vet : { years : I64 }
+        \\old_vet = { ..ruth, years: 30 }
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+
+    try test_env.assertOneTypeError("Type Mismatch");
+    try test_env.assertDefTypeOptions("ruth", "{ years: U8 }", .{ .allow_type_errors = true });
+}
+
+test "a record update in a function body that mismatches the result annotation leaves the base's alias intact" {
+    const source =
+        \\Vet : { years : U8 }
+        \\
+        \\label : Vet -> Str
+        \\label = |_vet| "vet"
+        \\
+        \\older : Vet -> { years : I64 }
+        \\older = |vet| { ..vet, years: 30 }
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+
+    try test_env.assertOneTypeError("Type Mismatch");
+    try test_env.assertDefTypeOptions("label", "Vet -> Str", .{ .allow_type_errors = true });
+    try test_env.assertDefTypeOptions("older", "Vet -> { years: I64 }", .{ .allow_type_errors = true });
+}
+
+test "a record update checked before the constant that uses its base reports the mismatch" {
+    const source =
+        \\Vet : { years : U8 }
+        \\
+        \\label : Vet -> Str
+        \\label = |_vet| "vet"
+        \\
+        \\ruth : Vet
+        \\ruth = { years: 12 }
+        \\
+        \\old_vet : { years : I64 }
+        \\old_vet = { ..ruth, years: 30 }
+        \\
+        \\ruth_label = label(ruth)
+    ;
+    var test_env = try TestEnv.init("Test", source);
+    defer test_env.deinit();
+
+    try test_env.assertOneTypeError("Type Mismatch");
+    try test_env.assertDefTypeOptions("ruth", "Vet", .{ .allow_type_errors = true });
+    try test_env.assertDefTypeOptions("ruth_label", "Str", .{ .allow_type_errors = true });
+}

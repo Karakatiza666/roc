@@ -78,11 +78,11 @@ import A/B/C/D as X3
 # CANONICALIZE
 ~~~clojure
 (can-ir
-	(s-import (mod "A/B")
+	(s-import (mod "A/B") (alias "X1")
 		(exposes))
-	(s-import (mod "A/B/C")
+	(s-import (mod "A/B/C") (alias "X2")
 		(exposes))
-	(s-import (mod "A/B/C/D")
+	(s-import (mod "A/B/C/D") (alias "X3")
 		(exposes)))
 ~~~
 # TYPES

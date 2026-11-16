@@ -4078,6 +4078,71 @@ test "commitGraph keeps distinguishable nodes of one cycle distinct" {
     try testing.expectEqual(commit.value_layouts[@backingInt(a)], commit_b.value_layouts[@backingInt(a2)]);
 }
 
+test "commitGraph gives a recursion box and an explicit box of the same target one layout" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+
+    // `s = { s, Box(s) }`. The field `s` is a recursive slot edge, so the
+    // commit boxes it. The explicit box node comes first, so it is the
+    // first node to finalize and it finishes in its raw slot. A separate
+    // recursion box of `s` would have the same contents in a second layout.
+    var graph = LayoutGraph{};
+    defer graph.deinit(testing.allocator);
+    const box_node = try graph.reserveNode(testing.allocator);
+    const s = try graph.reserveNode(testing.allocator);
+    graph.setNode(box_node, .{ .box = .{ .local = s } });
+    const fields = try graph.appendFields(testing.allocator, &[_]graph_mod.Field{
+        .{ .index = 0, .child = .{ .local = s } },
+        .{ .index = 1, .child = .{ .local = box_node } },
+    });
+    graph.setNode(s, .{ .struct_ = fields });
+    var commit = try store.commitGraph(&graph, .{ .local = s });
+    defer commit.deinit(testing.allocator);
+
+    const info = store.getStructInfo(store.getLayout(commit.root_idx));
+    try testing.expectEqual(@as(usize, 2), info.fields.len);
+    const box_layout = commit.value_layouts[@backingInt(box_node)];
+    try testing.expectEqual(LayoutTag.box, store.getLayout(box_layout).tag);
+    try testing.expectEqual(box_layout, info.fields.get(0).layout);
+    try testing.expectEqual(box_layout, info.fields.get(1).layout);
+}
+
+test "commitGraph gives two explicit boxes of the same target one layout" {
+    const testing = std.testing;
+    var store = try Store.init(testing.allocator, .u64);
+    defer store.deinit();
+
+    // `s = { Box(s), Box(s), s }` with two box nodes. The field `s` is a
+    // recursive slot edge, and it reads the first box node. The two box nodes
+    // have the same contents. The recursive keys of `commitGraph` give them
+    // one working node. Without that, the digest check of
+    // `commitWorkingGraph` makes them one layout. Each of the two alone
+    // keeps this test passing.
+    var graph = LayoutGraph{};
+    defer graph.deinit(testing.allocator);
+    const box_a = try graph.reserveNode(testing.allocator);
+    const box_b = try graph.reserveNode(testing.allocator);
+    const s = try graph.reserveNode(testing.allocator);
+    graph.setNode(box_a, .{ .box = .{ .local = s } });
+    graph.setNode(box_b, .{ .box = .{ .local = s } });
+    const fields = try graph.appendFields(testing.allocator, &[_]graph_mod.Field{
+        .{ .index = 0, .child = .{ .local = box_a } },
+        .{ .index = 1, .child = .{ .local = box_b } },
+        .{ .index = 2, .child = .{ .local = s } },
+    });
+    graph.setNode(s, .{ .struct_ = fields });
+    var commit = try store.commitGraph(&graph, .{ .local = s });
+    defer commit.deinit(testing.allocator);
+
+    const box_layout = commit.value_layouts[@backingInt(box_a)];
+    try testing.expectEqual(LayoutTag.box, store.getLayout(box_layout).tag);
+    try testing.expectEqual(box_layout, commit.value_layouts[@backingInt(box_b)]);
+    const info = store.getStructInfo(store.getLayout(commit.root_idx));
+    try testing.expectEqual(@as(usize, 3), info.fields.len);
+    for (0..3) |i| try testing.expectEqual(box_layout, info.fields.get(i).layout);
+}
+
 test "commitGraph collapses interchangeable copies of a recursive closure layout (issue #11072)" {
     const testing = std.testing;
     var store = try Store.init(testing.allocator, .u64);

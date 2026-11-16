@@ -120,15 +120,15 @@ main = {
 					(p-assign (ident "t"))))
 			(e-tuple
 				(elems
-					(e-call (constraint-fn-var 247)
+					(e-call (constraint-fn-var 401)
 						(e-lookup-local
 							(p-assign (ident "a")))
 						(e-runtime-error (tag "erroneous_value_expr")))
-					(e-call (constraint-fn-var 256)
+					(e-call (constraint-fn-var 410)
 						(e-lookup-local
 							(p-assign (ident "a")))
 						(e-runtime-error (tag "erroneous_value_expr")))
-					(e-call (constraint-fn-var 264)
+					(e-call (constraint-fn-var 418)
 						(e-lookup-local
 							(p-assign (ident "b")))
 						(e-num (value "2"))))))))
@@ -138,10 +138,10 @@ main = {
 (inferred-types
 	(defs
 		(patt (type "c -> c"))
-		(patt (type "(Dec -> Dec, Dec -> Dec)"))
+		(patt (type "((Dec -> Dec), (Dec -> Dec))"))
 		(patt (type "(Dec, Dec, Dec)")))
 	(expressions
 		(expr (type "c -> c"))
-		(expr (type "(Dec -> Dec, Dec -> Dec)"))
+		(expr (type "((Dec -> Dec), (Dec -> Dec))"))
 		(expr (type "(Dec, Dec, Dec)"))))
 ~~~

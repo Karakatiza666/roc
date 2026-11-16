@@ -120,6 +120,7 @@ const Fill = struct {
     /// A tag row a host-boundary annotation wrote is the same host row in
     /// every module that imports it (design.md "Row Joins").
     host_fixed_row: bool,
+    record_row: bool,
 };
 
 const IdentityResult = enum { flex, rigid };
@@ -376,6 +377,7 @@ fn request(ctx: *CopyContext, source_var: Var) std.mem.Allocator.Error!bool {
         .empty_tag_union_is_default = resolved.desc.flags.empty_tag_union_is_default,
         .nominal_backing_structure = resolved.desc.flags.nominal_backing_structure,
         .host_fixed_row = resolved.desc.flags.host_fixed_row,
+        .record_row = resolved.desc.flags.record_row,
     };
 
     // NOTE: a copied var whose content is a flex carrying a literal-conversion
@@ -540,6 +542,7 @@ fn finishFrame(ctx: *CopyContext, fill: Fill, content: Content) std.mem.Allocato
             .empty_tag_union_is_default = fill.empty_tag_union_is_default,
             .nominal_backing_structure = fill.nominal_backing_structure,
             .host_fixed_row = fill.host_fixed_row,
+            .record_row = fill.record_row,
         },
     });
     try ctx.scratch.values.append(ctx.allocator, fill.placeholder);

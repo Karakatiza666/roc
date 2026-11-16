@@ -4696,7 +4696,7 @@ test "nominal views inhabitedness modes preserve leaf and row-cycle policies" {
         .ret = unit,
     } } });
     const constraints = try store.appendStaticDispatchConstraints(&.{
-        .{ .fn_name = sentinel, .fn_var = function, .origin = .method_call },
+        .{ .runs = true, .fn_name = sentinel, .fn_var = function, .origin = .method_call },
     });
     const flex = try store.fresh();
     const constrained_flex = try store.freshFromContent(.{ .flex = .{ .name = null, .constraints = constraints } });

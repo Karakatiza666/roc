@@ -457,7 +457,7 @@ NO CHANGE
 												(required
 													(p-assign (ident "step"))))))))
 							(value
-								(e-call (constraint-fn-var 524)
+								(e-call (constraint-fn-var 678)
 									(e-lookup-local
 										(p-assign (ident "step"))))))))))
 		(annotation
@@ -480,7 +480,7 @@ NO CHANGE
 									(p-assign (ident "step"))))))
 					(e-lookup-local
 						(p-assign (ident "s"))))
-				(e-call (constraint-fn-var 546)
+				(e-call (constraint-fn-var 700)
 					(e-lookup-local
 						(p-assign (ident "step"))))))
 		(annotation
@@ -498,7 +498,7 @@ NO CHANGE
 						(record-destruct (label "step") (ident "step")
 							(required
 								(p-assign (ident "step")))))))
-			(e-call (constraint-fn-var 566)
+			(e-call (constraint-fn-var 720)
 				(e-lookup-local
 					(p-assign (ident "step")))))
 		(annotation
@@ -512,7 +512,7 @@ NO CHANGE
 		(e-lambda
 			(args
 				(p-assign (ident "s")))
-			(e-call (constraint-fn-var 582)
+			(e-call (constraint-fn-var 736)
 				(e-field-access
 					(receiver
 						(e-lookup-local
@@ -546,7 +546,7 @@ NO CHANGE
 											(p-assign (ident "s"))))
 									(segments
 										(segment (name "step") (mode "required"))))))))
-				(e-call (constraint-fn-var 605)
+				(e-call (constraint-fn-var 759)
 					(e-lookup-local
 						(p-assign (ident "step"))))))
 		(annotation
@@ -567,7 +567,7 @@ NO CHANGE
 							(record-destruct (label "step") (ident "step")
 								(required
 									(p-assign (ident "step"))))))
-					(e-call (constraint-fn-var 632)
+					(e-call (constraint-fn-var 786)
 						(e-lookup-local
 							(p-assign (ident "wrap")))
 						(e-field-access
@@ -576,7 +576,7 @@ NO CHANGE
 									(p-assign (ident "s"))))
 							(segments
 								(segment (name "step") (mode "required"))))))
-				(e-call (constraint-fn-var 635)
+				(e-call (constraint-fn-var 789)
 					(e-lookup-local
 						(p-assign (ident "step"))))))
 		(annotation
@@ -606,7 +606,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_pattern") (constraint-fn-var 639)
+								(e-dispatch-call (method "by_pattern") (constraint-fn-var 793)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -638,7 +638,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_statement") (constraint-fn-var 675)
+								(e-dispatch-call (method "by_statement") (constraint-fn-var 829)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -670,7 +670,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_param") (constraint-fn-var 711)
+								(e-dispatch-call (method "by_param") (constraint-fn-var 865)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -702,7 +702,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_field") (constraint-fn-var 747)
+								(e-dispatch-call (method "by_field") (constraint-fn-var 901)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -734,7 +734,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_literal") (constraint-fn-var 783)
+								(e-dispatch-call (method "by_literal") (constraint-fn-var 937)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -766,7 +766,7 @@ NO CHANGE
 					(e-match
 						(match
 							(cond
-								(e-dispatch-call (method "by_call") (constraint-fn-var 819)
+								(e-dispatch-call (method "by_call") (constraint-fn-var 973)
 									(receiver
 										(e-lookup-local
 											(p-assign (ident "s"))))
@@ -793,27 +793,27 @@ NO CHANGE
 									(value
 										(e-string
 											(e-literal (string "c")))))))))
-				(e-call (constraint-fn-var 871)
+				(e-call (constraint-fn-var 1025)
 					(e-lookup-external
 						(builtin))
-					(e-call (constraint-fn-var 867)
+					(e-call (constraint-fn-var 1021)
 						(e-lookup-external
 							(builtin))
-						(e-call (constraint-fn-var 863)
+						(e-call (constraint-fn-var 1017)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local
 								(p-assign (ident "a")))
 							(e-lookup-local
 								(p-assign (ident "b"))))
-						(e-call (constraint-fn-var 866)
+						(e-call (constraint-fn-var 1020)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local
 								(p-assign (ident "c")))
 							(e-lookup-local
 								(p-assign (ident "d")))))
-					(e-call (constraint-fn-var 870)
+					(e-call (constraint-fn-var 1024)
 						(e-lookup-external
 							(builtin))
 						(e-lookup-local

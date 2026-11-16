@@ -1209,6 +1209,7 @@ test "concrete keys default open literal flex vars per kind (numeral -> Dec, quo
 
     const numeral_fn_var = try store.freshFromContent(.{ .flex = types.Flex.init() });
     const numeral_constraints = try store.appendStaticDispatchConstraints(&.{.{
+        .runs = true,
         .fn_name = from_numeral_ident,
         .fn_var = numeral_fn_var,
         .origin = .{ .from_literal = .numeral },
@@ -1220,6 +1221,7 @@ test "concrete keys default open literal flex vars per kind (numeral -> Dec, quo
 
     const quote_fn_var = try store.freshFromContent(.{ .flex = types.Flex.init() });
     const quote_constraints = try store.appendStaticDispatchConstraints(&.{.{
+        .runs = true,
         .fn_name = from_quote_ident,
         .fn_var = quote_fn_var,
         .origin = .{ .from_literal = .quote },
@@ -1641,6 +1643,7 @@ test "type writer resets checker digest modes between requests" {
     defer store.deinit();
     const child = try store.fresh();
     const constraints = try store.appendStaticDispatchConstraints(&.{.{
+        .runs = true,
         .fn_name = try env.insertIdent(Ident.for_text("method")),
         .fn_var = child,
         .origin = .method_call,
@@ -1879,6 +1882,7 @@ test "issue 11350 inspection preserves identity slots through constraints and cy
     const flex_private = try store.fresh();
     const rigid = try store.freshFromContent(.{ .rigid = types.Rigid.init(rigid_name).withConstraints(
         try store.appendStaticDispatchConstraints(&.{.{
+            .runs = true,
             .fn_name = method_name,
             .fn_var = rigid_private,
             .origin = .method_call,
@@ -1886,6 +1890,7 @@ test "issue 11350 inspection preserves identity slots through constraints and cy
     ) });
     const flex = try store.freshFromContent(.{ .flex = types.Flex.init().withConstraints(
         try store.appendStaticDispatchConstraints(&.{.{
+            .runs = true,
             .fn_name = method_name,
             .fn_var = flex_private,
             .origin = .method_call,
@@ -2545,6 +2550,7 @@ test "keys are equal exactly when types are equal up to renaming, over random sh
                 const content: types.Content = switch (shapes[i]) {
                     0 => .{ .flex = types.Flex.init() },
                     1 => .{ .flex = types.Flex.init().withConstraints(try store.appendStaticDispatchConstraints(&.{.{
+                        .runs = true,
                         .fn_name = method,
                         .fn_var = c0,
                         .origin = .method_call,
@@ -2612,6 +2618,7 @@ test "keying every link of a constrained-variable chain takes work linear in its
                 .ret = links[i + 1],
             } } });
             try store.setVarContent(links[i], .{ .flex = types.Flex.init().withConstraints(try store.appendStaticDispatchConstraints(&.{.{
+                .runs = true,
                 .fn_name = method,
                 .fn_var = callable,
                 .origin = .method_call,

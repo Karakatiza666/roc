@@ -205,7 +205,7 @@ pub const SealedTypeView = struct {
                 .optional => .optional,
             } },
             .flex => |flex| {
-                const variable_facts = checked_artifact.flexVariableFacts(env, flex, resolved.desc.flags.bounded_row_ext);
+                const variable_facts = checked_artifact.flexVariableFacts(env, flex, resolved.desc.flags.bounded_row_ext, resolved.desc.flags.record_row);
                 return .{ .flex = .{
                     .name = if (flex.name) |name| checked_artifact.checkedVariableNameText(env, name) else null,
                     .constraints = .{ .sealed = .{ .constraints = type_store.sliceStaticDispatchConstraints(flex.constraints), .view = self } },
@@ -213,10 +213,11 @@ pub const SealedTypeView = struct {
                     .row_default = self.rowDefault(var_, resolved.desc.content),
                     .row_default_discharges_constraints = variable_facts.row_default_discharges_constraints,
                     .bounded_row_ext = variable_facts.bounded_row_ext,
+                    .record_row = variable_facts.record_row,
                 } };
             },
             .rigid => |rigid| {
-                const variable_facts = checked_artifact.rigidVariableFacts(env, rigid);
+                const variable_facts = checked_artifact.rigidVariableFacts(env, rigid, resolved.desc.flags.record_row);
                 return .{ .rigid = .{
                     .name = checked_artifact.checkedVariableNameText(env, rigid.name),
                     .constraints = .{ .sealed = .{ .constraints = type_store.sliceStaticDispatchConstraints(rigid.constraints), .view = self } },
@@ -224,6 +225,7 @@ pub const SealedTypeView = struct {
                     .row_default = self.rowDefault(var_, resolved.desc.content),
                     .row_default_discharges_constraints = variable_facts.row_default_discharges_constraints,
                     .bounded_row_ext = variable_facts.bounded_row_ext,
+                    .record_row = variable_facts.record_row,
                 } };
             },
             .alias => |alias| return .{ .alias = .{

@@ -1,0 +1,453 @@
+# `main.roc`, refactored by hand: the parameters of the functions the
+# queries reify renamed, bindings added, and the bindings in another order.
+# None of it changes what a function computes, so every description is the
+# same, and the script this prints is `expected_output.sql`, byte for byte,
+# which the `expect` at the end checks.
+#
+# A shop's schema and queries, written against `Sql.roc`.
+#
+# The rows are ordinary Roc records. The same `Order` and `Product` values the
+# queries describe are the ones the application builds, inserts, passes to its
+# own functions and tests with `expect`. Every clause of every query, and every
+# constraint of every migration, is a Roc function over those records, reified
+# where a builder method asks for a `Code(f)`.
+#
+# `roc main.roc` prints one SQLite script: the migrations, the seed rows, and
+# each query with its parameters written in. `check.py` runs it and compares
+# each query's result with the one Roc computes from the same functions over
+# the same rows.
+
+app [main!] { sql: "package.roc", time: "time/package.roc", time_sql: "time_sql/package.roc" }
+
+import sql.Sql
+import time.Time
+import time_sql.TimeSql
+import "expected_output.sql" as expected_output : Str
+
+# ------------------------------------------------------------------- rows
+
+Customer : { id : I64, name : Str, country : Str, email ?: Str }
+
+Product : { id : I64, title : Str, price : Dec }
+
+Order : { id : I64, customer_id : I64, product_id : I64, quantity : I64, discount : Dec }
+
+customers : Sql.Table(Customer)
+customers = Sql.table("customers")
+
+products : Sql.Table(Product)
+products = Sql.table("products")
+
+orders : Sql.Table(Order)
+orders = Sql.table("orders")
+
+## Something that happened in the shop, and when. `Time` is another package's
+## opaque type: `Sql.roc` knows nothing of it, and `TimeSql.extension` says
+## what its column type and its comparisons are in SQL.
+Event : { id : I64, title : Str, at : Time }
+
+events : Sql.Table(Event)
+events = Sql.table("events")
+
+# --------------------------------------------------- ordinary Roc functions
+
+## What one order line costs. A query that calls it computes it in the
+## database; the application calls it on the rows it holds.
+line_total : Order, Product -> Dec
+line_total = |line, item| {
+	kept = 1 - line.discount
+	units = line.quantity.to_dec()
+	gross = item.price * units
+	gross * kept
+}
+
+## A wholesale order.
+is_bulk : Order -> Bool
+is_bulk = |line| {
+	threshold = 10
+	line.quantity >= threshold
+}
+
+expect is_bulk({ id: 1, customer_id: 1, product_id: 1, quantity: 12, discount: 0 })
+
+expect line_total({ id: 1, customer_id: 1, product_id: 1, quantity: 4, discount: 0.25 }, { id: 1, title: "Pen", price: 2.50 }) == 7.5
+
+# -------------------------------------------------------------- migrations
+
+## Each step lists the columns it creates, so a migration keeps saying what it
+## said when it was written even after the record gains a field. The column
+## types a Roc type cannot say, like a `NUMERIC`'s precision, are one more
+## function over the row.
+migrations : List(Sql.Migration)
+migrations = [
+	Sql.migration(
+		"001_catalog",
+		[
+			products.create(|p| { id: p.id, title: p.title, price: p.price })
+				.primary_key(|p| p.id)
+				.numeric(|p| p.price, 10, 2)
+				.check(|p| p.price > 0)
+				.done(),
+		],
+	),
+	Sql.migration(
+		"002_customers_and_orders",
+		[
+			customers.create(|c| { id: c.id, name: c.name, country: c.country })
+				.primary_key(|c| c.id)
+				.varchar(|c| c.country, 2)
+				.done(),
+			orders.create(|o| { id: o.id, customer_id: o.customer_id, product_id: o.product_id, quantity: o.quantity, discount: o.discount })
+				.primary_key(|o| o.id)
+				.references(|o| o.customer_id, customers)
+				.references(|o| o.product_id, products)
+				.numeric(|o| o.discount, 3, 2)
+				.check(|o| o.quantity > 0 and o.discount >= 0 and o.discount < 1)
+				.done(),
+		],
+	),
+	Sql.migration("003_customer_email", [customers.add_columns(|c| { email: c.?email }).done()]),
+	Sql.migration("004_events", [events.create_with([TimeSql.extension], |ev| { id: ev.id, title: ev.title, at: ev.at }).primary_key(|ev| ev.id).done()]),
+]
+
+# Every field of every row type is created by exactly one migration.
+expect Sql.schema_gaps(migrations) == []
+
+# Without the third migration, the schema is missing a column the code reads.
+expect Sql.schema_gaps(migrations.take_first(2)) == ["customers.email is never created"]
+
+# ------------------------------------------------------------------ seeds
+
+seed_products : List(Product)
+seed_products = [
+	{ id: 1, title: "Espresso machine", price: 249.00 },
+	{ id: 2, title: "Coffee beans, 1kg", price: 18.50 },
+	{ id: 3, title: "Milk jug", price: 12.25 },
+	{ id: 4, title: "Gift card", price: 50.00 },
+]
+
+grace : Customer
+grace = { country: "US", name: "Grace", id: 2 }
+
+ada : Customer
+ada = { email: "ada@example.com", country: "GB", name: "Ada", id: 1 }
+
+seed_customers : List(Customer)
+seed_customers = [
+	ada,
+	grace,
+	{ id: 3, name: "Edsger", country: "NL", email: "ewd@example.com" },
+	{ id: 4, name: "O'Neil", country: "US", email: "oneil@example.com" },
+]
+
+seed_orders : List(Order)
+seed_orders = [
+	{ id: 1, customer_id: 1, product_id: 1, quantity: 1, discount: 0 },
+	{ id: 2, customer_id: 1, product_id: 2, quantity: 12, discount: 0.10 },
+	{ id: 3, customer_id: 2, product_id: 2, quantity: 3, discount: 0 },
+	{ id: 4, customer_id: 2, product_id: 3, quantity: 10, discount: 0.25 },
+	{ id: 5, customer_id: 3, product_id: 4, quantity: 2, discount: 0 },
+	{ id: 6, customer_id: 4, product_id: 2, quantity: 20, discount: 0.15 },
+]
+
+seed_events : List(Event)
+seed_events = [
+	{ id: 1, title: "Supplier founded", at: Time.from_seconds(-86_400) },
+	{ id: 2, title: "Shop opens", at: Time.from_seconds(1_700_000_000) },
+	{ id: 3, title: "Spring sale", at: Time.from_seconds(1_710_000_000) },
+	{ id: 4, title: "Stocktake", at: Time.from_nanos(1_720_000_000_000_000_001) },
+]
+
+## One `INSERT` of an event. The function reads the event's fields, so each
+## is a `?` the program binds, and the `Time` binds as the bytes
+## `Sql.Param` writes: the same bytes a filter that captures a `Time` binds.
+insert_event : Event -> Try(Sql.Statement, Sql.Error)
+insert_event = |happening| Sql.bind_captured(events.insert_one(|{}| { id: happening.id, title: happening.title, at: happening.at }))
+
+## One `INSERT` of a customer. The function returns the captured row, so
+## each column is a `?`, and a customer with no `email` binds `NULL` there.
+insert_customer : Customer -> Try(Sql.Statement, Sql.Error)
+insert_customer = |buyer| Sql.bind_captured(customers.insert_one(|{}| buyer))
+
+# ---------------------------------------------------------------- queries
+
+## Binary operators and `NUMERIC` arithmetic, over one table. A record's
+## fields reach the translator in name order, so the result columns do too.
+premium =
+	Sql.from(products)
+		.filter(
+			|item| {
+				not_a_card = item.title != "Gift card"
+				dear = item.price >= 20
+				dear and not_a_card
+			},
+		)
+		.select(|item| { with_tax: item.price * 1.2, price: item.price, title: item.title })
+		.order_by(|r| r.price, Desc)
+
+## Two filters are two conditions, each kept whole.
+two_filters =
+	Sql.from(products)
+		.filter(|p| p.price < 20 or p.price > 100)
+		.filter(|p| p.title != "Gift card")
+		.select(|p| { title: p.title })
+
+expect two_filters.to_sql() == Ok("SELECT products.title AS title\nFROM products\nWHERE ((products.price < 20.0) OR (products.price > 100.0)) AND (products.title <> 'Gift card')")
+
+## A parameter is a field of a record the filter takes first. Every
+## `filter_by` of a query takes the same record, so its type is the fields the
+## filters read between them, and `bind` accepts exactly it.
+PriceBand : { low : Dec, high : Dec }
+
+in_band =
+	Sql.from(products)
+		.filter_by(|range, item| item.price >= range.low)
+		.filter_by(|range, item| item.price <= range.high)
+		.select(|p| { title: p.title, price: p.price })
+		.order_by(|r| r.price, Asc)
+
+## An optional field is a nullable column. Roc makes the absent case explicit
+## with `??`, so the query says what SQL's `NULL` would have left unsaid.
+contacts =
+	Sql.from(customers)
+		.filter(|who| who.country != "NL")
+		.select(
+			|who| {
+				address = who.?email ?? "(none)"
+				{ email: address, name: who.name }
+			},
+		)
+		.order_by(|r| r.name, Asc)
+
+## Every customer's purchases: a three-way join. A join makes the row a pair
+## of the rows so far and the table just joined, so a clause takes it apart
+## with a tuple pattern, and the second join's condition reads the order out
+## of the first join's pair.
+Purchase : ((Customer, Order), Product)
+
+purchases =
+	Sql.from(customers)
+		.join(orders, |c, o| o.customer_id == c.id)
+		.join(products, |(_, o), p| o.product_id == p.id)
+
+## One line of the report. It calls `line_total`, so the database computes
+## the same total the application does, from one definition.
+report_line : Purchase -> { customer : Str, product : Str, quantity : I64, total : Dec }
+report_line = |((buyer, line), item)| {
+	total = line_total(line, item)
+	{ total, quantity: line.quantity, product: item.title, customer: buyer.name }
+}
+
+bulk_purchase : Purchase -> Bool
+bulk_purchase = |((_, o), _)| is_bulk(o)
+
+bulk_lines =
+	purchases
+		.filter(bulk_purchase)
+		.select(report_line)
+		.order_by(|r| r.total, Desc)
+
+## Revenue per country. The aggregate is ordinary Roc over a group's rows, so
+## `rows.len()` is `COUNT(*)` and `rows.map(..).sum()` is `SUM`.
+CountryRevenue : { country : Str, orders : U64, revenue : Dec }
+
+country_revenue : Str, List(Purchase) -> CountryRevenue
+country_revenue = |place, group| {
+	revenue = group.map(|((_, line), item)| line_total(line, item)).sum()
+	count = group.len()
+	{ revenue, orders: count, country: place }
+}
+
+revenue_by_country =
+	purchases
+		.group_by(|((c, _), _)| c.country)
+		.aggregate(country_revenue)
+		.order_by(|r| r.revenue, Desc)
+
+## A query written inside a function, which reads the function's own
+## parameter. The value exists only when the program runs, so the translator
+## writes a `?` for it while the compiler runs, and the program binds the
+## value the function was called with.
+orders_of_at_least : I64 -> Try(Sql.Statement, Sql.Error)
+orders_of_at_least = |least| {
+	bound = Sql.select_where(
+		orders,
+		[],
+		|line| {
+			units = line.quantity
+			units >= least
+		},
+	)
+	Sql.bind_captured(bound)
+}
+
+## A filter that compares a column of another package's opaque type with a
+## captured value of it. `TimeSql.extension` says `<` on `Time` is `<` on
+## the column, and the captured `Time` binds as its `Sql.Param` bytes.
+events_before : Time -> Try(Sql.Statement, Sql.Error)
+events_before = |limit| Sql.bind_captured(Sql.select_where(events, [TimeSql.extension], |happening| happening.at < limit))
+
+events_after : Time -> Try(Sql.Statement, Sql.Error)
+events_after = |limit| Sql.bind_captured(Sql.select_where(events, [TimeSql.extension], |happening| happening.at > limit))
+
+events_at : Time -> Try(Sql.Statement, Sql.Error)
+events_at = |moment| Sql.bind_captured(Sql.select_where(events, [TimeSql.extension], |happening| happening.at == moment))
+
+events_not_at : Time -> Try(Sql.Statement, Sql.Error)
+events_not_at = |moment| Sql.bind_captured(Sql.select_where(events, [TimeSql.extension], |happening| happening.at != moment))
+
+same_customer : Customer -> Try(Sql.Statement, Sql.Error)
+same_customer = |wanted| {
+	query = Sql.select_where(customers, [], |candidate| candidate == wanted)
+	Sql.bind_captured(query)
+}
+
+# ------------------------------------------------ the same queries, in Roc
+
+## The join, as ordinary Roc. It is what the SQL result is checked against.
+purchases_in_memory : List(Purchase)
+purchases_in_memory =
+	seed_customers.join_map(
+		|c| seed_orders.keep_if(|o| o.customer_id == c.id).join_map(
+			|o| seed_products.keep_if(|p| p.id == o.product_id).map(|p| ((c, o), p)),
+		),
+	)
+
+bulk_lines_in_memory : List({ customer : Str, product : Str, quantity : I64, total : Dec })
+bulk_lines_in_memory = purchases_in_memory.keep_if(bulk_purchase).map(report_line)
+
+revenue_by_country_in_memory : List(CountryRevenue)
+revenue_by_country_in_memory = {
+	countries = purchases_in_memory.fold([], |seen, purchase| if (seen.contains(purchase.0.0.country)) seen else seen.append(purchase.0.0.country))
+	countries.map(|country| country_revenue(country, purchases_in_memory.keep_if(|purchase| purchase.0.0.country == country)))
+}
+
+orders_of_at_least_in_memory : I64 -> List(Order)
+orders_of_at_least_in_memory = |min_quantity| seed_orders.keep_if(|o| o.quantity >= min_quantity)
+
+## A `Time` in a result row is the blob the database stores, which is the
+## bytes `Sql.Param` writes for it.
+events_before_in_memory : Time -> List({ id : I64, title : Str, at : { blob : Str } })
+events_before_in_memory = |cutoff| events_in_memory(|e| e.at < cutoff)
+
+## The events `keep` keeps, as a result row of them reads.
+events_in_memory : (Event -> Bool) -> List({ id : I64, title : Str, at : { blob : Str } })
+events_in_memory = |keep| seed_events.keep_if(keep).map(|e| { id: e.id, title: e.title, at: { blob: Sql.hex(Sql.param_bytes(e.at)) } })
+
+# ---------------------------------------------------------------- refusals
+
+# A translator refuses what SQL cannot say, and names the construct. The
+# line it was written on comes with source provenance, which is not in the
+# description yet. `count_utf8_bytes` has an SQL look-alike, `length`, that counts characters
+# instead, so a translator that mapped one onto the other would compute a
+# different answer for any name with an accent in it.
+byte_length = Sql.from(customers).filter(|c| c.name.count_utf8_bytes() > 5).select(|c| { name: c.name })
+
+expect byte_length.to_sql() == Err(Unsupported("`count_utf8_bytes` counts bytes, and SQL's `length` counts characters; the two disagree on any non-ASCII text"))
+
+# Roc's `//` truncates a `Dec` toward zero. SQL has no portable spelling of
+# that, so the translator refuses it rather than emit a `/` that rounds
+# differently in each database.
+halves = Sql.from(products).select(|p| { half: p.price // 2 })
+
+expect {
+	match halves.to_sql() {
+		Err(Unsupported(message)) => message.contains("`//` truncates a fraction")
+		_ => Bool.False
+	}
+}
+
+# A row is where columns come from, not a value a column can hold.
+whole_rows = Sql.from(products).select(|p| { product: p })
+
+expect {
+	match whole_rows.to_sql() {
+		Err(Unsupported(message)) => message.contains("a whole row has no SQL value")
+		_ => Bool.False
+	}
+}
+
+# ------------------------------------------------------------------ output
+
+expected_bulk_lines : Str
+expected_bulk_lines =
+	\\SELECT customers.name AS customer, products.title AS product, orders.quantity AS quantity, (products.price * CAST(orders.quantity AS NUMERIC)) * (1.0 - orders.discount) AS total
+	\\FROM customers
+	\\JOIN orders ON orders.customer_id = customers.id
+	\\JOIN products ON orders.product_id = products.id
+	\\WHERE orders.quantity >= 10
+	\\ORDER BY total DESC
+
+expect bulk_lines.to_sql() == Ok(expected_bulk_lines)
+
+# A parameter is a placeholder until it is bound, and bound from the record
+# type the filter reads.
+expect {
+	match in_band.bind({ low: 10, high: 20 }) {
+		Ok(statement) => statement.sql.contains(":low") and statement.params.len() == 2
+		Err(_) => Bool.False
+	}
+}
+
+section : Str, Try(Str, Sql.Error) -> Str
+section = |name, rendered| match rendered {
+	Ok(sql) => "-- ${name}\n${sql}"
+	Err(Unsupported(message)) => "-- ${name} is unsupported: ${message}"
+	Err(BadSchema(message)) => "-- ${name} has a bad schema: ${message}"
+}
+
+query : Str, Try(Sql.Statement, Sql.Error), Str -> Str
+query = |name, bound, reference| {
+	checked = if (reference.is_empty()) "" else "\n-- roc: ${reference}"
+	section("query: ${name}", bound.map_ok(|statement| "${statement.inlined};${checked}"))
+}
+
+## A statement with `?` placeholders. Its values go on a line of their own,
+## as JSON, which `check.py` binds.
+bound_query : Str, Try(Sql.Statement, Sql.Error), Str -> Str
+bound_query = |name, bound, reference| {
+	json = |value| match value {
+		Integer(n) => n.to_str()
+		Numeric(d) => d.to_str()
+		Text(text) => Json.to_str(text)
+		Boolean(b) => if (b) "true" else "false"
+		Blob(bytes) => "{\"blob\": \"${Sql.hex(bytes)}\"}"
+		Null => "null"
+	}
+	section(
+		"query: ${name}",
+		bound.map_ok(|statement| "-- params: [${Str.join_with(statement.params.map(|p| json(p.value)), ", ")}]\n${statement.sql};\n-- roc: ${reference}"),
+	)
+}
+
+script : Str
+script =
+	Str.join_with(
+		[
+			section("migrations", Sql.migrate(migrations)),
+			section("seed", products.insert(seed_products)),
+			section("seed", seed_customers.map_try(insert_customer).map_ok(|statements| Str.join_with(statements.map(|statement| "${statement.inlined};"), "\n"))),
+			section("seed", orders.insert(seed_orders)),
+			section("seed", seed_events.map_try(insert_event).map_ok(|statements| Str.join_with(statements.map(|statement| "${statement.inlined};"), "\n"))),
+			query("premium", premium.bind({}), ""),
+			query("in_band", in_band.bind({ low: 10, high: 20 }), ""),
+			query("contacts", contacts.bind({}), ""),
+			query("bulk_lines", bulk_lines.bind({}), Json.to_str(bulk_lines_in_memory)),
+			query("revenue_by_country", revenue_by_country.bind({}), Json.to_str(revenue_by_country_in_memory)),
+			bound_query("orders_of_at_least", orders_of_at_least(10), Json.to_str(orders_of_at_least_in_memory(10))),
+			bound_query("events_before", events_before(Time.from_seconds(1_705_000_000)), Json.to_str(events_before_in_memory(Time.from_seconds(1_705_000_000)))),
+			bound_query("events_after_negative", events_after(Time.from_seconds(-100_000)), Json.to_str(events_in_memory(|e| e.at > Time.from_seconds(-100_000)))),
+			bound_query("events_at", events_at(Time.from_nanos(1_720_000_000_000_000_001)), Json.to_str(events_in_memory(|e| e.at == Time.from_nanos(1_720_000_000_000_000_001)))),
+			bound_query("events_not_at", events_not_at(Time.from_seconds(1_700_000_000)), Json.to_str(events_in_memory(|e| e.at != Time.from_seconds(1_700_000_000)))),
+			bound_query("same_customer_without_email", same_customer(grace), Json.to_str(seed_customers.keep_if(|c| c == grace))),
+			bound_query("same_customer_with_email", same_customer(ada), Json.to_str(seed_customers.keep_if(|c| c == ada))),
+		],
+		"\n\n",
+	)
+
+expect "${script}\n" == expected_output
+
+main! = |_args| {
+	echo!("${script}\n")
+	Ok({})
+}

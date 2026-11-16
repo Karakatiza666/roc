@@ -242,7 +242,11 @@ pub fn restoreTyping(context: *Context, env: *ModuleEnv) Allocator.Error!?check.
         },
     };
     try check.CheckingDependencies.bindOwners(&cached, &context.scope);
+    // The workspace fields are not in the capsule: the coordinator
+    // recorded them on the env this one replaces.
     cached.qualified_module_name = env.qualified_module_name;
+    cached.package_name = env.package_name;
+    cached.source_path = env.source_path;
     // The metadata returned below also reads the entry, which lives as
     // long as the environment.
     cached.loaded_entry = data.intoLoadedEntry();

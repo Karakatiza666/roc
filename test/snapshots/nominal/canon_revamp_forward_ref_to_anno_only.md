@@ -13,33 +13,41 @@ Foo := [Whatever].{
 }
 ~~~
 # EXPECTED
-DECLARATION HAS NO VALUE - canon_revamp_forward_ref_to_anno_only.md:5:5:5:17
-REFERENCE HAS NO VALUE - canon_revamp_forward_ref_to_anno_only.md:3:14:3:20
+EXISTS ONLY IN REIFIED CODE - canon_revamp_forward_ref_to_anno_only.md:3:14:3:20
 # PROBLEMS
 ~~~clojure
 (reports
 	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 5 5) (end 5 17))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "canon_revamp_forward_ref_to_anno_only.md") (start 5 5) (end 5 17) (annotation error) (line-text "    absent : Foo"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
 		(severity runtime_error)
-		(title "Reference Has No Value")
+		(title "Exists Only in Reified Code")
 		(region (start 3 14) (end 3 20))
 		(headline
-			(reflow "This refers to a declaration that has a type annotation but no implementation, so there is no value here to use."))
+			(annotated code "Foo.absent")
+			(reflow " ")
+			(reflow "is used here as a value, but it reaches an intrinsic, which has no Roc body."))
 		(document
 			(source-region (file "canon_revamp_forward_ref_to_anno_only.md") (start 3 14) (end 3 20) (annotation error) (line-text "    callMe = absent"))
 			(line-break)
 			(line-break)
-			(reflow "Give that declaration a value body, or stop referring to it here."))))
+			(annotation-start code-block)
+			(text "Foo.absent is an intrinsic")
+			(text " at ")
+			(source-location
+				(file "canon_revamp_forward_ref_to_anno_only.md")
+				(line 5)
+				(column 5))
+			(annotation-end)
+			(line-break)
+			(line-break)
+			(reflow "An intrinsic exists only inside a function that a translator describes. Pass the function where a")
+			(reflow " ")
+			(annotated code "Code")
+			(reflow " ")
+			(reflow "is expected, or give")
+			(reflow " ")
+			(annotated code "Foo.absent")
+			(reflow " ")
+			(reflow "a Roc body."))))
 ~~~
 # TOKENS
 ~~~zig
@@ -89,7 +97,7 @@ Foo := [Whatever].{
 			(ty-lookup (name "Foo") (local))))
 	(d-let
 		(p-assign (ident "Foo.absent"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-lookup (name "Foo") (local))))
 	(s-nominal-decl

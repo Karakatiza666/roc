@@ -210,6 +210,7 @@ pub const CheckArgs = struct {
     timings: bool = false, // always show the per-phase timing breakdown
     no_cache: bool = false, // disable cache
     verbose: bool = false, // enable verbose output
+    intrinsics: bool = false, // list the intrinsics of the checked modules after the check
     watch: bool = false, // rerun check when source inputs change
     watch_inputs_file: ?[]const u8 = null, // internal: write watch input paths and byte states here
     max_threads: ?usize = null, // max worker threads (null = auto, 1 = single-threaded)
@@ -992,6 +993,7 @@ const commands = [_]Command{
             .{ .name = "--timings", .field = "timings", .help = "Show how long each compilation phase took (shown automatically when checking is slow)" },
             .{ .name = "--no-cache", .field = "no_cache", .help = "Disable caching" },
             .{ .name = "--verbose", .field = "verbose", .help = "Enable verbose output including cache statistics" },
+            .{ .name = "--intrinsics", .field = "intrinsics", .help = "After checking, list each intrinsic of the checked modules as path:line:col Module.name : type" },
             .{ .name = "--watch", .field = "watch", .help = "Re-run when source inputs change" },
             watch_inputs_file_flag,
             jobs_flag,
@@ -1978,6 +1980,17 @@ test "roc check" {
         defer result.deinit(gpa);
         try testing.expectEqualStrings("foo.roc", result.check.path);
         try testing.expectEqual(true, result.check.timings);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "check", "--intrinsics", "foo.roc" });
+        defer result.deinit(gpa);
+        try testing.expectEqualStrings("foo.roc", result.check.path);
+        try testing.expect(result.check.intrinsics);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "check", "foo.roc" });
+        defer result.deinit(gpa);
+        try testing.expect(!result.check.intrinsics);
     }
     {
         const result = try parse(gpa, testing.io, &[_][]const u8{ "check", "--watch", "foo.roc" });
@@ -3320,6 +3333,7 @@ test "golden help: roc check --help" {
         \\      --timings      Show how long each compilation phase took (shown automatically when checking is slow)
         \\      --no-cache     Disable caching
         \\      --verbose      Enable verbose output including cache statistics
+        \\      --intrinsics   After checking, list each intrinsic of the checked modules as path:line:col Module.name : type
         \\      --watch        Re-run when source inputs change
         \\  -j, --jobs=<N>     Max worker threads for parallel compilation (default: auto-detect CPU count)
         \\      --replace-dep OLD NEW    Load NEW wherever a dependency declares exactly OLD, for this invocation only.

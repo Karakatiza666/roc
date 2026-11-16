@@ -90,6 +90,9 @@ pub const InitializeParams = struct {
     root_uri: ?[]u8 = null,
     client_info: ?ClientInfo = null,
     capabilities_json: ?[]u8 = null,
+    /// Whether the client accepts diagnostics with related information
+    /// (`textDocument.publishDiagnostics.relatedInformation`).
+    related_information: bool = false,
 
     pub fn fromJson(allocator: std.mem.Allocator, value: std.json.Value) (Allocator.Error || error{InvalidParams})!InitializeParams {
         if (std.meta.activeTag(value) != .object) return error.InvalidParams;
@@ -153,6 +156,7 @@ pub const InitializeParams = struct {
         }
 
         params.capabilities_json = try stringifyValue(allocator, capabilities_value);
+        params.related_information = acceptsRelatedInformation(capabilities_value);
 
         return params;
     }
@@ -169,6 +173,7 @@ pub const InitializeParams = struct {
         state.root_uri = self.root_uri;
         state.client_info = self.client_info;
         state.capabilities_json = self.capabilities_json;
+        state.related_information = self.related_information;
 
         self.process_id = null;
         self.root_uri = null;
@@ -177,12 +182,29 @@ pub const InitializeParams = struct {
     }
 };
 
+/// Whether `capabilities` sets `textDocument.publishDiagnostics.relatedInformation`
+/// to true. The protocol gives each level as optional, so a missing level means
+/// the client does not accept related information.
+fn acceptsRelatedInformation(capabilities: std.json.Value) bool {
+    const text_document = jsonField(capabilities, "textDocument") orelse return false;
+    const publish = jsonField(text_document, "publishDiagnostics") orelse return false;
+    const related = jsonField(publish, "relatedInformation") orelse return false;
+    return std.meta.activeTag(related) == .bool and related.bool;
+}
+
+fn jsonField(value: std.json.Value, name: []const u8) ?std.json.Value {
+    if (std.meta.activeTag(value) != .object) return null;
+    return value.object.get(name);
+}
+
 /// Snapshot of the last `initialize` data retained by the server.
 pub const ClientState = struct {
     process_id: ?i64 = null,
     root_uri: ?[]u8 = null,
     client_info: ?ClientInfo = null,
     capabilities_json: ?[]u8 = null,
+    /// See `InitializeParams.related_information`.
+    related_information: bool = false,
 
     pub fn deinit(self: *ClientState, allocator: std.mem.Allocator) void {
         if (self.root_uri) |uri| allocator.free(uri);

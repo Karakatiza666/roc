@@ -14,7 +14,6 @@ c : L
 # EXPECTED
 UNDECLARED TYPE - fuzz_crash_080.md:1:5:1:6
 UNBOUND WHERE RECEIVER - fuzz_crash_080.md:3:17:4:23
-DECLARATION HAS NO VALUE - fuzz_crash_080.md:1:1:5:10
 # PROBLEMS
 ~~~clojure
 (reports
@@ -49,18 +48,7 @@ DECLARATION HAS NO VALUE - fuzz_crash_080.md:1:1:5:10
 			(reflow " ")
 			(annotated code "o")
 			(reflow " ")
-			(reflow "to the annotation, or remove this constraint.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 1) (end 5 10))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_080.md") (start 1 1) (end 5 10) (annotation error) (line-text "c : L\n        where [\n                o\n                .h : a,\n        ]"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(reflow "to the annotation, or remove this constraint."))))
 ~~~
 # TOKENS
 ~~~zig

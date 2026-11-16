@@ -209,12 +209,12 @@ pub fn offsetToPosition(offset: u32, line_offsets: *const LineOffsets) document_
 }
 
 /// What a column past the end of its line's text converts to.
-const PastLineEnd = enum { reject, clamp_to_line_end };
+pub const PastLineEnd = enum { reject, clamp_to_line_end };
 
 /// The byte offset of a line/character position in `source`, or null when the
 /// document has no such line. `character` is a UTF-16 code unit count, as the
 /// protocol specifies and as the server advertises with `positionEncoding`.
-fn offsetOnLine(source: []const u8, line_starts: []const u32, line: u32, character: u32, past_line_end: PastLineEnd) ?u32 {
+pub fn offsetOnLine(source: []const u8, line_starts: []const u32, line: u32, character: u32, past_line_end: PastLineEnd) ?u32 {
     const text = lineText(source, line_starts, line) orelse return null;
     const column = utf16ColumnToByteOffset(text, character, .nearest) orelse switch (past_line_end) {
         .reject => return null,

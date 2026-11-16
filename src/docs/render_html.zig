@@ -1189,6 +1189,11 @@ fn renderEntryTree(
                 try w.writeAll("<pre class=\"entry-signature-pre\"><code class=\"entry-signature-code\">");
                 try renderEntrySignature(w, ctx, gpa, entry, anchor_id);
                 try w.writeAll("</code></pre>\n");
+                if (entry.intrinsic) {
+                    try writeIndent(w, base + 2);
+                    try writeIntrinsicBadge(w);
+                    try w.writeAll("\n");
+                }
                 try writeIndent(w, base + 1);
                 try w.writeAll("</div>\n");
             }
@@ -1730,6 +1735,11 @@ fn renderSearchTree(
     for (node.children.items) |child| {
         try renderSearchTree(w, ctx, gpa, module_name, child, base);
     }
+}
+
+/// The badge on an intrinsic's signature.
+fn writeIntrinsicBadge(w: Writer) error{WriteFailed}!void {
+    try w.writeAll("<span class=\"entry-badge entry-badge-intrinsic\">" ++ DocModel.intrinsic_badge ++ "</span>");
 }
 
 fn renderEntrySignature(w: Writer, ctx: *const RenderContext, gpa: Allocator, entry: *const DocModel.DocEntry, anchor_id: []const u8) (Allocator.Error || error{WriteFailed})!void {
@@ -3116,6 +3126,32 @@ test "renderDocTypeHtml renders the empty record without an interior space" {
         "{}<span class=\"sig-arrow\"> =&gt; </span>{}",
         output.written(),
     );
+}
+
+test "an intrinsic entry shows its badge in HTML and in the S-expression" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var html: std.Io.Writer.Allocating = .init(gpa);
+    defer html.deinit();
+    try writeIntrinsicBadge(&html.writer);
+    try testing.expectEqualStrings(
+        "<span class=\"entry-badge entry-badge-intrinsic\">intrinsic: no Roc body</span>",
+        html.written(),
+    );
+
+    const entry = DocModel.DocEntry{
+        .name = "is_email",
+        .kind = .value,
+        .type_signature = null,
+        .doc_comment = null,
+        .children = &.{},
+        .intrinsic = true,
+    };
+    var sexpr: std.Io.Writer.Allocating = .init(gpa);
+    defer sexpr.deinit();
+    try entry.writeToSExpr(&sexpr.writer, 0);
+    try testing.expect(std.mem.find(u8, sexpr.written(), "(badge \"intrinsic: no Roc body\")") != null);
 }
 
 test "record field kinds round-trip through writeToSExpr" {

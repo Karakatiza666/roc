@@ -101,6 +101,7 @@ pub fn fromStore(
             .problems = try allocator.dupe(problem.Problem, store.problems.items),
             .extra_strings = try allocator.dupe(u8, store.extra_strings_backing.items),
             .missing_patterns = try allocator.dupe(problem.ExtraStringIdx, store.missing_patterns_backing.items),
+            .refusal_calls = try allocator.dupe(problem.RefusalCall, store.refusal_calls_backing.items),
             .regions = try allocator.dupe(base.Region, checking.regions),
             .contents = try allocator.dupe(snapshot.SnapshotContent, checking.contents),
             .node_formats = try allocator.dupe(snapshot.NodeFormat, checking.node_formats),
@@ -160,12 +161,14 @@ pub fn instantiateRendering(
     try self.outcome.installRendering(allocator, snapshots, regions, format_context);
 }
 
-test "checked reports keep every problem, its strings and the import names across serialization" {
+test "checked reports keep every problem, its strings, its refusal calls and the import names across serialization" {
     const allocator = std.testing.allocator;
     var store = try problem.Store.init(allocator);
     defer store.deinit();
     const message = try store.putExtraString("the helper message is unavailable");
     _ = try store.appendProblem(.{ .comptime_crash = .{ .message = message, .region = base.Region.zero() } });
+    const call_text = try store.putExtraString("helper(x)");
+    const calls = try store.putRefusalCalls(&.{.{ .text = call_text, .place = .{ .local = base.Region.zero() } }});
     var names = ImportMapping.init(allocator);
     defer names.deinit();
     const qualified: base.Ident.Idx = @bitCast(@as(u32, 9));
@@ -184,6 +187,9 @@ test "checked reports keep every problem, its strings and the import names acros
     defer restored.deinit();
     try std.testing.expectEqual(@as(usize, 1), restored.problems.items.len);
     try std.testing.expectEqualStrings("the helper message is unavailable", restored.getExtraString(restored.problems.items[0].comptime_crash.message));
+    const restored_calls = restored.getRefusalCalls(calls);
+    try std.testing.expectEqual(@as(usize, 1), restored_calls.len);
+    try std.testing.expectEqualStrings("helper(x)", restored.getExtraString(restored_calls[0].text));
     var restored_names = try round_trip.loaded.instantiateImportMapping(allocator);
     defer restored_names.deinit();
     try std.testing.expectEqual(display, restored_names.get(qualified).?);

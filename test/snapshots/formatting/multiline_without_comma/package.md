@@ -21,8 +21,6 @@ b! : Str => Str
 # EXPECTED
 EXPOSED BUT NOT DEFINED - package.md:3:3:3:5
 EXPOSED BUT NOT DEFINED - package.md:4:3:4:5
-DECLARATION HAS NO VALUE - package.md:11:1:11:16
-DECLARATION HAS NO VALUE - package.md:12:1:12:16
 # PROBLEMS
 ~~~clojure
 (reports
@@ -51,29 +49,7 @@ DECLARATION HAS NO VALUE - package.md:12:1:12:16
 			(source-region (file "package.md") (start 4 3) (end 4 5) (annotation error) (line-text "\t\tb!"))
 			(reflow "You can fix this by either defining ")
 			(annotated symbol-unqualified "b!")
-			(reflow " in this mod, or by removing it from the list of exposed values.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 11 1) (end 11 16))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "package.md") (start 11 1) (end 11 16) (annotation error) (line-text "a! : Str => Str"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 12 1) (end 12 16))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "package.md") (start 12 1) (end 12 16) (annotation error) (line-text "b! : Str => Str"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(reflow " in this mod, or by removing it from the list of exposed values."))))
 ~~~
 # TOKENS
 ~~~zig
@@ -129,14 +105,14 @@ b! : Str => Str
 (can-ir
 	(d-let
 		(p-assign (ident "a!"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-fn (effectful true)
 				(ty-lookup (name "Str") (builtin))
 				(ty-lookup (name "Str") (builtin)))))
 	(d-let
 		(p-assign (ident "b!"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-fn (effectful true)
 				(ty-lookup (name "Str") (builtin))

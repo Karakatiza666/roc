@@ -207,7 +207,7 @@ pub fn constTypeOf(program: *Program, ty: TypeId) Allocator.Error!const_store.Co
             for (all_args[0..formal_count], ids) |arg, *slot| slot.* = try constTypeOf(program, arg);
             const backing_ty = try program.layouts.converter.backing(ty);
             const backing = try constTypeOf(program, backing_ty);
-            const declared_order = try declaredOrderOf(program, backing_ty);
+            const declared_order = try declaredOrderOf(program, view, declaration, backing_ty);
             // An opaque declaration's backing is a layout later stages never
             // look into, as Monotype types it.
             break :blk .{ .named = .{
@@ -242,14 +242,19 @@ pub fn constTypeOf(program: *Program, ty: TypeId) Allocator.Error!const_store.Co
 /// declaration's entries in declared order, named fields by label, as the
 /// checked declaration and the specialized lowering record it. The fields a
 /// row extension supplies have no entry.
-fn declaredOrderOf(program: *Program, backing_ty: TypeId) Allocator.Error!const_store.ConstRange {
+fn declaredOrderOf(
+    program: *Program,
+    view: *const types.ModuleView,
+    declaration: checked.CheckedNominalDeclaration,
+    backing_ty: TypeId,
+) Allocator.Error!const_store.ConstRange {
     const store = &program.store;
     const const_types = &program.result.const_types;
     const record = switch (store.get(backing_ty)) {
         .record => |record| record,
         .primitive, .empty_record, .tuple, .tag_union, .list, .box, .nominal, .function, .variable => return .{},
     };
-    const declared = record.declared.get() orelse return .{};
+    const declared = record.declared.get() orelse return try unpaddedDeclaredOrderOf(program, view, declaration);
     const padding = store.span(declared.padding);
     const entries = store.declaredEntries(declared);
     const out = try program.allocator.alloc(const_store.TypeDeclaredField, entries.len);
@@ -259,6 +264,27 @@ fn declaredOrderOf(program: *Program, backing_ty: TypeId) Allocator.Error!const_
         .padding => |ordinal| .{ .padding = try constTypeOf(program, padding[ordinal]) },
     };
     return try const_types.appendDeclaredFieldSpan(out);
+}
+
+/// The declared order of a declaration with no unnamed fields. Its backing
+/// is its record row, which carries no order (`Converter.declaredBacking`),
+/// so the order comes from the declaration's record fields, as Monotype
+/// instantiates the nominal. A restoring Monotype program compares the two
+/// types (upstream bug, draft issue-stored-const-declared-order.md).
+fn unpaddedDeclaredOrderOf(
+    program: *Program,
+    view: *const types.ModuleView,
+    declaration: checked.CheckedNominalDeclaration,
+) Allocator.Error!const_store.ConstRange {
+    const fields = declaration.declaredRecordFields(view.types());
+    if (fields.len == 0) return .{};
+    const out = try program.allocator.alloc(const_store.TypeDeclaredField, fields.len);
+    defer program.allocator.free(out);
+    for (fields, out) |field, *stored| stored.* = switch (field) {
+        .named => |label| .{ .named = try program.result.const_type_names.internRecordFieldLabel(view.nameStore().recordFieldLabelText(label)) },
+        .padding => invariant("a nominal declaration with an unnamed field backed onto a record with no declared order"),
+    };
+    return try program.result.const_types.appendDeclaredFieldSpan(out);
 }
 
 /// The named type a stored nominal value names: its declaring module.

@@ -12,7 +12,6 @@ type=file
 UNEXPECTED STATEMENT - fuzz_crash_018.md:1:1:1:2
 UNEXPECTED STATEMENT - fuzz_crash_018.md:2:1:2:3
 UNDECLARED TYPE - fuzz_crash_018.md:1:5:1:6
-DECLARATION HAS NO VALUE - fuzz_crash_018.md:1:3:1:6
 # PROBLEMS
 ~~~clojure
 (reports
@@ -75,18 +74,7 @@ DECLARATION HAS NO VALUE - fuzz_crash_018.md:1:3:1:6
 			(annotated code "S")
 			(reflow " is not declared in this scope."))
 		(document
-			(source-region (file "fuzz_crash_018.md") (start 1 5) (end 1 6) (annotation error) (line-text "0 b:S"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 3) (end 1 6))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_018.md") (start 1 3) (end 1 6) (annotation error) (line-text "0 b:S"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "fuzz_crash_018.md") (start 1 5) (end 1 6) (annotation error) (line-text "0 b:S")))))
 ~~~
 # TOKENS
 ~~~zig

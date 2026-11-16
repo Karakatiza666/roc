@@ -109,6 +109,15 @@ table tr td {
 }
 
 
+.entry-badge {
+  font-family: var(--font-mono);
+  font-size: 0.75em;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border: 1px solid var(--violet);
+  border-radius: 4px;
+}
+
 .entry-signature-pre {
   background: none;
   font-size: inherit;

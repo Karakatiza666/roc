@@ -717,7 +717,7 @@ comment_forces = [
 			(elems
 				(e-num (value "1"))
 				(e-num (value "2")))))
-	(s-import (mod "Foo")
+	(s-import (mod "Foo") (alias "Foo")
 		(exposes
 			(exposed (name "one") (wildcard false))
 			(exposed (name "two") (wildcard false))))

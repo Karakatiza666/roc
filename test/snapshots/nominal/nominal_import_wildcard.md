@@ -161,7 +161,7 @@ green = Green
 		(e-runtime-error (tag "erroneous_value_expr"))
 		(annotation
 			(ty-malformed)))
-	(s-import (mod "Color")
+	(s-import (mod "Color") (alias "Color")
 		(exposes)))
 ~~~
 # TYPES

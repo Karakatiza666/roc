@@ -449,7 +449,13 @@ pub const Document = struct {
     /// Add a code block with proper formatting.
     pub fn addCodeBlock(self: *Document, code: []const u8) std.mem.Allocator.Error!void {
         try self.startAnnotation(.code_block);
+        try self.addCodeLines(code);
+        try self.endAnnotation();
+    }
 
+    /// Add code inside an open `.code_block` annotation, one indented line per
+    /// line of `code`, so a block can hold more than plain text.
+    pub fn addCodeLines(self: *Document, code: []const u8) std.mem.Allocator.Error!void {
         // Split code into lines and add each with proper indentation
         var lines = std.mem.splitScalar(u8, code, '\n');
         var first = true;
@@ -464,8 +470,6 @@ pub const Document = struct {
                 try self.addText(line);
             }
         }
-
-        try self.endAnnotation();
     }
 
     /// Add an inline code element.
@@ -566,6 +570,16 @@ pub const Document = struct {
         });
     }
 
+    /// Add a source code region whose lines and 1-based span were taken from
+    /// a source this report does not hold, such as another module's.
+    pub fn addSourceExcerpt(self: *Document, region: SourceCodeDisplayRegion) std.mem.Allocator.Error!void {
+        std.debug.assert(region.end_line >= region.start_line);
+        var owned = region;
+        owned.line_text = try self.ownString(region.line_text);
+        owned.filename = if (region.filename) |f| try self.ownString(f) else null;
+        try self.elements.append(.{ .source_code_region = owned });
+    }
+
     /// Add a source location inline with surrounding prose.
     /// Accepts 0-based coordinates and stores 1-based display coordinates.
     pub fn addSourceLocation(
@@ -583,6 +597,25 @@ pub const Document = struct {
                 .filename = owned_filename,
                 .line = region_info.start_line_idx + 1,
                 .column = region_info.start_col_idx + 1,
+            },
+        });
+    }
+
+    /// Add a source location inline with surrounding prose, from 1-based
+    /// coordinates in a source this report does not hold, such as another
+    /// module's.
+    pub fn addForeignSourceLocation(
+        self: *Document,
+        filename: []const u8,
+        line: u32,
+        column: u32,
+    ) std.mem.Allocator.Error!void {
+        std.debug.assert(line != 0 and column != 0);
+        try self.elements.append(.{
+            .source_location = .{
+                .filename = try self.ownString(filename),
+                .line = line,
+                .column = column,
             },
         });
     }

@@ -13,8 +13,6 @@ o=||{D()=0}
 # EXPECTED
 UNDECLARED TYPE - fuzz_crash_082.md:1:3:1:4
 EMPTY TUPLE NOT ALLOWED - fuzz_crash_082.md:4:4:4:6
-DECLARATION HAS NO VALUE - fuzz_crash_082.md:1:1:1:4
-DECLARATION HAS NO VALUE - fuzz_crash_082.md:2:1:2:4
 TYPE MISMATCH - fuzz_crash_082.md:3:10:3:11
 # PROBLEMS
 ~~~clojure
@@ -41,28 +39,6 @@ TYPE MISMATCH - fuzz_crash_082.md:3:10:3:11
 			(reflow "If you want to represent nothing, try using an empty record: ")
 			(annotated code "{}")
 			(reflow ".")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 1) (end 1 4))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_082.md") (start 1 1) (end 1 4) (annotation error) (line-text "i:U"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 2 1) (end 2 4))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_082.md") (start 2 1) (end 2 4) (annotation error) (line-text "d:i"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
 	(report
 		(severity runtime_error)
 		(title "Type Mismatch")
@@ -132,7 +108,7 @@ o = || {
 			(ty-malformed)))
 	(d-let
 		(p-assign (ident "d"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-rigid-var (name "i"))))
 	(d-let

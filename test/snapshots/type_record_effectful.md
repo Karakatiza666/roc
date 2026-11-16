@@ -135,7 +135,7 @@ main! = |_| {}
 			(args
 				(p-underscore))
 			(e-empty_record)))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes)))
 ~~~
 # TYPES

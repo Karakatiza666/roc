@@ -63,7 +63,7 @@ NO CHANGE
 		(p-assign (ident "world"))
 		(e-string
 			(e-literal (string "World"))))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes)))
 ~~~
 # TYPES

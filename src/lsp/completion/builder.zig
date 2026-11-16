@@ -13,12 +13,15 @@ const base = @import("base");
 const can = @import("can");
 const types = @import("types");
 const compile = @import("compile");
+const Check = @import("check").Check;
 
 const completion_handler = @import("../handlers/completion.zig");
 const builtin_completion = @import("builtins.zig");
 const scope_map = @import("../scope_map.zig");
 const module_lookup = @import("../module_lookup.zig");
+const module_envs = @import("../module_envs.zig");
 const doc_comments = @import("../doc_comments.zig");
+const record_row = @import("../record_row.zig");
 
 const Allocator = std.mem.Allocator;
 const CIR = can.CIR;
@@ -34,6 +37,7 @@ const MethodOwnerLookup = struct {
     owner: CIR.Statement.Idx,
     type_name: []const u8,
     builtin_origin: bool,
+    origin_module: base.ModuleIdentity.Idx,
 };
 
 fn patternIdent(pattern: CIR.Pattern) ?base.Ident.Idx {
@@ -60,31 +64,6 @@ fn patternIdent(pattern: CIR.Pattern) ?base.Ident.Idx {
     };
 }
 
-fn statementTypeHeader(statement: CIR.Statement) ?CIR.TypeHeader.Idx {
-    return switch (statement) {
-        inline .s_alias_decl, .s_nominal_decl, .s_where_alias_decl => |alias| alias.header,
-        .s_decl,
-        .s_var,
-        .s_var_uninitialized,
-        .s_reassign,
-        .s_crash,
-        .s_dbg,
-        .s_expr,
-        .s_expect,
-        .s_for,
-        .s_while,
-        .s_infinite_loop,
-        .s_breakable_loop,
-        .s_break,
-        .s_return,
-        .s_import,
-        .s_type_anno,
-        .s_type_var_alias,
-        .s_runtime_error,
-        => null,
-    };
-}
-
 fn completionKindForExpr(expr: CIR.Expr) u32 {
     const tag = std.meta.activeTag(expr);
     return if (tag == .e_closure or tag == .e_lambda or tag == .e_hosted_lambda)
@@ -102,14 +81,22 @@ pub const CompletionBuilder = struct {
     strings: Allocator,
     std_io: std.Io,
     items: *std.ArrayList(CompletionItem),
-    /// Accepted labels, borrowing the copies in `strings`.
+    /// Accepted labels of every kind but `method`, borrowing the copies in
+    /// `strings`.
     seen_labels: std.StringHashMapUnmanaged(void) = .empty,
+    /// Accepted method labels. After a value and a dot, `value.name` reads a
+    /// field and `value.name()` calls a method, so a field and a method of one
+    /// name are two items.
+    seen_methods: std.StringHashMapUnmanaged(void) = .empty,
     builtin_module_env: ?*ModuleEnv,
     /// The handle owning the document module the completions are built for,
     /// which holds that module's scope map.
     module_handle: *BuildEnvHandle,
     debug: DebugFlags = .{},
     log_file: ?std.Io.File = null,
+    /// The document module the completions are for. Value-dot completions
+    /// offer only what this module may write after the dot.
+    requester_env: ?*ModuleEnv = null,
 
     /// Initialize a new CompletionBuilder with debug logging. `items` and all
     /// strings in it are allocated from `strings`.
@@ -135,9 +122,28 @@ pub const CompletionBuilder = struct {
         };
     }
 
+    /// Set the document module that value-dot completions are for.
+    pub fn setRequester(self: *CompletionBuilder, module_env: *ModuleEnv) void {
+        self.requester_env = module_env;
+    }
+
+    /// Whether the document module may see the backing of `nominal`, a type
+    /// of `store_env`'s type store. This is the checker's rule
+    /// `NominalType.canLiftInner`: a `::` opaque type opens only in its own
+    /// module. For a type of another module's store, the module identities
+    /// are compared by content hash, as the checker matches origin modules.
+    fn backingVisibleToRequester(self: *const CompletionBuilder, store_env: *ModuleEnv, nominal: types.NominalType) bool {
+        if (!nominal.isOpaque()) return true;
+        const requester = self.requester_env.?; // value-dot completion runs only for a document module
+        if (store_env == requester) return nominal.canLiftInner(requester.selfModuleIdentity());
+        const requester_hash = requester.moduleIdentityHash(requester.selfModuleIdentity());
+        return std.mem.eql(u8, store_env.moduleIdentityHash(nominal.origin_module), requester_hash);
+    }
+
     /// Clean up resources used by the builder.
     pub fn deinit(self: *CompletionBuilder) void {
         self.seen_labels.deinit(self.allocator);
+        self.seen_methods.deinit(self.allocator);
     }
 
     /// The scope bindings of the document module `module_env`.
@@ -156,13 +162,15 @@ pub const CompletionBuilder = struct {
     }
 
     /// Add a completion item, returning true if it was added (not a duplicate).
+    /// A method is a duplicate only of another method of its label.
     ///
     /// The item's optional strings must be allocated from `strings`; the label
     /// may be borrowed, since an accepted label is copied there.
     pub fn addItem(self: *CompletionBuilder, item: CompletionItem) Allocator.Error!bool {
-        const gop = try self.seen_labels.getOrPut(self.allocator, item.label);
+        const seen = if (item.kind == @backingInt(CompletionItemKind.method)) &self.seen_methods else &self.seen_labels;
+        const gop = try seen.getOrPut(self.allocator, item.label);
         if (gop.found_existing) return false;
-        errdefer self.seen_labels.removeByPtr(gop.key_ptr);
+        errdefer seen.removeByPtr(gop.key_ptr);
 
         const owned_label = try self.strings.dupe(u8, item.label);
         gop.key_ptr.* = owned_label;
@@ -224,24 +232,20 @@ pub const CompletionBuilder = struct {
 
     // Module Member Completions
 
-    /// Add completions for members of a specific module (e.g., Str.concat).
+    /// Add completions for members after `qualifier.` (e.g., Str.concat).
+    /// `imported_env` is the module the qualifier names, if it names one.
     pub fn addModuleMemberCompletions(
         self: *CompletionBuilder,
         env: *BuildEnv,
-        module_name: []const u8,
+        qualifier: []const u8,
+        imported_env: ?*ModuleEnv,
         module_env_opt: ?*ModuleEnv,
     ) Allocator.Error!void {
-        // Builtins are backed by a single Builtin module env. Treat builtin type
-        // names (Str, List, etc.) as top-level modules for member completions.
-        if (builtin_completion.isBuiltinType(module_name)) {
-            try self.addModuleMemberCompletionsFromModuleEnv(env.builtin_modules.builtin_module.env, module_name);
-        }
-
-        // Try to find the module in imported modules.
-        if (env.findModuleByName(module_name)) |module_state| {
-            if (module_state.moduleEnv()) |imported_env| {
-                try self.addModuleMemberCompletionsFromModuleEnv(imported_env, module_name);
-            }
+        if (imported_env) |target_env| {
+            // Builtins are backed by a single Builtin module env, where a
+            // builtin type's members are qualified by the type's name.
+            const member_prefix = if (target_env == env.builtin_modules.builtin_module.env) qualifier else target_env.module_name;
+            try self.addModuleMemberCompletionsFromModuleEnv(target_env, member_prefix);
             return;
         }
 
@@ -249,7 +253,7 @@ pub const CompletionBuilder = struct {
         // Don't require module_name to match module_env.module_name - this
         // handles Record2.ttt where Record2 is a nominal type in the current module.
         if (module_env_opt) |module_env| {
-            try self.addModuleMemberCompletionsFromModuleEnv(module_env, module_name);
+            try self.addModuleMemberCompletionsFromModuleEnv(module_env, qualifier);
         }
     }
 
@@ -380,8 +384,7 @@ pub const CompletionBuilder = struct {
         const statements_slice = module_env.store.sliceStatements(module_env.all_statements);
         for (statements_slice) |stmt_idx| {
             const stmt = module_env.store.getSourceStatement(stmt_idx);
-            const parts = getStatementParts(stmt);
-            const pattern_idx = parts.pattern orelse continue;
+            const pattern_idx = module_lookup.boundPattern(stmt) orelse continue;
             const ident_idx = module_lookup.extractIdentFromPattern(&module_env.store, pattern_idx) orelse continue;
             const full_name = module_env.getIdentText(ident_idx);
             const label = namespaceMemberLabel(full_name, namespace_chain) orelse continue;
@@ -426,7 +429,7 @@ pub const CompletionBuilder = struct {
         const statements_slice = module_env.store.sliceStatements(module_env.all_statements);
         for (statements_slice) |stmt_idx| {
             const stmt = module_env.store.getSourceStatement(stmt_idx);
-            const header_idx = statementTypeHeader(stmt) orelse continue;
+            const header_idx = module_lookup.typeDeclHeader(stmt) orelse continue;
             const header = module_env.store.getTypeHeader(header_idx);
             const name = module_env.getIdentText(header.name);
             if (name.len == 0) continue;
@@ -465,8 +468,7 @@ pub const CompletionBuilder = struct {
             const name = module_env.getIdentText(binding.ident);
             if (name.len == 0) continue;
 
-            const label = lastSegment(name);
-            if (label.len == 0) continue;
+            const label = module_lookup.declaredName(module_env, binding.ident);
 
             // Determine kind - parameters and local variables
             const kind: u32 = @backingInt(CompletionItemKind.variable);
@@ -553,9 +555,9 @@ pub const CompletionBuilder = struct {
         const local_statements_slice = module_env.store.sliceStatements(module_env.all_statements);
         for (local_statements_slice) |stmt_idx| {
             const stmt = module_env.store.getSourceStatement(stmt_idx);
-            const stmt_parts = getStatementParts(stmt);
+            const stmt_parts = module_lookup.getStatementParts(stmt);
 
-            if (stmt_parts.pattern) |pattern_idx| {
+            if (module_lookup.boundPattern(stmt)) |pattern_idx| {
                 const pattern = module_env.store.getSourcePattern(pattern_idx);
 
                 const ident_idx = patternIdent(pattern) orelse continue;
@@ -692,6 +694,7 @@ pub const CompletionBuilder = struct {
                 continue;
             }
             if (std.meta.activeTag(content) != .structure or std.meta.activeTag(content.structure) != .nominal_type) break;
+            if (!self.backingVisibleToRequester(module_env, content.structure.nominal_type)) break;
 
             // Row/tuple structure is declaration data: unwrap through the
             // declaration's backing template (formals appear as rigid vars).
@@ -755,18 +758,8 @@ pub const CompletionBuilder = struct {
                     }
                     return;
                 }
-                if (std.meta.activeTag(flat_type) == .nominal_type) {
-                    const nominal = flat_type.nominal_type;
-                    // Row/tuple structure is declaration data: unwrap
-                    // through the declaration's backing template
-                    // (formals appear as rigid vars).
-                    const decl_idx = type_store.lookupNominalDecl(nominal) orelse break;
-                    const decl = type_store.getNominalDecl(decl_idx);
-                    if (!decl.isValid()) break;
-                    resolved = type_store.resolveVar(decl.backing);
-                    content = resolved.desc.content;
-                    continue;
-                }
+                // The checker refuses tuple access on a nominal type, so
+                // its backing is not followed.
                 break;
             }
             if (std.meta.activeTag(content) == .alias) {
@@ -784,11 +777,11 @@ pub const CompletionBuilder = struct {
     /// This unwraps aliases to find records and returns the field's type var
     /// for chained access resolution (e.g., myrec.subrec.).
     pub fn getFieldTypeVarFromTypeVar(
-        _: *CompletionBuilder,
+        self: *CompletionBuilder,
         module_env: *ModuleEnv,
         type_var: types.Var,
         field_name: []const u8,
-    ) ?types.Var {
+    ) Allocator.Error!?types.Var {
         const type_store = &module_env.types;
 
         var resolved = type_store.resolveVar(type_var);
@@ -797,7 +790,7 @@ pub const CompletionBuilder = struct {
         var steps: usize = 0;
         while (steps < 8) : (steps += 1) {
             if (content.unwrapRecord()) |record| {
-                return findFieldVarInRecord(module_env, record, field_name);
+                return try self.findFieldVarInRecord(module_env, record, field_name);
             }
 
             if (std.meta.activeTag(content) == .alias) {
@@ -807,6 +800,7 @@ pub const CompletionBuilder = struct {
                 continue;
             }
             if (std.meta.activeTag(content) != .structure or std.meta.activeTag(content.structure) != .nominal_type) break;
+            if (!self.backingVisibleToRequester(module_env, content.structure.nominal_type)) break;
 
             // Row/tuple structure is declaration data: unwrap through the
             // declaration's backing template (formals appear as rigid vars).
@@ -863,20 +857,19 @@ pub const CompletionBuilder = struct {
     fn addFieldsFromRecord(self: *CompletionBuilder, module_env: *ModuleEnv, record: types.Record) Allocator.Error!void {
         const type_store = &module_env.types;
 
-        // Get the record fields
-        const fields_slice = type_store.getRecordFieldsSlice(record.fields);
-        const field_names = fields_slice.items(.name);
-        const field_presences = fields_slice.items(.presence);
+        const row = try record_row.gather(self.allocator, &module_env.types, &module_env.common.idents, record);
+        defer self.allocator.free(row);
 
-        self.logDebug("addFieldsFromRecord: record.fields={}, fields_slice.len={}, field_names.len={d}", .{ record.fields, fields_slice.len, field_names.len });
+        self.logDebug("addFieldsFromRecord: record.fields={}, row.len={d}", .{ record.fields, row.len });
 
         // Initialize type writer for formatting field types
         var type_writer: ?types.TypeWriter = try module_env.initTypeWriter();
         defer if (type_writer) |*tw| tw.deinit();
 
         // Iterate over record fields
-        for (field_names, field_presences) |field_name_idx, field_presence| {
-            const field_name = module_env.getIdentText(field_name_idx);
+        for (row) |field| {
+            const field_name = module_env.getIdentText(field.name);
+            const field_presence = field.presence;
             self.logDebug("addFieldsFromRecord: field '{s}'", .{field_name});
             if (field_name.len == 0) continue;
 
@@ -923,16 +916,13 @@ pub const CompletionBuilder = struct {
     }
 
     /// Find the type var for a specific field within a record.
-    fn findFieldVarInRecord(module_env: *ModuleEnv, record: types.Record, field_name: []const u8) ?types.Var {
-        const type_store = &module_env.types;
-        const fields_slice = type_store.getRecordFieldsSlice(record.fields);
-        const field_names = fields_slice.items(.name);
-        const field_presences = fields_slice.items(.presence);
+    fn findFieldVarInRecord(self: *CompletionBuilder, module_env: *ModuleEnv, record: types.Record, field_name: []const u8) Allocator.Error!?types.Var {
+        const row = try record_row.gather(self.allocator, &module_env.types, &module_env.common.idents, record);
+        defer self.allocator.free(row);
 
-        for (field_names, field_presences) |field_name_idx, field_presence| {
-            const name = module_env.getIdentText(field_name_idx);
-            if (std.mem.eql(u8, name, field_name)) {
-                return field_presence.typeVar();
+        for (row) |field| {
+            if (std.mem.eql(u8, module_env.getIdentText(field.name), field_name)) {
+                return field.presence.typeVar();
             }
         }
 
@@ -1041,12 +1031,14 @@ pub const CompletionBuilder = struct {
                     .owner = @fromBackingInt(@intCast(source_decl)),
                     .type_name = module_env.getIdentText(content.alias.ident.ident_idx),
                     .builtin_origin = content.alias.source_decl.originIsBuiltin(),
+                    .origin_module = content.alias.origin_module,
                 } else null
             else if (std.meta.activeTag(content) == .structure and std.meta.activeTag(content.structure) == .nominal_type)
                 if (content.structure.nominal_type.sourceDeclOptional()) |source_decl| .{
                     .owner = @fromBackingInt(@intCast(source_decl)),
                     .type_name = module_env.getIdentText(content.structure.nominal_type.ident.ident_idx),
                     .builtin_origin = content.structure.nominal_type.originIsBuiltin(),
+                    .origin_module = content.structure.nominal_type.origin_module,
                 } else null
             else
                 null;
@@ -1054,17 +1046,10 @@ pub const CompletionBuilder = struct {
             if (method_owner_opt) |method_owner| {
                 self.logDebug("addMethodsFromTypeVar: owner={} name={s}", .{ method_owner.owner, method_owner.type_name });
 
-                // Route builtin type methods through the builtin module env to ensure
-                // completions include real Builtin.roc backing data.
-                if (self.builtin_module_env) |builtin_env| {
-                    if (method_owner.builtin_origin) {
-                        try self.addMethodsForOwnerInEnv(builtin_env, method_owner);
-                    } else {
-                        try self.addMethodsForOwnerInEnv(module_env, method_owner);
-                    }
-                } else {
-                    try self.addMethodsForOwnerInEnv(module_env, method_owner);
-                }
+                // A type's methods are declared in its own module.
+                const owner_env = module_envs.forTypeOrigin(self.module_handle.envPtr(), module_env, method_owner.origin_module, method_owner.builtin_origin) orelse
+                    base.invariant("completion: no module env of the build declares a type of module {s}", .{module_env.moduleIdentityDisplayText(method_owner.origin_module)});
+                try self.addMethodsForOwnerInEnv(owner_env, method_owner);
             }
 
             switch (content) {
@@ -1145,8 +1130,8 @@ pub const CompletionBuilder = struct {
         const statements_slice = module_env.store.sliceStatements(module_env.all_statements);
         for (statements_slice) |stmt_idx| {
             const stmt = module_env.store.getSourceStatement(stmt_idx);
-            const stmt_parts = getStatementParts(stmt);
-            if (stmt_parts.pattern) |stmt_pattern_idx| {
+            const stmt_parts = module_lookup.getStatementParts(stmt);
+            if (module_lookup.boundPattern(stmt)) |stmt_pattern_idx| {
                 if (stmt_pattern_idx == pattern_idx) {
                     if (stmt_parts.expr) |expr_idx| {
                         self.logDebug("findExprTypeForPattern: stmt expr for pattern_idx={} expr_idx={}", .{ pattern_idx, expr_idx });
@@ -1184,20 +1169,25 @@ pub const CompletionBuilder = struct {
                 const qualified_ident = entry.value;
                 const qualified_name = module_env.getIdentText(qualified_ident);
 
-                // Look up the method definition to get its type
-                if (self.findMethodType(module_env, qualified_ident)) |method_type_var| {
-                    if (type_writer) |*tw| {
-                        // Type formatting is best-effort; missing type info is acceptable
-                        tw.write(method_type_var, .one_line) catch |err| switch (err) {
-                            error.OutOfMemory => return error.OutOfMemory,
-                            error.WriteFailed => {},
-                        };
-                        const type_str = tw.get();
-                        if (type_str.len > 0) {
-                            detail = try self.strings.dupe(u8, type_str);
-                        }
-                        tw.reset();
+                // The method table entry names the method's def.
+                const binding = module_env.lookupMethodBindingForOwnerConst(method_owner.owner, method_ident) orelse
+                    base.invariant("completion: a method ident has no method table entry", .{});
+                const method_def = module_env.store.getDef(binding.def_idx);
+                const method_type_var = ModuleEnv.varFrom(method_def.pattern);
+                if (Check.valuelessMethod(module_env, binding.def_idx) != null) continue;
+                if (!firstParameterTakesOwner(module_env, method_type_var, method_owner)) continue;
+
+                if (type_writer) |*tw| {
+                    // Type formatting is best-effort; missing type info is acceptable
+                    tw.write(method_type_var, .one_line) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.WriteFailed => {},
+                    };
+                    const type_str = tw.get();
+                    if (type_str.len > 0) {
+                        detail = try self.strings.dupe(u8, type_str);
                     }
+                    tw.reset();
                 }
 
                 // If we couldn't get the type signature, at least show which type it's from
@@ -1206,7 +1196,7 @@ pub const CompletionBuilder = struct {
                 }
 
                 // Extract documentation for the method definition.
-                const documentation = try self.findMethodDocumentation(module_env, qualified_ident);
+                const documentation = try doc_comments.extractDocForDef(self.strings, module_env.common.source, &module_env.store, method_def);
 
                 const added = try self.addItem(.{
                     .label = method_name,
@@ -1219,82 +1209,36 @@ pub const CompletionBuilder = struct {
         }
     }
 
-    /// Find the documentation string for a method by its qualified identifier.
-    ///
-    /// Searches top-level definitions and statements for a def/decl whose
-    /// pattern ident matches `qualified_ident`, then extracts the doc comment.
-    fn findMethodDocumentation(self: *CompletionBuilder, module_env: *ModuleEnv, qualified_ident: base.Ident.Idx) Allocator.Error!?[]const u8 {
-        // Search all_defs for a matching definition.
-        const defs_slice = module_env.store.sliceDefs(module_env.all_defs);
-        for (defs_slice) |def_idx| {
-            const def = module_env.store.getDef(def_idx);
-            const pattern = module_env.store.getSourcePattern(def.pattern);
-
-            const ident_idx = patternIdent(pattern) orelse continue;
-
-            if (ident_idx.eql(qualified_ident)) {
-                return try doc_comments.extractDocForDef(
-                    self.strings,
-                    module_env.common.source,
-                    &module_env.store,
-                    def,
-                );
-            }
-        }
-
-        // Fall back to statements (apps use s_decl/s_var for definitions).
-        const statements_slice = module_env.store.sliceStatements(module_env.all_statements);
-        for (statements_slice) |stmt_idx| {
-            const stmt = module_env.store.getSourceStatement(stmt_idx);
-            const pattern_idx = module_lookup.getDeclarationPattern(stmt) orelse continue;
-
-            const pattern = module_env.store.getSourcePattern(pattern_idx);
-            const ident_idx = patternIdent(pattern) orelse continue;
-
-            if (ident_idx.eql(qualified_ident)) {
-                return try doc_comments.extractDocForStatement(
-                    self.strings,
-                    module_env.common.source,
-                    &module_env.store,
-                    stmt,
-                    stmt_idx,
-                );
-            }
-        }
-
-        return null;
-    }
-
-    /// Find the type of a method definition by its qualified identifier.
-    fn findMethodType(_: *CompletionBuilder, module_env: *ModuleEnv, qualified_ident: base.Ident.Idx) ?types.Var {
-        // Look through definitions to find the method
-        const defs_slice = module_env.store.sliceDefs(module_env.all_defs);
-        for (defs_slice) |def_idx| {
-            const def = module_env.store.getDef(def_idx);
-            const pattern = module_env.store.getSourcePattern(def.pattern);
-
-            const ident_idx = patternIdent(pattern) orelse continue;
-
-            if (ident_idx.eql(qualified_ident)) {
-                return ModuleEnv.varFrom(def.pattern);
-            }
-        }
-
-        // Also check statements
-        const statements_slice = module_env.store.sliceStatements(module_env.all_statements);
-        for (statements_slice) |stmt_idx| {
-            const stmt = module_env.store.getSourceStatement(stmt_idx);
-            const pattern_idx = module_lookup.getDeclarationPattern(stmt) orelse continue;
-
-            const pattern = module_env.store.getSourcePattern(pattern_idx);
-            const ident_idx = patternIdent(pattern) orelse continue;
-
-            if (ident_idx.eql(qualified_ident)) {
-                return ModuleEnv.varFrom(pattern_idx);
-            }
-        }
-
-        return null;
+    /// A completion filter: whether to suggest the associated item of type
+    /// `method_type` after a value of the owner's type. Completion is a
+    /// suggestion, so this filter only leaves out items that cannot take the
+    /// receiver: it keeps a function whose first parameter is the owner type
+    /// or a type variable. The exact rule is unification in the checker,
+    /// which relates the item's type to `receiver, args -> ret`, including
+    /// the type arguments and a variable's `where` constraints.
+    fn firstParameterTakesOwner(owner_env: *ModuleEnv, method_type: types.Var, method_owner: MethodOwnerLookup) bool {
+        const type_store = &owner_env.types;
+        const func = type_store.resolveThroughAliases(method_type).desc.content.unwrapFunc() orelse return false;
+        const params = type_store.sliceVars(func.args);
+        if (params.len == 0) return false;
+        var content = type_store.resolveVar(params[0]).desc.content;
+        while (true) switch (content) {
+            .flex, .rigid => return true,
+            .alias => |alias| {
+                if (alias.source_decl.toOptional()) |decl| {
+                    if (decl == @backingInt(method_owner.owner) and alias.origin_module == owner_env.self_module_identity) return true;
+                }
+                content = type_store.resolveVar(type_store.getAliasBackingVar(alias)).desc.content;
+            },
+            .structure => |flat_type| switch (flat_type) {
+                .nominal_type => |nominal| {
+                    const decl = nominal.sourceDeclOptional() orelse return false;
+                    return decl == @backingInt(method_owner.owner) and nominal.origin_module == owner_env.self_module_identity;
+                },
+                .record, .tuple, .fn_pure, .fn_effectful, .fn_unbound, .empty_record, .tag_union, .empty_tag_union => return false,
+            },
+            .field_presence, .err => return false,
+        };
     }
 
     // Tag Union Completions
@@ -1545,13 +1489,6 @@ fn firstSegment(name: []const u8) []const u8 {
     return name[0..dot_idx];
 }
 
-/// Get the last segment of a dotted name.
-fn lastSegment(name: []const u8) []const u8 {
-    const dot_idx = std.mem.findScalarLast(u8, name, '.') orelse return name;
-    if (dot_idx + 1 >= name.len) return name;
-    return name[dot_idx + 1 ..];
-}
-
 /// Extract the immediate child label under `namespace_chain` from a full name.
 ///
 /// Examples:
@@ -1588,33 +1525,6 @@ fn namespaceMemberLabel(full_name: []const u8, namespace_chain: []const u8) ?[]c
     return null;
 }
 
-/// Parts extracted from a statement for common processing.
-const StatementParts = struct {
-    pattern: ?CIR.Pattern.Idx,
-    expr: ?CIR.Expr.Idx,
-    expr2: ?CIR.Expr.Idx,
-};
-
-/// Extract common parts from a statement.
-fn getStatementParts(stmt: CIR.Statement) StatementParts {
-    return switch (stmt) {
-        .s_decl => |decl| .{ .pattern = decl.pattern, .expr = decl.expr, .expr2 = null },
-        .s_var => |var_stmt| .{ .pattern = var_stmt.pattern_idx, .expr = var_stmt.expr, .expr2 = null },
-        .s_var_uninitialized => |var_stmt| .{ .pattern = var_stmt.pattern_idx, .expr = null, .expr2 = null },
-        .s_reassign => |reassign| .{ .pattern = null, .expr = reassign.expr, .expr2 = null },
-        .s_for => |for_stmt| .{ .pattern = for_stmt.patt, .expr = for_stmt.expr, .expr2 = for_stmt.body },
-        .s_while => |while_stmt| .{ .pattern = null, .expr = while_stmt.cond, .expr2 = while_stmt.body },
-        .s_infinite_loop => |while_stmt| .{ .pattern = null, .expr = while_stmt.cond, .expr2 = while_stmt.body },
-        .s_breakable_loop => |while_stmt| .{ .pattern = null, .expr = while_stmt.cond, .expr2 = while_stmt.body },
-        .s_expr => |expr_stmt| .{ .pattern = null, .expr = expr_stmt.expr, .expr2 = null },
-        .s_expect => |expect_stmt| .{ .pattern = null, .expr = expect_stmt.body, .expr2 = null },
-        .s_dbg => |dbg_stmt| .{ .pattern = null, .expr = dbg_stmt.expr, .expr2 = null },
-        .s_return => |return_stmt| .{ .pattern = null, .expr = return_stmt.expr, .expr2 = null },
-        .s_crash => .{ .pattern = null, .expr = null, .expr2 = null },
-        .s_import, .s_alias_decl, .s_nominal_decl, .s_where_alias_decl, .s_break, .s_type_anno, .s_type_var_alias, .s_runtime_error => .{ .pattern = null, .expr = null, .expr2 = null },
-    };
-}
-
 // Tests
 
 test "stripModulePrefix" {
@@ -1634,13 +1544,4 @@ test "firstSegment" {
     try testing.expectEqualStrings("foo", firstSegment("foo"));
     try testing.expectEqualStrings("A", firstSegment("A.B.C"));
     try testing.expectEqualStrings("", firstSegment(""));
-}
-
-test "lastSegment" {
-    const testing = std.testing;
-
-    try testing.expectEqualStrings("to_str", lastSegment("Basic.to_str"));
-    try testing.expectEqualStrings("foo", lastSegment("foo"));
-    try testing.expectEqualStrings("C", lastSegment("A.B.C"));
-    try testing.expectEqualStrings("", lastSegment(""));
 }

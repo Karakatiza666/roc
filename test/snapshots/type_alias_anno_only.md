@@ -10,22 +10,9 @@ MyType : Str
 hey : MyType
 ~~~
 # EXPECTED
-DECLARATION HAS NO VALUE - type_alias_anno_only.md:3:1:3:13
+NIL
 # PROBLEMS
-~~~clojure
-(reports
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 3 1) (end 3 13))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_alias_anno_only.md") (start 3 1) (end 3 13) (annotation error) (line-text "hey : MyType"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
-~~~
+NIL
 # TOKENS
 ~~~zig
 UpperIdent,OpColon,UpperIdent,
@@ -53,7 +40,7 @@ NO CHANGE
 (can-ir
 	(d-let
 		(p-assign (ident "hey"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-lookup (name "MyType") (local))))
 	(s-alias-decl

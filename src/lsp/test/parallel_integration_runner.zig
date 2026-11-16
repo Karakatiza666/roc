@@ -131,6 +131,7 @@ fn runSingleTest(io: std.Io, allocator: Allocator, spec: integration.Spec, _: u6
         error.CorruptArtifact,
         error.CorruptBuiltinArtifact,
         error.CorruptEmbeddedBuiltins,
+        error.DefaultAppStagingFailed,
         error.DeviceBusy,
         error.DiskQuota,
         error.DuplicateField,

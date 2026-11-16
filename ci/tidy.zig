@@ -24,7 +24,7 @@ const max_text_file_size = 4 * MiB;
 const binary_extensions: []const []const u8 = &.{
     ".ico",  ".png",   ".webp", ".jpg",  ".jpeg",  ".gif", ".bin",
     ".o",    ".obj",   ".bc",   ".a",    ".lib",   ".dll", ".so",
-    ".so.6", ".dylib", ".wasm", ".rlib", ".rmeta",
+    ".so.6", ".dylib", ".wasm", ".rlib", ".rmeta", ".cbor",
 };
 
 const TermColor = struct {
@@ -519,7 +519,7 @@ const Errors = struct {
     pub fn addDisallowedBuiltinType(errors: *Errors, file: SourceFile, offset: usize, name: []const u8) void {
         errors.emit(
             "{s}:{d}: error: '{s}' is exposed as a top-level Builtin type. The only types allowed " ++
-                "directly under Builtin are: Str, Hasher, Iter, Stream, List, Bool, Box, Try, Dict, Set, Num, Encoding, Crypto. " ++
+                "directly under Builtin are: Str, Hasher, Iter, Stream, List, Bool, Box, Try, Dict, Set, Num, Encoding, Crypto, Code. " ++
                 "Make '{s}' private by moving it below the exposed Builtin block (to the module's top level), " ++
                 "unless a user-facing method needs it and would break without it—in which case nest it under a " ++
                 "logical Builtin type instead (e.g. DictBucket under Dict, ParseTagUnionSpec under Encoding).\n",
@@ -590,7 +590,7 @@ fn tidyFile(
 /// type must either be private (declared below the exposed block, at the module's
 /// top level) or nested under one of these.
 const allowed_builtin_types = [_][]const u8{
-    "Str", "Hasher", "Iter", "Stream", "List", "Bool", "Box", "Try", "Dict", "Set", "Num", "Encoding", "Crypto",
+    "Str", "Hasher", "Iter", "Stream", "List", "Bool", "Box", "Try", "Dict", "Set", "Num", "Encoding", "Crypto", "Code",
 };
 
 fn isAllowedBuiltinType(name: []const u8) bool {
@@ -955,6 +955,7 @@ fn tidyBannedCoreCtxCreation(file: SourceFile, errors: *Errors) void {
         "src/lsp/syntax.zig",
         "src/ctx/CoreCtx.zig",
         "test/downstream-compiler/main.zig",
+        "test/fuzzing/fuzz-reify.zig",
     };
 
     // Don't ban ourselves (this file contains the banned strings as literals)

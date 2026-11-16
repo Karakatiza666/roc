@@ -35,8 +35,6 @@ EXPECTED TUPLE SEPARATOR - fuzz_crash_022.md:9:1:9:1
 UNEXPECTED EXPRESSION SYNTAX - fuzz_crash_022.md:9:1:9:1
 MALFORMED TYPE - fuzz_crash_022.md:1:19:1:27
 UNUSED VARIABLE - fuzz_crash_022.md:6:12:6:14
-DECLARATION HAS NO VALUE - fuzz_crash_022.md:1:16:1:27
-DECLARATION HAS NO VALUE - fuzz_crash_022.md:5:1:5:20
 # PROBLEMS
 ~~~clojure
 (reports
@@ -521,29 +519,7 @@ DECLARATION HAS NO VALUE - fuzz_crash_022.md:5:1:5:20
 			(annotated symbol-unqualified "_id")
 			(reflow " to suppress this warning.")
 			(line-break)
-			(source-region (file "fuzz_crash_022.md") (start 6 12) (end 6 14) (annotation error) (line-text "getUser = |id| if (id > 1!) \"big\" else \"l\""))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 16) (end 1 27))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_022.md") (start 1 16) (end 1 27) (annotation error) (line-text "app [main!] { |f: platform \"c\" }"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 5 1) (end 5 20))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_022.md") (start 5 1) (end 5 20) (annotation error) (line-text "ser : UserId -> Str"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "fuzz_crash_022.md") (start 6 12) (end 6 14) (annotation error) (line-text "getUser = |id| if (id > 1!) \"big\" else \"l\"")))))
 ~~~
 # TOKENS
 ~~~zig
@@ -603,7 +579,7 @@ getUser = |id| if
 			(ty-malformed)))
 	(d-let
 		(p-assign (ident "ser"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-fn (effectful false)
 				(ty-lookup (name "UserId") (local))

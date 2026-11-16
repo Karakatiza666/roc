@@ -1386,6 +1386,7 @@ fn compileSourceWithValidation(source: []const u8, module_name: []const u8, vali
         // Propagate this error up to halt compilation gracefully.
         return err;
     };
+    can.HostedCompiler.markIntrinsicsByModuleHeader(env);
 
     czer.runValidation() catch |err| {
         logDebug("compileSource: validation failed: {}\n", .{err});

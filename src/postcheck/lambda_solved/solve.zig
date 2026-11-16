@@ -3204,6 +3204,7 @@ const Solver = struct {
             .dec_to_f64,
             .compare,
             .crash,
+            .code_refuse,
             => {},
         }
     }

@@ -1,4 +1,4 @@
-//! Name rules for `textDocument/rename`.
+//! Name and scope rules for `textDocument/rename`.
 //!
 //! A rename may only change what a binding is called. In Roc part of what a
 //! name *means* is spelled in the name itself: a trailing `!` marks a value
@@ -18,6 +18,12 @@ const base = @import("base");
 const can = @import("can");
 const parse = @import("parse");
 
+const cir_queries = @import("cir_queries.zig");
+const module_lookup = @import("module_lookup.zig");
+const scope_map = @import("scope_map.zig");
+
+const CIR = can.CIR;
+const ModuleEnv = can.ModuleEnv;
 const Ident = base.Ident;
 const Token = parse.tokenize.Token;
 
@@ -107,4 +113,116 @@ fn nameShape(allocator: Allocator, text: []const u8) Allocator.Error!?NameShape 
 /// Whether a token tag names something a binding can be called.
 fn isIdentifierTag(tag: Token.Tag) bool {
     return tag == .LowerIdent or tag == .UpperIdent or tag == .NamedUnderscore;
+}
+
+/// The binding a rename request refers to.
+pub const Target = struct {
+    pattern: CIR.Pattern.Idx,
+    ident: Ident.Idx,
+};
+
+/// Resolve a source offset to a binding that can be renamed.
+///
+/// Only a plain `assign` pattern names a single binding whose every occurrence
+/// this server can account for. Destructuring, literal, and tag patterns bind
+/// through structure that a name-for-name rewrite cannot express, so they are
+/// refused rather than half-renamed.
+pub fn targetAt(module_env: *ModuleEnv, offset: u32) ?Target {
+    const pattern_idx = cir_queries.resolveSymbolAtOffset(module_env, offset) orelse return null;
+    return switch (module_env.store.getSourcePattern(pattern_idx)) {
+        .assign => |assign| .{ .pattern = pattern_idx, .ident = assign.ident },
+        .var_assign => |assign| .{ .pattern = pattern_idx, .ident = assign.ident },
+        .as,
+        .applied_tag,
+        .nominal,
+        .nominal_external,
+        .record_destructure,
+        .list,
+        .tuple,
+        .num_literal,
+        .small_dec_literal,
+        .dec_literal,
+        .frac_f32_literal,
+        .frac_f64_literal,
+        .num_from_numeral_literal,
+        .str_literal,
+        .str_interpolation,
+        .underscore,
+        .runtime_error,
+        => null,
+        .deferred_import_ref => base.invariant("compiler invariant violated: deferred import reference pattern reached a stage that runs after import resolution", .{}),
+    };
+}
+
+/// Find the collected range that contains the given position.
+pub fn rangeContaining(regions: []const cir_queries.LspRange, line: u32, character: u32) ?cir_queries.LspRange {
+    for (regions) |range| {
+        if (range.start_line != line or range.end_line != line) continue;
+        if (character >= range.start_col and character <= range.end_col) return range;
+    }
+    return null;
+}
+
+/// What checking a new name against the surrounding scopes established.
+pub const ScopeCheck = enum {
+    /// No other binding of that name is live where the renamed one is.
+    clear,
+    /// Another such binding is live, so the rewrite would capture or shadow.
+    taken,
+    /// The renamed binding's extent was not found, so nothing was checked.
+    scope_unavailable,
+};
+
+/// Whether renaming `target` to `new_name` would collide with another binding
+/// of that name.
+///
+/// Rename rewrites text, but a name means whichever binding is live where
+/// it is written. If a different `new_name` binding is live anywhere the
+/// renamed one is, the rewrite silently repoints a reference: renaming `k`
+/// in `|v| { helper = |k| k + v }` to `v` yields `|v| v + v`, which
+/// compiles and computes something else.
+///
+/// Two bindings whose live ranges overlap cannot both be called
+/// `new_name`, so an overlap is refused. Bindings in unrelated scopes do
+/// not overlap and stay renameable.
+pub fn checkNewNameAgainstScope(
+    bindings: []const scope_map.Binding,
+    module_env: *const ModuleEnv,
+    target: Target,
+    new_name: []const u8,
+) ScopeCheck {
+    var target_binding: ?scope_map.Binding = null;
+    for (bindings) |binding| {
+        if (binding.pattern_idx == target.pattern) {
+            target_binding = binding;
+            break;
+        }
+    }
+
+    // Without the renamed binding's own extent there is nothing to compare
+    // against. Refuse, but say which of the two happened:
+    // "the name is taken" would be a claim about the code that has not
+    // been established.
+    const extent = target_binding orelse return .scope_unavailable;
+    const target_item = module_lookup.associatedItemKey(module_env, target.ident);
+
+    for (bindings) |binding| {
+        if (binding.pattern_idx == target.pattern) continue;
+        if (!bindingIsCalled(module_env, binding.ident, target_item, new_name)) continue;
+        if (binding.visible_from <= extent.visible_to and extent.visible_from <= binding.visible_to) {
+            return .taken;
+        }
+    }
+    return .clear;
+}
+
+/// Whether a binding bound as `ident` would be called `new_name` after the
+/// rename. The renamed associated item would be called `new_name` in its own
+/// type, so a sibling item of that name collides with it, and so does a plain
+/// binding that a bare use inside the type can be captured by.
+fn bindingIsCalled(module_env: *const ModuleEnv, ident: Ident.Idx, target_item: ?ModuleEnv.MethodKey, new_name: []const u8) bool {
+    if (std.mem.eql(u8, module_env.getIdentText(ident), new_name)) return true;
+    const owner = target_item orelse return false;
+    const item = module_lookup.associatedItemKey(module_env, ident) orelse return false;
+    return item.owner == owner.owner and std.mem.eql(u8, module_env.getIdentText(item.methodIdent()), new_name);
 }

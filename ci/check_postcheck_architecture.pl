@@ -131,6 +131,24 @@ my @RULES = (
     { category => 'checked-body-store', regex => qr/\bpatternIdForSource\b/, allowed => {} },
     { category => 'checked-body-store', regex => qr/\bSyntheticExprOrigin\b/, allowed => {} },
     { category => 'checked-row-coerce-variant', regex => qr/\brow_coerce\b/, scope => qr{\Asrc/check/}, allowed => {} },
+    # A `Code` description, a refusal and an instance table are evaluation
+    # output (`CodeOutput`), which only the description step of compile-time
+    # evaluation writes. Checking and publication write none, and no checked
+    # table holds one: the shape of a site is the module-index code-site bit.
+    { category => 'code-description-in-checked-data', regex => qr/\breifyStagedCode\b/, allowed => {} },
+    { category => 'code-description-in-checked-data', regex => qr/\battachCodeReification\b/, allowed => {} },
+    { category => 'code-description-in-checked-data', regex => qr/\brefuseCodeReification\b/, allowed => {} },
+    { category => 'code-description-in-checked-data', regex => qr/\bmarkInstanceSite\b/, allowed => {} },
+    { category => 'code-description-in-checked-data', regex => qr/\brefuseInstanceUse\b/, allowed => {} },
+    { category => 'code-description-in-checked-data', regex => qr/\brefuseInstanceLoop\b/, allowed => {} },
+    { category => 'code-description-in-checked-data', regex => qr/\bcode_site_bits\b/, allowed => {} },
+    { category => 'code-description-in-checked-data', regex => qr/\brefused_exprs\b/, allowed => {} },
+    {
+        category => 'code-description-outside-description-step',
+        regex => qr/(?<!\bfn )\b(?:describeSites|describeIdentities|closeUses)\s*\(/,
+        scope => qr{\A(?!.*/test/)(?!.*_test\.zig\z)},
+        allowed => { 'src/eval/code_descriptions.zig' => 1 },
+    },
     # Post-check code reads sealed solver stores through the checked type
     # reader and never writes one.
     {

@@ -158,7 +158,7 @@ main! = |_| {
 		(p-assign (ident "topThunk"))
 		(e-lambda
 			(args)
-			(e-call (constraint-fn-var 268)
+			(e-call (constraint-fn-var 421)
 				(e-lookup-local
 					(p-assign (ident "echo!")))
 				(e-string
@@ -173,17 +173,17 @@ main! = |_| {
 					(p-assign (ident "thunk"))
 					(e-lambda
 						(args)
-						(e-call (constraint-fn-var 281)
+						(e-call (constraint-fn-var 433)
 							(e-lookup-local
 								(p-assign (ident "echo!")))
 							(e-string
 								(e-literal (string ""))))))
 				(s-expr
-					(e-call (constraint-fn-var 282)
+					(e-call (constraint-fn-var 437)
 						(e-lookup-local
 							(p-assign (ident "thunk")))))
 				(s-expr
-					(e-call (constraint-fn-var 287)
+					(e-call (constraint-fn-var 442)
 						(e-lookup-local
 							(p-assign (ident "topThunk")))))
 				(e-tuple

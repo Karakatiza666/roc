@@ -295,6 +295,8 @@ pub const TypeAnno = union(enum) {
     /// Record field in a type annotation: `{ field_name: Type }`
     pub const RecordField = struct {
         name: Ident.Idx,
+        /// The label token in source, without the `?` mark or the type.
+        label_region: base.Region,
         ty: TypeAnno.Idx,
         /// Whether the field may be absent from a runtime record value.
         is_optional: bool,

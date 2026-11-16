@@ -92,6 +92,8 @@ pub const BoxyStoredFunctions = postcheck.Boxy.StoredFn.Retained;
 pub const BoxyFunctionMetadata = postcheck.Boxy.StoredFn;
 /// The names the modules of one link give their workers and nominal types.
 pub const BoxyModuleNames = postcheck.Boxy.Types.ModuleNames;
+/// The digest of a Code instance table a `.boxy` unit read of another module.
+pub const BoxyTableDigest = postcheck.Boxy.TableDigest;
 
 /// Resource failure while lowering checked modules to LIR, plus the one
 /// checked input this entrance rejects outright: see
@@ -1413,6 +1415,7 @@ pub fn prepareCheckedModulesMonotype(
 ) LowerResourceError!PreparedMonotype {
     if (target.specialization_strategy != .lss) checkedPipelineInvariant("Monotype preparation requires LSS");
     try modules.demandBodyIndexes();
+    try modules.demandCodeInventories(allocator);
     try verifyCheckedBoundary(modules, target);
     try requireHostedProceduresBound(modules, target);
 

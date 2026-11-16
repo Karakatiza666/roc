@@ -108,7 +108,7 @@ NO CHANGE
 					(e-string
 						(e-literal (string "World"))))
 				(e-runtime-error (tag "erroneous_value_expr")))))
-	(s-import (mod "pf.Stdout")
+	(s-import (mod "pf.Stdout") (alias "Stdout")
 		(exposes)))
 ~~~
 # TYPES

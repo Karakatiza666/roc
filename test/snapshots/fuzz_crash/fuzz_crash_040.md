@@ -13,7 +13,6 @@ UNEXPECTED STATEMENT - fuzz_crash_040.md:1:20:1:21
 UNEXPECTED TYPE SYNTAX - fuzz_crash_040.md:2:3:2:4
 UNEXPECTED STATEMENT - fuzz_crash_040.md:2:4:2:5
 MALFORMED TYPE - fuzz_crash_040.md:2:3:2:4
-DECLARATION HAS NO VALUE - fuzz_crash_040.md:2:1:2:4
 # PROBLEMS
 ~~~clojure
 (reports
@@ -98,18 +97,7 @@ DECLARATION HAS NO VALUE - fuzz_crash_040.md:2:1:2:4
 		(headline
 			(reflow "This type annotation is malformed or contains invalid syntax."))
 		(document
-			(source-region (file "fuzz_crash_040.md") (start 2 3) (end 2 4) (annotation error) (line-text "o:0)"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 2 1) (end 2 4))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "fuzz_crash_040.md") (start 2 1) (end 2 4) (annotation error) (line-text "o:0)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "fuzz_crash_040.md") (start 2 3) (end 2 4) (annotation error) (line-text "o:0)")))))
 ~~~
 # TOKENS
 ~~~zig

@@ -84,6 +84,19 @@ pub const CheckedModules = struct {
         for (self.root.relation_modules) |view| try view.checked_bodies.demandIndex();
         for (self.imports) |view| try view.checked_bodies.demandIndex();
     }
+
+    /// Demand the Code inventories of every module of the set, with the
+    /// whole set in reach. Monotype lowers the whole program and demands
+    /// every body index first, so it demands every inventory with them and
+    /// then reads each module's computed slot.
+    pub fn demandCodeInventories(self: CheckedModules, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+        var reach = std.ArrayList(checked.ImportedModuleView).empty;
+        defer reach.deinit(allocator);
+        try reach.append(allocator, checked.importedView(self.root.module));
+        try reach.appendSlice(allocator, self.root.relation_modules);
+        try reach.appendSlice(allocator, self.imports);
+        for (reach.items) |view| _ = try check.CodeLookups.codeInventories(allocator, view, reach.items);
+    }
 };
 
 /// Dense id of one checked module inside a single lowering's module set; see

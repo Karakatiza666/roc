@@ -30,14 +30,6 @@ open_record_with_comma : {
 UNDECLARED TYPE - type_annotations.md:3:7:3:12
 UNDECLARED TYPE - type_annotations.md:9:14:9:20
 UNDECLARED TYPE - type_annotations.md:11:13:11:18
-DECLARATION HAS NO VALUE - type_annotations.md:1:1:1:10
-DECLARATION HAS NO VALUE - type_annotations.md:3:1:3:23
-DECLARATION HAS NO VALUE - type_annotations.md:5:1:5:19
-DECLARATION HAS NO VALUE - type_annotations.md:7:1:7:27
-DECLARATION HAS NO VALUE - type_annotations.md:9:1:9:35
-DECLARATION HAS NO VALUE - type_annotations.md:11:1:11:32
-DECLARATION HAS NO VALUE - type_annotations.md:13:1:15:2
-DECLARATION HAS NO VALUE - type_annotations.md:17:1:20:2
 # PROBLEMS
 ~~~clojure
 (reports
@@ -70,95 +62,7 @@ DECLARATION HAS NO VALUE - type_annotations.md:17:1:20:2
 			(annotated code "Value")
 			(reflow " is not declared in this scope."))
 		(document
-			(source-region (file "type_annotations.md") (start 11 13) (end 11 18) (annotation error) (line-text "tag_tuple : Value((_a, _b, _c))"))))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 1 1) (end 1 10))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotations.md") (start 1 1) (end 1 10) (annotation error) (line-text "foo : U64"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 3 1) (end 3 23))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotations.md") (start 3 1) (end 3 23) (annotation error) (line-text "bar : Thing(_a, _b, _)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 5 1) (end 5 19))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotations.md") (start 5 1) (end 5 19) (annotation error) (line-text "baz : (_a, _b, _c)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 7 1) (end 7 27))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotations.md") (start 7 1) (end 7 27) (annotation error) (line-text "add_one : (U8, U16 -> U32)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 9 1) (end 9 35))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotations.md") (start 9 1) (end 9 35) (annotation error) (line-text "main! : List(String) -> Try({}, _)"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 11 1) (end 11 32))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotations.md") (start 11 1) (end 11 32) (annotation error) (line-text "tag_tuple : Value((_a, _b, _c))"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 13 1) (end 15 2))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotations.md") (start 13 1) (end 15 2) (annotation error) (line-text "closed_record_with_comma : {\n\ta : U8,\n}"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 17 1) (end 20 2))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "type_annotations.md") (start 17 1) (end 20 2) (annotation error) (line-text "open_record_with_comma : {\n\ta : U8,\n\t..,\n}"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(source-region (file "type_annotations.md") (start 11 13) (end 11 18) (annotation error) (line-text "tag_tuple : Value((_a, _b, _c))")))))
 ~~~
 # TOKENS
 ~~~zig
@@ -236,7 +140,7 @@ NO CHANGE
 (can-ir
 	(d-let
 		(p-assign (ident "foo"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-lookup (name "U64") (builtin))))
 	(d-let
@@ -246,7 +150,7 @@ NO CHANGE
 			(ty-malformed)))
 	(d-let
 		(p-assign (ident "baz"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-tuple
 				(ty-rigid-var (name "_a"))
@@ -254,7 +158,7 @@ NO CHANGE
 				(ty-rigid-var (name "_c")))))
 	(d-let
 		(p-assign (ident "add_one"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-parens
 				(ty-fn (effectful false)
@@ -278,14 +182,14 @@ NO CHANGE
 			(ty-malformed)))
 	(d-let
 		(p-assign (ident "closed_record_with_comma"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-record
 				(field (field "a")
 					(ty-lookup (name "U8") (builtin))))))
 	(d-let
 		(p-assign (ident "open_record_with_comma"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-record
 				(field (field "a")

@@ -171,6 +171,10 @@ pub const Statement = union(enum) {
     s_import: struct {
         module_name_tok: Ident.Idx,
         qualifier_tok: ?Ident.Idx,
+        /// The name this import binds as a module qualifier: the `as` alias,
+        /// or else the last segment of the module path (`Stdout` for
+        /// `import pf.Stdout`). Null for an import of nested types, which
+        /// binds no qualifier.
         alias_tok: ?Ident.Idx,
         exposes: CIR.ExposedItem.Span,
     },

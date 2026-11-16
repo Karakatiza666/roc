@@ -30,6 +30,8 @@
 //!   a literal whose conversion root no evaluation of this compilation
 //!   requests and whose payload is not stored, each of which registers a
 //!   literal root whatever the instance; or a body no checked data bounds;
+//!   or a generic bound call, which registers a root of the program at each
+//!   specialization;
 //! - *dependent numeral* (*quote*): a numeral (quote) whose conversion depends
 //!   on its instance and which no checked instantiation converts, which
 //!   registers a literal root only at a custom numeral (quote) type;
@@ -300,6 +302,9 @@ const Builder = struct {
     demand: *LiteralDemand,
     declared: *const std.AutoHashMapUnmanaged(DeclaredRoot, void),
     views: std.AutoHashMapUnmanaged([32]u8, checked.ImportedModuleView) = .empty,
+    /// Every module of `views`, through which a module's Code inventories
+    /// are computed on demand.
+    reach: []const checked.ImportedModuleView = &.{},
     types: std.AutoHashMapUnmanaged(TypeKey, NodeId) = .empty,
     /// Own flags, by node.
     own: std.ArrayListUnmanaged(Flags) = .empty,
@@ -321,6 +326,7 @@ const Builder = struct {
 
     fn deinit(self: *Builder) void {
         self.views.deinit(self.allocator);
+        self.allocator.free(self.reach);
         self.converted_literals.deinit(self.allocator);
         self.implicit_methods.deinit(self.allocator);
         self.types.deinit(self.allocator);
@@ -528,6 +534,12 @@ const Builder = struct {
     fn addTemplate(self: *Builder, view: checked.ImportedModuleView, node: NodeId, template: checked.CheckedProcedureTemplate) Allocator.Error!void {
         if (template.target == .hosted) return;
         try self.addTypeEdge(node, view, template.checked_fn_root);
+        // A generic bound call is a compile-time root of the program at each
+        // specialization (design.md "Bound Instance Roots").
+        const inventories = try check.CodeLookups.codeInventories(self.allocator, view, self.reach);
+        if (inventories.inventoryOf(template.template_id)) |inventory| {
+            if (inventories.inventoryBoundCalls(inventory).len != 0) self.markOwn(node, .{ .strict = true });
+        }
 
         const refs = view.resolved_value_refs;
         for (refs.template_refs.items()[template.resolved_value_refs.start..][0..template.resolved_value_refs.len]) |ref_id| {
@@ -625,7 +637,8 @@ const Builder = struct {
                     .quote => .{ conversion.conversion_root, .{ .dependent_quote = true } },
                 };
             },
-            .expr => switch (bodies.exprData(@fromBackingInt(plan.node))) {
+            // A literal written as a whole value site is still a literal.
+            .expr => switch (bodies.exprDataOpeningValueSite(@fromBackingInt(plan.node))) {
                 .numeral => .{ bodies.literalConversionRoot(plan.node), .{ .dependent_numeral = true } },
                 .str => if (bodies.quoteIsCustom(plan.node)) .{ bodies.literalConversionRoot(plan.node), .{ .dependent_quote = true } } else return .{},
                 // An interpolation whose conversion depends on its instance
@@ -673,6 +686,7 @@ const Builder = struct {
                 .expect,
                 .ellipsis,
                 .anno_only,
+                .code_site,
                 .break_,
                 .return_,
                 .for_,
@@ -821,6 +835,12 @@ pub fn compute(
     for (modules.root.relation_modules) |view| try addView(&builder, view);
     for (modules.imports) |view| try addView(&builder, view);
     demand.counters.modules = builder.views.count();
+    {
+        const reach = try allocator.alloc(checked.ImportedModuleView, builder.views.count());
+        var reach_views = builder.views.valueIterator();
+        for (reach) |*slot| slot.* = reach_views.next().?.*;
+        builder.reach = reach;
+    }
     demand.builtin = try builder.addNode(.{});
 
     // Every template has its node before any edge names one.
@@ -899,6 +919,9 @@ fn requirementFlagsOf(view: checked.ImportedModuleView, template: checked.Checke
             .numeral => .{ .dependent_numeral = true },
             .quote => .{ .dependent_quote = true },
             .interpolation => .{ .strict = true },
+            // A generic bound call registers a root of the program at each
+            // specialization.
+            .bound_call => .{ .strict = true },
         });
     }
     return flags;

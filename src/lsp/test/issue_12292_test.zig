@@ -26,20 +26,26 @@ pub const specs = [_]integration_spec.Spec{
     .{ .name = "issue 12292: goto definition follows resolved imports and type annotations", .run = gotoDefinitionFollowsResolvedImportsAndTypes },
 };
 
-const Sibling = struct {
+/// A file written next to the document before it is checked.
+pub const Sibling = struct {
     name: []const u8,
     source: []const u8,
 };
 
-/// One checked document that built without problems.
-const Fixture = struct {
+/// One checked document, built with no problems unless the spec expects some.
+pub const Fixture = struct {
     tmp: test_env.TmpDir,
     source: []u8,
     file_path: [:0]u8,
     file_uri: []u8,
     checker: SyntaxChecker,
 
-    fn init(fixture: *Fixture, comptime template: []const u8, file_name: []const u8, siblings: []const Sibling) integration_spec.SpecError!void {
+    pub fn init(fixture: *Fixture, comptime template: []const u8, file_name: []const u8, siblings: []const Sibling) integration_spec.SpecError!void {
+        try fixture.initWithProblems(template, file_name, siblings, 0);
+    }
+
+    /// Like `init`, for a document that builds with `expected_problems` diagnostics.
+    pub fn initWithProblems(fixture: *Fixture, comptime template: []const u8, file_name: []const u8, siblings: []const Sibling, expected_problems: usize) integration_spec.SpecError!void {
         const allocator = test_env.allocator;
         fixture.tmp = test_env.tmpDir(.{});
         errdefer fixture.tmp.cleanup();
@@ -71,10 +77,10 @@ const Fixture = struct {
             problem_count += set.diagnostics.len;
             for (set.diagnostics) |diagnostic| std.debug.print("\n{s}\n", .{diagnostic.message});
         }
-        try std.testing.expectEqual(@as(usize, 0), problem_count);
+        try std.testing.expectEqual(expected_problems, problem_count);
     }
 
-    fn deinit(fixture: *Fixture) void {
+    pub fn deinit(fixture: *Fixture) void {
         const allocator = test_env.allocator;
         fixture.checker.deinit();
         allocator.free(fixture.file_uri);
@@ -83,7 +89,7 @@ const Fixture = struct {
         fixture.tmp.cleanup();
     }
 
-    fn expectHover(fixture: *Fixture, line: u32, character: u32, expected: []const u8, unexpected: []const u8) integration_spec.SpecError!void {
+    pub fn expectHover(fixture: *Fixture, line: u32, character: u32, expected: []const u8, unexpected: []const u8) integration_spec.SpecError!void {
         const result = try fixture.checker.getTypeAtPosition(fixture.file_uri, fixture.source, line, character) orelse {
             std.debug.print("\nhover returned null at {d}:{d}\n", .{ line, character });
             return error.TestUnexpectedResult;
@@ -97,9 +103,22 @@ const Fixture = struct {
         }
     }
 
+    /// Like `expectHover`, and the hover range must be the columns
+    /// `start_col` to `end_col` of `line`.
+    pub fn expectHoverRange(fixture: *Fixture, line: u32, character: u32, expected: []const u8, unexpected: []const u8, start_col: u32, end_col: u32) integration_spec.SpecError!void {
+        try fixture.expectHover(line, character, expected, unexpected);
+        const result = try fixture.checker.getTypeAtPosition(fixture.file_uri, fixture.source, line, character) orelse return error.TestUnexpectedResult;
+        defer test_env.allocator.free(result.type_str);
+        const range = result.range orelse return error.TestUnexpectedResult;
+        if (range.start_line != line or range.end_line != line or range.start_col != start_col or range.end_col != end_col) {
+            std.debug.print("\nhover range at {d}:{d} was {d}:{d}-{d}:{d}, expected {d}:{d}-{d}:{d}\n", .{ line, character, range.start_line, range.start_col, range.end_line, range.end_col, line, start_col, line, end_col });
+            return error.TestUnexpectedResult;
+        }
+    }
+
     /// Goto definition at `line`:`character` must land on `definition_line`
     /// of the file whose URI ends with `uri_suffix`.
-    fn expectDefinition(fixture: *Fixture, line: u32, character: u32, uri_suffix: []const u8, definition_line: u32) integration_spec.SpecError!void {
+    pub fn expectDefinition(fixture: *Fixture, line: u32, character: u32, uri_suffix: []const u8, definition_line: u32) integration_spec.SpecError!void {
         var result = try fixture.checker.getDefinitionAtPosition(fixture.file_uri, fixture.source, line, character) orelse {
             std.debug.print("\ngoto definition returned null at {d}:{d}\n", .{ line, character });
             return error.TestUnexpectedResult;

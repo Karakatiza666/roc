@@ -7,6 +7,7 @@ pub const Layouts = @import("layouts.zig");
 pub const StaticDescs = @import("static_descs.zig");
 /// Type tables: each generic worker's needs list and its recipes.
 pub const Tables = @import("tables.zig");
+pub const TableDigest = @import("table_digest.zig");
 pub const Body = @import("body.zig");
 pub const Match = @import("match.zig");
 /// Stored function values of compile-time evaluation.

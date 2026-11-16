@@ -143,7 +143,7 @@ main = {
 ~~~clojure
 (inferred-types
 	(defs
-		(patt (type "{ init: Model, render: Box(Model -> I64), update: Box(Model, I64 -> Model) }")))
+		(patt (type "{ init: Model, render: Box(Model -> I64), update: Box((Model, I64 -> Model)) }")))
 	(expressions
-		(expr (type "{ init: Model, render: Box(Model -> I64), update: Box(Model, I64 -> Model) }"))))
+		(expr (type "{ init: Model, render: Box(Model -> I64), update: Box((Model, I64 -> Model)) }"))))
 ~~~

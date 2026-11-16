@@ -33,6 +33,8 @@ pub const TestSyntaxDriver = struct {
     inlay_hint_calls: usize = 0,
     code_action_calls: usize = 0,
     forget_calls: usize = 0,
+    /// Set by the `initialize` handler, as on `SyntaxChecker`.
+    related_information: bool = false,
 
     pub const CheckError = syntax.SyntaxChecker.CheckError;
 
@@ -59,6 +61,10 @@ pub const TestSyntaxDriver = struct {
         module_env: *can.ModuleEnv,
 
         pub fn deinit(_: CheckedModule) void {}
+
+        pub fn view(self: CheckedModule) @import("lsp").document_view.DocumentView {
+            return .{ .module_env = self.module_env, .staged = null };
+        }
     };
 
     pub const DefinitionResult = struct {

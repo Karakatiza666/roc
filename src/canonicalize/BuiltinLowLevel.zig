@@ -38,6 +38,15 @@ pub const IntrinsicId = enum(u8) {
     field_names_iter,
     field_names_for_size,
     field_name,
+    /// `Code.prim(f)`: the identity of the definition `f` names. Publication
+    /// writes it as a constant at each call (design.md "Code Reification").
+    code_prim,
+    /// `Code.type_id(p)`: the identity of the nominal type `p` stands for.
+    /// Publication writes it as a constant at each call.
+    code_type_id,
+    /// `Code.ty_of(p)`: the description of the type `p` stands for.
+    /// Publication writes it as a constant at each call.
+    code_ty_of,
 
     pub const RequestResultSource = union(enum(u8)) {
         declared_return,
@@ -49,7 +58,7 @@ pub const IntrinsicId = enum(u8) {
     /// checked protocol.
     pub fn callsiteArity(self: IntrinsicId) ?u8 {
         return switch (self) {
-            .str_inspect, .structural_eq => null,
+            .str_inspect, .structural_eq, .code_prim, .code_type_id, .code_ty_of => null,
             .parse_tag_union, .field_names_rename_fields, .field_names_for_size => 2,
             .field_names_shortest_name,
             .field_names_longest_name,
@@ -82,6 +91,9 @@ pub fn intrinsicAnnotation(env: *const ModuleEnv, ident: base.Ident.Idx) ?Intrin
         .{ .name = "Builtin.Encoding.FieldName.FieldNames.iter", .intrinsic = .field_names_iter },
         .{ .name = "Builtin.Encoding.FieldName.FieldNames.for_size", .intrinsic = .field_names_for_size },
         .{ .name = "Builtin.Encoding.FieldName.name", .intrinsic = .field_name },
+        .{ .name = "Builtin.Code.prim", .intrinsic = .code_prim },
+        .{ .name = "Builtin.Code.type_id", .intrinsic = .code_type_id },
+        .{ .name = "Builtin.Code.ty_of", .intrinsic = .code_ty_of },
     };
     for (entries) |entry| {
         if (env.common.findIdent(entry.name)) |intrinsic_ident| {
@@ -177,6 +189,7 @@ fn replaceProvidedByCompilerLowLevels(env: *ModuleEnv) (Allocator.Error || error
     // We need to find the actual ident that was created during canonicalization
     for ([_]NamedLowLevel{
         .{ "Builtin.Str.is_eq", .str_is_eq },
+        .{ "code_refuse", .code_refuse },
         .{ "Builtin.Str.concat", .str_concat },
         .{ "Builtin.Str.contains", .str_contains },
         .{ "Builtin.Str.trim", .str_trim },

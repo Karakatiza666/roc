@@ -242,7 +242,7 @@ test "a user type named like the nominal type behind a Str problem alias keeps i
         \\
         \\It has the type:
         \\
-        \\    (StrUtf8Problem, Utf8Problem, Utf8Problem, Utf8Problem -> Bool)
+        \\    (StrUtf8Problem, Utf8Problem, (Utf8Problem, Utf8Problem -> Bool))
         \\
         \\But the annotation says it should be:
         \\

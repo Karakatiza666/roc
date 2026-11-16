@@ -26,10 +26,7 @@ EXPECTED WHERE CONSTRAINT - where_clauses_error_cases.md:7:3:7:10
 UNEXPECTED STATEMENT - where_clauses_error_cases.md:7:10:7:11
 MALFORMED WHERE CLAUSE - where_clauses_error_cases.md:3:10:3:21
 MALFORMED WHERE CLAUSE - where_clauses_error_cases.md:7:3:7:10
-DECLARATION HAS NO VALUE - where_clauses_error_cases.md:2:1:3:21
-DECLARATION HAS NO VALUE - where_clauses_error_cases.md:6:1:7:10
 UNBOUND WHERE RECEIVER - where_clauses_error_cases.md:11:10:11:27
-DECLARATION HAS NO VALUE - where_clauses_error_cases.md:10:1:11:28
 # PROBLEMS
 ~~~clojure
 (reports
@@ -212,28 +209,6 @@ DECLARATION HAS NO VALUE - where_clauses_error_cases.md:10:1:11:28
 			(line-break)
 			(reflow "Check the syntax of your where clause.")))
 	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 2 1) (end 3 21))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "where_clauses_error_cases.md") (start 2 1) (end 3 21) (annotation error) (line-text "broken_fn1 : a -> b\n  where [a.method -> b]"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 6 1) (end 7 10))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "where_clauses_error_cases.md") (start 6 1) (end 7 10) (annotation error) (line-text "broken_fn2 : a -> b\n  where []"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary.")))
-	(report
 		(severity runtime_error)
 		(title "Unbound Where Receiver")
 		(region (start 11 10) (end 11 27))
@@ -254,18 +229,7 @@ DECLARATION HAS NO VALUE - where_clauses_error_cases.md:10:1:11:28
 			(reflow " ")
 			(annotated code "c")
 			(reflow " ")
-			(reflow "to the annotation, or remove this constraint.")))
-	(report
-		(severity warning)
-		(title "Declaration Has No Value")
-		(region (start 10 1) (end 11 28))
-		(headline
-			(reflow "This declaration has a type annotation but no implementation."))
-		(document
-			(source-region (file "where_clauses_error_cases.md") (start 10 1) (end 11 28) (annotation error) (line-text "broken_fn3 : a -> b\n  where [c.method : c -> d]"))
-			(line-break)
-			(line-break)
-			(reflow "Add a value body here, or put hosted functions in a platform type mod so they are published through the host boundary."))))
+			(reflow "to the annotation, or remove this constraint."))))
 ~~~
 # TOKENS
 ~~~zig
@@ -326,7 +290,7 @@ broken_fn3 : a -> b
 (can-ir
 	(d-let
 		(p-assign (ident "broken_fn1"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-fn (effectful false)
 				(ty-rigid-var (name "a"))
@@ -335,7 +299,7 @@ broken_fn3 : a -> b
 				(malformed))))
 	(d-let
 		(p-assign (ident "broken_fn2"))
-		(e-anno-only)
+		(e-anno-only (kind "intrinsic"))
 		(annotation
 			(ty-fn (effectful false)
 				(ty-rigid-var (name "a"))

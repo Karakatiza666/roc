@@ -106,7 +106,7 @@ NO CHANGE
 			(e-match
 				(match
 					(cond
-						(e-call (constraint-fn-var 300)
+						(e-call (constraint-fn-var 454)
 							(e-lookup-external
 								(builtin))
 							(e-lookup-local
@@ -140,10 +140,10 @@ NO CHANGE
 				(p-assign (ident "_args")))
 			(e-block
 				(s-expr
-					(e-call (constraint-fn-var 407)
+					(e-call (constraint-fn-var 560)
 						(e-lookup-local
 							(p-assign (ident "echo!")))
-						(e-call (constraint-fn-var 406)
+						(e-call (constraint-fn-var 559)
 							(e-lookup-local
 								(p-assign (ident "describe")))
 							(e-string
