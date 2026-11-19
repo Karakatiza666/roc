@@ -2932,6 +2932,9 @@ pub fn build(b: *std.Build) void {
         // for the memory-safe nightlies. An omitted `-Doptimize` resolves to
         // `.debug` too, so only `user_input_options` tells the two apart.
         const release_optimize: OptimizeMode = if (b.user_input_options.contains("optimize")) optimize else .fast;
+        // Stripped unless `-Dstrip=false` is given, e.g. for the debug
+        // nightlies, which keep their debug info for stack traces.
+        const release_strip = strip_flag orelse true;
         // Create a release-specific zstd dependency with release settings
         const release_zstd = b.dependency("zstd", .{
             .target = release_target,
@@ -2942,7 +2945,7 @@ pub fn build(b: *std.Build) void {
             roc_modules,
             release_target,
             release_optimize,
-            true, // Always strip for release
+            release_strip,
             null, // Default frame pointer handling
             dependency_source,
             null, // No tracy for release
@@ -2963,7 +2966,11 @@ pub fn build(b: *std.Build) void {
             exe.step.dependOn(&write_compiled_builtins.step);
             release_exe_for_llvm_embedded = exe;
             build_release_step.dependOn(addInstallMaybeStrippedExe(b, exe, strip_macho_exports_tool));
-            build_release_step.dependOn(addBuildPathCheck(b, exe.getEmittedBin()));
+            // Debug info names the checkout and the Zig directories by
+            // design, so only a stripped binary can pass the path check.
+            if (release_strip) {
+                build_release_step.dependOn(addBuildPathCheck(b, exe.getEmittedBin()));
+            }
         }
     }
 
